@@ -1,0 +1,34 @@
+[Unit]
+Description=Authenticated TCP relay
+After=network-online.target tau-relay-firewall.service
+Requires=tau-relay-firewall.service
+Wants=network-online.target
+
+[Service]
+User=tau-relay
+Group=tau-relay
+ExecStart=/usr/local/bin/tau-relay /etc/tau-relay/config.toml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+MemoryMax=256M
+MemorySwapMax=0
+TasksMax=32
+LimitNOFILE=256
+
+[Install]
+WantedBy=multi-user.target

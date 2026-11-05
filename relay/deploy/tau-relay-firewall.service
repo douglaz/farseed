@@ -1,0 +1,12 @@
+[Unit]
+Description=Relay firewall
+Before=tau-relay.service
+After=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nft -f /etc/tau-relay/relay.nft
+
+[Install]
+WantedBy=multi-user.target

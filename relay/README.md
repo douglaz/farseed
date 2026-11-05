@@ -1,0 +1,146 @@
+# /v1 TCP relay PoC
+
+This crate supplies one fixture-tested relay component. It does not establish a
+checkpoint or specification conformance. The wire is paid-tcp-relay `844e834`, /v1;
+the browser client stays unchanged. TLS terminates at the front proxy, on a
+separate host from the TCP destination. No page is hosted here.
+
+Run `tau-relay CONFIG.toml`. Example configuration (documentation addresses must
+be replaced; public interface and NAT addresses must all be listed):
+
+```toml
+listen = "127.0.0.1:9000"
+public_url = "wss://relay.example.net/"
+pass_file = "/etc/tau-relay/passes.toml"
+dns_server = "192.0.2.53:53"
+own_public = ["203.0.113.10"]
+```
+
+The exact URL, including its slash, appears in the challenge and must match AUTH.
+The listener must be loopback. The one startup line reports its actual address,
+including when port zero is requested. Configuration errors contain no record
+values. Connections write nothing to stdout, stderr or files.
+
+The pass file is TOML:
+
+```toml
+[[passes]]
+key = "<64 lowercase hex characters: x-only public key>"
+hosts = ["target.example.net"]
+expiry = 1800000000
+revoked = false
+```
+
+Expiry is a required Unix timestamp in seconds. Keys must be valid curve points;
+unknown fields, duplicate keys/hosts and invalid hosts are refused. Every host is
+admitted at registration, even in an expired or revoked record, and checked again
+on every attempt. Empty files use `passes = []`. Registration of a forbidden
+literal, failing DNS, or any forbidden DNS answer prevents startup. All ports on a
+recorded host are eligible. Restart to apply pass changes; a restart ends existing
+sessions. There are no purchase, recording or signed revocation endpoints.
+
+The numeric DNS endpoint is an explicit operator choice; a loopback stub resolver
+is supported. The bounded UDP stub queries A, then AAAA, with fresh transaction
+IDs and no cache. Both responses must succeed. It accepts address records and
+CNAME chains in the answer section, refuses malformed or truncated responses,
+and does not follow a CNAME requiring another query. Unsupported DNS features
+fail closed. Every returned address must pass policy; only the first is dialed,
+as a numeric socket address. No alternate-target fallback or reconnect occurs.
+
+The address policy denies every row of both IANA special-purpose registries,
+Last Updated 2025-10-09, regardless of global-reachability flags. IPv4 also denies
+multicast and reserved space. IPv6 must lie in 2000::/3 outside the denied ranges.
+The policy also denies every interface address enumerated with `getifaddrs` at
+startup and the configured public addresses. Enumeration failure is fatal.
+Interface changes and NAT changes require a restart with an updated inventory.
+
+Local PoC decisions are collected in `PocLimits`, separate from profile timing:
+
+| Parameter | Value and reason |
+|---|---|
+| Handshake | 20 s from accept through upgrade, AUTH and admission; dial has its own deadline; OK flush is bounded by another 20 s |
+| DNS | 5 s for both queries; no retry; 4096-byte packet, 64 answers, 128 name-decompression steps |
+| TCP connect | 10 s; no alternate address retry |
+| Idle | 300 s without activity; useful for SSH without unbounded idle sessions |
+| Write stall | 30 s without a successful TCP write while data is pending; no progress closes 1013, including with a full queue |
+| HTTP upgrade header | 64 KiB, bounded before the WebSocket parser; no frame prefetch |
+| WebSocket frame/message | 64 KiB each; TCP read chunks 16 KiB |
+| Close send | 1 s; a peer that stops reading cannot retain the TCP stream |
+| TCP write queue | Four messages plus one active write and one pending enqueue (at most 384 KiB of payload); transient congestion pauses reads until space returns |
+| Connections | 64; excess accepted sockets are dropped before upgrade |
+| Pass file/config | 256 KiB each; at most 128 passes, 16 hosts per pass |
+| Counter sweep | 1 s; expired timestamps also pruned on admission |
+
+These caps suit a 1 vCPU / 1 GiB host and are local operating bounds, not a
+resolution of the upstream destination-cap question. Profile `auth_skew`,
+`min_spacing`, `window`, and `window_cap` come directly from the pinned timing
+vector. Pacing uses a monotonic clock, scoped by (pass key, canonical host), across
+ports. The sliding window is `(now - window, now]`; minimum-spacing equality is
+allowed. Counting is atomic before dialing, so a failed dial consumes one slot.
+Only timestamps still needed by the current window remain, with at most one
+sweep interval of stale retention. Nothing records a connection verdict.
+
+AUTH failures stop at the first WIR-6 check. Binary data before OK closes 1002;
+this PoC also rejects extra text between AUTH and OK with 1002. That text case is
+unspecified by /v1. Control ping/pong frames remain WebSocket controls. The socket
+wins simultaneous readiness during admission, dialing and OK flushing. TCP is
+neither read nor written until OK has finished sending. A frame guard rejects
+forbidden data at its first header byte, including non-final frames, before
+message reassembly. When the TCP queue is full, one bounded enqueue waits without
+an independent deadline; successful partial TCP writes reset the writer's
+no-progress deadline even if a message takes longer than 30 s to finish.
+Controls behind that pending binary message wait for space or termination on
+write failure or no progress. Regular write progress can delay later controls
+and text while the buffered data drains.
+Text and closure remain observable while the writer is blocked and queue space
+remains. No queue overflow alone discards a healthy stream.
+
+Build and test from the workspace root with `cargo test --locked -p tau-relay`.
+Tests honor `TMPDIR` when supplied; otherwise scratch uses Cargo's target test
+directory. Each test creates and removes its own randomly named directory. All network
+fixtures stay on loopback; public addresses are synthetic policy/dialer inputs.
+The root package is a test-only signing dependency. The release dependency graph
+has no TLS stack or C build step; libc supplies interface enumeration through the
+target runtime.
+
+For a static release, supply an isolated Rust installation containing the
+`x86_64-unknown-linux-musl` target, and run `relay/build-static.sh`. `CARGO` can
+name an executable; `PATH`, `RUSTUP_HOME`, `CARGO_HOME`, `RUSTUP_TOOLCHAIN`,
+`CARGO_TARGET_DIR`, linker selection and other normal build variables are
+respected. The output is `${CARGO_TARGET_DIR:-target}/x86_64-unknown-linux-musl/release/tau-relay`.
+Verify static linking with `file` before deployment.
+
+Deployment targets a dedicated Arch Linux x86_64 host, `arch` with passwordless
+`sudo -n`, using packages installed in one full `pacman -Syu` transaction. The
+script uses one pinned SSH transport; it never learns or rewrites a host key.
+The known-hosts path must be absolute and contain only letters, digits, `/`, `_`,
+`.` and `-`, preventing OpenSSH list parsing or expansion from adding trust sources.
+Identity paths remain individual argv entries and may contain spaces or quotes.
+Dry run reads no binary, pass, key or known-hosts file and opens no connection:
+
+```sh
+python3 relay/deploy/deploy.py --dry-run \
+  --host relay.example.net --domain relay.example.net \
+  --known-hosts /operator/known_hosts --identity /operator/ssh_key \
+  --binary /artifacts/tau-relay --passes /operator/passes.toml \
+  --dns-server 192.0.2.53 --own-address 203.0.113.10
+```
+
+Replace documentation placeholders and remove `--dry-run` only for a deliberate
+deployment. Every interface/NAT public address needs its own `--own-address`.
+The DNS option selects a numeric IPv4 server at UDP port 53. Caddy proxies every
+path to loopback without access logging. The dedicated service has a 256 MiB
+memory cap, no capabilities and read-only system files; AF_NETLINK allows
+interface enumeration. The relay requires successful firewall startup. Its restart delay is 5 s.
+Configuration and passes are root-owned, group-readable
+only by the service.
+
+The firewall owns only `inet tau_relay`; atomic replacement preserves established
+SSH. It accepts only loopback, established inbound traffic and ports 22/80/443. Unsolicited IPv6 neighbour/router discovery is not allowed; deployment must
+provide routing/neighbour configuration compatible with this inbound policy.
+Relay-user egress denies
+special/local/private/metadata routes and host-owned addresses. The sole DNS
+exception permits UDP to the configured address at port 53; it cannot admit TCP
+destinations. Established reply-direction loopback traffic permits replies to
+Caddy; new relay TCP connections to loopback still fail. Existing host firewall
+rules may further restrict this policy. Static validation never applies rules.

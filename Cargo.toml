@@ -1,8 +1,8 @@
 [workspace]
-members = ["tracer"]
+members = ["tracer", "relay"]
 # The tracer (fixtures, browser driver and the served build's checks) is linted and unit-tested
 # by the same `cargo clippy`/`cargo test` as the harness.
-default-members = [".", "tracer"]
+default-members = [".", "tracer", "relay"]
 
 [package]
 name = "tau-web"
