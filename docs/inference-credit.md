@@ -15,7 +15,9 @@ credential never enters the browser or a test does not apply to this path. The s
 memory-only, used only by harness code, registered with the filter on receipt, and never journaled
 or sent to the page. The Default key is never used for inference.
 
-A saved invoice displays its amount, **Open in wallet**, **Copy**, minutes left and **Check now**.
+Pending, unknown, expired-unpaid and abandoned credit invoices display their amount,
+**Open in wallet**, **Copy** and minutes left. Paid and seen credit invoices display only their
+amount and status. The account-wide **Check now** remains available.
 The wallet link uses its saved `lightning:` invoice, never a checkout URL. Invoices are paid
 externally under ARC-30/ADR-0014. The page holds no wallet, spends nothing, never enables
 automatic top-up and makes no NWC connection.
@@ -57,7 +59,12 @@ by 24 lowercase hexadecimal characters drawn from 96 random bits: exactly 25 cha
 new mint uses fresh randomness and the store refuses a repeated name. Before a new mint it lists
 keys including disabled ones, matches earlier committed names for that session and best-effort
 deletes their issuer ids, including keys whose mint answers were lost. Returned unusable and late
-keys are deleted best effort. End cannot be undone by cleanup failure.
+keys are deleted best effort. End cannot be undone by cleanup failure. Each successful Unlock
+retries best-effort cleanup for ended credit-backed sessions, using only recorded mint metadata
+and the account credential. A recorded returned expiry is the retry cutoff; otherwise the cutoff
+is the requested expiry plus 60 seconds. Cleanup answers are not recorded, so another Unlock
+can repeat a deletion before its cutoff. Passing a cutoff establishes neither successful
+cancellation nor expiry at the service.
 
 Lock, reload and worker loss clear session keys. Eligible interrupted work or Resume restores the
 account automatically and mints when inference is next needed, retaining the same session,

@@ -2,7 +2,7 @@
 // carries words to the page; re-entry and passphrase buffers are zero-filled by the module.
 import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, accept_page_goal, TaskPublication, requirements_answer, delivery_request, retire_runtime, sweep_inference, lifecycle_transition, publication_generation, publish_report, verify_inference_clock, withdraw_reinstall } from './pkg/tau_web.js';
 import { identify_execution, wake_tasks, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_propose_requirements } from './pkg/tau_web.js';
-import { credit_request } from './pkg/tau_web.js';
+import { credit_request, retry_ended_credit } from './pkg/tau_web.js';
 import { provider_configure, provider_key_is_set, provider_request } from './pkg/tau_web.js';
 
 const clearInput = request => {
@@ -84,8 +84,8 @@ const schedulePayments = () => {
     paymentTimer = null;
     if (!paymentsEligible()) return;
     const generation = publication_generation();
-    if (creditPending && pendingCredit() === creditPending) await reportStore(await credit_request(JSON.stringify({action:'poll'})), generation, '', 'credit');
-    if (machinePending && pendingMachine() === machinePending) await reportStore(await provider_request(JSON.stringify({action:'payment_check'})), generation, '', 'machine');
+    if (creditPending && pendingCredit() === creditPending) await reportStore(await credit_request(JSON.stringify({action:'poll'})), generation, '', 'credit', true);
+    if (machinePending && pendingMachine() === machinePending) await reportStore(await provider_request(JSON.stringify({action:'payment_check'})), generation, '', 'machine', true);
     schedulePayments();
   }, 5000);
 };
@@ -100,13 +100,14 @@ const presentationReport = (report, step) => {
   if (value.error) value.page_error_step = step;
   return JSON.stringify(value);
 };
-const reportStore = (report, generation = publication_generation(), session = '', step = 'store') => {
+const reportStore = (report, generation = publication_generation(), session = '', step = 'store', paymentTimerReport = false) => {
   report = presentationReport(report, step);
   const value = JSON.parse(report);
   lastReport = value;
   schedulePayments();
   value.poc_configuration = { key_set: poc_key_is_set() };
   value.provider_configuration = { key_set: provider_key_is_set() };
+  if (paymentTimerReport) value.payment_timer = true;
   return publish_report(generation, session, JSON.stringify(value));
 };
 const exactMembers = (value, names) => value && typeof value === 'object' &&
@@ -248,6 +249,7 @@ onmessage = async ({ data: envelope }) => {
   await reportStore(report, generation, session, step);
   if (data.unlock instanceof Uint8Array || data.seed_backup_redisplay instanceof Uint8Array) {
     setTimeout(() => sweep_inference(), 0);
+    if (data.unlock instanceof Uint8Array && JSON.parse(report).state === 'unlocked' && !JSON.parse(report).error) setTimeout(() => retry_ended_credit(), 0);
     wake_tasks();
     await refreshPayments();
   }

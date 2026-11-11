@@ -124,8 +124,9 @@ const startDisclosure = parent => {
   parent.append(disclosure);
 };
 const mainHomes = new Map();
-const restoreMainActions = () => {
+const restoreMainActions = (retained) => {
   for (const [button, {parent, next, form}] of mainHomes) {
+    if (retained.has(button)) continue;
     if (parent.isConnected) parent.insertBefore(button, next?.parentNode === parent ? next : null);
     else button.remove();
     if (form === null) button.removeAttribute('form'); else button.setAttribute('form', form);
@@ -133,8 +134,8 @@ const restoreMainActions = () => {
       control.classList.remove('main-action');
       if (!control.className) control.removeAttribute('class');
     }
+    mainHomes.delete(button);
   }
-  mainHomes.clear();
 };
 const renderSteps = store => {
   const unlocked = store.state === 'unlocked';
@@ -163,16 +164,23 @@ const renderSteps = store => {
     $(`step-${name}-fold`).open = foldChoices.get(name) ?? current === name;
     step.querySelectorAll('.main-action').forEach(button => { button.classList.remove('main-action'); if (!button.className) button.removeAttribute('class'); });
   }
+  const retained = new Set();
   const emphasize = (name, controls) => {
-    const offered = controls.filter(button => button && !button.closest('[hidden]') && button.closest('[data-step]')?.dataset.step === name);
+    const offered = controls.filter(button => {
+      if (!button || button.closest('[hidden]') || button.closest('[data-step]')?.dataset.step !== name) return false;
+      const home = mainHomes.get(button.form ?? button)?.parent;
+      return !home || (home.isConnected && !home.closest('[hidden]'));
+    });
     const button = offered.find(button => !button.disabled) ?? offered[0];
     if (!button) return;
     button.classList.add('main-action');
     // Move the existing form intact when its action is inside optional settings.
     // Controls already beside their required facts keep their original container.
-    if (!button.closest(`#tau-step-${name}-fold`)) return;
     const node = button.form ?? button;
+    if (mainHomes.has(node)) { retained.add(node); return; }
+    if (!button.closest(`#tau-step-${name}-fold`)) return;
     mainHomes.set(node, {parent: node.parentNode, next: node.nextSibling, form: node.getAttribute('form')});
+    retained.add(node);
     $(`step-${name}-action`).append(node);
   };
   emphasize('store', [$('create'), $('unlock'), $('seed-backup-answer'), $('seed-backup-check'), $('redisplay')]);
@@ -196,14 +204,19 @@ const renderSteps = store => {
       !sessions.some(session => session.bound_set.some(machine => button.textContent === `Start session ${machine}`))),
     ...taskControls('[data-poc-propose], [data-end-session], [data-delivery-check], [data-task] button, #tau-poc-targets button'),
   ]);
+  restoreMainActions(retained);
 };
+let renderedReport;
 const render = (store) => {
+  const { payment_timer, ...content } = store;
+  const report = JSON.stringify(content);
+  if (payment_timer === true && report === renderedReport && !store.error && !store.credit_error) return;
+  renderedReport = report;
   const focused = document.activeElement;
   const selection = [focused?.selectionStart, focused?.selectionEnd, focused?.selectionDirection];
   for (const details of document.querySelectorAll('details[data-fold-key]')) {
     rawFoldChoices.set(details.dataset.foldKey, details.open);
   }
-  restoreMainActions();
   const { state } = store;
   if (state !== 'unlocked') $('task-results')?.replaceChildren();
   $('store-state').dataset.lifecycle = store.lifecycle_state ?? '';
@@ -711,8 +724,16 @@ const invoiceControls = (parent, savedInvoice, expires) => {
   remaining.textContent = `${Math.max(0, Math.ceil((expires - Date.now() / 1000) / 60))} minutes left`;
   parent.append(wallet, ' ', copy, ' ', remaining);
 };
+let providerCloseState = {purchase: {}, enabled: false};
+const updateProviderClose = () => {
+  const {purchase, enabled} = providerCloseState;
+  const closeEligible = Boolean(purchase.vm_id) && !purchase.target && (!purchase.payment || (purchase.payment.is_paid === false && Math.floor(Date.parse(purchase.payment.expires) / 1000) <= Math.floor(Date.now() / 1000)));
+  $('provider-close').hidden = !closeEligible;
+  $('provider-close').disabled = !enabled || !closeEligible;
+};
 setInterval(() => {
   for (const node of document.querySelectorAll('[data-invoice-expires]')) node.textContent = `${Math.max(0, Math.ceil((Number(node.dataset.invoiceExpires) - Date.now() / 1000) / 60))} minutes left`;
+  updateProviderClose();
 }, 1000);
 const renderCredit = (store, enabled) => {
   const credit = store.credit;
@@ -729,7 +750,8 @@ const renderCredit = (store, enabled) => {
   for (const invoice of invoices) {
     const row = document.createElement('section'); row.dataset.creditInvoice = invoice.id;
     paragraph(row, `${invoice.amount_sat} sat. ${({abandoned:'Invoice marked abandoned.',pending:'Waiting for external payment.',paid:'Payment seen; inference credit read.',expired_unpaid:'This invoice expired unpaid, according to the credit service.',unknown:'Payment status unknown.',seen:'Payment seen; balance not read yet.'})[invoice.outcome]}`);
-    invoiceControls(row, invoice.bolt11, invoice.expires_at); slot.append(row);
+    if (!['paid', 'seen'].includes(invoice.outcome)) invoiceControls(row, invoice.bolt11, invoice.expires_at);
+    slot.append(row);
   }
 };
 $('credit-invoice').addEventListener('click', () => {
@@ -754,8 +776,9 @@ const renderProvider = (store, enabled) => {
     const home = document.createElement('span'); home.id = 'tau-purchase-review-home';
     $('purchase-review').before(home);
   }
-  if (purchase.selection) $('purchase-review-slot').append($('purchase-review'));
-  else $('purchase-review-home').after($('purchase-review'));
+  if (purchase.selection) {
+    if ($('purchase-review').parentNode !== $('purchase-review-slot')) $('purchase-review-slot').append($('purchase-review'));
+  } else if ($('purchase-review-home').nextSibling !== $('purchase-review')) $('purchase-review-home').after($('purchase-review'));
   $('purchase-review-slot').hidden = store.state !== 'unlocked';
   if (!$('provider-origin').value && (store.provider_configuration?.origin ?? purchase.origin)) $('provider-origin').value = store.provider_configuration?.origin ?? purchase.origin;
   providerDisplayedOrigin = purchase.origin ?? null;
@@ -818,9 +841,11 @@ const renderProvider = (store, enabled) => {
     if (purchase.payment) {
       const pay = purchase.payment;
       paragraph(progress, `Payment ${pay.id} for VM ${pay.vm_id}: ${pay.is_paid ? 'paid' : 'payment pending'}; expires ${pay.expires}. Amount ${pay.amount}, tax ${pay.tax}, processing fee ${pay.processing_fee} (${pay.currency === 'BTC' ? 'millisats' : pay.currency + ' cents'}).`);
-      invoiceControls(progress, pay.data.lightning, Math.floor(Date.parse(pay.expires) / 1000));
-      const check = document.createElement('button'); check.type = 'button'; check.textContent = 'Check now'; check.disabled = !enabled;
-      check.addEventListener('click', () => providerRequest({action:'payment_check'})); progress.append(check);
+      if (!pay.is_paid) {
+        invoiceControls(progress, pay.data.lightning, Math.floor(Date.parse(pay.expires) / 1000));
+        const check = document.createElement('button'); check.type = 'button'; check.textContent = 'Check now'; check.disabled = !enabled;
+        check.addEventListener('click', () => providerRequest({action:'payment_check'})); progress.append(check);
+      }
     }
     if (purchase.public_keys) {
       paragraph(progress, 'Registering the machine SSH public key with the provider does not enroll the relay. Copy the separate relay public key and ask your relay operator to enroll it before configuration.');
@@ -835,9 +860,8 @@ const renderProvider = (store, enabled) => {
   if (renewal) {
     for (const name of ['provider-machine', 'provider-relay', 'provider-class']) $(name).disabled = true;
   }
-  const closeEligible = Boolean(purchase.vm_id) && !purchase.target && (!purchase.payment || (purchase.payment.is_paid === false && Math.floor(Date.parse(purchase.payment.expires) / 1000) <= Math.floor(Date.now() / 1000)));
-  $('provider-close').hidden = !closeEligible;
-  $('provider-close').disabled = !enabled || !closeEligible;
+  providerCloseState = {purchase, enabled};
+  updateProviderClose();
   $('provider-resume').disabled = !enabled || !purchase.phase;
   $('provider-invoice').disabled = !enabled || purchase.phase !== 'initial_invoice' || !purchase.billing;
 };
@@ -921,7 +945,10 @@ const renderPoc = (store) => {
     paragraph(row, `${target.machine}: relay profile ${target.profile}; elevation ${target.elevation}.`);
     paragraph(row, `Host ${target.host}, port ${target.port}, user ${target.user}; relay ${target.relay}.`);
     paragraph(row, `Independent host pin: ${target.pin}`);
-    const useCredit = store.credit?.can_start && (store.credit.selected || !store.poc_configuration?.key_set);
+    const creditSession = (store.sessions ?? []).some(session => session.credit_backed && session.session_state !== 'ended' && (session.bound_set ?? []).includes(target.machine));
+    const creditChoice = store.credit?.selected || !store.poc_configuration?.key_set;
+    const readingCredit = store.credit?.account && store.credit.balance === null && !store.credit_error;
+    const useCredit = creditSession || (creditChoice && (store.credit?.can_start || readingCredit));
     const configuration = document.createElement('p');
     if (useCredit) configuration.dataset.inferenceApproval = '';
     else configuration.textContent = `Inference endpoint: ${store.poc_configuration?.configuration?.endpoint ?? 'unavailable'}; model: ${store.poc_configuration?.configuration?.model ?? 'unavailable'}.`;
@@ -933,11 +960,14 @@ const renderPoc = (store) => {
       creditGoal.setAttribute('aria-label', 'Goal before Start session'); creditGoal.value = creditGoalDrafts.get(target.machine) ?? '';
       creditGoal.addEventListener('input', () => creditGoalDrafts.set(target.machine, creditGoal.value)); row.append(creditGoal);
       paragraph(row, store.credit.disclosure);
+      if (readingCredit) paragraph(row, 'Reading inference credit balance…');
+      else if (store.credit_error) paragraph(row, store.credit_error);
+      else if (!store.credit.can_start) paragraph(row, store.credit.balance_text);
     }
     for (const [kind, label] of [['poc_bind', 'Start session'], ['poc_public_keys', 'Show public keys']]) {
       const button = document.createElement('button');
       button.type = 'button';
-      button.disabled = !enabled || (kind === 'poc_bind' && !useCredit && !store.poc_configuration?.configuration);
+      button.disabled = !enabled || (kind === 'poc_bind' && (useCredit ? !store.credit?.can_start : !store.poc_configuration?.configuration));
       button.textContent = `${label} ${target.machine}`;
       button.addEventListener('click', () => {
         button.disabled = true;

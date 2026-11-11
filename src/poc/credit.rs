@@ -306,23 +306,33 @@ pub fn mint_name() -> Result<String, String> {
     Ok(format!("k{}", hex::encode(bytes)))
 }
 pub(crate) fn expiry_matches(requested: u64, text: &str) -> bool {
-    let Ok(seconds) = super::provisioning::timestamp(text) else {
-        return false;
-    };
+    expiry_nanos(text).is_some_and(|actual| {
+        actual.abs_diff(u128::from(requested) * 1_000_000_000) <= 60_000_000_000
+    })
+}
+fn expiry_nanos(text: &str) -> Option<u128> {
+    let seconds = super::provisioning::timestamp(text).ok()?;
     let fraction = if text.len() == 20 {
         0
     } else {
         let digits = &text[20..text.len() - 1];
         if digits.is_empty() || digits.len() > 9 {
-            return false;
+            return None;
         }
-        let Ok(number) = digits.parse::<u128>() else {
-            return false;
-        };
+        let number = digits.parse::<u128>().ok()?;
         number * 10u128.pow(9 - digits.len() as u32)
     };
-    let actual = u128::from(seconds) * 1_000_000_000 + fraction;
-    actual.abs_diff(u128::from(requested) * 1_000_000_000) <= 60_000_000_000
+    Some(u128::from(seconds) * 1_000_000_000 + fraction)
+}
+impl Mint {
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) fn retry_eligible(&self, now_nanos: u128) -> bool {
+        let cutoff = match &self.returned_expiry {
+            Some(expiry) => expiry_nanos(expiry),
+            None => Some((u128::from(self.requested_expiry) + 60) * 1_000_000_000),
+        };
+        cutoff.is_some_and(|cutoff| now_nanos < cutoff)
+    }
 }
 pub fn returned_mint(value: &Value, mint: &Mint) -> Result<(String, String), String> {
     let data = &value["data"];

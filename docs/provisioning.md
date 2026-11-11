@@ -248,8 +248,10 @@ bound origin and exact price, and the approval shows the relay being approved. A
 question has no answer preselected. A later defaults response cannot replace operator edits
 or a reviewed selection. The saved purchase's origin and review-snapshot checks still govern.
 
-Both machine and credit invoices show amount, a saved `lightning:` wallet link, Copy, minutes
-remaining and Check now. While visible, unlocked and holding the provider key, the worker
+Pending and unknown invoices show amount, a saved `lightning:` wallet link, Copy and minutes
+remaining. Paid machine invoices and credit invoices whose payment was seen retain their amount
+and status without wallet controls or a countdown. Check now remains available for pending
+machine payments and at the account level for credit. While visible, unlocked and holding the provider key, the worker
 automatically checks a pending saved machine payment every **five seconds**, until its expiry
 plus 60 seconds. At dispatch it rechecks that deadline, the current saved payment and lifecycle,
 including after awaited credit work; a stale timer cannot read a retired or replaced payment.

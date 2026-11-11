@@ -294,7 +294,8 @@ export async function purchaseSnapshot(c, report, state) {
   c.check(await c.evaluate(`document.querySelector('#tau-provider-progress').innerText.includes(${JSON.stringify(quote)})`),'exact invoice approval quote remains visible');
  }
  if(report.procurement?.payment){
-  c.check(await c.evaluate("document.querySelector('#tau-provider-progress a[href^=\"lightning:\"]')?.textContent==='Open in wallet' && [...document.querySelectorAll('#tau-provider-progress button')].some(n=>n.textContent==='Copy') && document.querySelector('#tau-provider-progress [data-invoice-expires]')"),'invoice wallet, copy and time controls remain present');
+  const controls=await c.evaluate("({wallet:document.querySelectorAll('#tau-provider-progress a[href^=\"lightning:\"]').length,copy:[...document.querySelectorAll('#tau-provider-progress button')].filter(n=>n.textContent==='Copy').length,time:document.querySelectorAll('#tau-provider-progress [data-invoice-expires]').length,check:[...document.querySelectorAll('#tau-provider-progress button')].filter(n=>n.textContent==='Check now').length})");
+  assert.deepEqual(controls,Object.fromEntries(['wallet','copy','time','check'].map(name=>[name,report.procurement.payment.is_paid?0:1])),'pending payments retain controls; paid payments retain only their payment line');
  }
  await phoneSnapshot(c,state);
  await c.call('Emulation.setDeviceMetricsOverride',{width:360,height:844,deviceScaleFactor:1,mobile:true},c.sessionId);

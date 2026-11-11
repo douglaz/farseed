@@ -1,5 +1,45 @@
 use super::*;
 use serde_json::json;
+
+#[test]
+fn poc_credit_cleanup_cutoffs_use_returned_precision_or_requested_tolerance() {
+    let requested = super::super::provisioning::timestamp("2026-11-11T00:00:00Z").unwrap();
+    let mut mint = Mint {
+        session: "session-1".into(),
+        name: "k0123456789abcdef012345678".into(),
+        requested_cap: CAP,
+        requested_expiry: requested,
+        issuer_id: None,
+        returned_cap: None,
+        returned_expiry: None,
+    };
+    let fallback = u128::from(requested + 60) * 1_000_000_000;
+    assert!(mint.retry_eligible(fallback - 1));
+    assert!(!mint.retry_eligible(fallback));
+    assert!(!mint.retry_eligible(fallback + 1));
+    for expiry in ["2026-11-10T23:59:00Z", "2026-11-11T00:00:00.123456789Z"] {
+        mint.issuer_id = Some("key-1".into());
+        mint.returned_cap = Some(CAP);
+        mint.returned_expiry = Some(expiry.into());
+        let cutoff = expiry_nanos(expiry).unwrap();
+        assert!(mint.retry_eligible(cutoff - 1));
+        assert!(!mint.retry_eligible(cutoff));
+        assert!(!mint.retry_eligible(cutoff + 1));
+    }
+    for expiry in [
+        "2026-11-11T00:00:00.Z",
+        "2026-11-11T00:00:00.1234567890Z",
+        "2201-01-01T00:00:00Z",
+        "invalid",
+    ] {
+        mint.returned_expiry = Some(expiry.into());
+        assert!(!mint.retry_eligible(0));
+    }
+    mint.returned_expiry = None;
+    mint.requested_expiry = u64::MAX;
+    assert!(mint.retry_eligible(u128::from(u64::MAX) * 1_000_000_000));
+}
+
 fn invoice() -> Invoice {
     Invoice::from_response(201, &json!({"invoice_id":"invoice-1","lightning_invoice":"lnbc1000synthetic","amount":1000,"currency":"SATS","expires_at":200}), 1000, 0.7).unwrap()
 }

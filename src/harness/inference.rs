@@ -103,6 +103,9 @@ async fn publication(generation: u64, session: String, report: String, post: boo
             }
             let safe = store.protect_output(&value)?;
             let mut current = local.report(None);
+            if safe["payment_timer"] == true {
+                current["payment_timer"] = true.into();
+            }
             if let Some(outcome) = safe.get("goal_outcome") {
                 if outcome["session"] != session {
                     return Err("publication session differs".into());

@@ -1,6 +1,8 @@
 import {phoneSnapshot} from './layout-page.mjs';
 import assert from 'node:assert/strict';
+import {edgeCases, edgePaidInvoices, edgeSession, edgeFocusPending} from './edges-page.mjs';
 export const creditCases = ['credit-funding','credit-expiry','credit-failures','credit-key','credit-lock','credit-reload','credit-loss','credit-defaults','credit-defaults-invalid','credit-defaults-missing','credit-control-account','credit-control-key','credit-control-name','credit-lifecycle','credit-refusals','credit-account-write','credit-double-press','credit-late-lock','credit-late-end','credit-poll-bounds','credit-defaults-directory','credit-defaults-late','credit-mint-pause','credit-existing-balance','credit-defaults-urls','credit-new-balance-failure','credit-resolved-history','credit-goal-drafts','credit-refresh-contention','credit-ensure-contention','credit-balance-loss-refresh','credit-balance-loss-mint',...['collection','verification'].flatMap(phase=>['refused','lost','wrong-cap'].map(mode=>`credit-mint-${phase}-${mode}`))];
+creditCases.push(...edgeCases);
 export const creditId = 'synthetic-credit-identity-482700';
 export const defaultKey = 'synthetic-default-credential-482700';
 export function fixtureCredit() {
@@ -14,6 +16,15 @@ export function fixtureCredit() {
   state.requests.push({route,method,evidence,at:Date.now()});
   res.setHeader('Content-Type','application/json');
   const answer=(code,value)=>res.writeHead(code).end(JSON.stringify(value));
+  if(route.startsWith('/api/v1/')) {
+   assert.equal(method,'GET');
+   const region={id:1,name:'Fixture region',country_code:'IE',company_id:1};
+   const cost={id:1,name:'Monthly',currency:'BTC',amount:1000000,other_price:[],interval_amount:1,interval_type:'month'};
+   if(route==='/api/v1/vm/templates')answer(200,{data:{templates:[{limits:{},id:1,name:'Small fixture',created:'2026-01-01T00:00:00Z',cpu:1,memory:1073741824,disk_size:10737418240,disk_type:'ssd',disk_interface:'scsi',cpu_arch:'x86_64',cpu_mfg:'amd',cpu_features:['AVX2','AES'],cost_plan:cost,region}],custom_template:[]}});
+   else if(route==='/api/v1/image')answer(200,{data:[{id:3,distribution:'archlinux',flavour:'base',version:'rolling',release_date:'2026-10-01T00:00:00Z',cpu_arch:'x86_64',default_username:'arch',encrypted:false,popularity:0.1}]});
+   else throw Error('unexpected provider fixture route '+route);
+   return true;
+  }
   if(route==='/accounts/create'){
    assert.equal(method,'POST');assert.equal(raw,'');assert.equal(req.headers.authorization,undefined);state.accountCalls++;
    if(state.mode==='account-fail'){answer(503,{error:'private-prefix'});return true;}
@@ -36,7 +47,7 @@ export function fixtureCredit() {
    assert.equal(evidence?.account_contains,true,'account pair is already readable before invoice dispatch');
    if(state.mode==='invoice-lost'){res.destroy();return true;}
    if(state.mode==='invoice-fail'){answer(503,{error:'private-prefix'});return true;}
-   const invoice={invoice_id:'invoice-'+state.invoiceCalls,amount:body.amount,currency:'SATS',created_at:Math.floor(Date.now()/1000),expires_at:Math.floor(Date.now()/1000)+(state.mode==='past-expiry'?-1:120),lightning_invoice:'lnbc1000synthetic'+state.invoiceCalls,checkout_url:'https://checkout.example/unused'};
+   const invoice={invoice_id:'invoice-'+state.invoiceCalls,amount:body.amount,currency:'SATS',created_at:Math.floor(Date.now()/1000),expires_at:Math.floor(Date.now()/1000)+(state.mode==='past-expiry'?-1:state.invoiceLifetime??120),lightning_invoice:'lnbc1000synthetic'+state.invoiceCalls,checkout_url:'https://checkout.example/unused'};
    if(state.mode==='invoice-invalid')invoice.lightning_invoice='LNBC1000invalid';
    state.invoices.push(invoice);answer(201,invoice);return true;
   }
@@ -55,6 +66,7 @@ export function fixtureCredit() {
   }
   if(route.startsWith('/keys/')){
    assert.equal(method,'DELETE');state.deletes.push(route.slice(6));
+   if(state.onDelete)await state.onDelete(route.slice(6));
    const key=state.keys.find(k=>k._id===route.slice(6));if(key)key.deleted_at='2026-11-10T00:00:00Z';
    answer(state.mintMode==='revoke-fail'?503:200,{status:'success',message:'Key deleted'});return true;
   }
@@ -62,7 +74,7 @@ export function fixtureCredit() {
    assert.equal(method,'POST');state.mintCalls++;
    if(!evidence?.mint_names?.includes(body.name))state.orderingFailures.push('mint name was not committed before request');
    assert.equal(body.usage_limit_usd,0.25);assert.equal(body.name.length,25);
-   assert.ok(Math.abs(Date.parse(body.expire_at)-Date.now()-86400000)<5000);
+   assert.ok(Math.abs(Date.parse(body.expire_at)-(state.clockMs??Date.now())-86400000)<5000);
    if(state.mintMode==='refused'){answer(403,{error:'private-prefix'});return true;}
    const key={_id:'key-'+state.mintCalls,name:body.name,api_key:'synthetic-session-credential-'+state.mintCalls+'-482700',created_at:new Date().toISOString(),usage_limit_usd:0.25,reset_period:null,expire_at:body.expire_at,deleted_at:null};
    state.keys.push(key);
@@ -83,6 +95,7 @@ export function fixtureCredit() {
 export async function creditProof(c) {
  const {name,info,call,sessionId,evaluate,workerEvaluate,invoke,wait,click,message,hold,point,release,check,control,pageOrigin,credit,inferenceEndpoint}=c;
  const state=credit.state;
+ if(name.startsWith('edge-focus'))state.invoiceLifetime=600;
  const report=()=>evaluate('fixtureReports.at(-1)');
  const request=async(action)=>{
   const count=await evaluate('fixtureEvents.filter(e=>e.fixture_credit_complete).length');await message({credit_request:action});
@@ -187,6 +200,8 @@ export async function creditProof(c) {
  const idScan=await journal(creditId),keyScan=await journal(defaultKey);
  assert.equal(idScan.account_records,1);assert.equal(idScan.account_contains,true);assert.equal(idScan.contains,false);assert.equal(keyScan.account_contains,true);assert.equal(keyScan.contains,false);
  check(await evaluate("document.querySelector('#tau-credit-invoices a').getAttribute('href').startsWith('lightning:lnbc') && document.querySelector('#tau-credit-invoices').textContent.includes('1000 sat') && document.querySelector('#tau-credit-invoices [data-invoice-expires]').textContent.includes('minutes left')"),'saved invoice has amount, wallet link, Copy and countdown');
+ if(name==='edge-paid-invoices'){await edgePaidInvoices(c,{request,report});return;}
+ if(name==='edge-focus-provider'){await edgeFocusPending(c,{request,report});return;}
  if(name==='credit-new-balance-failure'){
   state.mode='balance-fail';await checked();
   assert.equal((await report()).credit.invoices[0].outcome,'unknown');
@@ -331,6 +346,7 @@ export async function creditProof(c) {
  }
  await wait('fixtureReports.at(-1)?.sessions?.[0]?.credit_backed && fixtureReports.at(-1)?.poc_configuration?.key_set');
  const session=(await report()).sessions[0].identity;
+ if(name.startsWith('edge-')){await edgeSession(c,{request,report,workerCall,journal,session});return;}
  if(process.env.TAU_LAYOUT_CREDIT==='1'){assert.equal(await evaluate("document.querySelector('[data-credit-new-key]')?.tagName"),'BUTTON');await phoneSnapshot(c,'credit-session');}
  assert.equal(state.mintCalls,1);assert.equal((await journal(state.keys[0].api_key)).contains,false);
  assert.ok((await journal('')).mint_names.includes(state.keys[0].name));

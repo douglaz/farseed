@@ -5,6 +5,7 @@ import {spawn, spawnSync} from 'node:child_process';
 import {once} from 'node:events';
 import {createInterface} from 'node:readline';
 import {join} from 'node:path';
+import {createHash} from 'node:crypto';
 import {layoutCases, layoutObserver, fixtureLayout, publicKeysLayout} from './layout-page.mjs';
 import {creditCases, creditId, fixtureCredit, creditProof} from './credit-page.mjs';
 
@@ -368,12 +369,13 @@ const server=createServer(async(req,res)=>{
   }
   const file=path==='/'?'index.html':path.slice(1);
   if(!/^(index.html|boot.js|worker.js|pkg\/[a-zA-Z0-9_.-]+)$/.test(file)){res.writeHead(404).end();return;}
-  let data=await readFile(new URL('../'+(file.startsWith('pkg/')||layoutCases.includes(name)||process.env.TAU_LAYOUT_CREDIT==='1'?'dist/tracer/':'www/')+file,import.meta.url));
+  let data=await readFile(new URL('../'+(file.startsWith('pkg/')||name.startsWith('edge-')||layoutCases.includes(name)||process.env.TAU_LAYOUT_CREDIT==='1'?'dist/tracer/':'www/')+file,import.meta.url));
+  if(name.startsWith('edge-'))console.log(JSON.stringify({artifact:file,sha256:createHash('sha256').update(data).digest('hex')}));
   if(file==='index.html')data=data.toString().replace(/<meta http-equiv="Content-Security-Policy"[^>]*>\n/,'');
   if(file==='worker.js') {
    assert.ok(data.toString().includes('const finalGeneration = publication_generation();'),'goal return hook exists');
    assert.ok(data.toString().includes('await publication.publish(generation, session, report);'),'task return hook exists');
-   data=injection+data.toString()
+   data=(credit.state.clockMs===undefined?'':`Date.now=()=>${credit.state.clockMs};\n`)+injection+data.toString()
    .replace('const finalGeneration = publication_generation();','await fixturePoint("worker_return"); const finalGeneration = publication_generation();')
    .replace('await publication.publish(generation, session, report);','await fixturePoint("worker_return"); await publication.publish(generation, session, report);')+hook;
   }
@@ -398,7 +400,7 @@ try{
  const {targetId}=await call('Target.createTarget',{url:'about:blank'});
  const {sessionId}=await call('Target.attachToTarget',{targetId,flatten:true});
  await call('Page.enable',{},sessionId);
- if(layoutCases.includes(name)||process.env.TAU_LAYOUT_CREDIT==='1')await call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true},sessionId);
+ if(layoutCases.includes(name)||name.startsWith('edge-focus')||process.env.TAU_LAYOUT_CREDIT==='1')await call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true},sessionId);
  if(creditCase||layoutCases.includes(name)){await call('Target.setDiscoverTargets',{discover:true});await call('Target.setAutoAttach',{autoAttach:true,waitForDebuggerOnStart:false,flatten:true},sessionId);}
  const observerSource=`const pageFetch=fetch.bind(window);window.fetch=(input,options)=>{const u=new URL(input instanceof Request?input.url:input,location.href);if(!['127.0.0.1','localhost','[::1]'].includes(u.hostname))throw Error('external page request refused');return pageFetch(input,options);};window.fixtureReports=[];window.fixtureEvents=[];window.fixtureWorkers=[];const OriginalWorker=Worker;window.Worker=class extends OriginalWorker{constructor(...args){super(...args);fixtureWorkers.push(this);this.addEventListener('message',event=>{if(event.data.store)fixtureReports.push(event.data.store);else {fixtureEvents.push(event.data);if(Object.keys(event.data).some(key=>key.startsWith('fixture_')))event.stopImmediatePropagation();}});}terminate(){this.fixtureTerminated=true;super.terminate();}};`;
  await call('Page.addScriptToEvaluateOnNewDocument',{source:observerSource},sessionId);

@@ -677,6 +677,12 @@ try {
             await invoke(()=>[...document.querySelectorAll('#tau-provider-progress button')].find(b=>b.textContent==='Copy').click());
             await wait('globalThis.fixtureCopied');check(await evaluate('fixtureCopied')===payments[0].data.lightning,'machine Copy uses the recorded invoice');
             await sleep(5200);check(count('GET /api/v1/payment/aabb')>reads,'automatic payment status read');
+            await wait('reports.filter(r=>r.payment_timer).length>=3');
+            const pollReports=await evaluate('reports.filter(r=>r.payment_timer).slice(-2)');
+            const pollContents=pollReports.map(({payment_timer,...content})=>{assert.equal(payment_timer,true,'payment timer tag survives publication');return content;});
+            const unchangedMachinePollsEqual=JSON.stringify(pollContents[0])===JSON.stringify(pollContents[1]);
+            console.log(JSON.stringify({unchangedMachinePollsEqual,pollReports}));
+            assert.deepEqual(pollContents[0],pollContents[1],'unchanged machine payment polls compare equal despite durable payment appends');
             assert.deepEqual(mutationDispatches(),mutations,'payment polling creates no machine or invoice and never calls renewal');
             paid=true;await wait('reports.at(-1)?.procurement?.payment?.is_paid');current=await report();
             check(!current.poc_targets?.length,'payment observation waits for explicit readiness Resume');

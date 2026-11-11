@@ -661,11 +661,52 @@ impl Drop for Cleanup {
 }
 
 async fn cleanup(session: &str, ended: bool) -> Result<(), String> {
+    cleanup_mints(session, ended, false).await
+}
+
+fn cleanup_now() -> u128 {
+    (js_sys::Date::now() as u64) as u128 * 1_000_000
+}
+
+#[wasm_bindgen]
+pub async fn retry_ended_credit() {
+    let Ok(fence) = Fence::new(None) else {
+        return;
+    };
+    let sessions = {
+        let local = crate::worker::local();
+        let mut local = local.lock().await;
+        let Ok(store) = fence.store(&mut local) else {
+            return;
+        };
+        store
+            .sessions()
+            .into_iter()
+            .filter(|session| {
+                session["session_state"] == "ended" && session["credit_backed"] == true
+            })
+            .filter_map(|session| session["identity"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    for session in sessions {
+        if fence.check().is_err() {
+            return;
+        }
+        let _ = cleanup_mints(&session, true, true).await;
+    }
+}
+
+async fn cleanup_mints(session: &str, ended: bool, retry: bool) -> Result<(), String> {
     let fence = Fence::new(if ended { None } else { Some(session) })?;
     let mints = {
         let local = crate::worker::local();
         let mut local = local.lock().await;
-        fence.store(&mut local)?.credit_mints(session)
+        fence
+            .store(&mut local)?
+            .credit_mints(session)
+            .into_iter()
+            .filter(|mint| !retry || mint.retry_eligible(cleanup_now()))
+            .collect::<Vec<_>>()
     };
     if mints.is_empty() {
         return Ok(());
@@ -675,8 +716,12 @@ async fn cleanup(session: &str, ended: bool) -> Result<(), String> {
         let mut local = local.lock().await;
         Cleanup::new(fence.store(&mut local)?)?
     };
-    let mut ids: std::collections::BTreeSet<String> =
-        mints.iter().filter_map(|m| m.issuer_id.clone()).collect();
+    let mut ids = std::collections::BTreeMap::<String, Vec<&Mint>>::new();
+    for mint in &mints {
+        if let Some(id) = &mint.issuer_id {
+            ids.entry(id.clone()).or_default().push(mint);
+        }
+    }
     if let Ok((200, value)) = exchange(
         &fence,
         "GET",
@@ -688,14 +733,20 @@ async fn cleanup(session: &str, ended: bool) -> Result<(), String> {
         && let Some(keys) = value.0["data"].as_array().filter(|a| a.len() <= 128)
     {
         for key in keys {
-            if mints.iter().any(|m| key["name"] == m.name)
-                && let Some(id) = key["_id"].as_str().filter(|s| cleanup.safe_id(s))
-            {
-                ids.insert(id.into());
+            if let Some(id) = key["_id"].as_str().filter(|s| cleanup.safe_id(s)) {
+                for mint in mints.iter().filter(|mint| key["name"] == mint.name) {
+                    ids.entry(id.into()).or_default().push(mint);
+                }
             }
         }
     }
-    for id in ids {
+    for (id, mints) in ids {
+        if retry {
+            fence.check()?;
+            if !mints.iter().any(|mint| mint.retry_eligible(cleanup_now())) {
+                continue;
+            }
+        }
         cleanup.revoke(&id).await;
     }
     Ok(())
