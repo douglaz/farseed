@@ -305,6 +305,20 @@ mod worker {
 
     #[cfg(feature = "tracer")]
     #[wasm_bindgen]
+    pub async fn test_pending_context(kind: String) -> String {
+        let local = local();
+        let mut writer = local.lock().await;
+        writer
+            .store()
+            .expect("fixture unlocked")
+            .test_pending_context(&kind)
+            .await
+            .expect("pending fixture context");
+        writer.report(None).to_string()
+    }
+
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
     pub async fn test_credit_append_probe(value: String) -> String {
         let local = local();
         let mut local = local.lock().await;

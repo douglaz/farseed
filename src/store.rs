@@ -1549,10 +1549,19 @@ impl<S: Storage> Store<S> {
         if matches!(report, DispositionReport::Refused { .. }) {
             return Ok(report);
         }
+        let tasks = self.project_disposition(self.next, &disposition)?;
         let number = self
             .commit(&Event::Disposition(disposition.clone()))
             .await?;
-        Ok(self.dispatch.disposition(number, disposition))
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        poc::disposition::crash_point(1).await;
+        let report = self.dispatch.disposition(number, disposition);
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        poc::disposition::crash_point(2).await;
+        for task in tasks {
+            self.poc.insert(task.id.clone(), task);
+        }
+        Ok(report)
     }
 
     fn apply_intent(&mut self, number: u64, intent: Intent) -> Result<(), String> {
@@ -1785,8 +1794,20 @@ impl<S: Storage> Store<S> {
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
                 (_, Event::Disposition(disposition)) => {
+                    // Project against this journal prefix, before later task revisions.
+                    let tasks = if matches!(
+                        self.dispatch.check_disposition(number, disposition),
+                        DispositionReport::Accepted { .. }
+                    ) {
+                        self.project_disposition(number, disposition)?
+                    } else {
+                        Vec::new()
+                    };
                     // A semantically refused disposition is shown, not corruption.
                     self.dispatch.disposition(number, disposition.clone());
+                    for task in tasks {
+                        self.poc.insert(task.id.clone(), task);
+                    }
                 }
                 (_, Event::Allocation(event)) => {
                     let allocation = self.allocation.as_mut().expect("record 0 is the seed");
@@ -2549,7 +2570,11 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             }
             if !store.poc.is_empty() {
                 report["tasks"] = serde_json::to_value(
-                    store.poc.values().map(poc::Task::view).collect::<Vec<_>>(),
+                    store
+                        .poc
+                        .values()
+                        .map(|task| store.poc_task_view(task))
+                        .collect::<Vec<_>>(),
                 )
                 .expect("tasks serialize");
             }

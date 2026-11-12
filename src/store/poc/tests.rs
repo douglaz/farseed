@@ -3248,3 +3248,6 @@ fn poc_payment_scheduler_checks_dispatch_time_state() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[path = "disposition_tests.rs"]
+mod disposition_tests;

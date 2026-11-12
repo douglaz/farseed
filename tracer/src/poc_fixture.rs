@@ -141,7 +141,19 @@ pub async fn run() -> Result<(), String> {
                 .iter()
                 .filter(|r| r.starts_with(b"POST /completion "))
                 .count();
-            json!({"launches":launches,"inference_requests":inference_requests,"ssh_connections":observed.ssh_connections,"ssh_ends":observed.ssh_ends.len(),"execs":observed.ssh_exec.iter().map(|e|String::from_utf8_lossy(e).into_owned()).collect::<Vec<_>>(),"contacts":observed.relay_accepted,"authentication":observed.ssh_auth,"wire_errors":observed.relay_wire_errors,"binary_sizes":observed.relay_binary_sizes})
+            let inference_bodies: Vec<_> = inference
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r.starts_with(b"POST /completion "))
+                .filter_map(|r| {
+                    r.windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .and_then(|n| serde_json::from_slice::<Value>(&r[n + 4..]).ok())
+                })
+                .collect();
+            json!({"launches":launches,"inference_requests":inference_requests,"inference_bodies":inference_bodies,"ssh_connections":observed.ssh_connections,"ssh_ends":observed.ssh_ends.len(),"execs":observed.ssh_exec.iter().map(|e|String::from_utf8_lossy(e).into_owned()).collect::<Vec<_>>(),"contacts":observed.relay_accepted,"authentication":observed.ssh_auth,"wire_errors":observed.relay_wire_errors,"binary_sizes":observed.relay_binary_sizes})
         };
         println!("{result}");
         std::io::stdout().flush().map_err(|e| e.to_string())?;

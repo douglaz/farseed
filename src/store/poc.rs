@@ -72,6 +72,7 @@ pub struct Task {
     pub requesting: bool,
     /// Compare-and-append token: stale requests cannot publish or arm a command.
     pub revision: u64,
+    pub inspection_record: Option<u64>,
 }
 impl Task {
     /// The page card shows bounded excerpts; complete outcomes remain in the journal
@@ -758,6 +759,7 @@ impl<S: Storage> Store<S> {
                 verifying: false,
                 requesting: false,
                 revision: 0,
+                inspection_record: None,
             });
         }
         let (id, expected) = match record {
@@ -935,7 +937,9 @@ impl<S: Storage> Store<S> {
                     let index = task
                         .verification
                         .iter()
-                        .position(|v| v.exit_status.is_some_and(|exit| exit != 0))
+                        .position(|v| {
+                            v.exit_status.is_some_and(|exit| exit != 0) || task.disposed_check(v)
+                        })
                         .ok_or("no settled failed verification check")?;
                     // Completed attempts retain their original job and outcome. Only the
                     // latest verification sequence is restarted by this explicit action.
@@ -982,6 +986,7 @@ impl<S: Storage> Store<S> {
                     }
                 }
                 Change::Inspect => {
+                    task.inspection_record = Some(number);
                     if task.pending.is_none() {
                         return Err("inspection requires pending identity".into());
                     }
@@ -1061,3 +1066,5 @@ impl<S: Storage> Store<S> {
 pub(super) mod tests;
 
 mod admission;
+
+pub(crate) mod disposition;

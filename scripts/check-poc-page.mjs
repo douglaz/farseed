@@ -109,7 +109,12 @@ async function resumeProof(c) {
  }
  if(name!=='resume-approval') await click('[data-requirements-decision="approve"]');
  await wait("!document.querySelector('[data-requirements-decision=\"approve\"]')");
+ if(pendingCases.includes(name)) await hold('pending_launch_committed');
  await invoke(()=>[...document.querySelectorAll('[data-task] button')].find(b=>b.textContent==='Resume').click());
+ if(pendingCases.includes(name)) {
+  await pendingProof({...c, session, reopen, journal, relayReady, normal});
+  return;
+ }
  if(name==='resume-stale-fetch') {
   await point('poc_inference_writer');
   const beforeEnd=await journal();
@@ -137,6 +142,7 @@ async function resumeProof(c) {
   await new Promise(resolve=>setTimeout(resolve,25));
  }
  check(launched.launches.length===1 && launched.launches[0].job===job,'one original remote launch');
+ check(await evaluate("document.querySelectorAll('[data-pending-assumption]').length===0"),'running work offers no pending assumption');
  if(name==='resume-end') {
   await click('[data-end-session]');await wait("fixtureReports.at(-1)?.sessions?.[0]?.session_state==='ended'");
   let stopped;
@@ -265,7 +271,100 @@ async function resumeProof(c) {
  check((await control({inspect:true})).launches.filter(j=>j.job===job).length===1,'reopening ended history launches nothing');
 }
 
+async function pendingProof(c) {
+ const {name,info,session,evaluate,invoke,wait,click,message,hold,point,release,configure,check,control,journal,relayReady,normal}=c;
+ await point('pending_launch_committed');
+ const pending=await evaluate('fixtureReports.at(-1).tasks[0]');
+ const {call,job}=pending.pending;
+ check((await control({inspect:true})).launches.length===0,'deterministic cut after task intent and before any launch bytes');
+ await evaluate('window.cutWorker=fixtureWorkers.at(-1)');
+ await click('#tau-lock');
+ await release('pending_launch_committed');
+ await wait("document.querySelector('#tau-store')?.dataset.state==='locked'");
+ await relayReady();
+ await invoke(()=>{document.querySelector('#tau-passphrase').value='durable fixture passphrase';document.querySelector('#tau-unlock').click();});
+ await wait("fixtureReports.at(-1)?.tasks?.[0]?.status==='paused' && document.querySelectorAll('[data-pending-assumption]').length===2");
+ const task=await evaluate('fixtureReports.at(-1).tasks[0]');
+ check(task.pending.call===call && task.pending.job===job,'Lock and Unlock preserve pending identity');
+ check(await evaluate("document.querySelector('[data-task]').textContent.includes('no record found')"),'paused card retains no-record sentence');
+ if(['pending-context','pending-ended'].includes(name)) {
+  await message({fixture:{pending_context:session,kind:name==='pending-context'?'incomplete':'ended'}});
+  await wait(`fixtureReports.at(-1)?.tasks?.[0]?.disposition_offer?.read===${JSON.stringify(name==='pending-context'?'incomplete':'ended')}`);
+ }
+ const before=await journal();
+ const assumption=name==='pending-done'?'as_if_done':'as_if_not_done';
+ await click(`[data-pending-assumption="${assumption}"]`);
+ const text=await evaluate('document.querySelector("[data-pending-confirmation]").textContent');
+ for(const expected of [String(call),job,'machine-a',name==='pending-context'?'incomplete':name==='pending-ended'?'ended':'missing','outcome stays unknown','your assumption',assumption,'same command again, as a new command','overlap later commands','page will never show it']) check(text.includes(expected),`confirmation contains ${expected}`);
+ if(name==='pending-context') {
+  const offer=await evaluate('fixtureReports.at(-1).tasks[0].disposition_offer');
+  check(text.includes('may still be running'),'incomplete warning names live-command risk');
+  check(text.includes(offer.remaining.join(', ')) && text.includes('machine remains held'),'confirmation names remaining holds');
+  check(text.includes(String(offer.standing.number)) && text.includes(offer.standing.continuation) && text.includes(offer.standing.calls.join(', ')) && text.includes('Dropped calls retain their unknown outcome'),'confirmation names replacement and dropped unknown calls');
+ }
+ for(const label of ['Resume','Stop task','Raise limits']) check(await evaluate(`[...document.querySelectorAll('[data-task] button')].some(b=>b.textContent===${JSON.stringify(label)})`),`confirmation retains ${label}`);
+ check((await journal()).records===before.records,'opening confirmation appends nothing');
+ await invoke(()=>[...document.querySelectorAll('[data-task] button')].find(b=>b.textContent==='Cancel assumption').click());
+ check((await journal()).records===before.records,'Cancel appends nothing');
+ check(await evaluate('!document.querySelector("[data-pending-confirmation]").textContent'),'Cancel dismisses inside the card');
+ await configure(normal);await wait('fixtureReports.at(-1)?.poc_configuration?.key_set');
+ await relayReady();
+ await control({verify:true});
+ await click(`[data-pending-assumption="${assumption}"]`);
+ const actions=await evaluate('fixtureEvents.filter(e=>e.fixture_action_complete).length');
+ if(name==='pending-ceremony') {
+  const confirmation=await evaluate('fixtureReports.at(-1).tasks[0].disposition_offer');
+  await click('#tau-redisplay');
+  await wait("document.querySelector('#tau-store')?.dataset.state==='locked'");
+  await invoke(()=>{document.querySelector('#tau-passphrase').value='durable fixture passphrase';document.querySelector('#tau-unlock').click();});
+  await wait("fixtureReports.at(-1)?.seed_backup_stage==='showing_words'");
+  const files=await journal();
+  await message({task:{action:'dispose-pending',id:confirmation.task,session,confirmation,continuation:assumption}});
+  await wait(`fixtureEvents.filter(e=>e.fixture_action_complete).length>${actions}`);
+  check((await journal()).records===files.records,'seed backup ceremony refuses a current-generation disposition without append');
+  check((await control({inspect:true})).launches.length===0,'seed backup ceremony launches nothing');
+  return;
+ }
+ if(name==='pending-stale') await hold('pending_disposition_writer');
+ await invoke(()=>[...document.querySelectorAll('[data-task] button')].find(b=>b.textContent==='Confirm unknown outcome').click());
+ if(name==='pending-stale') {
+  await point('pending_disposition_writer');
+  const files=await journal();
+  await message({lifecycle:'freeze'});await wait("fixtureReports.at(-1)?.lifecycle_state==='reconciling'");
+  await message({lifecycle:'resume'});await wait("fixtureReports.at(-1)?.lifecycle_state==='running'");
+  await release('pending_disposition_writer');
+  await wait(`fixtureEvents.filter(e=>e.fixture_action_complete).length>${actions}`);
+  check((await journal()).records===files.records,'lifecycle-stale confirmation appends nothing');
+  check(await evaluate('fixtureReports.at(-1).tasks[0].pending!==null'),'lifecycle-stale confirmation retains pending call');
+  return;
+ }
+ await wait(`fixtureEvents.filter(e=>e.fixture_action_complete).length>${actions}`);
+ check(await evaluate('fixtureReports.at(-1).tasks[0].completed.some(step=>step[2]?.content?.outcome===\'unknown\')'),'confirmation reaches the worker and completes the pending tool');
+ if(name==='pending-context') {
+  const final=await evaluate('fixtureReports.at(-1).tasks[0]');
+  check(final.completed[0][2].content.machine_held && final.completed[0][2].content.remaining_unresolved.length===1,'result retains remaining hold');
+  check(await evaluate('document.querySelector("[data-task]").textContent.includes("machine remains held by other unresolved calls")'),'card retains remaining hold');
+  check((await control({inspect:true})).launches.length===0,'remaining hold prevents another launch');
+  return;
+ }
+ await wait("fixtureReports.at(-1)?.tasks?.[0]?.status==='complete'");
+ const final=await evaluate('fixtureReports.at(-1).tasks[0]');
+ const result=final.completed.find(step=>step[0]===pending.proposal.call_id)?.[2];
+ check(result?.type==='untrusted' && result.source==='tool_output' && result.content.outcome==='unknown','original tool receives one untrusted unknown outcome');
+ check(result.content.continuation===assumption && !JSON.stringify(result).includes('exit_status'),'selected assumption retained without exit field');
+ check(final.completed.filter(step=>step[0]===pending.proposal.call_id).length===1 && !final.pending,'original proposal consumed once');
+ check((await journal()).dispositions===before.dispositions+1,'confirmation appends exactly one disposition');
+ const observed=await control({inspect:true});
+ check(observed.inference_requests===2,'confirmation automatically makes a new model request');
+ check(observed.launches.every(launch=>launch.job!==job),'disposed job is never launched');
+ check(observed.launches.length===1 && observed.launches[0].job!==job,'only the distinct normal verification job launches');
+ check(JSON.stringify(observed.inference_bodies.at(-1)).includes('outcome') && JSON.stringify(observed.inference_bodies.at(-1)).includes('unknown') && JSON.stringify(observed.inference_bodies.at(-1)).includes(job),'new request carries disposed outcome history');
+ check(await evaluate(`document.querySelector('[data-task]').textContent.includes(${JSON.stringify(assumption)})`),'card retains selected assumption');
+}
+
+const pendingCases = ['pending-not-done', 'pending-done', 'pending-context', 'pending-ended', 'pending-stale', 'pending-ceremony'];
 const name = process.argv[2] ?? 'interruption';
+if (name === 'list-pending') { console.log(JSON.stringify(pendingCases)); process.exit(0); }
 if (name === 'list-layout') { console.log(JSON.stringify([...layoutCases, 'layout-purchase', 'layout-credit'])); process.exit(0); }
 if (name === 'list-credit') { console.log(JSON.stringify(creditCases)); process.exit(0); }
 if (name === 'layout-credit') {
@@ -288,7 +387,7 @@ if (name==='wire') {
   }
   process.exit(0);
 }
-const resumeCases=['resume-lock','resume-reload','resume-loss','resume-stale-fetch','resume-freeze','resume-append','resume-approval','resume-end','resume-configuration'];
+const resumeCases=[...pendingCases,'resume-lock','resume-reload','resume-loss','resume-stale-fetch','resume-freeze','resume-append','resume-approval','resume-end','resume-configuration'];
 const realResume=resumeCases.includes(name) || creditCase || layoutCases.includes(name);
 if (![...layoutCases,...creditCases,...resumeCases,'resume-envelopes','approval-refusal','goal-span','job-span','future-revision','metadata-key','mismatched-terminal','first-key','rotation','publication','progress','interruption','aggregate','resolver','configuration','wire-12000','wire-largest','wire-too-long','first-key-checks','reload-key','reload-control','keyless-collection','reload-progress'].includes(name)) throw Error('unknown page case');
 const keyless=['goal-span','job-span','first-key','first-key-checks','reload-key','reload-control','keyless-collection','reload-progress','mismatched-terminal'].includes(name);
@@ -337,6 +436,7 @@ onmessage=async event=>{
  if(!value){const result=await productionMessage(event);if(event.data?.request?.credit_request)postMessage({fixture_credit_complete:event.data.request.credit_request.action});if(event.data?.request?.unlock)postMessage({fixture_unlock_complete:true});if(event.data?.request?.lifecycle)postMessage({fixture_lifecycle_complete:event.data.request.lifecycle});if(event.data?.request?.task||event.data?.request?.goal_accept||event.data?.request?.requirements_answer)postMessage({fixture_action_complete:true,fixture_action:event.data.request.task?.action??(event.data.request.requirements_answer?'requirements':'goal')});return result;}
  if(value.append_credit_probe){postMessage({fixture_credit_probe:JSON.parse(await fixtureApi.test_credit_append_probe(value.append_credit_probe))});return;}
  if(value.publish){const report=JSON.parse(await fixtureApi.open());report.goal_outcome={session:value.publish,outcome:{done:true}};await fixtureApi.publish_report(fixtureApi.publication_generation(),value.publish,JSON.stringify(report));return;}
+ if(value.pending_context){const report=await fixtureApi.test_pending_context(value.kind);await fixtureApi.publish_report(fixtureApi.publication_generation(),value.pending_context,report);return;}
  if(value.probe){postMessage({fixture_protected:JSON.parse(await fixtureApi.test_poc_protect_output(JSON.stringify(value.probe)))});return;}
  if(value.credential){await fixtureApi.test_poc_register_credential(new TextEncoder().encode(value.credential));postMessage({fixture_registered:true});return;}
  if(value.command!==undefined){fixtureCommand=value.command;fixtureCommands=[value.command];fixtureCalls=0;}

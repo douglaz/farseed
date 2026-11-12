@@ -197,3 +197,14 @@ pub fn stop_waits(machine: &str) -> usize {
             .count()
     })
 }
+
+/// Actual worker work only; durable inspection checkpoints do not keep this fence alive.
+pub(crate) fn inspection_active(session: &str) -> bool {
+    WAITS.with_borrow(|waits| {
+        waits.iter().any(|(_, weak)| {
+            weak.upgrade().is_some_and(|stop| {
+                !stop.stopped() && stop.session.borrow().as_deref() == Some(session)
+            })
+        })
+    })
+}

@@ -318,6 +318,8 @@ pub async fn run_command(
             .await);
         }
     };
+    #[cfg(feature = "tracer")]
+    ssh_point(&ssh, "pending_launch_committed").await;
     if stop.stopped() || journal.current(&session).await.is_err() {
         return Err(Refusal::Unresolved {
             call: seq,

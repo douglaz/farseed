@@ -512,6 +512,8 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
         session: Option<String>,
         checks: Option<Vec<String>>,
         limits: Option<crate::store::poc::Limits>,
+        confirmation: Option<crate::store::poc::disposition::Confirmation>,
+        continuation: Option<crate::dispatch::Continuation>,
     }
     let result = async {
         let value: Value = serde_json::from_str(&request).map_err(|_| "task request")?;
@@ -524,21 +526,53 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
         } else {
             continuation.as_ref().map_err(Clone::clone)?.check()?;
         }
-        if request.action == "resume" {
+        if request.action == "resume" || request.action == "dispose-pending" {
             let continuation = continuation.as_ref().map_err(Clone::clone)?;
             let id = request.id.as_deref().ok_or("task ID required")?;
             let session = request
                 .session
                 .as_deref()
                 .ok_or("original session required")?;
+            #[cfg(feature = "tracer")]
+            if request.action == "dispose-pending" {
+                crate::testonly::session_point("pending_disposition_writer").await;
+            }
             let task = {
                 let local = local();
                 let mut writer = local.lock().await;
                 continuation.check()?;
+                if request.action == "dispose-pending"
+                    && let Some(why) = writer.dispatch_refusal()
+                {
+                    return Err(why.into());
+                }
                 let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
                 let task = store.poc_task(id)?;
                 store.check_task_session(&task, session)?;
-                task
+                if request.action == "dispose-pending" {
+                    let confirmation = request
+                        .confirmation
+                        .as_ref()
+                        .ok_or("confirmation required")?;
+                    if confirmation.task != id || confirmation.session != session {
+                        return Err("confirmation task or session differs".into());
+                    }
+                    store.ensure_scan_references().await?;
+                    continuation.check()?;
+                    response
+                        .borrow_mut()
+                        .get_or_insert_with(crate::poc::inference::CommandResponse::reserve);
+                    store
+                        .poc_dispose(
+                            confirmation,
+                            request
+                                .continuation
+                                .ok_or("continuing assumption required")?,
+                        )
+                        .await?
+                } else {
+                    task
+                }
             };
             if !automatic {
                 crate::poc::credit::browser::retry_mint(session);

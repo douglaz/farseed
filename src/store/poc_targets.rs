@@ -443,7 +443,7 @@ impl<S: Storage + Clone> Store<S> {
         // A provider key carried by another account's field is still a leak.
         contains |= provider_account_contains && account_contains;
         Ok(
-            json!({"contains":contains,"provider_account_records":provider_account_records,"provider_account_contains":provider_account_contains,"account_records":account_records,"account_contains":account_contains,"mint_names":mint_names,"records":self.next,"provider_protection":provider_protection,"poc_pauses":poc_pauses,"machines":self.allocation().next_unused().machines,"passes":self.allocation().next_unused().passes,"targets":self.poc_targets.len()}),
+            json!({"contains":contains,"provider_account_records":provider_account_records,"provider_account_contains":provider_account_contains,"account_records":account_records,"account_contains":account_contains,"mint_names":mint_names,"records":self.next,"provider_protection":provider_protection,"poc_pauses":poc_pauses,"dispositions":self.dispatch.dispositions.len(),"machines":self.allocation().next_unused().machines,"passes":self.allocation().next_unused().passes,"targets":self.poc_targets.len()}),
         )
     }
 }

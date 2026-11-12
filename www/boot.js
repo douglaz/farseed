@@ -606,6 +606,7 @@ const renderCommandResult = (result) => {
   if (previous) previous.replaceWith(card); else slot.append(card);
 };
 
+const taskDispositionDrafts = new Map();
 const renderTasks = (store) => {
   const worker = snapshotWorker();
   let slot = $('tasks');
@@ -639,6 +640,14 @@ const renderTasks = (store) => {
     if (task.pending) paragraph(card, `Pending job ${task.pending.job}; journal call ${task.pending.call}. Resume inspects this job without launching it again.`);
     if (task.pause_reason) paragraph(card, task.pause_reason);
     for (const check of task.verification) paragraph(card, `Verification: ${check.command}; job ${check.job}; exit ${check.exit_status ?? 'unknown'}; ${check.excerpt}`);
+    for (const [, , result] of task.completed) {
+      if (result.content?.outcome === 'unknown' && result.content?.disposition) {
+        const outcome = result.content;
+        paragraph(card, `Call ${outcome.call}; job ${outcome.job}; outcome unknown. Disposition record ${outcome.disposition}; assumption ${outcome.continuation}.`);
+        if (outcome.machine_held) paragraph(card, `The machine remains held by other unresolved calls: ${outcome.remaining_unresolved.join(', ')}.`);
+        paragraph(card, outcome.uncertainty);
+      }
+    }
     if (['complete', 'abandoned'].includes(task.status)) { slot.append(card); continue; }
     const session = (store.sessions ?? []).find(s => s.identity === task.start_session && s.session_state !== 'ended' && s.bound_set.length === 1 && s.bound_set[0] === task.machine);
     paragraph(card, 'This task retains its original session, machine, approvals and budgets. Eligible interrupted work continues after unlock and any required key resupply. Resume continues a genuine pause.');
@@ -652,9 +661,50 @@ const renderTasks = (store) => {
       action('Resume', { action: 'resume', session: session.identity });
     } else if ((store.sessions ?? []).some(s => s.identity === task.start_session && s.session_state === 'ended')) paragraph(card, `Session ${task.start_session} is ended. This task remains history and cannot continue.`);
     else paragraph(card, `Unlock to restore session ${task.start_session}.`);
-    if (session && task.verification.some(check => check.exit_status !== null && check.exit_status !== 0)) {
+    if (session && (task.verification.some(check => check.exit_status !== null && check.exit_status !== 0) || task.disposed_check_retry)) {
       action('Prepare verification retry', { action: 'retry-checks', session: session.identity });
     }
+    if (session && store.lifecycle_state !== 'ended' && task.disposition_offer) {
+      const offer = task.disposition_offer;
+      const labels = {as_if_not_done: "Carry on as if it didn't run", as_if_done: 'Carry on as if it ran'};
+      const confirmation = document.createElement('section');
+      confirmation.dataset.pendingConfirmation = task.id;
+      const showConfirmation = () => {
+        confirmation.replaceChildren();
+        const draft = taskDispositionDrafts.get(task.id);
+        if (!draft) return;
+        const snapshot = draft.confirmation;
+        paragraph(confirmation, `Journal call ${snapshot.pending.call}; job ${snapshot.pending.job}; machine ${snapshot.machine}. Latest committed read: ${snapshot.read}, record ${snapshot.observation}.`);
+        paragraph(confirmation, `The outcome stays unknown. This records your assumption: ${labels[draft.continuation]} (${draft.continuation}).`);
+        paragraph(confirmation, 'The agent may then run the same command again, as a new command.');
+        paragraph(confirmation, 'If the earlier command arrives or runs late, it can overlap later commands and the page will never show it.');
+        if (snapshot.read === 'incomplete') paragraph(confirmation, 'The incomplete command may still be running.');
+        if (snapshot.remaining.length) paragraph(confirmation, `Other unresolved calls on this machine: ${snapshot.remaining.join(', ')}. This choice does not release them; the machine remains held by them.`);
+        if (snapshot.standing) {
+          const dropped = snapshot.standing.calls.filter(call => call !== snapshot.pending.call);
+          paragraph(confirmation, `This replaces disposition record ${snapshot.standing.number}, continuation ${snapshot.standing.continuation}. Dropped calls: ${dropped.length ? dropped.join(', ') : 'none'}. Dropped calls retain their unknown outcome under the old record.`);
+        }
+        const confirm = document.createElement('button'); confirm.type = 'button'; confirm.textContent = 'Confirm unknown outcome';
+        confirm.addEventListener('click', () => {
+          confirm.disabled = true;
+          taskDispositionDrafts.delete(task.id);
+          worker.postMessage({task: {action: 'dispose-pending', id: task.id, session: task.start_session, ...draft}});
+        });
+        const cancel = document.createElement('button'); cancel.type = 'button'; cancel.textContent = 'Cancel assumption';
+        cancel.addEventListener('click', () => { taskDispositionDrafts.delete(task.id); showConfirmation(); });
+        confirmation.append(confirm, cancel);
+      };
+      for (const [continuation, label] of Object.entries(labels)) {
+        const choose = document.createElement('button'); choose.type = 'button'; choose.textContent = label;
+        choose.dataset.pendingAssumption = continuation;
+        choose.addEventListener('click', () => {
+          taskDispositionDrafts.set(task.id, {confirmation: structuredClone(offer), continuation});
+          showConfirmation();
+        });
+        card.append(choose);
+      }
+      card.append(confirmation); showConfirmation();
+    } else if (task.disposition_refusal) paragraph(card, task.disposition_refusal);
     paragraph(card, 'Stop task stops local orchestration; remote effects and billing continue.');
     action('Stop task', { action: 'abandon' });
     const requests = document.createElement('input'); requests.type = 'number'; requests.min = task.limits.requests; requests.max = 1000; requests.value = taskLimitDrafts.get(task.id)?.[0] ?? task.limits.requests; requests.setAttribute('aria-label', 'Task request limit');

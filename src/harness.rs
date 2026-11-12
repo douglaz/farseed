@@ -169,3 +169,6 @@ pub trait BoundJournal: Journal {
         true
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) use wait::inspection_active;
