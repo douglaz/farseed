@@ -22,7 +22,7 @@ const defaultsEdited = new Set();
 for (const id of defaultsInputs) $(id).addEventListener('input', () => defaultsEdited.add(id));
 const validDefaults = value => {
   if (!value || typeof value !== 'object' || Array.isArray(value) ||
-      Object.keys(value).length !== defaultsFields.length || !defaultsFields.every(k => Object.hasOwn(value, k))) return false;
+      Object.keys(value).some(k => ![...defaultsFields, 'relay_key'].includes(k)) || !defaultsFields.every(k => Object.hasOwn(value, k))) return false;
   const ipv4 = host => host.split('.').length === 4 && host.split('.').every(p => /^(0|[1-9][0-9]{0,2})$/.test(p) && Number(p) <= 255);
   const dns = host => host.length > 0 && host.length <= 253 && host.split('.').every(p =>
     p.length <= 63 && /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(p));
@@ -58,6 +58,8 @@ const validDefaults = value => {
     value.model.length > 0 && value.model.length <= 128 && /^[A-Za-z0-9._/:\-]+$/.test(value.model) &&
     Number.isInteger(value.topup_sat) && value.topup_sat >= 100 && value.topup_sat <= 5000;
 };
+const validRelayKey = key => typeof key === 'string' && /^[0-9a-f]{64}$/.test(key) &&
+  BigInt('0x' + key) > 0n && BigInt('0x' + key) < 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n;
 const loadDefaults = async () => {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3000);
@@ -74,16 +76,28 @@ const loadDefaults = async () => {
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
     const value = JSON.parse(new TextDecoder('utf-8', {fatal:true}).decode(bytes));
     if (!validDefaults(value)) throw Error();
-    for (const [id, field] of [['provider-origin', 'provider_origin'], ['provider-relay', 'relay_url'], ['poc-relay', 'relay_url'], ['poc-endpoint', 'chat_endpoint'], ['poc-model', 'model'], ['credit-amount', 'topup_sat']]) {
-      if ($(id) && !defaultsEdited.has(id) && !providerReviewToken) $(id).value = value[field];
-    }
-    updateInferenceFacts();
-    $('defaults-status').textContent = 'Deployment defaults loaded. Public fields remain editable; review and approval use the displayed values.';
+    return {provider_origin: value.provider_origin, relay_key: validRelayKey(value.relay_key) ? value.relay_key : null,
+      fields: Object.fromEntries(defaultsFields.map(field => [field, value[field]]))};
   } catch {
-    $('defaults-status').textContent = 'Deployment defaults are missing or invalid. All fallback values remain in use.';
+    $('defaults-status').textContent = 'Deployment defaults are missing or invalid. Public fallback values remain in use. Creating a provider account requires valid deployment defaults; the existing-account form remains available.';
+    return {provider_origin: null, relay_key: null};
   } finally { clearTimeout(timer); }
 };
-void loadDefaults();
+let defaultsPublished = false;
+const publishDefaults = (material, accepted) => {
+  if (defaultsPublished || !material.fields) return;
+  defaultsPublished = true;
+  if (!accepted) {
+    $('defaults-status').textContent = 'Deployment defaults are missing or invalid. Public fallback values remain in use. Creating a provider account requires valid deployment defaults; the existing-account form remains available.';
+    return;
+  }
+  for (const [id, field] of [['provider-origin', 'provider_origin'], ['provider-relay', 'relay_url'], ['poc-relay', 'relay_url'], ['poc-endpoint', 'chat_endpoint'], ['poc-model', 'model'], ['credit-amount', 'topup_sat']]) {
+    if ($(id) && !defaultsEdited.has(id) && !providerReviewToken) $(id).value = material.fields[field];
+  }
+  updateInferenceFacts();
+  $('defaults-status').textContent = 'Deployment defaults loaded. Public fields remain editable; review and approval use the displayed values.';
+};
+const defaultsReady = loadDefaults();
 
 const texts = {
   starting: 'Opening the local store…',
@@ -178,7 +192,7 @@ const renderSteps = store => {
     // Controls already beside their required facts keep their original container.
     const node = button.form ?? button;
     if (mainHomes.has(node)) { retained.add(node); return; }
-    if (!button.closest(`#tau-step-${name}-fold`)) return;
+    if (button.closest('#tau-provider-existing') || !button.closest(`#tau-step-${name}-fold`)) return;
     mainHomes.set(node, {parent: node.parentNode, next: node.nextSibling, form: node.getAttribute('form')});
     retained.add(node);
     $(`step-${name}-action`).append(node);
@@ -186,7 +200,7 @@ const renderSteps = store => {
   emphasize('store', [$('create'), $('unlock'), $('seed-backup-answer'), $('seed-backup-check'), $('redisplay')]);
   emphasize('credit', [$('credit-invoice'), $('credit-check'), $('credit-configure'), $('poc-inference-form').querySelector('button')]);
   const purchase = store.procurement;
-  const machineAction = !store.provider_configuration?.key_set ? $('provider-key-form').querySelector('button')
+  const machineAction = !store.provider_configuration?.key_set ? $('provider-catalogue')
     : purchase?.phase === 'initial_invoice' ? $('provider-invoice')
     : purchase?.phase && purchase.phase !== 'terms_changed' ? $('provider-resume')
     : purchase?.selection ? $('provider-approval-form').querySelector('button')
@@ -770,7 +784,22 @@ let providerDisplayedOrigin = null;
 const providerRequest = action => worker.postMessage({provider_request: action});
 const renderProvider = (store, enabled) => {
   const worker = snapshotWorker();
-  $('provider-key-status').textContent = store.provider_configuration?.key_set ? 'Provider key set.' : 'Provider key unset; re-entry is required.';
+  const recorded = store.provider_configuration?.recorded === true;
+  const account = store.provider_configuration?.account;
+  $('provider-key-status').textContent = recorded
+    ? (/^[0-9a-f]{64}$/.test(account ?? '') ? `Provider account public identity: ${account}` : 'Provider account recorded; public identity unavailable.')
+    : 'The first provider action creates and keeps one provider account.';
+  const fixed = recorded || Boolean(store.procurement?.phase || store.procurement?.closed);
+  $('provider-key-form').hidden = fixed;
+  $('provider-account-fixed').hidden = !fixed;
+  const deployed = store.provider_configuration?.relay_deployed === true;
+  $('provider-relay-guidance').textContent = deployed
+    ? 'Registering the machine SSH public key with the provider does not enroll the relay. The deployment relay key is in use. You still need published pins and approvals for the goal, class, access and installation declaration.'
+    : 'Registering the machine SSH public key with the provider does not enroll the relay. Before configuration, copy the separate relay public key and ask your relay operator to enroll it. You still need published pins and approvals for the goal, class, access and installation declaration.';
+  $('relay-task-guidance').textContent = deployed
+    ? 'After enrollment, configure inference, then press Start session for the displayed model and machine. Copy its public keys. Install the SSH line. The deployment relay key is in use.'
+    : 'After enrollment, configure inference, then press Start session for the displayed model and machine. Copy its public keys. Install the SSH line and enroll the separate relay public key with the relay operator.';
+  $('relay-deployment-status').textContent = deployed ? 'The deployment relay key is in use.' : 'No valid deployment relay key is loaded. The seed-derived relay key requires manual enrollment.';
   const purchase = store.procurement ?? {};
   if (!$('purchase-review-home')) {
     const home = document.createElement('span'); home.id = 'tau-purchase-review-home';
@@ -848,8 +877,8 @@ const renderProvider = (store, enabled) => {
       }
     }
     if (purchase.public_keys) {
-      paragraph(progress, 'Registering the machine SSH public key with the provider does not enroll the relay. Copy the separate relay public key and ask your relay operator to enroll it before configuration.');
-      paragraph(progress, 'Relay public key — enroll this separately with the relay operator:');
+      paragraph(progress, deployed ? 'Registering the machine SSH public key with the provider does not enroll the relay. The deployment relay key is in use.' : 'Registering the machine SSH public key with the provider does not enroll the relay. Copy the separate relay public key and ask your relay operator to enroll it before configuration.');
+      paragraph(progress, deployed ? 'Deployment relay public key:' : 'Relay public key — enroll this separately with the relay operator:');
       const publicKey = document.createElement('pre'); publicKey.textContent = purchase.public_keys.relay_pubkey; progress.append(publicKey);
     }
     if (purchase.target) paragraph(progress, `Published pin saved for VM ${purchase.vm_id}: ${purchase.target.pin}. Press Start session ${purchase.machine} below to continue configuration.`);
@@ -1015,7 +1044,7 @@ const renderPoc = (store) => {
     pocKeyRefusal = store.poc_keys.refused ?? '';
     if (!store.poc_keys.refused) {
       paragraph(slot, `Public keys for ${store.poc_keys.machine}`);
-      paragraph(slot, 'Registering the machine SSH public key with the provider does not enroll the relay. Copy the separate relay public key and ask your relay operator to enroll it before configuration.');
+      paragraph(slot, store.provider_configuration?.relay_deployed ? 'Registering the machine SSH public key with the provider does not enroll the relay. The deployment relay key is in use.' : 'Registering the machine SSH public key with the provider does not enroll the relay. Copy the separate relay public key and ask your relay operator to enroll it before configuration.');
       for (const [field, label] of [['authorized_keys', 'SSH authorized_keys line'], ['relay_pubkey', 'Relay AUTH public key']]) {
         const value = String(store.poc_keys[field] ?? '');
         paragraph(slot, label);
@@ -1080,9 +1109,20 @@ const start = () => {
   const nativePost = current.postMessage.bind(current);
   current.sendAt = (request, transfer, generation) => nativePost({incarnation, generation, request}, transfer);
   current.postMessage = (request, transfer) => current.sendAt(request, transfer, current.generation);
-  nativePost({initialize: incarnation});
+  let deploymentMaterial;
+  void defaultsReady.then(material => {
+    if (worker !== current) return;
+    deploymentMaterial = material;
+    const key = new TextEncoder().encode(material.relay_key ?? '');
+    try { nativePost({initialize: incarnation, deployment: {origin: material.provider_origin, key, public_fields: JSON.stringify(material.fields ?? {})}}, [key.buffer]); }
+    finally { if (key.byteLength) key.fill(0); }
+  });
   worker.onmessage = ({ data }) => {
     if (worker !== current) return;
+    if (typeof data.deployment_ready === 'boolean') {
+      publishDefaults(deploymentMaterial, data.deployment_ready);
+      return;
+    }
     if (data.requirements_store) {
       const { state, error, reason, ...rest } = JSON.parse(data.requirements_store);
       data = { store: { store_state: state, ...(error ? { store_error: error } : {}), ...(reason ? { store_reason: reason } : {}), ...rest } };

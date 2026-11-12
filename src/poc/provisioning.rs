@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 
 pub const ORIGIN: &str = "https://api.lnvps.net";
 pub const REFUSED: &str = "Provider response refused; saved identities remain unchanged.";
-pub const INCOMPLETE: &str = "Provider request incomplete or browser access unavailable; unlock, re-enter the same account and Refresh. Uncertain operations are never resent.";
+pub const INCOMPLETE: &str = "Provider request incomplete or browser access unavailable; unlock and Refresh the saved purchase. Uncertain operations are never resent.";
 pub const BODY_LIMIT: usize = 256 * 1024;
 
 /// Strict origin grammar, checked before any URL parser can repair forbidden input.
@@ -107,6 +107,36 @@ pub(crate) fn request_url(origin: &str, path: &str) -> Result<String, String> {
     Ok(format!("{origin}{path}"))
 }
 
+/// One encrypted provider identity for this store.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AccountRecord {
+    pub key: crate::poc::credit::SecretText,
+    pub source: AccountSource,
+    pub origin: String,
+}
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AccountSource {
+    Generated,
+    Entered,
+}
+impl AccountRecord {
+    pub(crate) fn account(&self) -> Result<Account, String> {
+        if self.key.0.len() != 64
+            || !self
+                .key
+                .0
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || provider_origin(&self.origin)? != self.origin
+        {
+            return Err("Invalid provider account record.".into());
+        }
+        Account::parse(self.key.0.as_bytes())
+    }
+}
+
 /// Separate from inference credential admission: a hexadecimal scalar is required here.
 pub struct Account(Zeroizing<[u8; 32]>);
 impl Account {
@@ -118,6 +148,16 @@ impl Account {
         hex::decode_to_slice(input, bytes.as_mut()).map_err(|_| REFUSED)?;
         SigningKey::from_bytes(bytes.as_ref()).map_err(|_| "Invalid provider account scalar.")?;
         Ok(Self(bytes))
+    }
+    pub(crate) fn record(&self, source: AccountSource, origin: String) -> AccountRecord {
+        AccountRecord {
+            key: crate::poc::credit::SecretText(Zeroizing::new(hex::encode(*self.0))),
+            source,
+            origin,
+        }
+    }
+    pub(crate) fn copy(&self) -> Self {
+        Self(Zeroizing::new(*self.0))
     }
     pub fn public(&self) -> String {
         hex::encode(

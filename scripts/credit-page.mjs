@@ -1,7 +1,7 @@
 import {phoneSnapshot} from './layout-page.mjs';
 import assert from 'node:assert/strict';
 import {edgeCases, edgePaidInvoices, edgeSession, edgeFocusPending} from './edges-page.mjs';
-export const creditCases = ['credit-funding','credit-expiry','credit-failures','credit-key','credit-lock','credit-reload','credit-loss','credit-defaults','credit-defaults-invalid','credit-defaults-missing','credit-control-account','credit-control-key','credit-control-name','credit-lifecycle','credit-refusals','credit-account-write','credit-double-press','credit-late-lock','credit-late-end','credit-poll-bounds','credit-defaults-directory','credit-defaults-late','credit-mint-pause','credit-existing-balance','credit-defaults-urls','credit-new-balance-failure','credit-resolved-history','credit-goal-drafts','credit-refresh-contention','credit-ensure-contention','credit-balance-loss-refresh','credit-balance-loss-mint',...['collection','verification'].flatMap(phase=>['refused','lost','wrong-cap'].map(mode=>`credit-mint-${phase}-${mode}`))];
+export const creditCases = ['credit-funding','credit-expiry','credit-failures','credit-key','credit-lock','credit-reload','credit-loss','credit-defaults','credit-defaults-invalid','credit-defaults-missing','credit-control-account','credit-control-key','credit-control-name','credit-lifecycle','credit-refusals','credit-account-write','credit-double-press','credit-late-lock','credit-late-end','credit-poll-bounds','credit-defaults-directory','credit-defaults-late','credit-mint-pause','credit-existing-balance','credit-defaults-urls','credit-defaults-relay','credit-defaults-overlap','credit-new-balance-failure','credit-resolved-history','credit-goal-drafts','credit-refresh-contention','credit-ensure-contention','credit-balance-loss-refresh','credit-balance-loss-mint',...['collection','verification'].flatMap(phase=>['refused','lost','wrong-cap'].map(mode=>`credit-mint-${phase}-${mode}`))];
 creditCases.push(...edgeCases);
 export const creditId = 'synthetic-credit-identity-482700';
 export const defaultKey = 'synthetic-default-credential-482700';
@@ -108,14 +108,74 @@ export async function creditProof(c) {
  assert.ok(state.statusCalls>before || state.mode==='status-fail');return report();
  };
  await call('Page.navigate',{url:pageOrigin+(name==='credit-defaults-directory'?'/nested/index.html':'/')},sessionId);
- await wait("document.querySelector('#tau-store')?.dataset.state==='none'");
+ if(name!=='credit-defaults-late')await wait("document.querySelector('#tau-store')?.dataset.state==='none'");
  if(name==='credit-defaults-late'){
   for(let n=0;n<100&&!state.releaseDefaults;n++)await new Promise(r=>setTimeout(r,5));assert.equal(typeof state.releaseDefaults,'function');
   await invoke(()=>{for(const [id,value]of [['provider-origin','https://edited.example'],['poc-model','edited-model'],['credit-amount','1400']]){const input=document.querySelector('#tau-'+id);input.value=value;input.dispatchEvent(new Event('input',{bubbles:true}));}});
+  await invoke(()=>window.dispatchEvent(new Event('pagehide')));
+  await wait('fixtureWorkers.length===2');
+  assert.equal(state.accountCalls,0,'waiting for defaults grants no credit authority');
   state.releaseDefaults();await wait("document.querySelector('#tau-defaults-status').textContent.includes('loaded')");
+  await wait("document.querySelector('#tau-store')?.dataset.state==='none'");
   assert.deepEqual(await evaluate("['provider-origin','poc-model','credit-amount'].map(k=>document.querySelector('#tau-'+k).value)"),['https://edited.example','edited-model','1400']);
   assert.equal(await evaluate("document.querySelector('#tau-poc-endpoint').value"),'https://credit.example/v1/chat/completions');
   check(true,'late defaults preserve edited fields while filling untouched public configuration');return;
+ }
+ if(name==='credit-defaults-overlap') {
+  const scalar='6a'.repeat(32),raw=Buffer.from(scalar,'hex');
+  const forms=[...new Set([raw.toString(),scalar,scalar.toUpperCase(),'6A6a'.repeat(16),
+   ...[raw,Buffer.from(scalar)].flatMap(bytes=>[bytes.toString('hex'),bytes.toString('hex').toUpperCase(),bytes.toString('base64'),bytes.toString('base64').replace(/=+$/,''),bytes.toString('base64url')])])];
+  const fields=['provider-origin','provider-relay','poc-relay','poc-endpoint','poc-model','credit-amount'];
+  const fallback=['https://api.lnvps.net','','','','','1000'];
+  const {identifier}=await call('Page.addScriptToEvaluateOnNewDocument',{source:`
+   window.fixtureDefaultsWrites=0;window.fixtureDefaultsLeaks=0;
+   const descriptor=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
+   Object.defineProperty(HTMLInputElement.prototype,'value',{...descriptor,set(value){
+    if(${JSON.stringify(fields.map(id=>'tau-'+id))}.includes(this.id)){
+     fixtureDefaultsWrites++;
+     if(${JSON.stringify(forms)}.some(form=>String(value).includes(form)))fixtureDefaultsLeaks++;
+    }
+    descriptor.set.call(this,value);
+   }});
+  `},sessionId);
+  let cases=0;
+  for(const form of forms) {
+   const overrides=[{model:form},{chat_endpoint:'https://credit.example/'+form},{relay_url:'wss://relay.example/'+form+'/'}];
+   if(form.length<=63 && /^[A-Za-z0-9-]+$/.test(form))overrides.push({provider_origin:'https://'+form+'.example'});
+   for(const override of overrides) {
+    state.defaultsOverride={relay_key:scalar,...override};
+    await call('Page.reload',{},sessionId);await wait("document.querySelector('#tau-store')?.dataset.state==='none'");
+    const observed=await evaluate(`({writes:fixtureDefaultsWrites,leaks:fixtureDefaultsLeaks,values:${JSON.stringify(fields)}.map(id=>document.querySelector('#tau-'+id).value),text:document.querySelector('#tau-defaults-status').textContent,deployed:fixtureReports.at(-1).provider_configuration.relay_deployed})`);
+    assert.equal(observed.leaks,0,'no protected defaults value reaches an input setter, even transiently');
+    assert.equal(observed.writes,0,'refused defaults publish none of the public fields');
+    assert.deepEqual(observed.values,fallback);
+    assert.match(observed.text,/missing or invalid/);
+    assert.equal(observed.deployed,false);
+    cases++;
+   }
+  }
+  await call('Page.removeScriptToEvaluateOnNewDocument',{identifier},sessionId);
+  assert.equal(state.accountCalls,0);assert.equal(state.requests.length,0);
+  check(cases>=9,'the real defaults loader refuses raw and encoded relay overlap before any public input assignment');return;
+ }
+ if(name==='credit-defaults-relay') {
+  const scalar='35'.repeat(32);
+  const cases=[{key:undefined,loaded:true,deployed:false},{key:scalar,loaded:true,deployed:true},
+   ...['0'.repeat(64),'f'.repeat(64),'AB'.repeat(32),'12'.repeat(31),true,{},null].map(key=>({key,loaded:true,deployed:false})),
+   {key:scalar,extra:true,loaded:false,deployed:false}];
+  for(const row of cases) {
+   state.defaultsOverride={...(row.key===undefined?{}:{relay_key:row.key}),...(row.extra?{extra:'refused'}:{})};
+   await call('Page.reload',{},sessionId);await wait("document.querySelector('#tau-store')?.dataset.state==='none'");
+   const r=await report();
+   assert.equal(r.provider_configuration.relay_deployed,row.deployed);
+   assert.equal(await evaluate("document.querySelector('#tau-provider-origin').value"),row.loaded?'https://provider.example':'https://api.lnvps.net');
+   assert.equal(await evaluate("document.querySelector('#tau-poc-model').value"),row.loaded?'example-model':'');
+   assert.equal(await evaluate("document.querySelector('#tau-credit-amount').value"),row.loaded?'1200':'1000');
+   assert.equal(await evaluate("document.querySelector('#tau-relay-deployment-status').textContent.includes('manual enrollment')"),!row.deployed);
+   assert.equal(await invoke(key=>document.body.textContent.includes(key)||[...document.querySelectorAll('input,textarea')].some(n=>n.value.includes(key)),scalar),false);
+   assert.equal(JSON.stringify(r).includes(scalar),false);
+  }
+  check(true,'optional relay scalar validation preserves valid public defaults and refuses other extra fields');return;
  }
  if(name==='credit-defaults-urls'){
   const fields=['provider-origin','provider-relay','poc-relay','poc-endpoint','poc-model','credit-amount','poc-class','provider-class'];

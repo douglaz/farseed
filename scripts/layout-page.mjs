@@ -167,18 +167,18 @@ export async function layoutObserver(c, state) {
   assert.deepEqual(await c.evaluate("[...document.querySelectorAll('[data-step] > details[id^=\"tau-step-\"]')].map(n=>n.open)"),[true,false,false,false]);
   const source=await readFile(new URL('../www/index.html',import.meta.url),'utf8');
   assert.equal(source.match(/<meta http-equiv="Content-Security-Policy"[^>]*>/)[0],baseline.csp,'CSP unchanged');
-  assert.equal(source.match(/<p>Use a dedicated, already[^<]+<\/p>/)[0],baseline.providerParagraph,'provider paragraph changes only one word');
+  assert.equal(source.match(/<p>The page makes[^<]+<\/p>/)[0],'<p>The page makes and keeps one provider account per store, encrypted in this browser. It supports one outstanding purchase per store, external payment of the initial period, and published Ed25519 host keys. No stock or connectivity is promised.</p>','provider custody text retains all purchase qualifications');
   assert.equal((source.match(/<style>/g)||[]).length,1,'one inline style');
   assert.ok(source.indexOf('</style>')<source.indexOf('</head>'),'style stays in head');
  }
  if(state==='unlocked') {
   const later = await c.evaluate(`(() => {
    const visible=${visibleSource}, fold=document.querySelector('#tau-step-machine-fold');
-   const prose=[...document.querySelectorAll('[data-step="machine"] p')].filter(n=>n.textContent.startsWith('Use a dedicated, already')||n.textContent.startsWith('The published pin comes')||n.textContent.startsWith('App Lock, reload and worker loss'));
-   const action=document.querySelector('#tau-provider-key-form');
+   const prose=[...document.querySelectorAll('[data-step="machine"] p')].filter(n=>n.textContent.startsWith('The page makes')||n.textContent.startsWith('The published pin comes')||n.textContent.startsWith('App Lock, reload and worker loss'));
+   const action=document.querySelector('#tau-provider-catalogue');
    return {creditCurrent:document.querySelector('[data-step="credit"]').dataset.current,open:fold.open,
     ordinary:prose.map(n=>({inFold:fold.contains(n),visible:visible(n)})),
-    actionVisible:visible(action)&&visible(action.querySelector('button')),actionOutside:!fold.contains(action)};
+    actionVisible:visible(action),actionOutside:!fold.contains(action)};
   })()`);
   assert.equal(later.creditCurrent,'true','credit is current before inference configuration');
   assert.equal(later.open,false,'Machine starts folded while credit is current');
@@ -197,7 +197,7 @@ export async function layoutObserver(c, state) {
   assert.deepEqual(routes,['store','credit','machine','task','store'],'publication carries only fixed presentation routes');
   const before=await c.evaluate('fixtureReports.length');
   await c.click('#tau-step-machine-fold > summary');
-  c.check(await c.evaluate(`(() => {const visible=${visibleSource};return [...document.querySelectorAll('#tau-step-machine-fold p')].filter(n=>n.textContent.startsWith('Use a dedicated, already')||n.textContent.startsWith('The published pin comes')||n.textContent.startsWith('App Lock, reload and worker loss')).every(visible);})()`),'opening Machine reveals its ordinary body');
+  c.check(await c.evaluate(`(() => {const visible=${visibleSource};return [...document.querySelectorAll('#tau-step-machine-fold p')].filter(n=>n.textContent.startsWith('The page makes')||n.textContent.startsWith('The published pin comes')||n.textContent.startsWith('App Lock, reload and worker loss')).every(visible);})()`),'opening Machine reveals its ordinary body');
   await c.invoke(()=>{document.querySelector('#tau-provider-machine').value='draft machine';document.querySelector('#tau-poc-endpoint').value='https://example.invalid/completions';});
   await c.message({lifecycle:'hidden'});await c.message({lifecycle:'visible'});
   await c.wait(`fixtureReports.length>${before}`);

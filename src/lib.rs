@@ -98,6 +98,21 @@ mod worker {
         local().lock().await.unlock(passphrase).await.to_string()
     }
 
+    #[wasm_bindgen]
+    pub async fn deployment_configure(
+        origin: Option<String>,
+        bytes: Uint8Array,
+        public_fields: String,
+    ) -> Result<bool, wasm_bindgen::JsValue> {
+        let secret = zeroize::Zeroizing::new(bytes.to_vec());
+        bytes.fill(0, 0, bytes.length());
+        local()
+            .lock()
+            .await
+            .deployment_configure(origin, &secret, &public_fields)
+            .map_err(Into::into)
+    }
+
     /// The only mnemonic output: the dedicated seed-backup display message, or null.
     #[wasm_bindgen]
     pub async fn seed_backup_display() -> String {

@@ -145,7 +145,7 @@ impl<S: Storage> Store<S> {
         self.remember_provider_filter(fingerprints.filter());
         Ok(())
     }
-    fn procurement_ready(&self) -> Result<(), String> {
+    pub(super) fn procurement_ready(&self) -> Result<(), String> {
         self.authority.ordinary()?;
         if self.inference.ended || self.failed.is_some() || self.allocation().seed_backup_owed() {
             return Err("Complete unlock and seed backup before procurement.".into());
@@ -159,7 +159,7 @@ impl<S: Storage> Store<S> {
             .as_ref()
             .is_some_and(|p| p.account != account)
         {
-            return Err("Re-enter the same provider account used for this purchase.".into());
+            return Err("The recorded provider account does not match this purchase.".into());
         }
         Ok(())
     }
@@ -168,30 +168,14 @@ impl<S: Storage> Store<S> {
             .as_ref()
             .map_or(&self.provider_origin, |p| &p.origin)
     }
-    pub(crate) fn procurement_configure(
+    pub(crate) async fn procurement_configure(
         &mut self,
         account: &protocol::Account,
         secret: &[u8],
         origin: &str,
     ) -> Result<(), String> {
-        let normalized = protocol::provider_origin(origin)?;
-        self.procurement_account(&account.public())?;
-        let filter = account.filter(secret);
-        if !crate::poc::inference::safe(self, &json!([origin, normalized]), &[secret]) {
-            return Err("Provider origin contains protected or unscannable material.".into());
-        }
-        for value in [origin, normalized.as_str()] {
-            if filter.protect_bytes(value.as_bytes())?.as_slice() != value.as_bytes() {
-                return Err("Provider origin contains protected or unscannable material.".into());
-            }
-        }
-        // A bound Purchase always wins, including after re-entry with another field value.
-        if self.procurement.is_none() && self.provider_origin != normalized {
-            self.procurement_selection = None;
-            self.provider_origin = normalized;
-        }
-        self.remember_provider_filter(filter);
-        Ok(())
+        self.provider_install(account, secret, origin, protocol::AccountSource::Entered)
+            .await
     }
     fn check_api(&self, api: &impl Api) -> Result<(), String> {
         api.current()?;

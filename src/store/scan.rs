@@ -209,6 +209,9 @@ impl<S: Storage> Store<S> {
             {
                 safe = filter.protect_bytes_cached(&safe, cache)?;
             }
+            if let Some(key) = &self.deployment_relay {
+                safe = super::provider::deployment_filter(key).protect_bytes(&safe)?;
+            }
             Ok(safe)
         })
     }

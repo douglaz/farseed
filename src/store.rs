@@ -64,6 +64,14 @@ pub(crate) mod credit;
 pub mod delivery;
 mod goals;
 mod journal;
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    allow(
+        dead_code,
+        reason = "deployment and custody are driven by the browser worker"
+    )
+)]
+mod provider;
 mod sessions;
 use journal::journal;
 pub(crate) mod inference;
@@ -236,6 +244,7 @@ pub(crate) enum Event {
     PocTarget(poc_targets::Record),
     Procurement(provisioning::Record),
     ProviderProtection(crate::poc::inference::EchoFingerprints),
+    PocProviderAccount(crate::poc::provisioning::AccountRecord),
     PocCreditAccount(crate::poc::credit::AccountRecord),
     PocCredit(credit::Record),
     PocCreditExposure(Exposure),
@@ -307,15 +316,16 @@ impl Envelope {
     /// type; another version, purpose, KDF or iteration count; a field of the wrong length or not
     /// unpadded base64url.
     fn parse(bytes: &[u8]) -> Result<Envelope, String> {
-        let json: EnvelopeJson = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+        let json: EnvelopeJson =
+            serde_json::from_slice(bytes).map_err(|_| "invalid store envelope")?;
         if json.version != 1 {
             return Err(format!("version {}, not 1", json.version));
         }
         if json.purpose != "local" {
-            return Err(format!("purpose {:?}, not \"local\"", json.purpose));
+            return Err("purpose is not \"local\"".into());
         }
         if json.kdf != "PBKDF2-SHA256" {
-            return Err(format!("kdf {:?}, not \"PBKDF2-SHA256\"", json.kdf));
+            return Err("kdf is not \"PBKDF2-SHA256\"".into());
         }
         if json.iterations != u64::from(ITERATIONS) {
             return Err(format!("{} iterations, not {ITERATIONS}", json.iterations));
@@ -394,6 +404,9 @@ pub struct Store<S> {
     provider_filters: Vec<crate::poc::inference::EchoFilter>,
     procurement_selection: Option<crate::poc::provisioning::Selection>,
     provider_origin: String,
+    provider_account: Option<crate::poc::provisioning::Account>,
+    deployment_origin: Option<String>,
+    deployment_relay: Option<crate::credential::RelayKey>,
     /// Memory-only credential fingerprints continue protecting late evidence after key disposal.
     poc_credential_filters: Rc<std::cell::RefCell<Vec<crate::poc::inference::EchoFilter>>>,
     authority: Rc<crate::lifecycle::Authority>,
@@ -545,6 +558,9 @@ impl<S: Storage> Store<S> {
             provider_filters: Vec::new(),
             procurement_selection: None,
             provider_origin: crate::poc::provisioning::default_origin(),
+            provider_account: None,
+            deployment_origin: None,
+            deployment_relay: None,
             poc_credential_filters: Default::default(),
             authority,
             response_calls: std::collections::BTreeSet::new(),
@@ -1061,6 +1077,9 @@ impl<S: Storage> Store<S> {
                     )
             })?
             .identity;
+        if let Some(key) = &self.deployment_relay {
+            return Some(crate::credential::RelayKey(key.0));
+        }
         self.seed()?
             .relay_key(identity.derivation_version, identity.index)
             .ok()
@@ -1422,6 +1441,16 @@ impl<S: Storage> Store<S> {
             held.borrowed.push(&account.credit_id.0);
             held.borrowed.push(&account.default_key.0);
         }
+        if let Some(key) = &self.deployment_relay {
+            held.borrowed.push(&key.0);
+            let text = Zeroizing::new(hex::encode(key.0));
+            held.derived
+                .push(Derived::RelayText(crate::poc::credit::SecretText(
+                    Zeroizing::new(text.to_uppercase()),
+                )));
+            held.derived
+                .push(Derived::RelayText(crate::poc::credit::SecretText(text)));
+        }
         for session in &self.sessions {
             let bindings = session.given.borrow();
             for holding in bindings.iter() {
@@ -1563,9 +1592,7 @@ impl<S: Storage> Store<S> {
         let mut numbers = Vec::new();
         for name in self.storage.list().await? {
             if is_record_name(&name) {
-                let number: u64 = name
-                    .parse()
-                    .map_err(|_| format!("record {name}: the number is out of range"))?;
+                let number: u64 = name.parse().map_err(|_| "record number is out of range")?;
                 numbers.push(number);
             }
         }
@@ -1578,14 +1605,16 @@ impl<S: Storage> Store<S> {
                 ));
             }
             let bytes = self.storage.read(&number.to_string()).await?;
-            let event = self
-                .open(number, &bytes)
+            let (event, plaintext) = self
+                .open_record(number, &bytes)
                 .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
             self.previous = Address(Sha256::digest(&bytes).into());
-            records.push((number, bytes, event));
+            records.push((number, bytes, event, plaintext));
         }
         self.previous = Address([0; 32]);
-        for (number, bytes, event) in records {
+        for (number, bytes, event, plaintext) in records {
+            // Custody filters exist only after applying their record, not during decoding.
+            self.check_provider_material(&plaintext)?;
             match (number, &event) {
                 (FIRST, Event::Seed { mnemonic }) => {
                     let seed = Seed::import(mnemonic).map_err(|e| {
@@ -1604,6 +1633,7 @@ impl<S: Storage> Store<S> {
                     self.apply_inference(number, &event)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::PocProviderAccount(account)) => self.replay_provider_account(account)?,
                 (_, Event::PocCreditAccount(account)) => self.replay_credit_account(account)?,
                 (_, Event::PocCredit(record)) => self.replay_credit(record)?,
                 (_, Event::PocTarget(record)) => {
@@ -1789,8 +1819,13 @@ impl<S: Storage> Store<S> {
     }
 
     /// Parses, checks and decrypts the record stored as `bytes` under `number`.
-    fn open(&self, number: u64, bytes: &[u8]) -> Result<Event, String> {
-        let record: RecordJson = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    fn open_record(
+        &self,
+        number: u64,
+        bytes: &[u8],
+    ) -> Result<(Event, Zeroizing<Vec<u8>>), String> {
+        let record: RecordJson =
+            serde_json::from_slice(bytes).map_err(|_| "invalid record envelope")?;
         // Only this serialization is ever written, so any other bytes are a modification, even
         // one the parser tolerates (whitespace after the last record, where no successor's
         // `previous` would catch it). It is compared, never hashed in place of the stored bytes.
@@ -1803,7 +1838,7 @@ impl<S: Storage> Store<S> {
         match record.kind.as_str() {
             EVENT => {}
             "snapshot" => return Err("snapshots are not supported".into()),
-            other => return Err(format!("unknown type {other:?}")),
+            _ => return Err("unknown record type".into()),
         }
         if record.number != number {
             return Err(format!("it carries number {}", record.number));
@@ -1933,7 +1968,8 @@ impl<S: Storage> Store<S> {
         }
         if matches!(
             event,
-            Event::PocCreditAccount(_)
+            Event::PocProviderAccount(_)
+                | Event::PocCreditAccount(_)
                 | Event::PocCredit(_)
                 | Event::PocCreditExposure(_)
                 | Event::InferenceAccount { .. }
@@ -1965,7 +2001,15 @@ impl<S: Storage> Store<S> {
                 return Err("invalid inference record shape".into());
             }
         }
-        Ok(event)
+        Ok((event, plaintext))
+    }
+
+    #[cfg(any(
+        all(test, not(target_arch = "wasm32")),
+        all(feature = "tracer", target_arch = "wasm32")
+    ))]
+    fn open(&self, number: u64, bytes: &[u8]) -> Result<Event, String> {
+        self.open_record(number, bytes).map(|(event, _)| event)
     }
 
     /// Encrypts `event` as the record numbered `next` and commits it: written whole under the
@@ -1973,6 +2017,10 @@ impl<S: Storage> Store<S> {
     async fn commit(&mut self, event: &Event) -> Result<u64, String> {
         if let Some(why) = &self.failed {
             return Err(crate::poc::wait::EARLIER_APPEND.render(0, "", why));
+        }
+        if let Event::PocProviderAccount(record) = event {
+            self.provider_entry_ready()?;
+            record.account()?;
         }
         let number = self.next;
         // Credential format v1: "Never perform 2^32 encryptions under one data key". Record 0 is
@@ -1984,11 +2032,8 @@ impl<S: Storage> Store<S> {
         let previous = hex::encode(self.previous.0);
         let plaintext =
             Zeroizing::new(serde_json::to_vec(&journal(event)).expect("an event serializes"));
-        for filter in &self.provider_filters {
-            if filter.protect_bytes(&plaintext)?.as_slice() != plaintext.as_slice() {
-                return Err("protected provider material refused before encryption".into());
-            }
-        }
+        self.check_provider_material(&plaintext)?;
+        self.check_deployment_material(&plaintext)?;
         for filter in self.poc_credential_filters.borrow().iter() {
             if filter
                 .literal_match(&plaintext)
@@ -2201,6 +2246,8 @@ pub struct Local<S, K> {
     kdf: K,
     state: State<S>,
     seed_backup: BackupStage,
+    deployment_origin: Option<String>,
+    deployment_relay: Option<crate::credential::RelayKey>,
 }
 
 impl<S: Storage + Clone, K: Kdf> Local<S, K> {
@@ -2214,6 +2261,8 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         }
         self.seed_backup = BackupStage::Inactive;
         self.state = State::Locked;
+        self.deployment_origin = None;
+        self.deployment_relay = None;
     }
 
     pub fn new(storage: S, kdf: K) -> Local<S, K> {
@@ -2222,6 +2271,8 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             kdf,
             state: State::Unopened,
             seed_backup: BackupStage::Inactive,
+            deployment_origin: None,
+            deployment_relay: None,
         }
     }
 
@@ -2243,7 +2294,8 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             return self.report(Some("a store is created only where there is none"));
         }
         match create(self.storage.clone(), &self.kdf, passphrase).await {
-            Ok(store) => {
+            Ok(mut store) => {
+                self.restore_deployment(&mut store);
                 if store.allocation().seed_backup_owed() {
                     self.seed_backup = BackupStage::Display;
                 }
@@ -2261,7 +2313,8 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             return self.report(Some("only a locked store is unlocked"));
         }
         self.state = match unlock(self.storage.clone(), &self.kdf, passphrase).await {
-            Ok(store) => {
+            Ok(mut store) => {
+                self.restore_deployment(&mut store);
                 if store.allocation().seed_backup_owed() {
                     self.seed_backup = BackupStage::Display;
                 }
@@ -2269,6 +2322,10 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             }
             Err(why) => State::Refused(why),
         };
+        #[cfg(target_arch = "wasm32")]
+        if let State::Unlocked(store) = &self.state {
+            crate::poc::provisioning::browser::restore(store.provider_account.as_ref());
+        }
         #[cfg(target_arch = "wasm32")]
         if let State::Unlocked(store) = &self.state
             && let Some(exposure) = store

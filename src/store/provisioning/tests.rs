@@ -991,7 +991,7 @@ fn provisioning_failed_intent_write_sends_nothing_and_account_cannot_change() {
     assert!(
         block_on(s.procurement_resume(&mut api, false))
             .unwrap_err()
-            .contains("same provider account")
+            .contains("recorded provider account does not match")
     );
     assert_eq!(api.count("POST /api/v1/ssh-key"), 0);
     api.account = "a".repeat(64);
@@ -2523,8 +2523,16 @@ fn provisioning_request_fingerprint_wire_format_roundtrips_fixed_length_digests(
 fn configure_origin(s: &mut Store<MemoryStorage>, origin: &str) {
     let secret = hex::encode([7; 32]);
     let account = protocol::Account::parse(secret.as_bytes()).unwrap();
-    s.procurement_configure(&account, secret.as_bytes(), origin)
-        .unwrap();
+    block_on(s.procurement_configure(&account, secret.as_bytes(), origin)).unwrap();
+}
+
+fn assert_origin_fixed(s: &mut Store<MemoryStorage>, origin: &str) {
+    let secret = hex::encode([7; 32]);
+    let account = protocol::Account::parse(secret.as_bytes()).unwrap();
+    assert_eq!(
+        block_on(s.procurement_configure(&account, secret.as_bytes(), origin)).unwrap_err(),
+        "Provider account already recorded"
+    );
 }
 
 #[test]
@@ -2532,8 +2540,41 @@ fn provisioning_origin_invalid_configuration_is_atomic_and_credential_safe() {
     let mut s = ready();
     let secret = hex::encode([7; 32]);
     let account = protocol::Account::parse(secret.as_bytes()).unwrap();
-    configure_origin(&mut s, "https://first.invalid:8443/");
     let mut api = Fixture::new(false);
+    s.poc_credential_filters
+        .borrow_mut()
+        .push(crate::poc::inference::EchoFilter::new(&[b"guarded-origin"]));
+    let origin = "https://guarded-origin.invalid";
+    assert_eq!(protocol::provider_origin(origin).unwrap(), origin);
+    let initial_origin = s.procurement_origin().to_string();
+    let initial_selection = s.procurement_selection.clone();
+    let initial_files = s.storage.files();
+    let initial_allocation = s.allocation().clone();
+    let initial_next = s.next;
+    let initial_previous = s.previous.0;
+    assert_eq!(
+        block_on(s.procurement_configure(&account, secret.as_bytes(), origin)).unwrap_err(),
+        "Provider origin contains protected or unscannable material."
+    );
+    assert!(s.provider_account().is_none());
+    assert!(s.provider_filters.is_empty());
+    assert_eq!(s.procurement_origin(), initial_origin);
+    assert_eq!(s.procurement_selection, initial_selection);
+    assert_eq!(s.storage.files(), initial_files);
+    assert_eq!(s.allocation(), &initial_allocation);
+    assert_eq!(s.next, initial_next);
+    assert_eq!(s.previous.0, initial_previous);
+    assert!(api.calls.is_empty());
+    assert!(s.procurement.is_none());
+    assert_eq!(s.poc_credential_filters.borrow().len(), 1);
+    assert_ne!(
+        s.poc_credential_filters.borrow()[0]
+            .protect_bytes(origin.as_bytes())
+            .unwrap()
+            .as_slice(),
+        origin.as_bytes()
+    );
+    configure_origin(&mut s, "https://first.invalid:8443/");
     api.account = account.public();
     block_on(s.procurement_select(
         &mut api,
@@ -2548,18 +2589,15 @@ fn provisioning_origin_invalid_configuration_is_atomic_and_credential_safe() {
     let files = s.storage.files();
     let allocation = s.allocation().clone();
     let requests = api.calls.len();
-    s.poc_credential_filters
-        .borrow_mut()
-        .push(crate::poc::inference::EchoFilter::new(&[b"guarded-origin"]));
     for input in [
         "https://@second.invalid",
         "https://second.invalid?",
         "https://second.invalid/..",
         "https://guarded-origin.invalid",
     ] {
-        let reason = s
-            .procurement_configure(&account, secret.as_bytes(), input)
-            .unwrap_err();
+        let reason =
+            block_on(s.procurement_configure(&account, secret.as_bytes(), input)).unwrap_err();
+        assert_eq!(reason, "Provider account already recorded");
         assert!(!reason.contains(input));
         assert_eq!(s.procurement_origin(), "https://first.invalid:8443");
         assert_eq!(s.procurement_selection, selection);
@@ -2570,11 +2608,11 @@ fn provisioning_origin_invalid_configuration_is_atomic_and_credential_safe() {
     }
     let alias = base64::engine::general_purpose::STANDARD_NO_PAD.encode([7; 32]);
     assert!(
-        s.procurement_configure(
+        block_on(s.procurement_configure(
             &account,
             secret.as_bytes(),
             &format!("https://{alias}.invalid")
-        )
+        ))
         .is_err()
     );
     assert_eq!(s.procurement_origin(), "https://first.invalid:8443");
@@ -2595,10 +2633,18 @@ fn provisioning_origin_stale_consent_cannot_cross_identical_providers() {
     let mut old = approval();
     old.origin = s.procurement_origin().into();
     let selected = s.procurement_selection.clone();
-    configure_origin(&mut s, "https://second.invalid");
-    assert!(s.procurement_selection.is_none());
-    block_on(s.procurement_select(&mut api, choice())).unwrap();
+    let account = protocol::Account::parse(hex::encode([7; 32]).as_bytes()).unwrap();
+    assert_eq!(
+        block_on(s.procurement_configure(
+            &account,
+            hex::encode([7; 32]).as_bytes(),
+            "https://second.invalid"
+        ))
+        .unwrap_err(),
+        "Provider account already recorded"
+    );
     assert_eq!(selected, s.procurement_selection);
+    old.origin = "https://second.invalid".into();
     let before = s.storage.files();
     let allocation = s.allocation().clone();
     let calls = api.calls.len();
@@ -2616,7 +2662,7 @@ fn provisioning_origin_stale_consent_cannot_cross_identical_providers() {
     block_on(s.procurement_approve(&mut api, current)).unwrap();
     assert_eq!(
         s.procurement.as_ref().unwrap().origin,
-        "https://second.invalid"
+        "https://first.invalid"
     );
 }
 
@@ -2632,7 +2678,7 @@ fn provisioning_origin_every_route_signed_and_bound_across_resume_reapproval() {
         configure_origin(&mut s, "https://bound.invalid:18443/");
         approve(&mut s, &mut api);
         let original = s.procurement.clone().unwrap();
-        configure_origin(&mut s, "https://wrong.invalid");
+        assert_origin_fixed(&mut s, "https://wrong.invalid");
         assert_eq!(s.procurement_origin(), original.origin);
         api.current_selection.charge.amount += 1;
         if !custom {
@@ -2641,7 +2687,7 @@ fn provisioning_origin_every_route_signed_and_bound_across_resume_reapproval() {
         }
         assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
         let mut loaded = reopen(&s);
-        configure_origin(&mut loaded, "https://another.invalid");
+        assert_origin_fixed(&mut loaded, "https://another.invalid");
         let mut renewed = approval();
         renewed.origin = original.origin.clone();
         block_on(loaded.procurement_approve(&mut api, renewed)).unwrap();
@@ -2662,7 +2708,7 @@ fn provisioning_origin_every_route_signed_and_bound_across_resume_reapproval() {
         );
         let target = loaded.poc_target("machine-a").cloned();
         let mut replayed = reopen(&loaded);
-        configure_origin(&mut replayed, "https://wrong.invalid");
+        assert_origin_fixed(&mut replayed, "https://wrong.invalid");
         block_on(replayed.procurement_catalogue(&mut api)).unwrap();
         block_on(replayed.procurement_resume(&mut api, false)).unwrap();
         assert_eq!(replayed.poc_target("machine-a").cloned(), target);
@@ -2680,7 +2726,7 @@ fn provisioning_origin_every_route_signed_and_bound_across_resume_reapproval() {
         approve(&mut uncertain, &mut lost);
         assert!(block_on(uncertain.procurement_resume(&mut lost, false)).is_err());
         uncertain = reopen(&uncertain);
-        configure_origin(&mut uncertain, "https://wrong.invalid");
+        assert_origin_fixed(&mut uncertain, "https://wrong.invalid");
         assert!(block_on(uncertain.procurement_resume(&mut lost, false)).is_err());
         assert_eq!(lost.count("POST /api/v1/ssh-key"), 1);
         assert_eq!(lost.count("GET /api/v1/ssh-key"), 1);
@@ -2824,7 +2870,7 @@ fn provisioning_origin_foreign_publication_refuses_replay() {
 #[test]
 fn provisioning_origin_normalization_cannot_introduce_candidate_key_material() {
     let mut s = ready();
-    configure_origin(&mut s, "https://first.invalid:8443");
+    s.provider_origin = "https://first.invalid:8443".into();
     let before = s.storage.files();
     let allocation = s.allocation().clone();
     let alias = format!("{}c", "a".repeat(42));
@@ -2838,8 +2884,7 @@ fn provisioning_origin_normalization_cannot_introduce_candidate_key_material() {
         protocol::provider_origin(&input).unwrap(),
         format!("https://{alias}.invalid")
     );
-    let reason = s
-        .procurement_configure(&account, secret.as_bytes(), &input)
+    let reason = block_on(s.procurement_configure(&account, secret.as_bytes(), &input))
         .expect_err("normalized origin must not introduce an encoded provider scalar");
     assert!(reason.contains("protected or unscannable"));
     assert_eq!(s.procurement_origin(), "https://first.invalid:8443");

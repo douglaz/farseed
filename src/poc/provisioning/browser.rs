@@ -29,6 +29,9 @@ pub(crate) fn end() {
     freeze();
     ACCOUNT.with_borrow_mut(|a| *a = None);
 }
+pub(crate) fn restore(account: Option<&Account>) {
+    ACCOUNT.with_borrow_mut(|a| *a = account.map(Account::copy));
+}
 pub(crate) fn key_is_set() -> bool {
     ACCOUNT.with_borrow(Option::is_some)
 }
@@ -84,7 +87,8 @@ pub async fn provider_configure(bytes: js_sys::Uint8Array, origin: String) -> St
             .ok_or("Unlock before setting the provider account.")?;
         #[cfg(feature = "tracer")]
         let origin = TEST_ORIGIN.with_borrow(Clone::clone).unwrap_or(origin);
-        store.procurement_configure(&account, &secret, &origin)?;
+        store.procurement_configure(&account, &secret, &origin).await?;
+        continuation.check()?;
         ACCOUNT.with_borrow_mut(|a| *a = Some(account));
         Ok::<(), String>(())
     }
@@ -133,22 +137,11 @@ pub async fn provider_request(request: String) -> String {
         }
         LAST.set(Some(now));
         let continuation = crate::lifecycle::owner().continuation()?;
-        let mut api = Browser {
-            account: ACCOUNT
-                .with_borrow(|a| a.as_ref().map(Account::public))
-                .ok_or("Re-enter the provider account after unlock or reload.")?,
-            continuation,
-            filter: None,
-            prepared: None,
-            started: now,
-            requests: 0,
-            response_status: 0,
-        };
         let action: Action =
             serde_json::from_str(&request).map_err(|_| "Invalid provisioning request.")?;
         let local = crate::worker::local();
         let mut local = local.lock().await;
-        api.current()?;
+        continuation.check()?;
         if crate::poc::inference::response_pending() {
             return Err(
                 "Provider reads refused: command response pending; retry after it completes."
@@ -159,6 +152,19 @@ pub async fn provider_request(request: String) -> String {
             return Err("Unlock before provisioning.".into());
         }
         let store = local.store().ok_or("Unlock before provisioning.")?;
+        store.provider_generate().await?;
+        continuation.check()?;
+        restore(store.provider_account());
+        let mut api = Browser {
+            account: store.provider_account().ok_or("Provider account unavailable.")?.copy(),
+            continuation,
+            filter: None,
+            prepared: None,
+            started: now,
+            requests: 0,
+            response_status: 0,
+        };
+        api.current()?;
         match action {
             Action::Catalogue => store.procurement_catalogue(&mut api).await.map(Some),
             Action::Select { choice } => store
@@ -227,7 +233,7 @@ struct Prepared {
     auth: Zeroizing<String>,
 }
 struct Browser {
-    account: String,
+    account: Account,
     continuation: crate::lifecycle::Continuation,
     filter: Option<EchoFilter>,
     prepared: Option<Prepared>,
@@ -267,15 +273,13 @@ impl Api for Browser {
         let body = body.map(|b| Zeroizing::new(b.to_string()));
         let mut nonce = [0; 32];
         getrandom::fill(&mut nonce).map_err(|_| REFUSED)?;
-        let auth = ACCOUNT.with_borrow(|a| {
-            a.as_ref().ok_or(INCOMPLETE)?.authorization(
-                &url,
-                method,
-                body.as_ref().map(|b| b.as_bytes()),
-                self.now(),
-                &nonce,
-            )
-        })?;
+        let auth = self.account.authorization(
+            &url,
+            method,
+            body.as_ref().map(|b| b.as_bytes()),
+            self.now(),
+            &nonce,
+        )?;
         let filter = request_filter(&auth)?;
         let fingerprints = filter.fingerprints();
         self.filter = Some(filter);
@@ -288,7 +292,7 @@ impl Api for Browser {
         Ok(Some(fingerprints))
     }
     fn account(&self) -> String {
-        self.account.clone()
+        self.account.public()
     }
     fn now(&self) -> u64 {
         (js_sys::Date::now() / 1000.0) as u64
@@ -296,7 +300,10 @@ impl Api for Browser {
     fn current(&self) -> Result<(), String> {
         self.continuation.check()?;
         self.remaining_ms()?;
-        if ACCOUNT.with_borrow(|a| a.as_ref().is_none_or(|a| a.public() != self.account)) {
+        if ACCOUNT.with_borrow(|a| {
+            a.as_ref()
+                .is_none_or(|a| a.public() != self.account.public())
+        }) {
             return Err(INCOMPLETE.into());
         }
         Ok(())

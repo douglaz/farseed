@@ -185,15 +185,22 @@ async fn publication(generation: u64, session: String, report: String, post: boo
             .store()
             .and_then(|store| store.protect_output(&configuration).ok())
             .unwrap_or_else(|| json!({"key_set":crate::poc::inference::key_is_set()}));
-        let provider_configuration =
-            json!({"key_set":crate::poc::provisioning::browser::key_is_set()});
+        let provider_configuration = json!({
+            "key_set":crate::poc::provisioning::browser::key_is_set(),
+            "relay_deployed":local.deployment_relay_present(),
+        });
         value["provider_configuration"] = if let Some(store) = local.store() {
+            let mut fallback = provider_configuration;
+            fallback["recorded"] = store.provider_account().is_some().into();
             store
                 .protect_output(&json!({
                     "key_set":crate::poc::provisioning::browser::key_is_set(),
                     "origin":store.procurement_origin(),
+                    "account":store.provider_account().map(|a| a.public()),
+                    "recorded":store.provider_account().is_some(),
+                    "relay_deployed":store.deployment_relay_present(),
                 }))
-                .unwrap_or(provider_configuration)
+                .unwrap_or(fallback)
         } else {
             provider_configuration
         };

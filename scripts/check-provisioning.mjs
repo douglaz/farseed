@@ -31,7 +31,7 @@ if(scenario==='protocol-controls'){
 }
 const closeScenarios=['close-no-invoice','close-invoice','close-intent','close-soft-deleted','close-404-bodies','close-refresh-paid'];
 const closeCase=closeScenarios.includes(scenario);
-const scenarios=[...closeScenarios,'origin-entry','custom-origin-entry','origin-stale-review','origin-validation','fixed','payment-poll','pending-custody','custom','lost-create','empty-create','incomplete-create','multiple-create','lost-invoice','empty-invoice','expired-invoice','publication','pre-send-reload','associated-reload','registration','failed-write','credentials','transport','refusals','mismatched-host','multiple-invoice','incomplete-invoice','conflicting-invoice','conflicting-create','popularity','popularity-lost','mismatched-image','fixed-terms','fixed-terms-reload','fixed-config','custom-terms','custom-terms-reload','custom-config','counter-identical','counter-fresh','lifecycle','fixed-unavailable','custom-unavailable','later-image','fixed-config-reload','custom-config-reload','custom-resource','fixed-cpu-direct','custom-cpu-direct','fixed-cpu-lost','custom-cpu-lost','fixed-cpu-later','custom-cpu-later','clock-ahead','custom-clock-behind','clock-lost-behind','custom-clock-lost-ahead','clock-old-evidence','custom-clock-future-evidence','fixed-eur','custom-usd','existing-paid','existing-unpaid','unknown-quote','quote-change','quote-unavailable','lost-invoice-quote-reload','signature-encodings','approval-authority','custom-caps-mismatched','custom-caps-missing','custom-caps-lost-mismatched','custom-caps-lost-missing','custom-caps-later','custom-caps-matching','custom-caps-network','custom-caps-uncapped','missing-limits','fixed-caps-mismatched','fixed-caps-missing','custom-deadline-headers','custom-deadline-body','custom-deadline-inside','custom-deadline-clock','fixed-transfer-direct','fixed-transfer-lost','fixed-transfer-later','custom-transfer-direct','custom-transfer-lost','custom-transfer-later'];
+const scenarios=[...closeScenarios,'account-generated','account-lock','account-no-defaults','account-entered','relay-deployment','origin-entry','custom-origin-entry','origin-stale-review','origin-validation','fixed','payment-poll','pending-custody','custom','lost-create','empty-create','incomplete-create','multiple-create','lost-invoice','empty-invoice','expired-invoice','publication','pre-send-reload','associated-reload','registration','failed-write','credentials','transport','refusals','mismatched-host','multiple-invoice','incomplete-invoice','conflicting-invoice','conflicting-create','popularity','popularity-lost','mismatched-image','fixed-terms','fixed-terms-reload','fixed-config','custom-terms','custom-terms-reload','custom-config','counter-identical','counter-fresh','lifecycle','fixed-unavailable','custom-unavailable','later-image','fixed-config-reload','custom-config-reload','custom-resource','fixed-cpu-direct','custom-cpu-direct','fixed-cpu-lost','custom-cpu-lost','fixed-cpu-later','custom-cpu-later','clock-ahead','custom-clock-behind','clock-lost-behind','custom-clock-lost-ahead','clock-old-evidence','custom-clock-future-evidence','fixed-eur','custom-usd','existing-paid','existing-unpaid','unknown-quote','quote-change','quote-unavailable','lost-invoice-quote-reload','signature-encodings','approval-authority','custom-caps-mismatched','custom-caps-missing','custom-caps-lost-mismatched','custom-caps-lost-missing','custom-caps-later','custom-caps-matching','custom-caps-network','custom-caps-uncapped','missing-limits','fixed-caps-mismatched','fixed-caps-missing','custom-deadline-headers','custom-deadline-body','custom-deadline-inside','custom-deadline-clock','fixed-transfer-direct','fixed-transfer-lost','fixed-transfer-later','custom-transfer-direct','custom-transfer-lost','custom-transfer-later'];
 if(scenario==='list'){console.log(JSON.stringify(scenarios));process.exit(0);}
 if(!scenarios.includes(scenario))throw Error('unknown provisioning case');
 const deadlineCase=scenario.startsWith('custom-deadline-');
@@ -58,8 +58,13 @@ const existingHistory=scenario==='existing-paid'||scenario==='existing-unpaid';
 const unknownQuote=scenario==='unknown-quote';
 
 const secret='31'.repeat(32), other='32'.repeat(32), inference='fixture~inference~key~482700';
-const account=publicIdentity(secret), used=new Map(), counts={}, replays={}, effects={}, refusals={}, errors=[], authForms=new Set(), dispatches=[];
-let browser,socket,provider,alternateProvider,page,fixture,temp;let alternateContacts=0,allowedAlternateContacts=0,originChecks=0;const fixtureTimers=new Set();
+const deploymentRelay='35'.repeat(32);
+const relayForms=[...new Set([Buffer.from(deploymentRelay,'hex').toString(),deploymentRelay,deploymentRelay.toUpperCase(),
+  ...[Buffer.from(deploymentRelay,'hex'),Buffer.from(deploymentRelay),Buffer.from(deploymentRelay.toUpperCase())].flatMap(bytes=>[bytes.toString('hex'),bytes.toString('hex').toUpperCase(),bytes.toString('base64'),bytes.toString('base64').replace(/=+$/,''),bytes.toString('base64url')])])];
+const enteredAccount=['account-entered','origin-validation','credentials','pending-custody','counter-fresh'].includes(scenario);
+let account=enteredAccount?publicIdentity(secret):null;
+const used=new Map(), counts={}, replays={}, effects={}, refusals={}, errors=[], authForms=new Set(), dispatches=[];
+let browser,socket,provider,alternateProvider,page,fixture,temp;let defaultsReads=0;let alternateContacts=0,allowedAlternateContacts=0,originChecks=0;const fixtureTimers=new Set();
 await mkdir('target',{recursive:true});
 temp=await mkdtemp(process.env.TMPDIR?join(process.env.TMPDIR,'provisioning-'):resolve('target/provisioning-'));
 const check=(condition,label)=>assert.ok(condition,label);
@@ -144,12 +149,14 @@ try {
       if(req.url==='/inference') {
         check(req.headers.authorization==='Bearer '+inference,'inference fixture authorization');
         const request=JSON.parse(body);const encoded=JSON.stringify(request);
-        for(const value of [secret,other,...authForms])check(!encoded.includes(value),'no provider credential in model context');
+        for(const value of [secret,other,...authForms,...(scenario==='relay-deployment'?relayForms:[])])check(!encoded.includes(value),'no provider or deployment relay credential in model context');
         const tool=modelCalls++===0?'exec':'done';
         const argumentsValue=tool==='exec'?{machine:'machine-a',command:'true'}:{machine:'machine-a'};
         res.setHeader('Content-Type','application/json');res.end(JSON.stringify({choices:[{finish_reason:'tool_calls',message:{role:'assistant',content:null,tool_calls:[{id:'call-'+modelCalls,type:'function',function:{name:tool,arguments:JSON.stringify(argumentsValue)}}]}}]}));return;
       }
-      const event=verifyRequest(req.headers.authorization,requestOrigin+req.url,req.method,body,account,used,providerNow()/1000);
+      const publicKey=JSON.parse(Buffer.from(req.headers.authorization.slice(6),'base64')).pubkey;
+      const event=verifyRequest(req.headers.authorization,requestOrigin+req.url,req.method,body,account??publicKey,used,providerNow()/1000);
+      account??=event.pubkey;
       const accept=()=>acceptRequest(used,event,req.headers.authorization,requestOrigin+req.url,req.method,body);
       authForms.add(req.headers.authorization);authForms.add(event.sig);authForms.add(JSON.stringify(event));for(const form of signatureForms(event.sig))authForms.add(form);
       if(failCatalogue&&req.url==='/api/v1/vm/templates'){res.writeHead(503).end();return;}
@@ -213,9 +220,14 @@ try {
   const providerOrigin=`https://127.0.0.1:${provider.address().port}`;
   let alternateOrigin=null;
   if(originCase){alternateProvider=createServer(tls,providerHandler);alternateProvider.listen(0,'127.0.0.1');await once(alternateProvider,'listening');alternateOrigin=`https://127.0.0.1:${alternateProvider.address().port}`;}
-  const injection=`\nimport * as fixtureApi from './pkg/tau_web.js';\n${originCase?'':`await fixtureApi.test_procurement_origin(${JSON.stringify(providerOrigin)});`}\nconst fixtureSend=self.postMessage.bind(self);self.postMessage=(value,...transfer)=>{if(value?.runtime_retired===true)fixtureSend({fixture_provider_custody:fixtureApi.provider_key_is_set(),fixture_provider_custody_point:'ending_worker'});return fixtureSend(value,...transfer);};const fixtureHolds=new Map();const transportFetch=self.fetch.bind(self);let dispatchControl=null,rollbackClock=false;const fixtureDateNow=Date.now.bind(Date);const observedFetch=(input,init)=>{const request=input instanceof Request?input:new Request(input,init);const url=new URL(request.url);postMessage({fixture_dispatch:{method:request.method,path:url.pathname+url.search,origin:url.origin}});return transportFetch(input,init).then(response=>{if(rollbackClock&&url.pathname==='/api/v1/vm'&&request.method==='GET'){rollbackClock=false;Date.now=()=>fixtureDateNow()-10000;postMessage({fixture_clock_rollback:true});}return response;});};self.fetch=async(input,init)=>{const request=input instanceof Request?input:new Request(input,init);if(dispatchControl&&request.url.includes('/renew?')){const repeat=request.clone(),control=dispatchControl;dispatchControl=null;const response=await observedFetch(input,init);if(control.authorization)repeat.headers.set('Authorization',control.authorization);await observedFetch(repeat);return response;}return observedFetch(input,init);};const original=onmessage;onmessage=async e=>{const f=e.data?.request?.fixture;if(!f){await original(e);if(e.data?.request?.task||e.data?.request?.goal_accept)postMessage({fixture_task_complete:true});if(e.data?.request?.lifecycle)postMessage({fixture_lifecycle:e.data.request.lifecycle});return;}if(f.rollbackClock)rollbackClock=true;if(f.restoreClock)Date.now=fixtureDateNow;if(f.providerCustody)postMessage({fixture_provider_custody:fixtureApi.provider_key_is_set(),fixture_provider_custody_point:f.providerCustody});if(f.dispatchControl)dispatchControl=f.dispatchControl;if(f.hold){let release;const p=new Promise(r=>release=r);fixtureHolds.set(f.hold,release);fixtureApi.test_hold_session_point(f.hold,p,()=>postMessage({fixture_point:f.hold}));}if(f.release)fixtureHolds.get(f.release)?.();if(f.fail)await fixtureApi.test_seed_backup_fail_append();if(f.command)postMessage({fixture_command:JSON.parse(await fixtureApi.run_command(JSON.stringify({machine:'machine-a',command:'true'})))});if(f.scanRestore)postMessage({fixture_scan_restored:await fixtureApi.test_scan_reload(false)});if(f.scanUnavailable){await fixtureApi.test_scan_fixture('approval fixture',new Uint8Array(new TextEncoder().encode('required-secret-1234')));await fixtureApi.test_scan_reload(true);postMessage({fixture_scan_unavailable:true});}if(f.journalNeedles){let contains=false,available=true;for(const needle of f.journalNeedles){const result=JSON.parse(await fixtureApi.test_poc_journal(needle));available &&=typeof result.contains==='boolean'&&Number.isSafeInteger(result.records)&&result.records>0;contains ||=result.contains===true;}postMessage({fixture_journal_batch:{contains,available,checked:f.journalNeedles.length}});}if(f.journal){const result=JSON.parse(await fixtureApi.test_poc_journal(f.journal));postMessage({fixture_journal:result});}if(f.probe)postMessage({fixture_probe:JSON.parse(await fixtureApi.test_poc_protect_output(JSON.stringify(f.probe)))});postMessage({fixture_ack:true});};\n`;
+  const injection=`\nimport * as fixtureApi from './pkg/tau_web.js';\nconst fixtureSink=(kind,values)=>postMessage({fixture_sink:{kind,values:values.map(value=>{let json;try{json=JSON.stringify(value);}catch{}return {text:String(value),json};})}});for(const kind of ['log','info','warn','error','debug']){const originalConsole=console[kind].bind(console);console[kind]=(...values)=>{fixtureSink(kind,values);originalConsole(...values);};}self.addEventListener('error',event=>fixtureSink('error',[event.message]));self.addEventListener('unhandledrejection',event=>fixtureSink('rejection',[event.reason]));\n\nconst fixtureSend=self.postMessage.bind(self);self.postMessage=(value,...transfer)=>{if(value?.runtime_retired===true)fixtureSend({fixture_provider_custody:fixtureApi.provider_key_is_set(),fixture_provider_custody_point:'ending_worker'});return fixtureSend(value,...transfer);};const fixtureHolds=new Map();const transportFetch=self.fetch.bind(self);let dispatchControl=null,rollbackClock=false;const fixtureDateNow=Date.now.bind(Date);const observedFetch=(input,init)=>{const request=input instanceof Request?input:new Request(input,init);const url=new URL(request.url);if(url.hostname!=='127.0.0.1')throw Error('non-loopback fixture request refused');postMessage({fixture_dispatch:{method:request.method,path:url.pathname+url.search,origin:url.origin}});return transportFetch(input,init).then(response=>{if(rollbackClock&&url.pathname==='/api/v1/vm'&&request.method==='GET'){rollbackClock=false;Date.now=()=>fixtureDateNow()-10000;postMessage({fixture_clock_rollback:true});}return response;});};self.fetch=async(input,init)=>{const request=input instanceof Request?input:new Request(input,init);if(dispatchControl&&request.url.includes('/renew?')){const repeat=request.clone(),control=dispatchControl;dispatchControl=null;const response=await observedFetch(input,init);if(control.authorization)repeat.headers.set('Authorization',control.authorization);await observedFetch(repeat);return response;}return observedFetch(input,init);};const original=onmessage;onmessage=async e=>{const f=e.data?.request?.fixture;if(!f){await original(e);if(e.data?.request?.task||e.data?.request?.goal_accept)postMessage({fixture_task_complete:true});if(e.data?.request?.lifecycle)postMessage({fixture_lifecycle:e.data.request.lifecycle});return;}if(f.rollbackClock)rollbackClock=true;if(f.restoreClock)Date.now=fixtureDateNow;if(f.providerCustody)postMessage({fixture_provider_custody:fixtureApi.provider_key_is_set(),fixture_provider_custody_point:f.providerCustody});if(f.dispatchControl)dispatchControl=f.dispatchControl;if(f.hold){let release;const p=new Promise(r=>release=r);fixtureHolds.set(f.hold,release);fixtureApi.test_hold_session_point(f.hold,p,()=>postMessage({fixture_point:f.hold}));}if(f.release)fixtureHolds.get(f.release)?.();if(f.fail)await fixtureApi.test_seed_backup_fail_append();if(f.command)postMessage({fixture_command:JSON.parse(await fixtureApi.run_command(JSON.stringify({machine:'machine-a',command:'true'})))});if(f.scanRestore)postMessage({fixture_scan_restored:await fixtureApi.test_scan_reload(false)});if(f.scanUnavailable){await fixtureApi.test_scan_fixture('approval fixture',new Uint8Array(new TextEncoder().encode('required-secret-1234')));await fixtureApi.test_scan_reload(true);postMessage({fixture_scan_unavailable:true});}if(f.journalNeedles){let contains=false,available=true;for(const needle of f.journalNeedles){const result=JSON.parse(await fixtureApi.test_poc_journal(needle));available &&=typeof result.contains==='boolean'&&Number.isSafeInteger(result.records)&&result.records>0;contains ||=result.contains===true;}postMessage({fixture_journal_batch:{contains,available,checked:f.journalNeedles.length}});}if(f.journal){const result=JSON.parse(await fixtureApi.test_poc_journal(f.journal));postMessage({fixture_journal:result});}if(f.probe)postMessage({fixture_probe:JSON.parse(await fixtureApi.test_poc_protect_output(JSON.stringify(f.probe)))});postMessage({fixture_ack:true});};\n`;
   page=createServer(tls,async(req,res)=>{
     try{
+      if(req.url==='/poc-defaults.json') {
+        defaultsReads++;
+        if(scenario==='account-no-defaults'){res.writeHead(404).end();return;}
+        res.setHeader('Content-Type','application/json');res.end(JSON.stringify({provider_origin:providerOrigin+'/',relay_url:fixtureInfo.relay,chat_endpoint:providerOrigin+'/inference',model:'fixture-a',topup_sat:1200,...(scenario==='relay-deployment'?{relay_key:deploymentRelay}:{})}));return;
+      }
       if(req.url==='/credential-trap'){errors.push('redirect reached credential trap');res.writeHead(400).end();return;}
       const path=new URL(req.url,'https://fixture.invalid').pathname;const file=path==='/'?'index.html':path.slice(1);
       if(!/^(index.html|boot.js|worker.js|pkg\/[a-zA-Z0-9_.-]+)$/.test(file)){res.writeHead(404).end();return;}
@@ -237,7 +249,7 @@ try {
   const {targetId}=await call('Target.createTarget',{url:'about:blank'}),{sessionId}=await call('Target.attachToTarget',{targetId,flatten:true});
   await call('Page.enable',{},sessionId);
   if(layoutProof)await call('Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true},sessionId);
-  await call('Page.addScriptToEvaluateOnNewDocument',{source:`window.reports=[];window.events=[];window.workers=[];window.sinkLogs=[];window.addEventListener('error',()=>sinkLogs.push('page error'));const Original=Worker;window.Worker=class extends Original{constructor(...args){super(...args);workers.push(this);this.addEventListener('message',e=>{if(e.data.store)reports.push(e.data.store);else if(Object.keys(e.data).some(k=>k.startsWith('fixture_'))){events.push(e.data);e.stopImmediatePropagation();}});}};`},sessionId);
+  await call('Page.addScriptToEvaluateOnNewDocument',{source:`window.reports=[];window.events=[];window.workers=[];window.outputs=[];window.sinkLogs=[];const capture=(kind,values)=>sinkLogs.push({kind,values:values.map(value=>{let json;try{json=JSON.stringify(value);}catch{}return {text:String(value),json};})});for(const kind of ['log','info','warn','error','debug']){const originalConsole=console[kind].bind(console);console[kind]=(...values)=>{capture(kind,values);originalConsole(...values);};}window.addEventListener('error',event=>capture('error',[event.message]));window.addEventListener('unhandledrejection',event=>capture('rejection',[event.reason]));const Original=Worker;window.Worker=class extends Original{constructor(...args){super(...args);workers.push(this);this.addEventListener('error',event=>capture('worker error',[event.message]));this.addEventListener('message',e=>{outputs.push(e.data);if(e.data.fixture_sink)sinkLogs.push(e.data.fixture_sink);if(e.data.store)reports.push(e.data.store);else if(Object.keys(e.data).some(k=>k.startsWith('fixture_'))){events.push(e.data);e.stopImmediatePropagation();}});}};`},sessionId);
   const evaluate=async expression=>{
     const r=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true},sessionId);
     if(r.exceptionDetails){
@@ -262,6 +274,8 @@ try {
   const click=selector=>invoke(s=>document.querySelector(s).click(),selector);
   const message=data=>invoke(d=>workers.at(-1).postMessage(d),data);
   const report=()=>evaluate('reports.at(-1)');
+  const sinkHistory=[];
+  const snapshotSinks=()=>evaluate('JSON.stringify({dom:document.documentElement.outerHTML,inputs:[...document.querySelectorAll("input,textarea")].map(n=>n.value),reports,sinkLogs,outputs})');
   let snapshotIndex=0;
   const layout=async(value,state)=>{if(layoutProof)await purchaseSnapshot({name:scenario,call,sessionId,evaluate,check,message,wait},value,`${String(++snapshotIndex).padStart(3,'0')}-${state}`);};
   const action=async value=>{
@@ -281,15 +295,53 @@ try {
   const setOrigin=value=>invoke(value=>{document.querySelector('#tau-provider-origin').value=value;},value);
   const setKey=async keyValue=>{const n=await evaluate('reports.length');await invoke(key=>{document.querySelector('#tau-provider-key').value=key;document.querySelector('#tau-provider-key-form').requestSubmit();},keyValue);await wait(`reports.length>${n}`);check(await evaluate("document.querySelector('#tau-provider-key').value===''") ,'provider password cleared before evidence');return report();};
   const collectDispatches=async()=>{dispatches.push(...await evaluate('events.filter(e=>e.fixture_dispatch).map(e=>e.fixture_dispatch)'));await evaluate('events=events.filter(e=>!e.fixture_dispatch)');};
-  const reload=async()=>{await collectDispatches();await evaluate('workers.at(-1).terminate()');await call('Page.reload',{},sessionId);await wait("reports.at(-1)?.store_state==='locked'");await invoke(()=>{document.querySelector('#tau-passphrase').value='provisioning fixture passphrase';document.querySelector('#tau-unlock').click();});await wait("reports.at(-1)?.store_state==='unlocked'");check(!(await report()).provider_configuration.key_set,'reload clears provider custody');const before=Object.values(counts).reduce((a,b)=>a+b,0);const refused=await action({action:'catalogue'});check(refused.store_error?.includes('Re-enter'),'provider reads require fresh key entry after reload');check(Object.values(counts).reduce((a,b)=>a+b,0)===before,'keyless reload sends no provider traffic');};
+  const restoredAccount=async()=>{
+    check((await report()).provider_configuration.key_set,'Unlock restores provider custody before publication');
+    if(account!==null)check((await report()).provider_configuration.account===account,'Unlock restores the same public identity');
+  };
+  const reload=async()=>{sinkHistory.push(await snapshotSinks());await collectDispatches();await evaluate('workers.at(-1).terminate()');await call('Page.reload',{},sessionId);await wait("reports.at(-1)?.store_state==='locked'");await invoke(()=>{document.querySelector('#tau-passphrase').value='provisioning fixture passphrase';document.querySelector('#tau-unlock').click();});await wait("reports.at(-1)?.store_state==='unlocked'");await restoredAccount();};
   await call('Page.navigate',{url:pageOrigin+'/'},sessionId);await wait("reports.at(-1)?.store_state==='none'");
   await invoke(()=>{document.querySelector('#tau-passphrase').value=document.querySelector('#tau-confirm').value='provisioning fixture passphrase';document.querySelector('#tau-create').click();});
   await wait("!document.querySelector('#tau-seed-backup-answer').disabled");await click('#tau-seed-backup-answer');await wait("!document.querySelector('#tau-seed-backup-skip').disabled");await click('#tau-seed-backup-skip');await wait("!document.querySelector('#tau-provider-key-form button').disabled");
   const beforeAccountEntry=await journalMetadata();
-  if(originCase)await setOrigin(providerOrigin+'/');
-  check(!(await setKey(secret)).store_error,'provider key accepted');
-  if(originCase){check((await report()).provider_configuration.origin===providerOrigin,'entered origin normalized by worker');originChecks++;}
-  assert.deepEqual(await journalMetadata(),beforeAccountEntry,'account entry keeps private-key scan material out of the journal');
+  check(await evaluate("!document.querySelector('#tau-provider-existing').open && document.querySelector('#tau-provider-existing').contains(document.querySelector('#tau-provider-key-form'))"),'existing-account fold starts closed and retains its form');
+  check(await evaluate("document.querySelector('#tau-step-machine-action #tau-provider-catalogue')!==null"),'first provider action generates without promoting paste');
+  const foldSends=await invoke(async()=>{
+    const current=workers.at(-1),send=current.sendAt;let sends=0;
+    current.sendAt=(...args)=>{sends++;return send(...args);};
+    try {
+      const summary=document.querySelector('#tau-provider-existing > summary');
+      summary.click();await new Promise(resolve=>setTimeout(resolve,50));
+      summary.click();await new Promise(resolve=>setTimeout(resolve,50));
+      return sends;
+    } finally {current.sendAt=send;}
+  });
+  check(foldSends===0,'existing-account disclosure sends no action or approval');
+  assert.deepEqual(await journalMetadata(),beforeAccountEntry,'disclosure changes no custody or allocation');
+  if(scenario==='account-no-defaults') {
+    const before=Object.values(counts).reduce((a,b)=>a+b,0);
+    const refused=await action({action:'catalogue'});
+    check(refused.store_error?.includes('valid deployment defaults')&&!refused.provider_configuration.key_set,'generation without deployment defaults refused');
+    check(Object.values(counts).reduce((a,b)=>a+b,0)===before,'missing defaults sends no provider request');
+    assert.deepEqual(await journalMetadata(),beforeAccountEntry,'missing defaults creates no custody');
+    await setOrigin(providerOrigin);check(!(await setKey(secret)).store_error,'existing-account fallback works without defaults');account=publicIdentity(secret);
+  } else if(enteredAccount) {
+    if(scenario==='origin-validation') {
+      for(const origin of ['', 'http://127.0.0.1', 'https://@127.0.0.1', providerOrigin+'?', providerOrigin+'#', providerOrigin+'/..', providerOrigin+'/%2e', providerOrigin+'\\', ' '+providerOrigin, 'https://[::1', 'https://127.0.0.1:65536']) {
+        await setOrigin(origin);const refused=await setKey(other);
+        check(refused.store_error&&!refused.provider_configuration.recorded&&!refused.provider_configuration.key_set,'invalid first entry installs no account');
+        assert.deepEqual(await journalMetadata(),beforeAccountEntry,'invalid first origin appends nothing');
+      }
+      check(Object.keys(counts).length===0,'invalid first origins dispatch no provider traffic');
+    }
+    await setOrigin(providerOrigin+'/');
+    check(!(await setKey(secret)).store_error,'provider key admitted into encrypted custody');
+    account=publicIdentity(secret);
+  }
+  if(enteredAccount||scenario==='account-no-defaults') {
+    const after=await journalMetadata();check(after.records===beforeAccountEntry.records+1,'entry appends exactly one custody record');
+    check((await report()).provider_configuration.origin===providerOrigin,'entered origin normalized by worker');
+  }
   if(layoutProof){
     await invoke((url,key)=>{document.querySelector('#tau-poc-endpoint').value=url;document.querySelector('#tau-poc-model').value='fixture-a';document.querySelector('#tau-poc-key').value=key;document.querySelector('#tau-poc-inference-form').requestSubmit();},providerOrigin+'/inference',inference);
     await wait('reports.at(-1)?.poc_configuration?.key_set');
@@ -308,6 +360,29 @@ try {
     const reportsBefore=await evaluate('reports.length');await message({lifecycle:'hidden'});await message({lifecycle:'visible'});await wait(`reports.length>${reportsBefore}`);
     check(await evaluate("document.activeElement.id==='tau-provider-resources' && document.activeElement.selectionStart===1 && document.activeElement.value==='{'"),'ordinary reports keep the edited form and cursor');
   }
+  if(['account-generated','account-entered','account-lock','relay-deployment'].includes(scenario)) {
+    check(current.provider_configuration.account===account,'fixture signature public identity matches recorded account report');
+    check(await evaluate("document.querySelector('#tau-provider-key-form').hidden && !document.querySelector('#tau-provider-account-fixed').hidden"),'recorded custody hides existing-account form');
+    const before=await journalMetadata(),requests=Object.values(counts).reduce((a,b)=>a+b,0);
+    check((await setKey(other)).store_error==='Provider account already recorded','stale entry cannot replace custody before any purchase');
+    assert.deepEqual(await journalMetadata(),before,'stale entry appends nothing');
+    check(Object.values(counts).reduce((a,b)=>a+b,0)===requests,'stale entry dispatches nothing');
+    const beforeDefaults=defaultsReads;
+    if(scenario==='account-generated')await reload();
+    else {
+      await click('#tau-lock');await wait("reports.at(-1)?.store_state==='locked'");
+      await invoke(()=>{document.querySelector('#tau-passphrase').value='provisioning fixture passphrase';document.querySelector('#tau-unlock').click();});
+      await wait("reports.at(-1)?.store_state==='unlocked'");await restoredAccount();
+    }
+    if(scenario==='relay-deployment') {
+      check(defaultsReads===beforeDefaults,'Lock redelivers retained deployment material without another defaults fetch');
+      check(await evaluate("document.querySelector('#tau-provider-relay-guidance').textContent==='Registering the machine SSH public key with the provider does not enroll the relay. The deployment relay key is in use. You still need published pins and approvals for the goal, class, access and installation declaration.'"),'deployment guidance retains SSH registration, pin and approval qualifications');
+      check(await evaluate("document.querySelector('#tau-relay-task-guidance').textContent==='After enrollment, configure inference, then press Start session for the displayed model and machine. Copy its public keys. Install the SSH line. The deployment relay key is in use.'"),'task guidance retains configuration and SSH installation without manual relay enrollment');
+      check((await report()).provider_configuration.relay_deployed===true,'replacement worker receives deployment relay key before Unlock');
+      check(await evaluate("!document.body.textContent.includes('35'.repeat(32)) && [...document.querySelectorAll('input,textarea')].every(n=>!n.value.includes('35'.repeat(32)))"),'deployment private key never enters page inputs or text');
+    }
+    current=await action({action:'catalogue'});
+  }
   let signatureEncodingChecks=0,signatureReloadChecks=0;
   if(scenario==='signature-encodings'){
     const nonProtectionJournal=({records,providerProtection,...allocation})=>({records:records-providerProtection,...allocation});
@@ -319,7 +394,7 @@ try {
       let refused=await action({action:'catalogue'});
       check(ordinaryRefusal(refused)&&!refused.provider_catalogue,'encoded request signature refused before catalogue publication');
       check(heldSignatureEcho?.length===(mode===0?88:128),'actual schema-valid signature representation selected');signatureEncodingChecks++;
-      await reload();await setKey(secret);
+      await reload();await restoredAccount();
       refused=await action({action:'catalogue'});
       check(ordinaryRefusal(refused)&&!refused.provider_catalogue,'prior request signature refused after worker reload');signatureReloadChecks++;
       refused=await action({action:'select',choice:{offer_id:1,image_id:3,resources:null}});
@@ -365,22 +440,23 @@ try {
         }
         const alias='a'.repeat(42)+'c',candidate=Buffer.from(alias,'base64').toString('hex');
         await setOrigin('https://'+alias.toUpperCase()+'.invalid');const refused=await setKey(candidate);
-        check(refused.store_error?.includes('protected or unscannable')&&refused.procurement.origin===providerOrigin,'normalization cannot introduce candidate key material');
+        check(refused.store_error==='Provider account already recorded'&&refused.procurement.origin===providerOrigin,'custody refuses candidate material even from a stale form');
         assert.deepEqual(await journalMetadata(),before,'normalized-key refusal preserves journal and allocation');originChecks++;
         check(Object.values(counts).reduce((a,b)=>a+b,0)===requests&&alternateContacts===0,'invalid origins dispatch nothing');
         check(await invoke(()=>document.querySelector('#tau-provider-origin').value===reports.at(-1).procurement.origin),'raw rejected entry cleared');
       }
       if(scenario==='origin-stale-review'){
         const stale=structuredClone(approval),selection=structuredClone(current.procurement.selection);
-        await setOrigin(alternateOrigin);check(!(await setKey(secret)).store_error,'second origin configured');
-        check(!(await report()).procurement?.selection,'origin change invalidates old review');
-        current=await action({action:'select',choice});assert.deepEqual(current.procurement.selection,selection,'both origins offer identical terms');
+        await setOrigin(alternateOrigin);check((await setKey(secret)).store_error==='Provider account already recorded','recorded origin cannot be replaced');
+        assert.deepEqual((await report()).procurement.selection,selection,'refused origin change preserves review');
+        stale.origin=alternateOrigin;
+        current=await action({action:'select',choice});assert.deepEqual(current.procurement.selection,selection,'fixed-origin review retains identical terms');
         const before=await journalMetadata(),requests=Object.values(counts).reduce((a,b)=>a+b,0);
         current=await action({action:'approve',approval:stale,selection});
         check(current.store_error?.includes('origin is stale')&&!current.procurement.phase,'stale origin consent refused at worker boundary');
         check(Object.values(counts).reduce((a,b)=>a+b,0)===requests,'stale consent dispatches nothing');assert.deepEqual(await journalMetadata(),before);
-        await setOrigin(providerOrigin);await setKey(secret);current=await action({action:'select',choice});
-        allowedAlternateContacts=alternateContacts;check(allowedAlternateContacts>0,'second loopback provider actually observed during review');originChecks++;
+        await setOrigin(providerOrigin);await restoredAccount();current=await action({action:'select',choice});
+        allowedAlternateContacts=alternateContacts;check(allowedAlternateContacts===0,'fixed custody and stale consent never contact the second provider');originChecks++;
       }
     }
     if(scenario==='approval-authority'){
@@ -400,7 +476,13 @@ try {
       }
       await message({fixture:{scanUnavailable:true}});await wait('events.some(e=>e.fixture_scan_unavailable)');
       current=await action({action:'approve',approval,selection:approvedSelection});check(current.store_error&&!current.procurement?.phase,'unscannable authority refused before durable approval');assert.deepEqual(await journalMetadata(),before);
-      await message({fixture:{scanRestore:true}});await wait('events.some(e=>e.fixture_scan_restored)');await reload();await setKey(secret);check(!(await report()).procurement?.phase,'refusal remains unapproved after reload');assert.deepEqual(await journalMetadata(),before);
+      check(current.provider_configuration?.recorded===true,'refused approval retains recorded account custody');
+      // Exercise the view when protected publication withholds the public identity.
+      const withheld=structuredClone(current);delete withheld.provider_configuration.account;delete withheld.provider_configuration.origin;
+      await invoke(value=>workers.at(-1).onmessage({data:{store:value}}),withheld);
+      check(await evaluate("document.querySelector('#tau-provider-key-status').textContent==='Provider account recorded; public identity unavailable.'&&document.querySelector('#tau-provider-key-form').hidden&&!document.querySelector('#tau-provider-account-fixed').hidden"),'unavailable public identity is accurate and cannot reopen account entry');
+      await invoke(value=>workers.at(-1).onmessage({data:{store:value}}),current);
+      await message({fixture:{scanRestore:true}});await wait('events.some(e=>e.fixture_scan_restored)');await reload();await restoredAccount();check(!(await report()).procurement?.phase,'refusal remains unapproved after reload');assert.deepEqual(await journalMetadata(),before);
       await setInference(retained);await setInference(inference);current=await action({action:'select',choice});current=await action({action:'approve',approval});check(!current.store_error&&current.procurement.phase==='approved','safe authority remains approvable with both credential generations protected');check(!Object.values(effects).some(Boolean),'approval alone has no provider effect');
       console.log(JSON.stringify({approvalAuthorityRefusals:refusalsChecked,unscannableRefusals:1,journalUnchanged:true,identitiesUnchanged:true}));
     }else if(scenario==='refusals'){
@@ -414,17 +496,18 @@ try {
       check((await control({inspect:true})).contacts===0,'no contact before published pin');
       const identity=current.procurement.identity;
       if(originCase){
-        await setOrigin(alternateOrigin);await setKey(secret);
+        await setOrigin(alternateOrigin);await restoredAccount();
         check((await report()).procurement.origin===providerOrigin,'entry cannot redirect approved Purchase');
-        await reload();await setOrigin(alternateOrigin);await setKey(secret);
+        await reload();await setOrigin(alternateOrigin);await restoredAccount();
         current=await report();check(current.procurement.origin===providerOrigin,'reload and different field retain bound origin');
         assert.deepEqual(current.procurement.identity,identity);originChecks++;
       }
       const selectedAtApproval=structuredClone(current.procurement.selection);
       const publicKeys=current.procurement.public_keys;
+      if(scenario==='relay-deployment')check(publicKeys.relay_pubkey===publicIdentity(deploymentRelay),'published relay public key is the deployment key used by AUTH');
       if(scenario.includes('-terms')||scenario.includes('-config')){
         changePrice=scenario.includes('-terms');changeConfig=scenario.includes('-config');
-        if(scenario.endsWith('-reload')){await reload();await setKey(secret);}
+        if(scenario.endsWith('-reload')){await reload();await restoredAccount();}
         current=await action({action:'resume'});
         check(current.store_error&&current.procurement.phase==='terms_changed','changed current terms pause before create intent');
         check(!machines.length&&!(effects[createRoute]??0),'changed terms never create');
@@ -437,25 +520,25 @@ try {
         current=await action({action:'approve',approval,selection:selectedAtApproval});
         check(current.store_error&&current.procurement.phase==='terms_changed'&&(effects[createRoute]??0)===0,'stale displayed selection cannot approve changed terms');
         assert.deepEqual(current.procurement.identity,identity);
-        await reload();await setKey(secret);current=await report();
+        await reload();await restoredAccount();current=await report();
         check(current.procurement.phase==='terms_changed','pending terms survive replay without authority');
         check(!await evaluate("document.querySelector('#tau-provider-approve-charge').checked"),'renewed charge approval is explicit after reload');
         check(await evaluate("document.querySelector('#tau-provider-machine').value==='machine-a'&&document.querySelector('#tau-provider-machine').disabled"),'same machine identity displayed and locked');
         current=await action({action:'resume'});check(current.store_error&&current.procurement.phase==='terms_changed','Resume cannot approve changed terms');
         await sleep(1100);const reviewed=await evaluate('reports.length');await invoke(()=>{document.querySelector('#tau-provider-approve-charge').checked=document.querySelector('#tau-provider-approve-access').checked=true;document.querySelector('#tau-provider-approval-form').requestSubmit();});await wait(`reports.length>${reviewed}`);current=await report();check(!current.store_error&&current.procurement.phase==='registered'&&current.procurement.ssh_key_id===7,'renewed explicit page approval retains registered SSH identity');
         assert.deepEqual(current.procurement.identity,identity);assert.deepEqual(current.procurement.public_keys,publicKeys);
-        await reload();await setKey(secret);
+        await reload();await restoredAccount();
       }
       if(scenario==='custom-resource'){
         raiseMinimum=true;current=await action({action:'resume'});check(current.store_error&&!machines.length,'invalidated custom resource terms cannot create');
-        await reload();await setKey(secret);selectedResources={...resources,cpu:3};
+        await reload();await restoredAccount();selectedResources={...resources,cpu:3};
         current=await action({action:'select',choice:{offer_id:2,image_id:3,resources:selectedResources}});check(!current.store_error&&current.procurement.phase==='terms_changed','valid custom resources require renewed approval');
         current=await action({action:'approve',approval});check(!current.store_error&&current.procurement.phase==='registered'&&current.procurement.ssh_key_id===7,'same identity approves changed valid custom resources with retained SSH identity');assert.deepEqual(current.procurement.identity,identity);assert.deepEqual(current.procurement.public_keys,publicKeys);
       }
-      if(['fixed-unavailable','custom-unavailable'].includes(scenario)){failCatalogue=true;current=await action({action:'resume'});check(current.store_error&&!machines.length,'unavailable selected terms send no create');assert.deepEqual(current.procurement.identity,identity);failCatalogue=false;await reload();await setKey(secret);}
+      if(['fixed-unavailable','custom-unavailable'].includes(scenario)){failCatalogue=true;current=await action({action:'resume'});check(current.store_error&&!machines.length,'unavailable selected terms send no create');assert.deepEqual(current.procurement.identity,identity);failCatalogue=false;await reload();await restoredAccount();}
       if(scenario==='failed-write'){await message({fixture:{fail:true}});await wait('events.some(e=>e.fixture_ack)');}
       if(['pre-send-reload','associated-reload'].includes(scenario)){
-        const point=scenario==='pre-send-reload'?'procurement_create_intent':'procurement_associated';await message({fixture:{hold:point}});await sleep(1100);await message({provider_request:{action:'resume'}});await wait(`events.some(e=>e.fixture_point===${JSON.stringify(point)})`);await reload();check((await setKey(other)).store_error,'different account cannot resume');await setKey(secret);
+        const point=scenario==='pre-send-reload'?'procurement_create_intent':'procurement_associated';await message({fixture:{hold:point}});await sleep(1100);await message({provider_request:{action:'resume'}});await wait(`events.some(e=>e.fixture_point===${JSON.stringify(point)})`);await reload();check((await setKey(other)).store_error,'different account cannot resume');await restoredAccount();
       }
       if(deadlineCase){
         if(scenario==='custom-deadline-clock')await message({fixture:{rollbackClock:true}});
@@ -476,10 +559,10 @@ try {
           check(deadlineReport.store_error&&deadlineReport.procurement?.phase==='create_uncertain'&&!deadlineReport.procurement?.vm_id,'timed-out create retains uncertain intent without late success');
           check(machines.length===1&&(effects[createRoute]??0)===1&&!payments.length,'deadline cancellation preserves one possible create and no invoice');
           const savedPurchase=structuredClone(deadlineReport.procurement);
-          check(!(await setKey(secret)).store_error,'deadline releases store authority for credential re-entry');
+          check((await setKey(secret)).store_error==='Provider account already recorded','deadline preserves fixed custody while releasing store authority');
           await sleep(7500);
           assert.deepEqual((await report()).procurement,savedPurchase,'late headers or body cannot revive timed-out authority');
-          await reload();await setKey(secret);
+          await reload();await restoredAccount();
           assert.deepEqual((await report()).procurement,savedPurchase,'deadline uncertainty survives reload and same-account re-entry');
         }
         deadlineMeasurement={elapsedMilliseconds:elapsed,responseDelayMilliseconds:deadlineInside?5000:11000,phase:deadlineReport.procurement.phase,pending:scenario.endsWith('body')?'body':'headers',insideBudget:deadlineInside,responseAborts,wallClockRollback:scenario==='custom-deadline-clock'};
@@ -491,7 +574,7 @@ try {
       if(transferCase&&transferPhase!=='later'){
         check(current.store_error&&current.procurement.phase==='create_uncertain'&&!current.procurement.vm_id,'unmetered offer cannot acquire an unapproved transfer cap');transferChecks++;
         const savedPurchase=structuredClone(current.procurement);
-        await reload();await setKey(secret);
+        await reload();await restoredAccount();
         for(let attempt=0;attempt<2;attempt++){
           current=await action({action:'resume'});check(current.store_error&&current.procurement.phase==='create_uncertain'&&!current.procurement.vm_id,'transfer contradiction keeps the uncertain create intent');transferChecks++;
           assert.deepEqual(current.procurement.identity,identity);assert.deepEqual(current.procurement.public_keys,publicKeys);assert.deepEqual(current.procurement.approved_selection,savedPurchase.approved_selection);
@@ -502,7 +585,7 @@ try {
       if(capsBad){
         check(current.store_error&&current.procurement.phase==='create_uncertain'&&!current.procurement.vm_id,(isCustom?'custom':'fixed')+' inherited caps must match before association');
         inheritedCapChecks++;const uncertain=structuredClone(current.procurement);
-        await reload();await setKey(secret);
+        await reload();await restoredAccount();
         for(let attempt=0;attempt<2;attempt++){
           current=await action({action:'resume'});check(current.store_error&&current.procurement.phase==='create_uncertain'&&!current.procurement.vm_id,'custom caps refusal preserves uncertainty on reconciliation');
           inheritedCapChecks++;assert.deepEqual(current.procurement.identity,identity);assert.deepEqual(current.procurement.public_keys,publicKeys);assert.deepEqual(current.procurement.approved_selection,uncertain.approved_selection);
@@ -514,7 +597,7 @@ try {
       }
       if(cpuCase&&cpuPhase!=='later'){
         check(current.store_error&&current.procurement.phase==='create_uncertain'&&!current.procurement.vm_id,'CPU evidence refuses direct or uncertain association');
-        await reload();await setKey(secret);
+        await reload();await restoredAccount();
         for(const variant of cpuVariants){
           cpuVariant=variant;current=await action({action:'resume'});
           check(current.store_error&&current.procurement.phase==='create_uncertain'&&!current.procurement.vm_id,'CPU conflicting or missing evidence keeps the create intent');
@@ -525,7 +608,7 @@ try {
         check(current.procurement.vm_id===11&&current.procurement.phase==='initial_invoice','valid CPU evidence resumes the same created machine');
       }
       if(['empty-create','incomplete-create','multiple-create','conflicting-create','mismatched-image','pre-send-reload','registration','failed-write'].includes(scenario)||creationOffsetSeconds!==0){
-        if(scenario!=='failed-write') {await reload();await setKey(secret);await action({action:'resume'});await action({action:'resume'});}
+        if(scenario!=='failed-write') {await reload();await restoredAccount();await action({action:'resume'});await action({action:'resume'});}
         if((await report()).procurement.phase==='create_uncertain'){const before=(await report()).procurement;check((await action({action:'approve',approval})).store_error,'uncertain create refuses renewed approval');assert.deepEqual((await report()).procurement.identity,before.identity);check((await report()).procurement.phase==='create_uncertain','renewal cannot erase possibly sent create');}
         check((await report()).store_error,'uncertainty paused concretely');
         check((effects[createRoute]??0)===(['pre-send-reload','registration','failed-write'].includes(scenario)?0:1),'uncertainty has no second accepted create');
@@ -558,7 +641,7 @@ try {
           const traffic=Object.values(counts).reduce((a,b)=>a+b,0),journal=await journalMetadata();
           current=await action({action:'close'});check(current.store_error==='Close is only for a purchase with no recorded payment whose machine the provider no longer has.','paid local refusal');
           check(Object.values(counts).reduce((a,b)=>a+b,0)===traffic,'paid close sends nothing');assert.deepEqual(await journalMetadata(),journal);
-          await reload();await setKey(secret);check((await report()).procurement.payment.is_paid===true,'paid evidence replays after decoded 404');
+          await reload();await restoredAccount();check((await report()).procurement.payment.is_paid===true,'paid evidence replays after decoded 404');
         }else{
           const pause='The provider reports machine 11 or its payment not found. LNVPS deletes a machine left unpaid for about an hour, with its payments. Close purchase checks that the provider has no record of the machine or any payment for it and that this purchase meets the closing conditions, then closes it. These checks cannot establish whether you paid.';
           if(scenario==='close-404-bodies'){
@@ -576,7 +659,7 @@ try {
           }
           current=await action({action:'resume'});check(current.store_error===pause,'own history or saved-payment decoded 404 gets precise pause');
           check(!await evaluate("document.querySelector('#tau-provider-close').hidden||document.querySelector('#tau-provider-close').disabled"),'eligible explicit close control shown');
-          await reload();await setOrigin(alternateOrigin);await setKey(secret);
+          await reload();await setOrigin(alternateOrigin);await restoredAccount();
           const before=await journalMetadata(),beforeEffects=structuredClone(effects),beforeCounts=structuredClone(counts);
           await collectDispatches();const beforeDispatch=dispatches.length;
           await sleep(1100);const reportsBefore=await evaluate('reports.length');await click('#tau-provider-close');await wait(`reports.length>${reportsBefore}`);current=await report();await collectDispatches();
@@ -589,18 +672,18 @@ try {
           for(const route of mutationRoutes)check(count(route)===(beforeCounts[route]??0),'close emits no raw mutation');
           const after=await journalMetadata();check(after.records-before.records===4&&after.providerProtection-before.providerProtection===3,'three protections precede exactly one durable close');
           check(after.machines===before.machines&&after.passes===before.passes,'closed allocation stays consumed');
-          const closed=current.procurement.closed;await reload();await setOrigin(providerOrigin);await setKey(secret);check((await report()).procurement.closed===closed,'closure and invoice proof survive replay');
+          const closed=current.procurement.closed;await reload();await setOrigin(providerOrigin);await restoredAccount();check((await report()).procurement.closed===closed,'closure and invoice proof survive replay');
           current=await action({action:'select',choice});check(!current.store_error,'closed purchase permits offer selection');
           current=await action({action:'approve',approval});check(!current.store_error&&current.procurement.phase==='approved','new explicit approval after close');
           check(current.procurement.identity.index===savedIdentity.index+1,'new purchase never reuses closed machine allocation');
-          await reload();await setKey(secret);check((await report()).procurement.phase==='approved'&&(await report()).procurement.identity.index===savedIdentity.index+1,'second purchase replays without reviving closed purchase');
+          await reload();await restoredAccount();check((await report()).procurement.phase==='approved'&&(await report()).procurement.identity.index===savedIdentity.index+1,'second purchase replays without reviving closed purchase');
         }
       }else if(existingHistory){
         check(current.procurement.vm_id===11&&current.procurement.payment?.id==='aabb','complete initial history reuses the existing payment');
         check(current.procurement.billing?.vm_id===11,'existing history has same-VM quote evidence');
         const savedBilling=structuredClone(current.procurement.billing),quoteReads=count('GET /api/v1/vm/11/renew/quote?method=lightning&intervals=1');
         check((effects[invoiceRoute]??0)===0,'existing paid or unpaid history never issues another invoice');
-        await reload();await setKey(secret);quoteVersion=1;
+        await reload();await restoredAccount();quoteVersion=1;
         current=await action({action:'initial_invoice'});assert.deepEqual(current.procurement.billing,savedBilling);
         check(count('GET /api/v1/vm/11/renew/quote?method=lightning&intervals=1')===quoteReads,'associated payment retains its original quote through reload');
         paid=true;current=await action({action:'resume'});
@@ -619,12 +702,12 @@ try {
             check(current.store_error&&!current.procurement.billing,'missing displayed quote cannot authorize issuance');
             check((effects[invoiceRoute]??0)===0,'unknown quote sends no invoice mutation');
           }
-          await reload();await setKey(secret);quoteResponseMode=null;unavailableQuote=false;current=await action({action:'resume'});
+          await reload();await restoredAccount();quoteResponseMode=null;unavailableQuote=false;current=await action({action:'resume'});
           check(current.procurement.billing?.vm_id===11,'read-only recovery establishes a displayed initial quote');
         }
         check(current.procurement.billing?.vm_id===11,'initial one-period Lightning quote saved for the associated VM');
         const displayedBilling=structuredClone(current.procurement.billing);
-        await reload();check((await setKey(other)).store_error,'account binding after reload');await setKey(secret);
+        await reload();check((await setKey(other)).store_error,'account binding after reload');await restoredAccount();
         assert.deepEqual((await report()).procurement.billing,displayedBilling);
         if(scenario==='quote-change'){
           quoteVersion=1;current=await clickInitialInvoice();
@@ -637,7 +720,7 @@ try {
           current=await action({action:'initial_invoice',billing:displayedBilling});
           check(current.store_error&&(effects[invoiceRoute]??0)===0,'stale displayed billing approval cannot issue an invoice');
           assert.deepEqual(current.procurement.billing,firstChangedBilling);
-          await reload();await setKey(secret);quoteVersion=2;current=await clickInitialInvoice();
+          await reload();await restoredAccount();quoteVersion=2;current=await clickInitialInvoice();
           check(current.store_error&&current.procurement.billing?.terms?.amount===3000000&&(effects[invoiceRoute]??0)===0,'reloaded quote changes remain read-only until renewed approval');
           current=await action({action:'initial_invoice',billing:firstChangedBilling});
           check(current.store_error&&(effects[invoiceRoute]??0)===0,'reloaded stale displayed billing cannot authorize an invoice');
@@ -647,7 +730,7 @@ try {
         if(scenario==='quote-unavailable'){
           unavailableQuote=true;current=await action({action:'initial_invoice'});
           check(current.store_error&&(effects[invoiceRoute]??0)===0,'unavailable initial quote sends no invoice');
-          await reload();await setKey(secret);current=await action({action:'initial_invoice'});
+          await reload();await restoredAccount();current=await action({action:'initial_invoice'});
           check(current.store_error&&(effects[invoiceRoute]??0)===0,'quote unavailability persists safely through reload');unavailableQuote=false;
         }
         if(scenario.startsWith('counter-')){await message({fixture:{dispatchControl:scenario==='counter-identical'?{}:{authorization:fixtureAuthorization(secret,providerOrigin+'/api/v1/vm/11/renew?method=lightning&intervals=1','GET',Buffer.alloc(0),'fresh-invoice-counter')}}});await wait('events.some(e=>e.fixture_ack)');}
@@ -655,13 +738,13 @@ try {
         if(lostInvoice){check(/outcome.*unknown/i.test(current.store_error??''),'lost invoice diagnostic preserves unknown outcome');}
         if(lostInvoice){
           const savedBilling=structuredClone(current.procurement.billing),quoteReads=count('GET /api/v1/vm/11/renew/quote?method=lightning&intervals=1');
-          if(scenario==='lost-invoice-quote-reload'){quoteVersion=1;await reload();await setKey(secret);}
+          if(scenario==='lost-invoice-quote-reload'){quoteVersion=1;await reload();await restoredAccount();}
           current=await action({action:'initial_invoice'});
           assert.deepEqual(current.procurement.billing,savedBilling);
           check(count('GET /api/v1/vm/11/renew/quote?method=lightning&intervals=1')===quoteReads,'possibly issued invoice reconciles with frozen quote without requoting');
         }
         if(['empty-invoice','multiple-invoice','incomplete-invoice','conflicting-invoice'].includes(scenario)){
-          await reload();await setKey(secret);await action({action:'initial_invoice'});await action({action:'resume'});check((await report()).procurement.phase==='invoice_uncertain','ambiguous invoice evidence stays uncertain');check(!(await report()).procurement.payment,'no ambiguous payment identity associated');
+          await reload();await restoredAccount();await action({action:'initial_invoice'});await action({action:'resume'});check((await report()).procurement.phase==='invoice_uncertain','ambiguous invoice evidence stays uncertain');check(!(await report()).procurement.payment,'no ambiguous payment identity associated');
         }else{
           check(current.procurement.payment?.id==='aabb','initial payment linked durably');
           check(payments[0].created.endsWith('.999999999Z')&&payments[0].expires.endsWith('.999999999Z'),'invoice issuance has nanosecond precision');
@@ -693,20 +776,20 @@ try {
             paid=true;if(scenario==='later-image')machines[0].image={...image,id:9};if(capsLater)capsBad=true;if(transferPhase==='later')transferBad=true;if(cpuCase&&cpuPhase==='later')cpuBad=true;current=await action({action:'resume'});
             if(transferPhase==='later'){
               check(current.store_error&&current.procurement.vm_id===11&&!current.poc_targets?.length,'later transfer cap refuses published-pin readiness');transferChecks++;
-              await reload();await setKey(secret);current=await action({action:'resume'});
+              await reload();await restoredAccount();current=await action({action:'resume'});
               check(current.store_error&&current.procurement.vm_id===11&&!current.poc_targets?.length,'later transfer contradiction survives reload');transferChecks++;
               assert.deepEqual(current.procurement.identity,identity);check((effects[createRoute]??0)===1&&(effects[invoiceRoute]??0)===1,'later transfer contradiction cannot reorder or reissue');
               transferBad=false;current=await action({action:'resume'});
             }
             if(capsLater){
               for(const variant of ['mismatched','missing']){
-                capsBad=true;capsVariant=variant;current=await action({action:'resume'});check(current.store_error&&current.procurement.vm_id===11&&!current.poc_targets?.length,'later inherited cap contradiction refuses published-pin readiness');inheritedCapChecks++;assert.deepEqual(current.procurement.identity,identity);check((effects[createRoute]??0)===1&&(effects[invoiceRoute]??0)===1,'later cap contradiction cannot reorder or reissue');await reload();await setKey(secret);
+                capsBad=true;capsVariant=variant;current=await action({action:'resume'});check(current.store_error&&current.procurement.vm_id===11&&!current.poc_targets?.length,'later inherited cap contradiction refuses published-pin readiness');inheritedCapChecks++;assert.deepEqual(current.procurement.identity,identity);check((effects[createRoute]??0)===1&&(effects[invoiceRoute]??0)===1,'later cap contradiction cannot reorder or reissue');await reload();await restoredAccount();
               }
               capsBad=false;current=await action({action:'resume'});
             }
             if(cpuCase&&cpuPhase==='later'){
               check(current.store_error&&current.procurement.vm_id===11&&!current.poc_targets?.length,'later CPU contradiction refuses published-pin readiness');
-              await reload();await setKey(secret);
+              await reload();await restoredAccount();
               for(const variant of cpuVariants){
                 cpuVariant=variant;current=await action({action:'resume'});
                 check(current.store_error&&current.procurement.vm_id===11&&!current.poc_targets?.length,'later missing or conflicting CPU evidence preserves associated identity');
@@ -714,7 +797,7 @@ try {
               }
               cpuBad=false;current=await action({action:'resume'});
             }
-            if(scenario==='later-image'){check(current.store_error&&!current.poc_targets?.length,'later mismatched image refuses readiness');await reload();await setKey(secret);current=await action({action:'resume'});check(current.store_error&&current.procurement.vm_id===11&&!current.poc_targets?.length,'later mismatch preserves associated identity across replay');}else{
+            if(scenario==='later-image'){check(current.store_error&&!current.poc_targets?.length,'later mismatched image refuses readiness');await reload();await restoredAccount();current=await action({action:'resume'});check(current.store_error&&current.procurement.vm_id===11&&!current.poc_targets?.length,'later mismatch preserves associated identity across replay');}else{
             if(scenario==='publication'){check(current.store_error.includes('published host key'),'empty publication truthfully waits');check(!current.poc_targets?.length,'empty publication cannot contact');publication=true;current=await action({action:'resume'});}
             check(current.procurement.phase==='handed_off','published pin handoff');
             assert.deepEqual(current.procurement.publication.host_ssh_keys.map(key=>key.key_type),['ecdsa-sha2-nistp256','ssh-ed25519','ssh-rsa']);
@@ -722,7 +805,7 @@ try {
             check((await control({inspect:true})).contacts===0,'no contact before ordinary relay and runner approvals');
             const savedTarget=structuredClone(current.procurement.target);
             if(originCase)check(current.procurement.publication.origin===providerOrigin,'Handoff provenance uses bound origin');
-            await reload();if(originCase)await setOrigin(alternateOrigin);await setKey(secret);current=await action({action:'resume'});check(current.procurement.phase==='handed_off','handoff reload replays same target');
+            await reload();if(originCase)await setOrigin(alternateOrigin);await restoredAccount();current=await action({action:'resume'});check(current.procurement.phase==='handed_off','handoff reload replays same target');
             if(originCase){assert.deepEqual(current.procurement.target,savedTarget);assert.deepEqual(current.procurement.identity,identity);check(current.procurement.origin===providerOrigin&&current.procurement.publication.origin===providerOrigin,'replayed Handoff retains authority');originChecks++;}
             await control({keys:current.procurement.public_keys});
             await invoke(url=>{document.querySelector('#tau-poc-endpoint').value=url;document.querySelector('#tau-poc-model').value='fixture-a';document.querySelector('#tau-poc-key').value='fixture~inference~key~482700';document.querySelector('#tau-poc-inference-form').requestSubmit();},providerOrigin+'/inference');await wait('reports.at(-1)?.poc_configuration?.key_set');
@@ -753,11 +836,22 @@ try {
       }
     }
   }
+  let protectedRelayCount=0;
+  if(scenario==='relay-deployment') {
+    await evaluate('events=events.filter(e=>!e.fixture_probe)');
+    await message({fixture:{probe:relayForms}});
+    const protectedRelay=await wait('events.find(e=>e.fixture_probe)?.fixture_probe');
+    protectedRelayCount=protectedRelay.length;
+    check(Array.isArray(protectedRelay)&&protectedRelay.length===relayForms.length&&protectedRelay.every((value,i)=>value!==relayForms[i]),'all deployment relay representations pass actual output protection');
+    const n=await evaluate('reports.length');await message({poc_public_keys:{machine:'machine-a'}});await wait(`reports.length>${n}&&reports.at(-1)?.poc_keys`);
+    check((await report()).poc_keys.relay_pubkey===publicIdentity(deploymentRelay),'existing public-key action publishes deployment identity');
+    check(await evaluate("document.querySelector('#tau-poc-public-keys').textContent.includes('Registering the machine SSH public key with the provider does not enroll the relay. The deployment relay key is in use.') && !document.body.textContent.includes('ask your relay operator to enroll') && !document.body.textContent.includes('enroll the separate relay public key')"),'all deployment-key displays retain qualifications without manual enrollment instructions');
+  }
   // Input fields are empty before every DOM/durable evidence scan.
   check(await evaluate("document.querySelector('#tau-provider-key').value===''&&document.querySelector('#tau-poc-key').value===''") ,'both credential inputs empty');
-  const sinks=await evaluate('JSON.stringify({dom:document.documentElement.outerHTML,reports,sinkLogs})');
-  for(const value of [secret,other,inference,Buffer.from(secret).toString('hex'),Buffer.from(secret).toString('base64'),...authForms])check(!sinks.includes(value),'credential absent from DOM reports and errors');
-  const journalNeedles=[secret,other,inference,Buffer.from(secret).toString('hex'),Buffer.from(secret).toString('base64'),...authForms];
+  sinkHistory.push(await snapshotSinks());
+  const journalNeedles=[secret,other,inference,Buffer.from(secret).toString('hex'),Buffer.from(secret).toString('base64'),...authForms,...(scenario==='relay-deployment'?relayForms:[])];
+  for(const sinks of sinkHistory)for(const value of journalNeedles)check(!sinks.includes(value),'credential absent from DOM input properties reports console errors and worker outputs across reload');
   await evaluate('events=events.filter(e=>!e.fixture_journal_batch)');await message({fixture:{journalNeedles}});
   const journalResult=await wait('events.find(e=>e.fixture_journal_batch)?.fixture_journal_batch',90000);
   check(journalResult.available===true&&journalResult.checked===journalNeedles.length&&journalResult.contains===false,'authenticated durable entries contain no credentials or encoded request material');
@@ -776,7 +870,8 @@ try {
   await message({fixture:{providerCustody:'locked_worker'}});
   const lockedCustody=await wait("events.find(e=>e.fixture_provider_custody_point==='locked_worker')");
   assert.equal(lockedCustody.fixture_provider_custody,false,'new locked worker has no provider custody');
-  console.log(JSON.stringify({scenario,rawHttp:counts,applicationDispatches:mutationDispatches(),replayRejections:replays,nonReplayRefusals:refusals,acceptedEffects:effects,distinctAcceptedAuthorizations:used.size,mutationIntents:mutationRoutes.map(route=>({operation:route.includes('/ssh-key')?'registration':route.includes('/renew?')?'initial_invoice':'create',identity:beforeLock.procurement?.identity??null,route,dispatches:mutationDispatches()[route],rawTransmissions:count(route),replayRejections:replays[route]??0,acceptedEffects:effects[route]??0})),traffic:{preflight:Object.entries(counts).filter(([route])=>route.startsWith('OPTIONS ')).reduce((n,[,count])=>n+count,0),reads:Object.entries(counts).filter(([route])=>!route.startsWith('OPTIONS ')&&!mutationRoutes.includes(route)).reduce((n,[,count])=>n+count,0),mutations:mutationRoutes.reduce((n,route)=>n+count(route),0),total:Object.values(counts).reduce((n,count)=>n+count,0)},vm:beforeLock.procurement?.vm_id??null,payment:beforeLock.procurement?.payment?.id??null,phase:beforeLock.procurement?.phase??null,clockEvidence:{providerOffsetSeconds,creationOffsetSeconds},billing:beforeLock.procurement?.billing??null,originEvidence:{fieldPath:originCase,legacyOverride:!originCase,checks:originChecks,bound:beforeLock.procurement?.origin,alternateContacts,allowedAlternateContacts},deadlineMeasurement,transferChecks,missingLimitsRefusals,inheritedCapChecks,signatureEncodingChecks,signatureReloadChecks,cpuAttributeChecks:cpuCase?cpuVariants.length:0,providerCustody:{beforeLock:beforeCustody.fixture_provider_custody,endingWorker:endingCustody.fixture_provider_custody,lockedWorker:lockedCustody.fixture_provider_custody},cspPreserved:true,checks:scenario.startsWith('counter-')?'counter detected the deliberate violation':'passed'}));
+  const lockedSinks=await snapshotSinks();for(const value of journalNeedles)check(!lockedSinks.includes(value),'credential absent from final locked page and worker outputs');
+  console.log(JSON.stringify({scenario,rawHttp:counts,applicationDispatches:mutationDispatches(),replayRejections:replays,nonReplayRefusals:refusals,acceptedEffects:effects,distinctAcceptedAuthorizations:used.size,mutationIntents:mutationRoutes.map(route=>({operation:route.includes('/ssh-key')?'registration':route.includes('/renew?')?'initial_invoice':'create',identity:beforeLock.procurement?.identity??null,route,dispatches:mutationDispatches()[route],rawTransmissions:count(route),replayRejections:replays[route]??0,acceptedEffects:effects[route]??0})),traffic:{preflight:Object.entries(counts).filter(([route])=>route.startsWith('OPTIONS ')).reduce((n,[,count])=>n+count,0),reads:Object.entries(counts).filter(([route])=>!route.startsWith('OPTIONS ')&&!mutationRoutes.includes(route)).reduce((n,[,count])=>n+count,0),mutations:mutationRoutes.reduce((n,route)=>n+count(route),0),total:Object.values(counts).reduce((n,count)=>n+count,0)},vm:beforeLock.procurement?.vm_id??null,payment:beforeLock.procurement?.payment?.id??null,phase:beforeLock.procurement?.phase??null,clockEvidence:{providerOffsetSeconds,creationOffsetSeconds},billing:beforeLock.procurement?.billing??null,originEvidence:{fieldPath:originCase,legacyOverride:!originCase,checks:originChecks,bound:beforeLock.procurement?.origin,alternateContacts,allowedAlternateContacts},deadlineMeasurement,transferChecks,missingLimitsRefusals,inheritedCapChecks,signatureEncodingChecks,signatureReloadChecks,cpuAttributeChecks:cpuCase?cpuVariants.length:0,...(scenario==='relay-deployment'?{relayCustody:{representations:relayForms.length,journalNeedles:journalNeedles.length,sinkSnapshots:sinkHistory.length+1,protectedOutputForms:protectedRelayCount}}:{}),providerCustody:{beforeLock:beforeCustody.fixture_provider_custody,endingWorker:endingCustody.fixture_provider_custody,lockedWorker:lockedCustody.fixture_provider_custody},cspPreserved:true,checks:scenario.startsWith('counter-')?'counter detected the deliberate violation':'passed'}));
   await call('Browser.close');await once(browser,'exit');socket.close();
   fixture.stdin.write('{"stop":true}\n');await once(fixture,'exit');
 } finally {

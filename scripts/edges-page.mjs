@@ -303,19 +303,22 @@ export async function focusField(c, selector, {reports='fixtureReports', ticks=3
 async function focusPending(c, {request}) {
   const options={afterTicks:()=>request({action:'check'})};
   await settlePolls(c);
-  assert.equal(await c.evaluate("document.querySelector('#tau-step-machine-action').contains(document.querySelector('#tau-provider-key-form'))"),true,'provider account form is the main action');
+  assert.equal(await c.evaluate("document.querySelector('#tau-step-machine-action').contains(document.querySelector('#tau-provider-catalogue'))"),true,'generating provider action is the main action');
+  assert.equal(await c.evaluate("!document.querySelector('#tau-provider-existing').open && document.querySelector('#tau-provider-existing').contains(document.querySelector('#tau-provider-key-form'))"),true,'existing-account form starts in its closed disclosure');
+  for(const selector of ['#tau-step-machine-fold','#tau-provider-existing'])if(!await c.evaluate(`document.querySelector(${JSON.stringify(selector)}).open`))await c.click(selector+' > summary');
   for(const field of ['#tau-provider-origin','#tau-provider-key'])await focusField(c,field,options);
   const lockedStructure=()=>c.evaluate(`(() => {
     const form=document.querySelector('#tau-provider-key-form');
-    const home=document.querySelector('#tau-provider-selection-form').parentElement;
+    const disclosure=document.querySelector('#tau-provider-existing');
+    const home=disclosure.parentElement;
     const ancestors=[];
     for(let node=form.parentElement;node;node=node.parentElement)ancestors.push({tag:node.tagName,id:node.id,classes:node.className,hidden:node.hidden});
-    return {atHome:form.parentElement===home,homeHidden:home.hidden,actionChildren:document.querySelector('#tau-step-machine-action').childElementCount,ancestors};
+    return {atHome:form.parentElement===disclosure && home===document.querySelector('#tau-provider-selection-form').parentElement,homeHidden:home.hidden,actionChildren:document.querySelector('#tau-step-machine-action').childElementCount,ancestors};
   })()`);
   await c.click('#tau-lock');
   await c.wait("document.querySelector('#tau-store')?.dataset.state==='locked'");
   const locked=await lockedStructure();
-  assert.equal(locked.atHome,true,'Lock restores the moved provider form to its original home');
+  assert.equal(locked.atHome,true,'Lock keeps the provider form in its disclosure at the original home');
   assert.equal(locked.homeHidden,true,'the original home is hidden while locked');
   assert.equal(locked.actionChildren,0,'no disabled provider form escapes its hidden home');
   await c.call('Page.reload',{},c.sessionId);
@@ -345,7 +348,7 @@ async function focusPending(c, {request}) {
   assert.equal(await c.evaluate("document.querySelector('#tau-provider-approval-form button').classList.contains('main-action') && document.querySelector('#tau-purchase-review-slot #tau-purchase-review').contains(document.querySelector('#tau-provider-approval-form'))"),true,'approval is the main action beside its purchase facts');
   for(const field of ['#tau-provider-machine','#tau-provider-relay'])await focusField(c,field,options);
   await request({action:'check'});
-  c.check(true,'phone fields in all three main-action forms survive actual unchanged credit polls and composition');
+  c.check(true,'phone fields in existing-account, selection and approval forms survive actual unchanged credit polls and composition');
 }
 
 async function edgeFocusSession(c, {request, report, session}) {

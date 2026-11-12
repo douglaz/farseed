@@ -3,26 +3,35 @@
 import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, accept_page_goal, TaskPublication, requirements_answer, delivery_request, retire_runtime, sweep_inference, lifecycle_transition, publication_generation, publish_report, verify_inference_clock, withdraw_reinstall } from './pkg/tau_web.js';
 import { identify_execution, wake_tasks, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_propose_requirements } from './pkg/tau_web.js';
 import { credit_request, retry_ended_credit } from './pkg/tau_web.js';
-import { provider_configure, provider_key_is_set, provider_request } from './pkg/tau_web.js';
+import { deployment_configure, provider_configure, provider_key_is_set, provider_request } from './pkg/tau_web.js';
 
 const clearInput = request => {
   for (const field of ['create','unlock','seed_backup_redisplay','seed_backup_reentry']) {
     if (request?.[field] instanceof Uint8Array) request[field].fill(0);
   }
-  for (const field of ['poc_configure','provider_configure']) {
+  for (const field of ['poc_configure','provider_configure','deployment']) {
     if (request?.[field]?.key instanceof Uint8Array) request[field].key.fill(0);
   }
 };
 // A fresh page worker gets one execution identity before it can receive authority.
 let incarnation;
+let deployment;
 let retirementRequested = false;
 const lockWait = new AbortController();
 await new Promise(resolve => {
   onmessage = ({data}) => {
-    if (!incarnation && data && Object.keys(data).length === 1 && typeof data.initialize === 'string') {
+    if (!incarnation && data && Object.keys(data).every(k => ['initialize','deployment'].includes(k)) && typeof data.initialize === 'string') {
       incarnation = data.initialize;
+      deployment = data.deployment;
       resolve();
     } else {
+      // Retirement can arrive while the page is still reading deployment defaults.
+      if (!incarnation && typeof data?.incarnation === 'string' && typeof data.generation === 'string' &&
+          data.request && Object.keys(data.request).length === 1 && data.request.retire_runtime === true) {
+        incarnation = data.incarnation;
+        retirementRequested = true;
+        resolve();
+      }
       if (incarnation && data?.incarnation === incarnation && typeof data.generation === 'string' &&
           data.request && Object.keys(data.request).length === 1 && data.request.retire_runtime === true) {
         retirementRequested = true;
@@ -35,6 +44,15 @@ await new Promise(resolve => {
 try {
   await init();
   identify_execution(incarnation);
+  try {
+    const accepted = await deployment_configure(typeof deployment?.origin === 'string' ? deployment.origin : undefined,
+      deployment?.key instanceof Uint8Array ? deployment.key : new Uint8Array(),
+      typeof deployment?.public_fields === 'string' ? deployment.public_fields : '{}');
+    postMessage({deployment_ready: accepted});
+  } finally {
+    if (deployment?.key instanceof Uint8Array) deployment.key.fill(0);
+    deployment = undefined;
+  }
   postMessage({ harness_ready: spec_commit() });
 } catch (error) {
   postMessage({ harness_error: String(error) });

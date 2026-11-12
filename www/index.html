@@ -129,20 +129,25 @@ section section { min-width: 0; }
 <details id="tau-step-machine-fold"><summary>Machine options</summary>
 <div class="requires-store" hidden><p>The published pin comes from the provider’s hypervisor scan, rather than attestation. It trusts the provider and whoever can answer the machine address inside its network at scan time.</p></div>
 <div class="requires-store" hidden>
-<p>Use a dedicated, already confirmed provider account. This PoC uses an operator-supplied account rather than seed-based vendor recovery. It supports one outstanding purchase per store, external payment of the initial period, and published Ed25519 host keys. No stock or connectivity is promised.</p>
-<p id="tau-provider-key-status" role="status">Provider key unset.</p>
-<p>App Lock, reload and worker loss clear the provider key. Re-enter the same account to resume the saved purchase.</p>
+<p>The page makes and keeps one provider account per store, encrypted in this browser. It supports one outstanding purchase per store, external payment of the initial period, and published Ed25519 host keys. No stock or connectivity is promised.</p>
+<p id="tau-provider-key-status" role="status">The first provider action creates and keeps one provider account.</p>
+<p>App Lock, reload and worker loss retain the encrypted provider account. Losing this browser’s site data loses the provider account.</p>
 </div>
 <div id="tau-setup-facts"></div>
 <div class="requires-store" hidden>
 <h3>New machine</h3>
 
 
+<details id="tau-provider-existing"><summary>Use an existing provider account</summary>
+<p>Enter a dedicated provider account before this store records an account or purchase. It stays encrypted in this browser after Lock or reload.</p>
+<p id="tau-provider-account-fixed" hidden>This store’s provider account is fixed. Existing-account entry is unavailable.</p>
 <form id="tau-provider-key-form" novalidate>
 <label>Provider HTTPS origin <input id="tau-provider-origin" type="text" value="https://api.lnvps.net" autocomplete="off" spellcheck="false" autocapitalize="none"></label>
 <label>Provider account private key (64 hex) <input id="tau-provider-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="none"></label>
 <button type="submit">Set provider account</button>
 </form>
+</details>
+<p id="tau-relay-deployment-status" role="status">No valid deployment relay key is loaded. The seed-derived relay key requires manual enrollment.</p>
 
 <button id="tau-provider-catalogue" type="button">Fetch offers and images</button>
 <div id="tau-provider-catalogue-view"></div>
@@ -154,7 +159,7 @@ section section { min-width: 0; }
 </form>
 <div id="tau-purchase-review">
 <div id="tau-provider-selection-view"></div>
-<p>Registering the machine SSH public key with the provider does not enroll the relay. Before configuration, copy the separate relay public key and ask your relay operator to enroll it. You still need published pins and approvals for the goal, class, access and installation declaration.</p>
+<p id="tau-provider-relay-guidance">Registering the machine SSH public key with the provider does not enroll the relay. Before configuration, copy the separate relay public key and ask your relay operator to enroll it. You still need published pins and approvals for the goal, class, access and installation declaration.</p>
 <form id="tau-provider-approval-form">
 <p><label>Machine name <input id="tau-provider-machine" required autocomplete="off"></label></p>
 <p><label>Existing v1 relay URL (wss://, ending in /) <input id="tau-provider-relay" type="url" required autocomplete="off"></label></p>
@@ -203,7 +208,7 @@ section section { min-width: 0; }
 <div class="requires-store" hidden><div id="tau-poc-public-keys" aria-live="polite"></div></div>
 <details id="tau-step-task-fold"><summary>Task options</summary>
 <div class="requires-store" hidden>
-<p>After enrollment, configure inference, then press Start session for the displayed model and machine. Copy its public keys. Install the SSH line and enroll the separate relay public key with the relay operator.</p>
+<p id="tau-relay-task-guidance">After enrollment, configure inference, then press Start session for the displayed model and machine. Copy its public keys. Install the SSH line and enroll the separate relay public key with the relay operator.</p>
 <p>Set the session’s goal. Accept it with commands that check the result. Edit and propose the installation declaration, then approve its requirements card. Press Resume to continue. Commands require that approval.</p>
 </div>
 </details>

@@ -149,6 +149,7 @@ pub(crate) enum Derived {
     Sender(AttestSenderKey),
     Recipient(AttestRecipientKey),
     Relay(RelayKey),
+    RelayText(crate::poc::credit::SecretText),
     Handoff(PostHarnessCredential),
 }
 
@@ -168,6 +169,7 @@ impl Held<'_> {
                 Derived::Sender(key) => key.0.as_slice(),
                 Derived::Recipient(key) => key.0.as_slice(),
                 Derived::Relay(key) => key.0.as_slice(),
+                Derived::RelayText(text) => text.0.as_bytes(),
                 Derived::Handoff(key) => key.0.as_slice(),
             }))
             .filter(|value| !value.is_empty())

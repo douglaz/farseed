@@ -394,11 +394,13 @@ impl<S: Storage + Clone> Store<S> {
         let mut provider_protection = 0;
         let mut poc_pauses = 0;
         let mut account_records = 0;
+        let mut provider_account_records = 0;
+        let mut provider_account_contains = false;
         let mut account_contains = false;
         let mut mint_names = Vec::new();
         for number in 0..self.next {
             let bytes = self.storage.read(&number.to_string()).await?;
-            let event = reader.open(number, &bytes)?;
+            let (event, plaintext) = reader.open_record(number, &bytes)?;
             provider_protection += usize::from(matches!(event, Event::ProviderProtection(_)));
             poc_pauses += usize::from(matches!(
                 &event,
@@ -420,16 +422,28 @@ impl<S: Storage + Clone> Store<S> {
                 } else {
                     contains |= encoded.contains(needle);
                 }
+            } else if let Event::PocProviderAccount(account) = &event {
+                provider_account_records += 1;
+                provider_account_contains |= !needle.is_empty() && account.key.0.as_str() == needle;
+                // Exclude only the typed custody field, never its neighboring fields.
+                contains |= serde_json::to_string(&(account.source, &account.origin))
+                    .map_err(|_| "fixture account encoding")?
+                    .contains(needle);
             } else {
-                contains |= encoded.contains(needle);
+                contains |= encoded.contains(needle)
+                    || std::str::from_utf8(&plaintext)
+                        .map_err(|_| "fixture record text")?
+                        .contains(needle);
             }
             if let Event::PocCredit(crate::store::credit::Record::MintName(mint)) = &event {
                 mint_names.push(mint.name.clone());
             }
             reader.previous = Address(Sha256::digest(&bytes).into());
         }
+        // A provider key carried by another account's field is still a leak.
+        contains |= provider_account_contains && account_contains;
         Ok(
-            json!({"contains":contains,"account_records":account_records,"account_contains":account_contains,"mint_names":mint_names,"records":self.next,"provider_protection":provider_protection,"poc_pauses":poc_pauses,"machines":self.allocation().next_unused().machines,"passes":self.allocation().next_unused().passes,"targets":self.poc_targets.len()}),
+            json!({"contains":contains,"provider_account_records":provider_account_records,"provider_account_contains":provider_account_contains,"account_records":account_records,"account_contains":account_contains,"mint_names":mint_names,"records":self.next,"provider_protection":provider_protection,"poc_pauses":poc_pauses,"machines":self.allocation().next_unused().machines,"passes":self.allocation().next_unused().passes,"targets":self.poc_targets.len()}),
         )
     }
 }
