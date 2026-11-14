@@ -59,6 +59,7 @@ pub struct Purchase {
     #[serde(default)]
     pub billing: Option<Billing>,
     pub payment: Option<Value>,
+    pub paid_at: Option<u64>,
     pub publication: Option<Value>,
     pub target: Option<TargetRecord>,
 }
@@ -103,7 +104,10 @@ pub enum Record {
     Associated(Value),
     BillingQuoted(Billing),
     InvoiceSent(Invoice),
-    Payment(Value),
+    Payment {
+        payment: Value,
+        paid_at: Option<u64>,
+    },
     Observation(Value),
     Handoff {
         target: TargetRecord,
@@ -309,7 +313,7 @@ impl<S: Storage> Store<S> {
         } else {
             "approved"
         };
-        json!({"origin":p.origin,"phase":phase,"machine":p.machine,"account":p.account,"selection":p.pending_selection.as_ref().unwrap_or(&p.selected),"approved_selection":p.selected,"relay":p.relay,"class_answer":p.class_answer,"identity":p.identity,"ssh_key_id":p.ssh_key.as_ref().map(|k|&k["id"]),"vm_id":p.vm.as_ref().map(|vm|&vm["id"]),"billing":p.billing,"payment":p.payment,"auto_renewal_enabled":p.vm.as_ref().and_then(|vm|vm.get("auto_renewal_enabled")),"target":p.target,"publication":p.publication,"public_keys":self.poc_identity_public_keys(&p.machine,&p.identity).ok()})
+        json!({"origin":p.origin,"phase":phase,"machine":p.machine,"account":p.account,"selection":p.pending_selection.as_ref().unwrap_or(&p.selected),"approved_selection":p.selected,"relay":p.relay,"class_answer":p.class_answer,"identity":p.identity,"ssh_key_id":p.ssh_key.as_ref().map(|k|&k["id"]),"vm_id":p.vm.as_ref().map(|vm|&vm["id"]),"billing":p.billing,"payment":p.payment,"paid_at":p.paid_at,"readiness_poll_seconds":protocol::readiness_poll_seconds(),"readiness_wait_seconds":protocol::readiness_wait_seconds(),"readiness_state":p.vm.as_ref().map(|vm|&vm["status"]["state"]),"auto_renewal_enabled":p.vm.as_ref().and_then(|vm|vm.get("auto_renewal_enabled")),"target":p.target,"publication":p.publication,"public_keys":self.poc_identity_public_keys(&p.machine,&p.identity).ok()})
     }
     pub(crate) async fn procurement_catalogue(
         &mut self,
@@ -512,6 +516,7 @@ impl<S: Storage> Store<S> {
             invoice: None,
             billing: None,
             payment: None,
+            paid_at: None,
             publication: None,
             target: None,
         };
@@ -549,6 +554,7 @@ impl<S: Storage> Store<S> {
                 || p.vm.is_some()
                 || p.billing.is_some()
                 || p.invoice.is_some()
+                || p.paid_at.is_some()
                 || p.payment.is_some()
                 || p.target.is_some()
                 || p.publication.is_some()
@@ -583,7 +589,7 @@ impl<S: Storage> Store<S> {
                 Record::Associated(vm) => {
                     closed.vm.as_ref().is_some_and(|old| old["id"] == vm["id"])
                 }
-                Record::Payment(payment) => closed
+                Record::Payment { payment, .. } => closed
                     .payment
                     .as_ref()
                     .and_then(|old| payment_id(old).ok())
@@ -703,7 +709,7 @@ impl<S: Storage> Store<S> {
                 }
                 p.invoice = Some(intent.clone());
             }
-            Record::Payment(payment) => {
+            Record::Payment { payment, paid_at } => {
                 let vm = p.vm.as_ref().ok_or(REFUSED)?;
                 if !protocol::suitable_payment(
                     payment,
@@ -730,6 +736,12 @@ impl<S: Storage> Store<S> {
                 }) {
                     return Err(REFUSED.into());
                 }
+                if (payment["is_paid"] == true) != paid_at.is_some()
+                    || p.paid_at.is_some_and(|saved| Some(saved) != *paid_at)
+                {
+                    return Err(REFUSED.into());
+                }
+                p.paid_at = *paid_at;
                 p.payment = Some(payment.clone());
             }
             Record::Observation(vm) => {
@@ -960,7 +972,7 @@ impl<S: Storage> Store<S> {
                 return Err("Initial payment evidence conflicts or cannot be established from the saved one-period quote; no invoice issued.".into());
             }
             return self
-                .procurement_commit(Record::Payment(history[0].clone()))
+                .procurement_commit(self.payment_record(history[0].clone(), api.now()))
                 .await;
         }
         if p.invoice.is_some() {
@@ -996,7 +1008,8 @@ impl<S: Storage> Store<S> {
                 None,
             )
             .await?;
-        self.procurement_commit(Record::Payment(payment)).await
+        self.procurement_commit(self.payment_record(payment, api.now()))
+            .await
     }
     /// Explicit bounded progress. Refresh never sends a create or invoice whose intent exists.
     /// Automatic observation can only read the saved payment, never issue an invoice.
@@ -1018,7 +1031,8 @@ impl<S: Storage> Store<S> {
         }
         let path = format!("/api/v1/payment/{}", payment_id(payment)?);
         let updated = self.provider_read(api, "GET", &path, None).await?;
-        self.procurement_commit(Record::Payment(updated)).await
+        self.procurement_commit(self.payment_record(updated, api.now()))
+            .await
     }
 
     pub(crate) async fn procurement_resume(
@@ -1039,6 +1053,9 @@ impl<S: Storage> Store<S> {
                 "The offer or price changed; review and approve the new terms before creating."
                     .into(),
             );
+        }
+        if p.paid_at.is_some() {
+            self.readiness_current(api, &p)?;
         }
         if p.registration_sent && p.ssh_key.is_none() {
             self.provider_read(api, "GET", "/api/v1/ssh-key", None)
@@ -1125,7 +1142,6 @@ impl<S: Storage> Store<S> {
             self.associate_payment(api, issue_invoice).await?;
             p = self.procurement.clone().ok_or(REFUSED)?;
         }
-        let vm_id = id(p.vm.as_ref().ok_or(REFUSED)?)?;
         let payment = p.payment.as_ref().ok_or(REFUSED)?;
         let updated = self
             .provider_read(
@@ -1135,7 +1151,7 @@ impl<S: Storage> Store<S> {
                 None,
             )
             .await?;
-        self.procurement_commit(Record::Payment(updated.clone()))
+        self.procurement_commit(self.payment_record(updated.clone(), api.now()))
             .await?;
         if updated["is_paid"] != true {
             if timestamp(text(&updated, "expires", 40)?)? <= api.now() {
@@ -1146,28 +1162,103 @@ impl<S: Storage> Store<S> {
                     .into(),
             );
         }
-        let vm = self
+        self.procurement_readiness(api, false).await
+    }
+
+    fn payment_record(&self, payment: Value, now: u64) -> Record {
+        let paid_at = (payment["is_paid"] == true).then(|| {
+            self.procurement
+                .as_ref()
+                .and_then(|p| p.paid_at)
+                .unwrap_or(now)
+        });
+        Record::Payment { payment, paid_at }
+    }
+
+    pub(crate) fn procurement_readiness_eligible(&self) -> bool {
+        self.procurement.as_ref().is_some_and(|p| {
+            p.payment.as_ref().is_some_and(|pay| pay["is_paid"] == true)
+                && p.paid_at.is_some()
+                && p.target.is_none()
+                && p.pending_selection.is_none()
+        })
+    }
+
+    fn readiness_current(&self, api: &impl Api, purchase: &Purchase) -> Result<(), String> {
+        self.check_api(api)?;
+        if !self.procurement_readiness_eligible()
+            || self
+                .procurement
+                .as_ref()
+                .is_none_or(|p| p.identity != purchase.identity)
+        {
+            return Err(REFUSED.into());
+        }
+        if api.now()
+            >= purchase
+                .paid_at
+                .ok_or(REFUSED)?
+                .saturating_add(protocol::readiness_wait_seconds())
+        {
+            return Err(protocol::READINESS_STOP.into());
+        }
+        Ok(())
+    }
+
+    /// Automatic observation has no route to registration, ordering, billing or payment reads.
+    pub(crate) async fn procurement_readiness_check(
+        &mut self,
+        api: &mut impl Api,
+    ) -> Result<(), String> {
+        if !self.procurement_readiness_eligible() {
+            return Ok(());
+        }
+        self.procurement_readiness(api, true).await
+    }
+
+    async fn procurement_readiness(
+        &mut self,
+        api: &mut impl Api,
+        automatic: bool,
+    ) -> Result<(), String> {
+        let p = self.procurement.clone().ok_or(REFUSED)?;
+        self.readiness_current(api, &p)?;
+        let vm_id = id(p.vm.as_ref().ok_or(REFUSED)?)?;
+        let fresh = self
             .provider_read(api, "GET", &format!("/api/v1/vm/{vm_id}"), None)
             .await?;
-        self.procurement_commit(Record::Observation(vm.clone()))
-            .await?;
+        self.readiness_current(api, &p)?;
+        let observation = Record::Observation(fresh.clone());
+        // Validate the complete fresh response before considering suppression.
+        self.procurement_projection(&observation)?;
+        if !automatic || !protocol::same_readiness(p.vm.as_ref().ok_or(REFUSED)?, &fresh)? {
+            self.procurement_commit(observation).await?;
+            self.readiness_current(api, &p)?;
+        }
+        #[cfg(all(feature = "tracer", target_arch = "wasm32"))]
+        crate::testonly::session_point("procurement_readiness_observed").await;
+        self.readiness_current(api, &p)?;
+        // Publication must agree exactly with the recorded VM, even after a reordered key set.
+        let saved = self.procurement.clone().ok_or(REFUSED)?;
+        let vm = saved.vm.as_ref().ok_or(REFUSED)?;
         if vm["status"]["state"] != "running" {
             return Err(
                 "Waiting for provider boot readiness; unknown state is not ready. Refresh later."
                     .into(),
             );
         }
-        let (key, pin) = protocol::published_pin(&vm)?;
+        let (key, pin) = protocol::published_pin(vm)?;
         let target = TargetRecord {
-            machine: p.machine,
-            relay: p.relay,
+            machine: p.machine.clone(),
+            relay: p.relay.clone(),
             profile: "v1".into(),
-            host: protocol::allocated_ipv4(&vm)?,
+            host: protocol::allocated_ipv4(vm)?,
             port: 22,
             user: "arch".into(),
             elevation: crate::jobs::Elevation::SudoNoninteractive,
             pin,
         };
+        self.readiness_current(api, &p)?;
         self.procurement_commit(Record::Handoff {target,publication:json!({"origin":p.origin,"vm_id":vm_id,"created":vm["created"],"selected_key":key,"host_ssh_keys":vm["host_ssh_keys"]})}).await
     }
 }

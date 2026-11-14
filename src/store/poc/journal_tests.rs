@@ -130,8 +130,8 @@ fn poc_journal_admission_is_symbolic_across_decimal_widths_and_upper_domain() {
         &mut s,
         &task,
         Change::Raise(Limits {
-            requests: 20,
-            steps: 40,
+            requests: 200,
+            steps: 400,
         }),
     );
     let mut task = task;
@@ -141,8 +141,8 @@ fn poc_journal_admission_is_symbolic_across_decimal_widths_and_upper_domain() {
             &mut s,
             &task,
             Change::Raise(Limits {
-                requests: 20,
-                steps: 40,
+                requests: 200,
+                steps: 400,
             }),
         );
         assert_eq!(task.revision, previous + 1);

@@ -692,3 +692,28 @@ fn provisioning_decoded_missing_is_bounded_to_read_only_routes_and_error_objects
         br#"{"error":"missing"}"#
     ));
 }
+
+#[test]
+fn provisioning_readiness_comparison_uses_state_key_set_and_ipv4_only() {
+    let old = vm(&selection(false), 11);
+    let mut fresh = old.clone();
+    fresh["status"]["uptime"] = json!(999);
+    fresh["status"]["timestamp"] = json!(999);
+    fresh["ip_assignments"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"ip":"2001:db8::1/64"}));
+    assert!(same_readiness(&old, &fresh).unwrap());
+    let mut no_ipv4 = old.clone();
+    no_ipv4["ip_assignments"] = json!([]);
+    fresh["ip_assignments"] = json!([{"ip":"2001:db8::2/64"}]);
+    assert!(same_readiness(&no_ipv4, &fresh).unwrap());
+    fresh["status"]["state"] = json!("starting");
+    assert!(!same_readiness(&no_ipv4, &fresh).unwrap());
+    fresh = old.clone();
+    fresh["ip_assignments"][0]["ip"] = json!("192.0.2.20/24");
+    assert!(!same_readiness(&old, &fresh).unwrap());
+    fresh = old.clone();
+    fresh["host_ssh_keys"] = json!([]);
+    assert!(!same_readiness(&old, &fresh).unwrap());
+}

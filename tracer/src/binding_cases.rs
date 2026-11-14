@@ -177,16 +177,7 @@ async fn prepare_with_enrolment(
         if bound {
             continue;
         }
-        if tracer {
-            setup_cases::click(run, tab, &format!("[data-bind={name:?}]")).await?;
-        } else {
-            // The served page has no fixture card; this fixture supplies explicit admission evidence.
-            let request = json!({"machine":name,"inference_approval":{"approved":true,"configuration":{"endpoint":"https://fixture.invalid/completions","model":"fixture"}}});
-            let report = run.browser.evaluate(&worker.session, &format!("(async()=>{{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href);const report=await m.bind(JSON.stringify({request}));await m.publish_report(m.publication_generation(),'',report);return JSON.parse(report);}})()")).await?;
-            if report.get("error").is_some() {
-                return Err("served fixture admission refused".into());
-            }
-        }
+        setup_cases::bind_fixture(run, worker, name).await?;
         wait(run, worker, "binding.page.bound", |s| {
             s["sessions"]
                 .as_array()
@@ -330,7 +321,7 @@ pub(super) async fn run(
     let state = run.inspect(&worker).await?;
     case.check(
         "binding_cases.a003",
-        "page binding gives each session only its machine client credential",
+        "fixture binding gives each session only its machine client credential",
         state["sessions"].as_array().is_some_and(|sessions| {
             sessions.len() == 2
                 && sessions.iter().all(|s| {

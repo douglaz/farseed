@@ -53,7 +53,7 @@ pub(super) async fn prepare(
         .iter()
         .any(|s| s["session_state"] != "ended" && s["bound_set"] == json!(["fixture"]));
     if !existing {
-        setup_cases::click(run, tab, "[data-bind=fixture]").await?;
+        setup_cases::bind_fixture(run, worker, "fixture").await?;
     }
     let binding_observer = observer::Call::begin(
         "declaration.prepare.binding",
@@ -138,7 +138,7 @@ pub(super) async fn prepare(
             run.browser
                 .evaluate(
                     &tab.session,
-                    &format!("!!document.querySelector('[data-goal-accept={session}]')"),
+                    &format!("!!document.querySelector('[data-start-accepted-goal={session}]')"),
                 )
                 .await?
                 == true,
@@ -157,7 +157,7 @@ pub(super) async fn start(
     script: Vec<Value>,
 ) -> Result<(), String> {
     run.aggregator.state.lock().unwrap().script = script.into();
-    setup_cases::click(run, tab, &format!("[data-goal-accept={session:?}]")).await
+    setup_cases::click(run, tab, &format!("[data-start-accepted-goal={session:?}]")).await
 }
 pub(super) async fn wait_card(
     site: &'static str,

@@ -21,6 +21,43 @@ pub fn wake_tasks() {
     wake();
 }
 
+pub(crate) fn wake_task(id: &str) {
+    let id = id.to_owned();
+    wasm_bindgen_futures::spawn_local(async move {
+        let candidate = {
+            let local = local();
+            let mut writer = local.lock().await;
+            if writer.dispatch_refusal().is_some() || crate::lifecycle::owner().ordinary().is_err()
+            {
+                None
+            } else {
+                writer.store().and_then(|store| {
+                    store
+                        .eligible_tasks()
+                        .into_iter()
+                        .find(|task| task.id == id)
+                })
+            }
+        };
+        if let Some(task) = candidate {
+            if run::defer_if_active(&task.id) {
+                return;
+            }
+            let generation = crate::harness::inference::publication_generation();
+            let response = Response::default();
+            let report = request_with_mode(
+                serde_json::json!({"action":"resume","id":task.id,"session":task.start_session})
+                    .to_string(),
+                response.clone(),
+                true,
+            )
+            .await;
+            let _response = response.borrow_mut().take();
+            crate::harness::inference::publish_report(generation, task.start_session, report).await;
+        }
+    });
+}
+
 pub(crate) fn wake() {
     WAKE.set(true);
     if WAKING.replace(true) {
@@ -529,6 +566,10 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
         if request.action == "resume" || request.action == "dispose-pending" {
             let continuation = continuation.as_ref().map_err(Clone::clone)?;
             let id = request.id.as_deref().ok_or("task ID required")?;
+            #[cfg(feature = "tracer")]
+            if automatic {
+                crate::testonly::session_point(&format!("poc_automatic_resume_{id}")).await;
+            }
             let session = request
                 .session
                 .as_deref()
@@ -792,6 +833,26 @@ impl TaskPublication {
     }
     pub async fn request(&self, request: String) -> String {
         request_with(request, self.response.clone()).await
+    }
+    pub async fn continue_task(&self, id: String, session: String) -> String {
+        {
+            let local = local();
+            let mut writer = local.lock().await;
+            if !writer.store().is_some_and(|store| {
+                store
+                    .eligible_tasks()
+                    .iter()
+                    .any(|task| task.id == id && task.start_session == session)
+            }) {
+                return writer.report(None).to_string();
+            }
+        }
+        request_with_mode(
+            serde_json::json!({"action":"resume","id":id,"session":session}).to_string(),
+            self.response.clone(),
+            true,
+        )
+        .await
     }
     pub async fn run_goal(&self, session: String, checks: String) -> String {
         crate::worker::run_page_goal_with(session, checks, self.response.clone()).await

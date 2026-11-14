@@ -1141,3 +1141,54 @@ pub fn allocated_ipv4(vm: &Value) -> Result<String, String> {
 pub(crate) mod browser;
 #[cfg(test)]
 pub(crate) mod tests;
+
+pub(crate) const READINESS_STOP: &str = "Published host-key wait expired after three hours from recorded payment. First contact is stopped; this page cannot reinstall or abandon a paid purchase.";
+
+fn readiness_seconds(name: &str) -> u64 {
+    let timing = crate::BUNDLE
+        .iter()
+        .find(|(name, _)| *name == "timing.toml")
+        .expect("compiled timing input")
+        .1;
+    let value = timing
+        .lines()
+        .find_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == name).then(|| value.trim().trim_matches('"'))
+        })
+        .expect("published-key timing");
+    let (number, unit) = value.split_at(value.len() - 1);
+    number.parse::<u64>().expect("timing number")
+        * match unit {
+            "m" => 60,
+            "h" => 3600,
+            "s" => 1,
+            _ => panic!("timing unit"),
+        }
+}
+pub(crate) fn readiness_poll_seconds() -> u64 {
+    readiness_seconds("published_key_poll_interval")
+}
+pub(crate) fn readiness_wait_seconds() -> u64 {
+    readiness_seconds("published_key_wait_max")
+}
+
+/// Status means the provider state, not incidental uptime or utilization counters.
+pub(crate) fn same_readiness(old: &Value, fresh: &Value) -> Result<bool, String> {
+    let keys = |vm: &Value| -> Result<std::collections::BTreeSet<String>, String> {
+        Ok(array(&vm["host_ssh_keys"])?
+            .iter()
+            .map(Value::to_string)
+            .collect())
+    };
+    // Preserve address diagnostics even when the selected facts otherwise match.
+    let addresses = (allocated_ipv4(old), allocated_ipv4(fresh));
+    let same_address = match addresses {
+        (Ok(a), Ok(b)) => a == b,
+        (Err(a), Err(b)) => a == b,
+        _ => false,
+    };
+    Ok(old["status"]["state"] == fresh["status"]["state"]
+        && keys(old)? == keys(fresh)?
+        && same_address)
+}

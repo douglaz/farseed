@@ -392,7 +392,9 @@ impl<S: Storage + Clone> Store<S> {
         let mut reader = Store::new(self.storage.clone(), DataKey(self.key.0), self.id.clone());
         let mut contains = false;
         let mut provider_protection = 0;
+        let mut procurement_counts = std::collections::BTreeMap::<String, usize>::new();
         let mut poc_pauses = 0;
+        let mut poc_requests = 0;
         let mut account_records = 0;
         let mut provider_account_records = 0;
         let mut provider_account_contains = false;
@@ -401,7 +403,24 @@ impl<S: Storage + Clone> Store<S> {
         for number in 0..self.next {
             let bytes = self.storage.read(&number.to_string()).await?;
             let (event, plaintext) = reader.open_record(number, &bytes)?;
+            if let Event::Procurement(record) = &event {
+                let value =
+                    serde_json::to_value(record).map_err(|_| "fixture procurement encoding")?;
+                let name = value
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| value.as_object().and_then(|o| o.keys().next()).cloned())
+                    .ok_or("fixture procurement shape")?;
+                *procurement_counts.entry(name).or_default() += 1;
+            }
             provider_protection += usize::from(matches!(event, Event::ProviderProtection(_)));
+            poc_requests += usize::from(matches!(
+                &event,
+                Event::Poc(poc::Record::Change {
+                    change: poc::Change::Request,
+                    ..
+                })
+            ));
             poc_pauses += usize::from(matches!(
                 &event,
                 Event::Poc(poc::Record::Change {
@@ -443,7 +462,7 @@ impl<S: Storage + Clone> Store<S> {
         // A provider key carried by another account's field is still a leak.
         contains |= provider_account_contains && account_contains;
         Ok(
-            json!({"contains":contains,"provider_account_records":provider_account_records,"provider_account_contains":provider_account_contains,"account_records":account_records,"account_contains":account_contains,"mint_names":mint_names,"records":self.next,"provider_protection":provider_protection,"poc_pauses":poc_pauses,"dispositions":self.dispatch.dispositions.len(),"machines":self.allocation().next_unused().machines,"passes":self.allocation().next_unused().passes,"targets":self.poc_targets.len()}),
+            json!({"contains":contains,"provider_account_records":provider_account_records,"provider_account_contains":provider_account_contains,"account_records":account_records,"account_contains":account_contains,"mint_names":mint_names,"records":self.next,"provider_protection":provider_protection,"procurement_counts":procurement_counts,"poc_pauses":poc_pauses,"poc_requests":poc_requests,"dispositions":self.dispatch.dispositions.len(),"machines":self.allocation().next_unused().machines,"passes":self.allocation().next_unused().passes,"targets":self.poc_targets.len()}),
         )
     }
 }

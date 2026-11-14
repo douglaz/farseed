@@ -96,6 +96,19 @@
   },
   "dynamicControls": [
     {
+      "selector": "[data-start-goal]",
+      "tag": "textarea"
+    },
+    {
+      "selector": "[data-start-checks]",
+      "tag": "textarea"
+    },
+    {
+      "selector": "[data-start-accepted-goal]",
+      "tag": "button",
+      "type": "button"
+    },
+    {
       "selector": "#tau-setup-approve",
       "tag": "button",
       "type": "button"
@@ -117,16 +130,6 @@
     },
     {
       "selector": "[data-verify-clock]",
-      "tag": "button",
-      "type": "button"
-    },
-    {
-      "selector": "[data-goal-accept]",
-      "tag": "button",
-      "type": "button"
-    },
-    {
-      "selector": "[data-poc-accept]",
       "tag": "button",
       "type": "button"
     },

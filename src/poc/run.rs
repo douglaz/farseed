@@ -16,7 +16,7 @@ impl Drop for Active {
         ACTIVE.with_borrow_mut(|set| set.remove(&self.0));
         if WAKE_PENDING.with_borrow_mut(|set| set.remove(&self.0)) {
             #[cfg(target_arch = "wasm32")]
-            crate::poc::web::wake();
+            crate::poc::web::wake_task(&self.0);
         }
     }
 }

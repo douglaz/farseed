@@ -14,6 +14,9 @@ thread_local! {
     static ACCOUNT: RefCell<Option<Account>> = const {RefCell::new(None)};
     static ACTIVE: Cell<bool> = const {Cell::new(false)};
     static PENDING: RefCell<Option<Rc<Pending>>> = const {RefCell::new(None)};
+    static READINESS_CHECKED: RefCell<Option<(Value, u64, &'static str)>> = const {RefCell::new(None)};
+    static VISIBLE: Cell<bool> = const {Cell::new(true)};
+    static VISIBILITY: Cell<u64> = const {Cell::new(0)};
     static LAST: Cell<Option<f64>> = const {Cell::new(None)};
     #[cfg(feature="tracer")]
     static TEST_ORIGIN: RefCell<Option<String>> = const {RefCell::new(None)};
@@ -38,6 +41,67 @@ pub(crate) fn key_is_set() -> bool {
 #[wasm_bindgen]
 pub fn provider_key_is_set() -> bool {
     key_is_set()
+}
+
+#[wasm_bindgen]
+pub fn provider_visibility(visible: bool) {
+    if VISIBLE.replace(visible) != visible {
+        VISIBILITY.set(VISIBILITY.get().wrapping_add(1));
+    }
+}
+
+#[wasm_bindgen]
+pub fn provider_action_delay() -> u32 {
+    let Ok(now) = monotonic_ms() else {
+        return 0;
+    };
+    LAST.get().map_or(0, |last| {
+        if now < last {
+            1000
+        } else {
+            (1000.0 - (now - last)).clamp(0.0, 1000.0).ceil() as u32
+        }
+    })
+}
+
+fn readiness_kind(result: &Result<(), String>) -> &'static str {
+    match result {
+        Ok(()) => "ready",
+        Err(why) if why.starts_with("Waiting for provider boot readiness") => "starting",
+        Err(why) if why.starts_with("Waiting for an unambiguous supported published host key") => {
+            "published_key"
+        }
+        Err(why) if why == "Waiting for one allocated IPv4 address." => "address",
+        Err(_) => "refused",
+    }
+}
+
+pub(crate) fn readiness_report(purchase: &Value) -> Value {
+    let inactive = if !VISIBLE.get() {
+        Some("the page is hidden")
+    } else if !key_is_set() {
+        Some("the provider key is missing")
+    } else if crate::poc::inference::response_pending() {
+        Some("a command response is pending")
+    } else if crate::lifecycle::owner().ordinary().is_err() {
+        Some("local lifecycle authority is unavailable")
+    } else {
+        None
+    };
+    let checked = READINESS_CHECKED.with_borrow(|saved| {
+        saved
+            .as_ref()
+            .filter(|(identity, _, _)| identity == &purchase["identity"])
+            .map(|(_, at, kind)| (at * 1000, *kind))
+    });
+    let now = (js_sys::Date::now() / 1000.0) as u64;
+    json!({"checked_at":checked.map(|(at,_)|at),"kind":checked.map(|(_,kind)|kind).unwrap_or("checking"),"inactive":inactive,"expired":purchase["paid_at"].as_u64().is_some_and(|paid|now >= paid.saturating_add(readiness_wait_seconds()))})
+}
+
+#[cfg(feature = "tracer")]
+#[wasm_bindgen]
+pub fn test_provider_clear() {
+    end();
 }
 
 #[cfg(feature = "tracer")]
@@ -114,6 +178,7 @@ enum Action {
     },
     Resume,
     PaymentCheck,
+    ReadinessCheck,
     Close,
     InitialInvoice {
         billing: crate::store::provisioning::Billing,
@@ -130,7 +195,7 @@ pub async fn provider_request(request: String) -> String {
                     .into(),
             );
         }
-        // Explicit reads are bounded per click and paced, never a hidden polling loop.
+        // Each action remains bounded and paced.
         let now = monotonic_ms()?;
         if LAST.get().is_some_and(|last| now < last || now - last < 1000.0) {
             return Err("Provider reads paused briefly; Refresh after one second.".into());
@@ -152,7 +217,11 @@ pub async fn provider_request(request: String) -> String {
             return Err("Unlock before provisioning.".into());
         }
         let store = local.store().ok_or("Unlock before provisioning.")?;
-        store.provider_generate().await?;
+        let automatic = matches!(action, Action::ReadinessCheck);
+        if automatic && (!VISIBLE.get() || !key_is_set() || !store.procurement_readiness_eligible()) {
+            return Ok(None);
+        }
+        if !automatic { store.provider_generate().await?; }
         continuation.check()?;
         restore(store.provider_account());
         let mut api = Browser {
@@ -160,12 +229,15 @@ pub async fn provider_request(request: String) -> String {
             continuation,
             filter: None,
             prepared: None,
+            automatic_visibility: automatic.then(|| VISIBILITY.get()),
             started: now,
             requests: 0,
             response_status: 0,
         };
         api.current()?;
-        match action {
+        let observe_readiness = matches!(action, Action::ReadinessCheck | Action::Resume | Action::InitialInvoice { .. });
+        let identity = store.procurement_view()["identity"].clone();
+        let result = match action {
             Action::Catalogue => store.procurement_catalogue(&mut api).await.map(Some),
             Action::Select { choice } => store
                 .procurement_select(&mut api, choice)
@@ -177,6 +249,7 @@ pub async fn provider_request(request: String) -> String {
                 }
                 store.procurement_approve(&mut api, approval).await.map(|_| None)
             }
+            Action::ReadinessCheck => store.procurement_readiness_check(&mut api).await.map(|_| None),
             Action::PaymentCheck => store.procurement_payment_check(&mut api).await.map(|_| None),
             Action::Close => store.procurement_close(&mut api).await.map(|_| None),
             Action::Resume => store
@@ -189,7 +262,12 @@ pub async fn provider_request(request: String) -> String {
                 }
                 store.procurement_resume(&mut api, true).await.map(|_| None)
             }
+        };
+        if observe_readiness && api.requests > 0 && api.current().is_ok() && store.procurement_readiness_eligible() && store.procurement_view()["identity"] == identity {
+            let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
+            READINESS_CHECKED.with_borrow_mut(|saved| *saved = Some((identity, api.now(), readiness_kind(&outcome))));
         }
+        result
     }
     .await;
     let local = crate::worker::local();
@@ -233,6 +311,7 @@ struct Prepared {
     auth: Zeroizing<String>,
 }
 struct Browser {
+    automatic_visibility: Option<u64>,
     account: Account,
     continuation: crate::lifecycle::Continuation,
     filter: Option<EchoFilter>,
@@ -299,6 +378,12 @@ impl Api for Browser {
     }
     fn current(&self) -> Result<(), String> {
         self.continuation.check()?;
+        if self
+            .automatic_visibility
+            .is_some_and(|epoch| !VISIBLE.get() || VISIBILITY.get() != epoch)
+        {
+            return Err("Readiness reads are not running while the page is hidden.".into());
+        }
         self.remaining_ms()?;
         if ACCOUNT.with_borrow(|a| {
             a.as_ref()

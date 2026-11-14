@@ -101,7 +101,7 @@ async fn reset_with_bindings(
     } else {
         origin(run, worker).await?;
         run.submit(tab, "unlock", PASSPHRASE).await?;
-        setup_cases::click(run, tab, "[data-bind=fixture]").await?;
+        setup_cases::bind_fixture(run, worker, "fixture").await?;
         let mut bound = false;
         {
             let observation = observer::Call::begin(

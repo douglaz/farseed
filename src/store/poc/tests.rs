@@ -291,9 +291,26 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> (Self, Task, String) {
+        Self::with_limits(Limits::default())
+    }
+    fn low_limits() -> (Self, Task, String) {
+        Self::with_limits(Limits {
+            requests: 10,
+            steps: 20,
+        })
+    }
+    fn with_limits(limits: Limits) -> (Self, Task, String) {
         let mut store = ready();
         let session = store.sessions[0].identity.clone();
-        let task = create_task(&mut store);
+        let record = Record::Create {
+            id: hex::encode(random::<24>().unwrap()),
+            session: session.clone(),
+            checks: vec!["systemctl is-active example.service".into()],
+            limits,
+        };
+        let number = block_on(store.commit(&Event::Poc(record.clone()))).unwrap();
+        store.apply_poc(number, &record).unwrap();
+        let task = store.poc_session_task(&session).unwrap().clone();
         (
             Self {
                 store: Rc::new(RefCell::new(store)),
@@ -861,7 +878,7 @@ fn poc_rebuilt_transcript_unique_calls_and_unavailable_tools_are_bounded() {
 
 #[test]
 fn poc_request_budget_is_spent_before_request_and_raise_preserves_pending() {
-    let (mut f, task, session) = Fixture::new();
+    let (mut f, task, session) = Fixture::low_limits();
     let mut model = Script {
         hold: true,
         ..Default::default()
@@ -932,7 +949,7 @@ fn poc_request_budget_is_spent_before_request_and_raise_preserves_pending() {
 
 #[test]
 fn poc_step_limit_counts_refusals_and_verification_without_off_by_one() {
-    let (mut f, task, session) = Fixture::new();
+    let (mut f, task, session) = Fixture::low_limits();
     let unavailable = Tool::Job {
         machine: "fixture".into(),
         job: crate::goals::Job::FetchArtifact,
@@ -1649,8 +1666,8 @@ fn poc_raise_request_cannot_invalidate_an_active_model_execute_or_collection() {
         }
         let control = f.clone();
         let limits = Limits {
-            requests: 12,
-            steps: 25,
+            requests: 112,
+            steps: 225,
         };
         let pending;
         {
@@ -3251,3 +3268,64 @@ fn poc_payment_scheduler_checks_dispatch_time_state() {
 
 #[path = "disposition_tests.rs"]
 mod disposition_tests;
+
+#[test]
+fn poc_new_start_records_higher_defaults_and_retains_brake() {
+    let mut store = ready_without_requirements();
+    let session = store.sessions[0].identity.clone();
+    let task = block_on(store.poc_start(&session, vec!["true".into()])).unwrap();
+    assert_eq!(
+        task.limits,
+        Limits {
+            requests: 100,
+            steps: 200
+        }
+    );
+    assert_eq!(
+        reopen(&store).poc_task(&task.id).unwrap().limits,
+        task.limits
+    );
+}
+
+#[test]
+fn poc_requirements_approval_releases_only_its_declaration_pause_and_replays() {
+    let mut store = ready_without_requirements();
+    let session = store.sessions[0].identity.clone();
+    let task = block_on(store.poc_page_start(&session, vec!["true".into()])).unwrap();
+    let other_session = block_on(store.admit_fixture("fixture-other")).unwrap();
+    store.synthetic_confirm_limits(100).unwrap();
+    block_on(store.enter_goal(&other_session, "check another machine".into(), None)).unwrap();
+    let other = block_on(store.poc_start(&other_session, vec!["true".into()])).unwrap();
+    let other = change(&mut store, &other, Change::Pause("operator pause".into()));
+    let proposed = proposal(&mut store, &task);
+    let why = store
+        .poc_prepare_execution(&proposed, &session)
+        .unwrap_err();
+    let paused = change(&mut store, &proposed, Change::Pause(why));
+    let candidate = store.pending_requirements_view(&session)["candidate"]
+        .as_u64()
+        .unwrap();
+    assert!(block_on(store.approve_requirements(&session, "fixture", candidate + 1)).is_err());
+    assert_eq!(store.poc_task(&task.id).unwrap(), paused);
+    store
+        .reject_requirements(&session, "fixture", candidate)
+        .unwrap();
+    assert_eq!(store.poc_task(&task.id).unwrap(), paused);
+    let _ = store.poc_prepare_execution(&paused, &session);
+    let candidate = store.pending_requirements_view(&session)["candidate"]
+        .as_u64()
+        .unwrap();
+    block_on(store.approve_requirements(&session, "fixture", candidate)).unwrap();
+    let active = store.poc_task(&task.id).unwrap();
+    assert_eq!(active.status, Status::Running);
+    assert!(active.revision > paused.revision);
+    assert_eq!(
+        store.poc_task(&other.id).unwrap(),
+        other,
+        "another task stays paused"
+    );
+    let replay = reopen(&store);
+    assert_eq!(replay.poc_task(&task.id).unwrap(), active);
+    assert_eq!(replay.poc_task(&other.id).unwrap(), other);
+    assert!(store.dispatch.calls.is_empty());
+}

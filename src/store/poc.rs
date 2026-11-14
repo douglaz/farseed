@@ -13,8 +13,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            requests: 10,
-            steps: 20,
+            requests: 100,
+            steps: 200,
         }
     }
 }
@@ -161,6 +161,75 @@ pub(crate) enum Record {
 }
 
 impl<S: Storage> Store<S> {
+    #[cfg(all(target_arch = "wasm32", feature = "tracer"))]
+    pub(crate) async fn test_approval_neighbor(&mut self) -> Result<String, String> {
+        let mut paused = None;
+        for machine in ["machine-b", "machine-c"] {
+            let mut entry = self
+                .dispatch
+                .approved_entries
+                .get("machine-a")
+                .ok_or("fixture entry")?
+                .clone();
+            entry.approved.entry.machine = machine.into();
+            entry.approved.identity = self
+                .allocation()
+                .issue(Family::Machines)
+                .map_err(|e| e.to_string())?;
+            self.record(allocation::Event::Reserve(entry.approved.identity.clone()))
+                .await?;
+            // Independent fixture sessions retain ordinary journaled task transitions.
+            self.dispatch.approved_entries.insert(machine.into(), entry);
+            let session = self.admit_fixture(machine).await?;
+            self.enter_goal(&session, "retain an independent task".into(), None)
+                .await?;
+            let task = if machine == "machine-c" {
+                // Run the eligible sentinel before the approved task in a broad wake.
+                let record = Record::Start {
+                    id: "0".repeat(48),
+                    session: session.clone(),
+                    checks: vec!["true".into()],
+                    limits: Limits::default(),
+                };
+                self.project_poc(self.next, &record)?;
+                let number = self.commit(&Event::Poc(record.clone())).await?;
+                self.apply_poc(number, &record)?;
+                self.poc_task(&"0".repeat(48))?
+            } else {
+                self.poc_start(&session, vec!["true".into()]).await?
+            };
+            if machine == "machine-b" {
+                self.poc_change(
+                    &task.id,
+                    task.revision,
+                    Change::Pause("independent fixture pause".into()),
+                )
+                .await?;
+                paused = Some(task.id);
+            }
+        }
+        Ok(paused.expect("paused neighbour created"))
+    }
+    pub(super) fn apply_requirements_task(
+        &mut self,
+        number: u64,
+        record: &crate::dispatch::SetupRecord,
+    ) {
+        if let crate::dispatch::SetupRecord::Requirements(approval) = record {
+            for task in self.poc.values_mut() {
+                if task.start_session == approval.session && task.machine == approval.proposal.machine()
+                    && task.status == Status::Paused
+                    && task.pause_reason.as_deref().is_some_and(|why| {
+                        why == "propose and explicitly approve the installation declaration to continue"
+                            || why == "installation facts: approved declaration missing; review the proposed requirements and approve explicitly to continue"
+                            || why == crate::poc::wait::APPROVAL_PENDING
+                    }) {
+                    task.active();
+                    task.revision = number;
+                }
+            }
+        }
+    }
     pub(crate) fn poc_inference_facts(&self, machine: &str, goal: &str) -> Option<Value> {
         let task = self.poc.values().find(|t| {
             t.machine == machine
@@ -428,7 +497,7 @@ impl<S: Storage> Store<S> {
             .dispatch
             .approved_entries
             .get(&task.machine)
-            .is_some_and(|m| m.declaration.is_none())
+            .is_some_and(|machine| machine.declaration.is_none())
         {
             self.propose_requirements(
                 session,
@@ -439,7 +508,7 @@ impl<S: Storage> Store<S> {
                 },
                 tool,
             )?;
-            return Err("installation facts: approved declaration missing; review the proposed requirements, approve explicitly, then Resume".into());
+            return Err("installation facts: approved declaration missing; review the proposed requirements and approve explicitly to continue".into());
         }
         self.poc_tool(&task.id, session, tool)
     }
@@ -490,7 +559,7 @@ impl<S: Storage> Store<S> {
         self.poc_create_inner(session, checks, true).await
     }
     /// The page lets the operator edit and approve intended requirements before any
-    /// request. Resume then chooses the first command against that declaration.
+    /// request. Approval then continues this task against that declaration.
     pub async fn poc_page_start(
         &mut self,
         session: &str,
@@ -507,7 +576,7 @@ impl<S: Storage> Store<S> {
                 &task.id,
                 task.revision,
                 Change::Pause(
-                    "propose and explicitly approve the installation declaration, then Resume"
+                    "propose and explicitly approve the installation declaration to continue"
                         .into(),
                 ),
             )
@@ -559,6 +628,8 @@ impl<S: Storage> Store<S> {
         self.poc_record_safe(&record)?;
         self.poc_adoption_safe(Some(&task), None)?;
         let number = self.commit(&Event::Poc(record.clone())).await?;
+        #[cfg(all(target_arch = "wasm32", feature = "tracer"))]
+        crate::testonly::session_point("poc_start_committed").await;
         self.apply_poc(number, &record)?;
         Ok(task)
     }

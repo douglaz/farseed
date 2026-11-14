@@ -719,7 +719,8 @@ impl<S: Storage> Store<S> {
         if matches!(record, crate::dispatch::SetupRecord::Approval(_)) {
             dispatch.setup_approval = Some(self.next);
         }
-        self.commit(&Event::Setup(record)).await?;
+        let number = self.commit(&Event::Setup(record.clone())).await?;
+        self.apply_requirements_task(number, &record);
         self.dispatch = dispatch;
         self.allocation = Some(allocation);
         Ok(())
@@ -1702,6 +1703,7 @@ impl<S: Storage> Store<S> {
                     self.connection_refusals.push(refusal.clone());
                 }
                 (_, Event::Setup(record)) => {
+                    self.apply_requirements_task(number, record);
                     self.dispatch
                         .apply_setup(self.allocation.as_mut().expect("seed first"), record)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;

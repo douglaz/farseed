@@ -204,6 +204,18 @@ async fn publication(generation: u64, session: String, report: String, post: boo
         } else {
             provider_configuration
         };
+        if value["procurement"]["payment"]["is_paid"] == true
+            && value["procurement"]["target"].is_null()
+        {
+            let readiness =
+                crate::poc::provisioning::browser::readiness_report(&value["procurement"]);
+            value["readiness"] = local
+                .store()
+                .and_then(|store| store.protect_output(&readiness).ok())
+                .unwrap_or_else(
+                    || json!({"kind":"refused","inactive":"diagnostic protection is unavailable"}),
+                );
+        }
         let encoded = value.to_string();
         let message = if post {
             let mut message = value.clone();

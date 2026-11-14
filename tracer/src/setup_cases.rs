@@ -10,6 +10,20 @@ pub(super) async fn click(run: &Run<'_>, tab: &Tab, selector: &str) -> Result<()
         .await?;
     Ok(())
 }
+/// Prepare an unstarted fixture session for admission checks; page cases exercise Start.
+pub(super) async fn bind_fixture(
+    run: &Run<'_>,
+    worker: &Worker,
+    machine: &str,
+) -> Result<(), String> {
+    let request = json!({"machine":machine,"inference_approval":{"approved":true,"configuration":{"endpoint":"https://fixture.invalid/completions","model":"fixture"}}});
+    let report = run.browser.evaluate(&worker.session, &format!("(async()=>{{const m=await import(new URL('./pkg/tau_web.js',self.location.href).href);const report=await m.bind(JSON.stringify({request}));await m.publish_report(m.publication_generation(),'',report);return JSON.parse(report);}})()")).await?;
+    if report.get("error").is_some() {
+        return Err("fixture admission refused".into());
+    }
+    Ok(())
+}
+
 pub(super) async fn approve(
     site: &'static str,
     run: &Run<'_>,

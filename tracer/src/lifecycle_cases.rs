@@ -456,7 +456,7 @@ pub(super) async fn run(
     ]
     .into();
     module(run,worker,"self.hiddenGoalReady=new Promise(ready=>m.test_hold_session_point('goal_turn',new Promise(release=>self.releaseHiddenGoal=release),ready));return true;").await?;
-    setup_cases::click(run, tab, &format!("[data-goal-accept='{session}']")).await?;
+    setup_cases::click(run, tab, &format!("[data-start-accepted-goal='{session}']")).await?;
     module(run, worker, "await self.hiddenGoalReady;return true;").await?;
     let from = run.aggregator.requests.lock().unwrap().len();
     let other = run

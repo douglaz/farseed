@@ -47,7 +47,7 @@ async fn prepare(
         .reload("delivery_cases.rs::reload#1", tab, worker)
         .await?;
     run.submit(tab, "unlock", PASSPHRASE).await?;
-    setup_cases::click(run, tab, "[data-bind=fixture]").await?;
+    setup_cases::bind_fixture(run, worker, "fixture").await?;
     for poll in 0..300 {
         observer.attempt(poll + 1);
         let state = observer.inspect(run, worker).await?;

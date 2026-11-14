@@ -52,7 +52,7 @@ async function interruptionDetails(c, selector) {
 }
 
 async function retainDetails(c, selector) {
- const read = () => c.evaluate(`Array.from(document.querySelectorAll(${JSON.stringify(selector)}), n=>({content:n.querySelector('[data-raw-json]').textContent,open:n.open}))`);
+ const read = () => c.evaluate(`Array.from(document.querySelectorAll(${JSON.stringify(selector)}), n=>({content:n.querySelector('[data-raw-json]')?.textContent??n.textContent,open:n.open}))`);
  const initial = await read();
  assert.ok(initial.length, `actual Details offered: ${selector}`);
  await toggleWithoutAction(c,selector,true);
@@ -216,14 +216,14 @@ export async function layoutObserver(c, state) {
   c.check(await c.evaluate("document.querySelector('#tau-step-credit-error').textContent===fixtureReports.at(-1).store_error && !document.querySelector('#tau-store-state').textContent.includes(fixtureReports.at(-1).store_error)"),'configuration failure appears at Inference credit');
  }
  if(state==='before-start') {
+  await c.invoke(()=>{const goal=document.querySelector('#tau-poc-targets [data-start-goal]');goal.value='Draft goal';goal.dispatchEvent(new Event('input'));const source=document.querySelector('[data-document-source]');source.value='https://example.invalid/goal';source.dispatchEvent(new Event('input'));});
+  const n=await c.evaluate('fixtureReports.length');await c.message({lifecycle:'hidden'});await c.message({lifecycle:'visible'});await c.wait(`fixtureReports.length>${n}`);
+  c.check(await c.evaluate("document.querySelector('#tau-poc-targets [data-start-goal]').value==='Draft goal' && document.querySelector('[data-document-source]').value==='https://example.invalid/goal'"),'Start goal and optional source drafts survive ordinary reports');
+  await c.invoke(()=>{const source=document.querySelector('[data-document-source]');source.value='';source.dispatchEvent(new Event('input'));});
   assert.equal(await c.evaluate("document.querySelector('#tau-step-task-fold').open"),true,'new current step opens');
  }
  if(state==='session') {
-  await c.invoke(()=>{document.querySelector('[data-goal-text]').value='Draft goal';document.querySelector('[data-document-source]').value='https://example.invalid/goal';});
-  const n=await c.evaluate('fixtureReports.length');await c.message({lifecycle:'hidden'});await c.message({lifecycle:'visible'});await c.wait(`fixtureReports.length>${n}`);
-  c.check(await c.evaluate("document.querySelector('[data-goal-text]').value==='Draft goal' && document.querySelector('[data-document-source]').value==='https://example.invalid/goal'"),'goal and document drafts survive ordinary reports');
-  c.check(await c.evaluate("document.querySelector('[data-goal-enter]')?.tagName==='BUTTON' && document.querySelector('[data-goal-text]')?.tagName==='TEXTAREA' && document.querySelector('[data-document-source]')?.tagName==='INPUT'"),'goal controls retain their roles');
-  c.check(await c.evaluate("document.querySelector('[data-goal-enter]').classList.contains('main-action')"),'Set goal is emphasized before End');
+  c.check(await c.evaluate("fixtureReports.at(-1).tasks.length===1 && !document.querySelector('[data-goal-accept]')"),'one Start saves a task without a separate no-brief button');
  }
  if(state==='requirements') {
   const draft=await c.evaluate("document.querySelector('[data-poc-declaration]').value+'  '");
@@ -239,7 +239,7 @@ export async function layoutObserver(c, state) {
   await toggleWithoutAction(c,'[data-step] > details[id^="tau-step-"]',false);
   c.check(await c.evaluate("[...document.querySelectorAll('[data-end-session]')].length>0"),'running session offers End outside all closed folds');
   c.check(await c.evaluate("[...document.querySelectorAll('[data-task] button')].some(n=>n.textContent==='Resume'&&n.classList.contains('main-action'))"),'Resume is emphasized before End');
-  c.check(await c.evaluate("document.querySelector('[aria-label=\"Task request limit\"]')?.max==='1000' && document.querySelector('[aria-label=\"Task step limit\"]')?.max==='2000' && [...document.querySelectorAll('[data-task] button')].some(n=>n.textContent==='Raise limits')"),'task budget controls retain their roles and bounds');
+  c.check(await c.evaluate("document.querySelector('[aria-label=\"Task request limit\"]')?.closest('details') && document.querySelector('[aria-label=\"Task request limit\"]')?.max==='1000' && document.querySelector('[aria-label=\"Task step limit\"]')?.max==='2000' && [...document.querySelectorAll('[data-task] button')].some(n=>n.textContent==='Raise limits')"),'task budget controls retain their roles and bounds');
   const limits=await c.evaluate('JSON.stringify(fixtureReports.at(-1).tasks[0].limits)');
   const drafts=await c.invoke(()=>['Task request limit','Task step limit'].map(label=>{const input=document.querySelector(`[aria-label="${label}"]`);input.value=String(Number(input.min)+1);return input.value;}));
   const n=await c.evaluate('fixtureReports.length');await c.message({lifecycle:'hidden'});await c.message({lifecycle:'visible'});await c.wait(`fixtureReports.length>${n}`);
@@ -339,6 +339,7 @@ export async function fixtureLayout(c) {
  }
  await c.wait("document.querySelector('[data-bind=fixture]')");
  await phoneSnapshot(c,'fixture-before-start');
+ await c.invoke(()=>{document.querySelector('[data-start-goal="fixture"]').value='Inspect the fixture';document.querySelector('[data-start-checks="fixture"]').value='true';});
  await c.click('[data-bind=fixture]');await c.wait('fixtureReports.at(-1)?.sessions?.length===1');
  const session=await c.evaluate('fixtureReports.at(-1).sessions[0].identity');
  assert.equal(await c.workerEvaluate(`(async()=>{const m=await import(new URL('./pkg/tau_web.js',location.href));return m.test_inference_account(new TextEncoder().encode('synthetic-limit-entry'));})()`),true,'existing local limit fixture initialized');

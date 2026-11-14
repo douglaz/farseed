@@ -31,7 +31,9 @@ if(scenario==='protocol-controls'){
 }
 const closeScenarios=['close-no-invoice','close-invoice','close-intent','close-soft-deleted','close-404-bodies','close-refresh-paid'];
 const closeCase=closeScenarios.includes(scenario);
-const scenarios=[...closeScenarios,'account-generated','account-lock','account-no-defaults','account-entered','relay-deployment','origin-entry','custom-origin-entry','origin-stale-review','origin-validation','fixed','payment-poll','pending-custody','custom','lost-create','empty-create','incomplete-create','multiple-create','lost-invoice','empty-invoice','expired-invoice','publication','pre-send-reload','associated-reload','registration','failed-write','credentials','transport','refusals','mismatched-host','multiple-invoice','incomplete-invoice','conflicting-invoice','conflicting-create','popularity','popularity-lost','mismatched-image','fixed-terms','fixed-terms-reload','fixed-config','custom-terms','custom-terms-reload','custom-config','counter-identical','counter-fresh','lifecycle','fixed-unavailable','custom-unavailable','later-image','fixed-config-reload','custom-config-reload','custom-resource','fixed-cpu-direct','custom-cpu-direct','fixed-cpu-lost','custom-cpu-lost','fixed-cpu-later','custom-cpu-later','clock-ahead','custom-clock-behind','clock-lost-behind','custom-clock-lost-ahead','clock-old-evidence','custom-clock-future-evidence','fixed-eur','custom-usd','existing-paid','existing-unpaid','unknown-quote','quote-change','quote-unavailable','lost-invoice-quote-reload','signature-encodings','approval-authority','custom-caps-mismatched','custom-caps-missing','custom-caps-lost-mismatched','custom-caps-lost-missing','custom-caps-later','custom-caps-matching','custom-caps-network','custom-caps-uncapped','missing-limits','fixed-caps-mismatched','fixed-caps-missing','custom-deadline-headers','custom-deadline-body','custom-deadline-inside','custom-deadline-clock','fixed-transfer-direct','fixed-transfer-lost','fixed-transfer-later','custom-transfer-direct','custom-transfer-lost','custom-transfer-later'];
+const readinessScenarios=['readiness-wait','readiness-reload','readiness-reordered'];
+const readinessCase=readinessScenarios.includes(scenario);
+const scenarios=[...readinessScenarios,...closeScenarios,'account-generated','account-lock','account-no-defaults','account-entered','relay-deployment','origin-entry','custom-origin-entry','origin-stale-review','origin-validation','fixed','payment-poll','pending-custody','custom','lost-create','empty-create','incomplete-create','multiple-create','lost-invoice','empty-invoice','expired-invoice','publication','pre-send-reload','associated-reload','registration','failed-write','credentials','transport','refusals','mismatched-host','multiple-invoice','incomplete-invoice','conflicting-invoice','conflicting-create','popularity','popularity-lost','mismatched-image','fixed-terms','fixed-terms-reload','fixed-config','custom-terms','custom-terms-reload','custom-config','counter-identical','counter-fresh','lifecycle','fixed-unavailable','custom-unavailable','later-image','fixed-config-reload','custom-config-reload','custom-resource','fixed-cpu-direct','custom-cpu-direct','fixed-cpu-lost','custom-cpu-lost','fixed-cpu-later','custom-cpu-later','clock-ahead','custom-clock-behind','clock-lost-behind','custom-clock-lost-ahead','clock-old-evidence','custom-clock-future-evidence','fixed-eur','custom-usd','existing-paid','existing-unpaid','unknown-quote','quote-change','quote-unavailable','lost-invoice-quote-reload','signature-encodings','approval-authority','custom-caps-mismatched','custom-caps-missing','custom-caps-lost-mismatched','custom-caps-lost-missing','custom-caps-later','custom-caps-matching','custom-caps-network','custom-caps-uncapped','missing-limits','fixed-caps-mismatched','fixed-caps-missing','custom-deadline-headers','custom-deadline-body','custom-deadline-inside','custom-deadline-clock','fixed-transfer-direct','fixed-transfer-lost','fixed-transfer-later','custom-transfer-direct','custom-transfer-lost','custom-transfer-later'];
 if(scenario==='list'){console.log(JSON.stringify(scenarios));process.exit(0);}
 if(!scenarios.includes(scenario))throw Error('unknown provisioning case');
 const deadlineCase=scenario.startsWith('custom-deadline-');
@@ -51,7 +53,8 @@ let cpuVariant=scenario==='custom-cpu-direct'?'arch-missing':'arch';
 const cpuVariants=['arch','arch-missing','mfg','mfg-missing','features','features-missing'];
 const providerOffsetSeconds=scenario.includes('clock')?(scenario.endsWith('ahead')?2:scenario.endsWith('behind')?-2:0):0;
 const creationOffsetSeconds=scenario.endsWith('old-evidence')?-90:scenario.endsWith('future-evidence')?180:0;
-const providerNow=()=>Date.now()+providerOffsetSeconds*1000;
+let readinessClock=null,readinessState=null,reverseKeys=false;const readinessNonces=new Set();let readinessAuthorizations=0;
+const providerNow=()=>(readinessClock??Date.now())+providerOffsetSeconds*1000;
 const planCurrency=scenario.endsWith('-eur')?'EUR':scenario.endsWith('-usd')?'USD':'BTC';
 const periodSeconds=scenario==='calendar-period'||planCurrency!=='BTC'?2678400:2592000;
 const existingHistory=scenario==='existing-paid'||scenario==='existing-unpaid';
@@ -80,7 +83,7 @@ if(scenario==='missing-limits'){delete fixed.limits;delete custom.limits;}
 const resources={pricing_id:2,cpu:2,memory:2147483648,disk:21474836480,disk_type:'ssd',disk_interface:'scsi',ip4_count:1,ip6_count:0,transfer_gb:500,network_mbps:500};
 if(transferCase&&scenario.startsWith('custom-')){delete custom.transfer;delete resources.transfer_gb;}
 let purged=false,missingMode='decoded',missingPayment=true;
-let machines=[],payments=[],hostKey,hostPin,fixtureInfo,publication=scenario!=='publication',paid=scenario==='existing-paid',changePrice=false,changeConfig=false,popularityDrift=false,heldProviderResponse=null,failCatalogue=false,raiseMinimum=false,selectedResources=resources,echo=null,echoSignatureMode=null,heldSignatureEcho=null,quoteVersion=0,quoteResponseMode=unknownQuote?'missing':null,unavailableQuote=false,cpuBad=Boolean(cpuCase&&cpuPhase!=='later'),transport=null,modelCalls=0;
+let machines=[],payments=[],hostKey,hostPin,fixtureInfo,publication=scenario!=='publication'&&!readinessCase,paid=scenario==='existing-paid',changePrice=false,changeConfig=false,popularityDrift=false,heldProviderResponse=null,failCatalogue=false,raiseMinimum=false,selectedResources=resources,echo=null,echoSignatureMode=null,heldSignatureEcho=null,quoteVersion=0,quoteResponseMode=unknownQuote?'missing':null,unavailableQuote=false,cpuBad=Boolean(cpuCase&&cpuPhase!=='later'),transport=null,modelCalls=0;
 const iso=()=>new Date(providerNow()).toISOString();
 const count=route=>counts[route]??0;
 const effect=route=>effects[route]=(effects[route]??0)+1;
@@ -105,7 +108,7 @@ const returnedTemplate=template=>{
   else returned[field]=field==='cpu_arch'?'arm64':field==='cpu_mfg'?'intel':['SSE2'];
   return returned;
 };
-const responseVm=vm=>({...vm,template:returnedTemplate(vm.template),image:{...vm.image,popularity:popularityDrift?0.1001:vm.image.popularity},host_ssh_keys:publication?publishedHostKeys():[]});
+const responseVm=vm=>({...vm,status:readinessState?{...vm.status,state:readinessState}:vm.status,template:returnedTemplate(vm.template),image:{...vm.image,popularity:popularityDrift?0.1001:vm.image.popularity},host_ssh_keys:publication?(reverseKeys?publishedHostKeys().reverse():publishedHostKeys()):[]});
 const renewalQuote=()=>({amount:quoteVersion?1000000*(quoteVersion+1):changePrice&&planCurrency==='BTC'?2000000:1000000,tax:230000,processing_fee:10000,currency:'BTC',time:periodSeconds});
 const nanoseconds=ms=>new Date(ms).toISOString().replace(/\.\d{3}Z$/,'.999999999Z');
 const databasePayment=p=>({...p,created:p.created.replace(/\.\d+Z$/,'Z'),expires:p.expires.replace(/\.\d+Z$/,'Z')});
@@ -120,7 +123,7 @@ const publishedHostKeys=()=>[
   syntheticHostKey('ssh-rsa',[Buffer.from([1,0,1]),Buffer.concat([Buffer.from([0]),Buffer.alloc(256,0xb1)])]),
 ];
 const watchdog=setTimeout(()=>{if(browser?.exitCode===null)browser.kill('SIGKILL');},240000);
-try {
+qualification: try {
   const cert=join(temp,'cert.pem'),key=join(temp,'key.pem');
   check(spawnSync('openssl',['req','-x509','-newkey','rsa:2048','-nodes','-keyout',key,'-out',cert,'-days','1','-subj','/CN=127.0.0.1','-addext','subjectAltName=IP:127.0.0.1'],{stdio:'ignore'}).status===0,'isolated certificate creation');
   const tls={key:await readFile(key),cert:await readFile(cert)};
@@ -156,6 +159,7 @@ try {
       }
       const publicKey=JSON.parse(Buffer.from(req.headers.authorization.slice(6),'base64')).pubkey;
       const event=verifyRequest(req.headers.authorization,requestOrigin+req.url,req.method,body,account??publicKey,used,providerNow()/1000);
+      if(readinessCase){readinessAuthorizations++;const nonce=event.tags.find(tag=>tag[0]==='nonce')[1];assert.ok(!readinessNonces.has(nonce),'fresh nonce for every authenticated readiness request');readinessNonces.add(nonce);}
       account??=event.pubkey;
       const accept=()=>acceptRequest(used,event,req.headers.authorization,requestOrigin+req.url,req.method,body);
       authForms.add(req.headers.authorization);authForms.add(event.sig);authForms.add(JSON.stringify(event));for(const form of signatureForms(event.sig))authForms.add(form);
@@ -220,7 +224,24 @@ try {
   const providerOrigin=`https://127.0.0.1:${provider.address().port}`;
   let alternateOrigin=null;
   if(originCase){alternateProvider=createServer(tls,providerHandler);alternateProvider.listen(0,'127.0.0.1');await once(alternateProvider,'listening');alternateOrigin=`https://127.0.0.1:${alternateProvider.address().port}`;}
-  const injection=`\nimport * as fixtureApi from './pkg/tau_web.js';\nconst fixtureSink=(kind,values)=>postMessage({fixture_sink:{kind,values:values.map(value=>{let json;try{json=JSON.stringify(value);}catch{}return {text:String(value),json};})}});for(const kind of ['log','info','warn','error','debug']){const originalConsole=console[kind].bind(console);console[kind]=(...values)=>{fixtureSink(kind,values);originalConsole(...values);};}self.addEventListener('error',event=>fixtureSink('error',[event.message]));self.addEventListener('unhandledrejection',event=>fixtureSink('rejection',[event.reason]));\n\nconst fixtureSend=self.postMessage.bind(self);self.postMessage=(value,...transfer)=>{if(value?.runtime_retired===true)fixtureSend({fixture_provider_custody:fixtureApi.provider_key_is_set(),fixture_provider_custody_point:'ending_worker'});return fixtureSend(value,...transfer);};const fixtureHolds=new Map();const transportFetch=self.fetch.bind(self);let dispatchControl=null,rollbackClock=false;const fixtureDateNow=Date.now.bind(Date);const observedFetch=(input,init)=>{const request=input instanceof Request?input:new Request(input,init);const url=new URL(request.url);if(url.hostname!=='127.0.0.1')throw Error('non-loopback fixture request refused');postMessage({fixture_dispatch:{method:request.method,path:url.pathname+url.search,origin:url.origin}});return transportFetch(input,init).then(response=>{if(rollbackClock&&url.pathname==='/api/v1/vm'&&request.method==='GET'){rollbackClock=false;Date.now=()=>fixtureDateNow()-10000;postMessage({fixture_clock_rollback:true});}return response;});};self.fetch=async(input,init)=>{const request=input instanceof Request?input:new Request(input,init);if(dispatchControl&&request.url.includes('/renew?')){const repeat=request.clone(),control=dispatchControl;dispatchControl=null;const response=await observedFetch(input,init);if(control.authorization)repeat.headers.set('Authorization',control.authorization);await observedFetch(repeat);return response;}return observedFetch(input,init);};const original=onmessage;onmessage=async e=>{const f=e.data?.request?.fixture;if(!f){await original(e);if(e.data?.request?.task||e.data?.request?.goal_accept)postMessage({fixture_task_complete:true});if(e.data?.request?.lifecycle)postMessage({fixture_lifecycle:e.data.request.lifecycle});return;}if(f.rollbackClock)rollbackClock=true;if(f.restoreClock)Date.now=fixtureDateNow;if(f.providerCustody)postMessage({fixture_provider_custody:fixtureApi.provider_key_is_set(),fixture_provider_custody_point:f.providerCustody});if(f.dispatchControl)dispatchControl=f.dispatchControl;if(f.hold){let release;const p=new Promise(r=>release=r);fixtureHolds.set(f.hold,release);fixtureApi.test_hold_session_point(f.hold,p,()=>postMessage({fixture_point:f.hold}));}if(f.release)fixtureHolds.get(f.release)?.();if(f.fail)await fixtureApi.test_seed_backup_fail_append();if(f.command)postMessage({fixture_command:JSON.parse(await fixtureApi.run_command(JSON.stringify({machine:'machine-a',command:'true'})))});if(f.scanRestore)postMessage({fixture_scan_restored:await fixtureApi.test_scan_reload(false)});if(f.scanUnavailable){await fixtureApi.test_scan_fixture('approval fixture',new Uint8Array(new TextEncoder().encode('required-secret-1234')));await fixtureApi.test_scan_reload(true);postMessage({fixture_scan_unavailable:true});}if(f.journalNeedles){let contains=false,available=true;for(const needle of f.journalNeedles){const result=JSON.parse(await fixtureApi.test_poc_journal(needle));available &&=typeof result.contains==='boolean'&&Number.isSafeInteger(result.records)&&result.records>0;contains ||=result.contains===true;}postMessage({fixture_journal_batch:{contains,available,checked:f.journalNeedles.length}});}if(f.journal){const result=JSON.parse(await fixtureApi.test_poc_journal(f.journal));postMessage({fixture_journal:result});}if(f.probe)postMessage({fixture_probe:JSON.parse(await fixtureApi.test_poc_protect_output(JSON.stringify(f.probe)))});postMessage({fixture_ack:true});};\n`;
+  const injection=`\nimport * as fixtureApi from './pkg/tau_web.js';\nconst fixtureSink=(kind,values)=>postMessage({fixture_sink:{kind,values:values.map(value=>{let json;try{json=JSON.stringify(value);}catch{}return {text:String(value),json};})}});for(const kind of ['log','info','warn','error','debug']){const originalConsole=console[kind].bind(console);console[kind]=(...values)=>{fixtureSink(kind,values);originalConsole(...values);};}self.addEventListener('error',event=>fixtureSink('error',[event.message]));self.addEventListener('unhandledrejection',event=>fixtureSink('rejection',[event.reason]));\n\nconst fixtureSend=self.postMessage.bind(self);self.postMessage=(value,...transfer)=>{if(value?.runtime_retired===true)fixtureSend({fixture_provider_custody:fixtureApi.provider_key_is_set(),fixture_provider_custody_point:'ending_worker'});return fixtureSend(value,...transfer);};const fixtureHolds=new Map();const transportFetch=self.fetch.bind(self);let dispatchControl=null,rollbackClock=false;const fixtureDateNow=Date.now.bind(Date);const observedFetch=(input,init)=>{const request=input instanceof Request?input:new Request(input,init);const url=new URL(request.url);if(url.hostname!=='127.0.0.1')throw Error('non-loopback fixture request refused');postMessage({fixture_dispatch:{method:request.method,path:url.pathname+url.search,origin:url.origin}});return transportFetch(input,init).then(response=>{if(rollbackClock&&url.pathname==='/api/v1/vm'&&request.method==='GET'){rollbackClock=false;Date.now=()=>fixtureDateNow()-10000;postMessage({fixture_clock_rollback:true});}return response;});};self.fetch=async(input,init)=>{const request=input instanceof Request?input:new Request(input,init);if(dispatchControl&&request.url.includes('/renew?')){const repeat=request.clone(),control=dispatchControl;dispatchControl=null;const response=await observedFetch(input,init);if(control.authorization)repeat.headers.set('Authorization',control.authorization);await observedFetch(repeat);return response;}return observedFetch(input,init);};const original=onmessage;onmessage=async e=>{const f=e.data?.request?.fixture;if(!f){await original(e);if(e.data?.request?.task||e.data?.request?.goal_accept||e.data?.request?.requirements_answer)postMessage({fixture_task_complete:true});if(e.data?.request?.lifecycle)postMessage({fixture_lifecycle:e.data.request.lifecycle});return;}if(f.rollbackClock)rollbackClock=true;if(f.restoreClock)Date.now=fixtureDateNow;if(f.providerCustody)postMessage({fixture_provider_custody:fixtureApi.provider_key_is_set(),fixture_provider_custody_point:f.providerCustody});if(f.dispatchControl)dispatchControl=f.dispatchControl;if(f.hold){let release;const p=new Promise(r=>release=r);fixtureHolds.set(f.hold,release);fixtureApi.test_hold_session_point(f.hold,p,()=>postMessage({fixture_point:f.hold}));}if(f.release)fixtureHolds.get(f.release)?.();if(f.fail)await fixtureApi.test_seed_backup_fail_append();if(f.command)postMessage({fixture_command:JSON.parse(await fixtureApi.run_command(JSON.stringify({machine:'machine-a',command:'true'})))});if(f.scanRestore)postMessage({fixture_scan_restored:await fixtureApi.test_scan_reload(false)});if(f.scanUnavailable){await fixtureApi.test_scan_fixture('approval fixture',new Uint8Array(new TextEncoder().encode('required-secret-1234')));await fixtureApi.test_scan_reload(true);postMessage({fixture_scan_unavailable:true});}if(f.journalNeedles){let contains=false,available=true;for(const needle of f.journalNeedles){const result=JSON.parse(await fixtureApi.test_poc_journal(needle));available &&=typeof result.contains==='boolean'&&Number.isSafeInteger(result.records)&&result.records>0;contains ||=result.contains===true;}postMessage({fixture_journal_batch:{contains,available,checked:f.journalNeedles.length}});}if(f.journal){const result=JSON.parse(await fixtureApi.test_poc_journal(f.journal));postMessage({fixture_journal:result});}if(f.probe)postMessage({fixture_probe:JSON.parse(await fixtureApi.test_poc_protect_output(JSON.stringify(f.probe)))});postMessage({fixture_ack:true});};\n`;
+  const readinessInjection=`
+if (${readinessCase}) {
+ const fixtureSetTimeout=self.setTimeout.bind(self), fixtureClearTimeout=self.clearTimeout.bind(self);
+ const fixtureRealPerformance=performance.now.bind(performance);let fixtureMonoOffset=0;Object.defineProperty(performance,'now',{value:()=>fixtureRealPerformance()+fixtureMonoOffset});
+ const fixtureReadyTimers=new Map(); let fixtureReadySerial=1000000000;
+ self.setTimeout=(callback,delay,...args)=>{if(callback.toString().includes('readyPurchase()')){const id=++fixtureReadySerial;fixtureReadyTimers.set(id,{callback,delay});return id;}return fixtureSetTimeout(callback,delay,...args);};
+ self.clearTimeout=id=>{if(!fixtureReadyTimers.delete(id))fixtureClearTimeout(id);};
+ ${readinessClock===null?'':`Date.now=()=>${readinessClock};`}
+ const previousReadyMessage=onmessage;
+ onmessage=async event=>{const f=event.data?.request?.fixture;
+  if(f?.clearProvider){fixtureApi.test_provider_clear();await reportStore(await fixtureApi.open());postMessage({fixture_provider_cleared:true});return;}
+  if(f?.readinessClock!==undefined){const now=f.readinessClock;fixtureMonoOffset+=Math.max(0,now-Date.now());Date.now=()=>now;postMessage({fixture_ready_clock:now});return;}
+  if(f?.readinessTick){if(fixtureReadyTimers.size!==1)throw Error('expected exactly one readiness timer');const [id,timer]=fixtureReadyTimers.entries().next().value;fixtureReadyTimers.delete(id);await timer.callback();postMessage({fixture_ready_tick:timer.delay});return;}
+  return previousReadyMessage(event);
+ };
+}
+`;
   page=createServer(tls,async(req,res)=>{
     try{
       if(req.url==='/poc-defaults.json') {
@@ -233,7 +254,7 @@ try {
       if(!/^(index.html|boot.js|worker.js|pkg\/[a-zA-Z0-9_.-]+)$/.test(file)){res.writeHead(404).end();return;}
       let data=await readFile(join('dist/tracer',file));
       if(file==='index.html')check(data.toString().includes(requiredCsp),'served CSP unchanged');
-      if(file==='worker.js'){res.setHeader('Content-Security-Policy',requiredCsp.match(/content="([^"]+)"/)[1]);data=data.toString()+injection;}
+      if(file==='worker.js'){res.setHeader('Content-Security-Policy',requiredCsp.match(/content="([^"]+)"/)[1]);data=data.toString()+injection+readinessInjection+(readinessClock===null?'':`\nDate.now=()=>${readinessClock};\n`);}
       res.setHeader('Set-Cookie','fixture_cookie=must_be_omitted; Secure; SameSite=None');
       res.setHeader('Content-Type',file.endsWith('.wasm')?'application/wasm':file.endsWith('.html')?'text/html':'text/javascript');res.end(data);
     }catch{res.writeHead(500).end('fixture file refused');}
@@ -631,6 +652,7 @@ try {
           assert.deepEqual(current.procurement,before);
           const after=await journalMetadata();check(after.records-metadata.records===3&&after.providerProtection-metadata.providerProtection===3,'refused close writes only three dispatched protections');
         }else if(scenario==='close-refresh-paid'){
+          await message({lifecycle:'hidden'});await wait("events.some(e=>e.fixture_lifecycle==='hidden')");
           missingPayment=false;paid=true;
           const before=await journalMetadata();
           current=await action({action:'resume'});
@@ -753,6 +775,57 @@ try {
           check(current.procurement.payment.currency==='BTC'&&current.procurement.payment.time===periodSeconds,'initial payment matches the provider Lightning quote currency and duration');
           if(planCurrency!=='BTC')check(current.procurement.selection.charge.currency===planCurrency&&current.procurement.billing.terms.currency==='BTC','fiat selected plan uses separately quoted Lightning billing terms');
           check(await evaluate("document.body.textContent.includes('tax 230000')&&document.body.textContent.includes('processing fee 10000')&&document.body.textContent.includes('policy: enabled')"),'invoice tax fee and actual auto-renewal display');
+          if(readinessCase) {
+            const inspect=async()=>{await evaluate('events=events.filter(e=>!e.fixture_journal)');await message({fixture:{journal:'readiness-inspection'}});return wait('events.find(e=>e.fixture_journal)?.fixture_journal');};
+            const clock=async value=>{readinessClock=value;await message({fixture:{readinessClock:value}});await wait(`events.some(e=>e.fixture_ready_clock===${value})`);};
+            const tick=async()=>{const n=await evaluate('events.filter(e=>e.fixture_ready_tick).length');await message({fixture:{readinessTick:true}});await wait(`events.filter(e=>e.fixture_ready_tick).length>${n}`);};
+            await collectDispatches();const mutations=structuredClone(mutationDispatches());
+            const beforePaid=await inspect();
+            const rawBefore=await report();await action({action:'readiness_check'});assert.deepEqual((await inspect()).procurement_counts,beforePaid.procurement_counts,'unpaid action has no procurement records');
+            paid=true;await action({action:'payment_check'});current=await report();
+            const paidAt=current.procurement.paid_at;assert.ok(Number.isSafeInteger(paidAt));
+            await collectDispatches();const paidReads=count('GET /api/v1/payment/aabb');const traffic=dispatches.length;
+            const originCounts=(await inspect()).procurement_counts;
+            await clock((paidAt+2)*1000);
+            if(scenario==='readiness-reordered') {
+              publication=true;await message({fixture:{hold:'procurement_readiness_observed'}});await message({fixture:{readinessTick:true}});await wait("events.some(e=>e.fixture_point==='procurement_readiness_observed')");
+              reverseKeys=true;await reload();await wait('reports.at(-1)?.procurement?.target');
+              const after=await inspect();assert.equal(after.procurement_counts.observation,(originCounts.observation??0)+1,'reordered same-set reading is skipped');assert.equal(after.procurement_counts.handoff,1,'skipped reordered reading reaches accepted Handoff');
+            } else if(scenario==='readiness-reload') {
+              await tick();publication=true;await clock((paidAt+10801)*1000);await collectDispatches();const before=dispatches.length;await reload();
+              await wait("document.querySelector('#tau-step-machine-status').textContent.includes('First contact is stopped')");await action({action:'resume'});assert.equal(dispatches.length,before,'new worker deadline blocks automatic and explicit reads despite valid published pin');assert.ok(!(await report()).procurement.target);
+            } else {
+              readinessState='starting';await tick();check(await evaluate("document.querySelector('#tau-step-machine-status').textContent.includes('provider is starting')"),'actual provider-start wait is named');
+              readinessState='running';await clock((paidAt+62)*1000);await tick();
+              const before=await inspect(), checked=(await report()).readiness.checked_at;
+              for(let n=2;n<5;n++){await clock((paidAt+2+60*n)*1000);await tick();}
+              const after=await inspect();assert.equal(after.procurement_counts.observation,before.procurement_counts.observation,'unchanged automatic readings append zero procurement Observations');assert.equal(after.provider_protection,before.provider_protection+3,'each request retains its own protection record');assert.ok((await report()).readiness.checked_at>checked,'report-only last-check time advances');
+              publication=true;machines[0].ip_assignments=[];await clock((paidAt+302)*1000);await tick();
+              check(await evaluate("document.querySelector('#tau-step-machine-status').textContent.includes('allocated IPv4')&&!document.querySelector('#tau-step-machine-status').textContent.includes('host key has not appeared')"),'valid pin with missing address names the address wait');
+              const beforeRefusal=(await inspect()).procurement_counts.observation;
+              transport='malformed';await clock((paidAt+362)*1000);await tick();
+              check(await evaluate("document.querySelector('#tau-step-machine-status').textContent.includes('Readiness read refused')"),'refused fresh reading names refusal rather than a provider wait');
+              assert.equal((await inspect()).procurement_counts.observation,beforeRefusal,'malformed fresh reading refuses before observation suppression');
+              transport=null;publication=false;machines[0].ip_assignments=[{id:1,ip:'192.0.2.10/24',gateway:'192.0.2.1'}];await clock((paidAt+422)*1000);await tick();
+              await message({lifecycle:'hidden'});await wait("events.some(e=>e.fixture_lifecycle==='hidden')");check(await evaluate("document.querySelector('#tau-step-machine-status').textContent.includes('reads are not running')"),'hidden page names local inactivity');
+              const reads=count('GET /api/v1/vm/11');await clock((paidAt+483)*1000);await message({lifecycle:'visible'});await wait(`reports.at(-1)?.readiness?.checked_at===${(paidAt+483)*1000}`);assert.equal(count('GET /api/v1/vm/11'),reads+1,'one immediate visible return read');
+              await message({fixture:{clearProvider:true}});await wait('events.some(e=>e.fixture_provider_cleared)');
+              check(await evaluate("document.querySelector('#tau-step-machine-status').textContent.includes('provider key is missing')"),'missing provider key names local inactivity');
+              const keylessReads=count('GET /api/v1/vm/11'), keylessRecords=(await inspect()).records;
+              await action({action:'readiness_check'});assert.equal(count('GET /api/v1/vm/11'),keylessReads);assert.equal((await inspect()).records,keylessRecords,'keyless automatic boundary has no setup or protection write');
+              await click('#tau-lock');await wait("document.querySelector('#tau-store')?.dataset.state==='locked'");check(await evaluate("document.querySelector('#tau-step-machine-status').textContent.includes('reads are not running')"),'locked page names local inactivity');
+              await invoke(()=>{document.querySelector('#tau-passphrase').value='provisioning fixture passphrase';document.querySelector('#tau-unlock').click();});await wait(`reports.at(-1)?.readiness?.checked_at===${(paidAt+483)*1000}`);assert.equal(count('GET /api/v1/vm/11'),keylessReads+1,'one immediate Unlock read after restoring the provider key');
+              publication=true;await clock((paidAt+543)*1000);await tick();await wait('reports.at(-1)?.procurement?.target');
+              assert.equal((await inspect()).procurement_counts.handoff,1,'zero presses reach saved Handoff');
+            }
+            assert.equal(count('GET /api/v1/payment/aabb'),paidReads,'post-paid automatic traffic has zero payment rereads');
+            assert.deepEqual(mutationDispatches(),mutations,'automatic readiness has no side-effecting routes');
+            await collectDispatches();assert.ok(dispatches.slice(traffic).every(d=>d.method==='GET'&&d.path==='/api/v1/vm/11'),'automatic traffic is VM readiness only');
+            const finalCounts=(await inspect()).procurement_counts;for(const kind of ['approved','registration_sent','invoice_sent','payment'])assert.equal(finalCounts[kind],originCounts[kind],'readiness cannot append '+kind);
+            assert.deepEqual(errors,[],'all loopback protocol requests were admitted');assert.equal(readinessNonces.size,readinessAuthorizations,'every authorization has a fresh nonce');
+            check(true,'paid readiness, deadline, suppression and protocol boundaries hold');
+            console.log(JSON.stringify({scenario,rawHttp:counts,dispatches,distinctAuthorizations:used.size}));break qualification;
+          }
           if(scenario==='payment-poll'){
             const mutations=structuredClone(mutationDispatches()),reads=count('GET /api/v1/payment/aabb');
             check(await evaluate("document.querySelector('#tau-provider-progress a')?.getAttribute('href')==='lightning:lnbc1fixtureinvoice' && document.querySelector('#tau-provider-progress [data-invoice-expires]').textContent.includes('minutes left')"),'saved machine invoice has its wallet link and countdown');
@@ -768,7 +841,8 @@ try {
             assert.deepEqual(pollContents[0],pollContents[1],'unchanged machine payment polls compare equal despite durable payment appends');
             assert.deepEqual(mutationDispatches(),mutations,'payment polling creates no machine or invoice and never calls renewal');
             paid=true;await wait('reports.at(-1)?.procurement?.payment?.is_paid');current=await report();
-            check(!current.poc_targets?.length,'payment observation waits for explicit readiness Resume');
+            await wait('reports.at(-1)?.procurement?.target');current=await report();
+            const paidReads=count('GET /api/v1/payment/aabb');await message({lifecycle:'hidden'});await message({lifecycle:'visible'});await wait("events.some(e=>e.fixture_lifecycle==='visible')");check(count('GET /api/v1/payment/aabb')===paidReads,'paid automatic readiness never rereads payment');
             assert.deepEqual(mutationDispatches(),mutations,'paid observation has no mutation');
           }
           if(scenario==='expired-invoice') {await sleep(1100);current=await action({action:'resume'});check(current.store_error.includes('expired'),'expired invoice pauses without reissue');}
@@ -809,19 +883,19 @@ try {
             if(originCase){assert.deepEqual(current.procurement.target,savedTarget);assert.deepEqual(current.procurement.identity,identity);check(current.procurement.origin===providerOrigin&&current.procurement.publication.origin===providerOrigin,'replayed Handoff retains authority');originChecks++;}
             await control({keys:current.procurement.public_keys});
             await invoke(url=>{document.querySelector('#tau-poc-endpoint').value=url;document.querySelector('#tau-poc-model').value='fixture-a';document.querySelector('#tau-poc-key').value='fixture~inference~key~482700';document.querySelector('#tau-poc-inference-form').requestSubmit();},providerOrigin+'/inference');await wait('reports.at(-1)?.poc_configuration?.key_set');
-            await invoke(()=>[...document.querySelectorAll('#tau-poc-targets button')].find(b=>b.textContent==='Start session machine-a').click());await wait("document.querySelector('[data-goal-enter]')");
-            await invoke(()=>{document.querySelector('[data-goal-text]').value='Check a small service';document.querySelector('[data-goal-enter]').click();});await wait("document.querySelector('[data-goal-accept]')");
-            await invoke(()=>{document.querySelector('[aria-label="Verification commands, one per line"]').value='true';document.querySelector('[data-goal-accept]').click();});await wait('reports.at(-1)?.tasks?.length===1');await wait("document.querySelector('[data-poc-propose]')");await click('[data-poc-propose]');await wait("document.querySelector('[data-requirements-decision=approve]')");await click('[data-requirements-decision=approve]');await wait("!document.querySelector('[data-requirements-decision=approve]')");
+            await invoke(()=>{document.querySelector('#tau-poc-targets [data-start-goal]').value='Check a small service';document.querySelector('#tau-poc-targets [data-start-checks]').value='true';[...document.querySelectorAll('#tau-poc-targets button')].find(b=>b.textContent==='Start session machine-a').click();});await wait('reports.at(-1)?.tasks?.length===1');await wait("document.querySelector('[data-poc-propose]')");await click('[data-poc-propose]');await wait("document.querySelector('[data-requirements-decision=approve]')");
             if(scenario==='mismatched-host')await control({wrong_host_key:true});
+            if(scenario==='pending-custody')await message({fixture:{hold:'poc_model_return'}});
+            await click('[data-requirements-decision=approve]');await wait("!document.querySelector('[data-requirements-decision=approve]')");
             const resumeTask=async()=>{const count=await evaluate('events.filter(e=>e.fixture_task_complete).length');await invoke(()=>[...document.querySelectorAll('[data-task] button')].find(b=>b.textContent==='Resume').click());await wait(`events.filter(e=>e.fixture_task_complete).length>${count}`);};
             if(scenario==='pending-custody'){
-              const responseRun=await evaluate('events.filter(e=>e.fixture_task_complete).length');await message({fixture:{hold:'poc_model_return'}});await invoke(()=>[...document.querySelectorAll('[data-task] button')].find(b=>b.textContent==='Resume').click());await wait("events.some(e=>e.fixture_point==='poc_model_return')");
+              const responseRun=await evaluate('events.filter(e=>e.fixture_task_complete).length');await wait("events.some(e=>e.fixture_point==='poc_model_return')");
               check((await setKey(secret)).store_error?.includes('command response pending'),'provider credential entry respects pending command response');
               const before=count('GET /api/v1/vm/templates');check((await action({action:'catalogue'})).store_error?.includes('command response pending'),'provider reads respect pending command response');check(count('GET /api/v1/vm/templates')===before,'no auth-filter inventory change while response pending');
               await message({fixture:{release:'poc_model_return'}});
               await wait(`events.filter(e=>e.fixture_task_complete).length>${responseRun}`);
             }
-            if(scenario!=='pending-custody'||(await report()).tasks[0].status!=='complete')await resumeTask();
+            await wait("['complete','paused'].includes(reports.at(-1)?.tasks?.[0]?.status) && reports.at(-1)?.tasks?.[0]?.requests>0");
             if(scenario==='mismatched-host'){
               await wait("reports.at(-1)?.tasks?.[0]?.pause_reason?.includes('host-key')");check((await control({inspect:true})).launches.length===0,'mismatched first host key refuses execution');
             }else{

@@ -509,6 +509,10 @@ enum Action {
     Start {
         machine: String,
         goal: String,
+        #[serde(default)]
+        checks: Vec<String>,
+        #[serde(default)]
+        document_source: Option<String>,
         endpoint: String,
         model: String,
     },
@@ -528,6 +532,7 @@ enum Action {
 }
 #[wasm_bindgen]
 pub async fn credit_request(request: String) -> String {
+    let mut started_session = None;
     let result = async {
         let action: Action =
             serde_json::from_str(&request).map_err(|_| "Invalid credit request.")?;
@@ -540,7 +545,7 @@ pub async fn credit_request(request: String) -> String {
         };
         fence.check()?;
         match action {
-            Action::Start { machine, goal, endpoint, model } => {
+            Action::Start { machine, goal, checks, document_source, endpoint, model } => {
                 let config = Configuration::new(endpoint,model)?;
                 let session = {
                     let local = crate::worker::local(); let mut local = local.lock().await;
@@ -554,10 +559,15 @@ pub async fn credit_request(request: String) -> String {
                     crate::poc::targets::resolve(store,&machine)?;
                     let session = store.admit_with_credit(&machine,&[],crate::binding::InferenceApproval {approved:true,configuration:config},true).await?;
                     fence.check()?;
+                    if document_source.is_some() { return Err("Document source is unavailable for credit Start.".into()); }
                     store.enter_goal(&session,goal,None).await?;
+                    fence.check()?;
+                    store.poc_start(&session,checks).await?;
                     session
                 };
-                mint(&session,false,&fence).await
+                mint(&session,false,&fence).await?;
+                started_session = Some(session);
+                Ok(())
             }
             Action::Invoice { amount } => fund(&fence, amount).await,
             Action::Check | Action::Refresh => check_invoice(&fence, false).await,
@@ -597,6 +607,9 @@ pub async fn credit_request(request: String) -> String {
     let mut report = local.report(None);
     if let Err(why) = result {
         report["credit_error"] = why.into();
+    }
+    if let Some(session) = started_session {
+        report["page_start_session"] = session.into();
     }
     report.to_string()
 }

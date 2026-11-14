@@ -4,6 +4,11 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { join } from 'node:path';
 
+const pageNames = ['page'];
+if (process.argv[2] === 'list') { console.log(JSON.stringify(pageNames)); process.exit(0); }
+const pageOnly = process.argv[2] === 'page';
+if (process.argv[2] && !pageOnly) throw Error('unknown browser case');
+
 // Separate fresh workers exercise the public release boundary and the real registration lock.
 async function releaseCases(api, init, name) {
   const checks = [], events = [];
@@ -608,6 +613,16 @@ async function cases(api, init) {
 }
 
 // Drive the actual packaged page/worker, including its publication and lifecycle path.
+async function pageFixture(api, init) {
+  await init(); await api.open();
+  const created = JSON.parse(await api.create(new TextEncoder().encode('fixture passphrase for browser checks')));
+  if (created.state !== 'unlocked') throw Error('page fixture store creation refused');
+  await api.seed_backup_answer(); await api.seed_backup_skip();
+  const target = {machine:'machine-a',relay:'wss://relay.invalid/base/',profile:'v1',host:'192.0.2.1',port:22,user:'arch',elevation:'sudo -n',pin:'SHA256:' + btoa(String.fromCharCode(...new Uint8Array(32).fill(7))).replace(/=+$/, '')};
+  if (JSON.parse(await api.poc_enroll(JSON.stringify({target,approve_existing:true,class_answer:'no',approve_maintained_access:true}))).error) throw Error('page fixture enrollment refused');
+  return ['isolated page fixture created and target enrolled'];
+}
+
 async function pageCases() {
   const checks = [];
   const $ = id => document.getElementById('tau-' + id);
@@ -628,20 +643,49 @@ async function pageCases() {
   $('poc-inference-form').requestSubmit();
   await until(() => $('poc-key-status').textContent === 'Key set.', 'configured key reported by real page publication');
   if ($('poc-key').value !== '') throw Error('page key input was retained');
-  // Exercise the dedicated declaration controls, without entering the old goal loop.
+  // One Start records the goal, checks and no-brief acceptance before declaration approval.
+  const history = structuredClone(window.__pocReports.at(-1));
+  history.sessions ??= [];
+  history.tasks ??= [];
+  const earlierSessions = new Set(history.sessions.map(session => session.identity));
+  const earlierTasks = new Set(history.tasks.map(task => task.id));
+  document.querySelector('#tau-poc-targets [data-start-goal="machine-a"]').value = 'Inspect a small service';
+  document.querySelector('#tau-poc-targets [data-start-checks="machine-a"]').value = 'true';
   [...$('poc-targets').querySelectorAll('button')].find(b=>b.textContent==='Start session machine-a').click();
-  await until(() => document.querySelector('[data-goal-text]'), 'bound session exposes goal form');
-  document.querySelector('[data-goal-text]').value = 'Inspect a small service';
-  document.querySelector('[data-goal-enter]').click();
-  await until(() => document.querySelector('[data-poc-accept]'), 'PoC acceptance control visible');
-  document.querySelector('[data-poc-accept]').click();
   await until(() => document.querySelector('[data-poc-declaration]'), 'visible editable declaration candidate');
-  const initial = document.querySelector('[data-poc-declaration]').value;
+  const report = window.__pocReports.at(-1);
+  const sessions = report.sessions.filter(session => !earlierSessions.has(session.identity));
+  if (sessions.length !== 1 || sessions[0].session_state === 'ended' ||
+      JSON.stringify(sessions[0].bound_set) !== '["machine-a"]') throw Error('one Start did not retain its own session');
+  const session = sessions[0].identity;
+  const started = report.tasks.filter(task => !earlierTasks.has(task.id));
+  if (started.length !== 1 || started[0].start_session !== session || started[0].machine !== 'machine-a' ||
+      started[0].goal !== 'Inspect a small service' || JSON.stringify(started[0].checks) !== '["true"]' ||
+      !sessions[0].standing_modes.includes('Acting on a goal with no brief') ||
+      document.querySelector('[data-poc-accept], [data-goal-accept]')) throw Error('one Start did not retain its task and checks');
+  const ownTask = () => {
+    const tasks = window.__pocReports.at(-1)?.tasks?.filter(task => task.start_session === session);
+    if (tasks?.length !== 1 || tasks[0].id !== started[0].id ||
+        JSON.stringify(tasks[0].checks) !== '["true"]') throw Error('Start task identity or checks changed');
+    return tasks[0];
+  };
+  const declaration = () => document.querySelector(`[data-poc-declaration="${session}"]`);
+  const propose = () => document.querySelector(`[data-poc-propose="${session}"]`);
+  const approval = () => document.querySelector(`[data-requirements-card="${session}"]`);
+  const declarationPauses = new Set([
+    'propose and explicitly approve the installation declaration to continue',
+    'installation facts: approved declaration missing; review the proposed requirements and approve explicitly to continue',
+  ]);
+  await until(() => ownTask().status === 'paused' &&
+    (declarationPauses.has(ownTask().pause_reason) || (ownTask().requests > 0 && window.__pocInference > 0)),
+  'new session reaches its own declaration or request pause');
+  const needsDeclaration = declarationPauses.has(ownTask().pause_reason);
+  const initial = declaration().value;
   const custom = JSON.parse(initial);
   custom.services = [{name:'draft-check',scope:{kind:'system'},lifecycle:'running-at-delivery'}];
   const draft = JSON.stringify(custom,null,2);
-  const setDraft = text => { const field=document.querySelector('[data-poc-declaration]');field.value=text;field.dispatchEvent(new Event('input',{bubbles:true})); };
-  const assertDraft = text => { if(document.querySelector('[data-poc-declaration]')?.value !== text)throw Error('declaration draft lost'); };
+  const setDraft = text => { const field=declaration();field.value=text;field.dispatchEvent(new Event('input',{bubbles:true})); };
+  const assertDraft = text => { if(declaration()?.value !== text)throw Error('declaration draft lost'); };
   setDraft(draft);
   const reports = window.__pocReports.length;
   [...$('poc-targets').querySelectorAll('button')].find(b=>b.textContent==='Show public keys machine-a').click();
@@ -661,8 +705,10 @@ async function pageCases() {
   document.dispatchEvent(new Event('freeze'));
   await until(() => ['suspended','reconciling'].includes($('store-state').dataset.lifecycle), 'freeze report reaches page');
   if ($('poc-key-status').textContent !== 'Key set.') throw Error('freeze falsely reported key unset');
-  if ([...$('poc').querySelectorAll('input,select,button')].some(control=>!control.disabled)) throw Error('suspended controls enabled');
-  checks.push('freeze reports retained custody with disabled controls');
+  const enabled = [...$('poc').querySelectorAll('input,select,button')].filter(control=>!control.disabled);
+  // Start now creates the task too; its existing End session control remains available.
+  if (enabled.length !== 1 || !enabled[0].matches('[data-end-session]') || enabled[0].textContent !== 'End session') throw Error('suspended controls enabled: ' + enabled.map(control=>control.id || control.textContent).join(', '));
+  checks.push('freeze reports retained custody, disables work controls and retains End session');
   document.dispatchEvent(new Event('resume'));
   await until(() => !$('poc-endpoint').disabled, 'resume restores authority without key re-entry');
   if ($('poc-key-status').textContent !== 'Key set.') throw Error('resume lost key custody');
@@ -676,24 +722,36 @@ async function pageCases() {
   const invalid = JSON.stringify({...custom,version:1},null,2);
   setDraft(invalid);
   const beforeInvalid = window.__pocReports.length;
-  document.querySelector('[data-poc-propose]').click();
+  propose().click();
   await until(() => window.__pocReports.length > beforeInvalid && Boolean(window.__pocReports.at(-1).store_error), 'editable invalid proposal refused in same session');
   assertDraft(invalid);
   setDraft(draft);
-  document.querySelector('[data-poc-propose]').click();
-  await until(() => document.querySelector('[data-requirements-decision="approve"]'), 'custom proposal displayed for explicit approval');
+  propose().click();
+  await until(() => approval()?.querySelector('[data-requirements-decision="approve"]'), 'custom proposal displayed for explicit approval');
   const sent = window.__pocMessages.map(m=>m.request).filter(m=>m?.poc_propose_requirements).at(-1).poc_propose_requirements;
-  if (JSON.stringify(sent.proposal.declaration)!==JSON.stringify(custom))throw Error('next proposal discarded custom draft');
-  if (!document.querySelector('[data-requirements-card]').textContent.includes('draft-check'))throw Error('approval card lost submitted candidate');
-  document.querySelector('[data-requirements-decision="approve"]').click();
-  await until(() => !document.querySelector('[data-requirements-decision="approve"]'), 'explicit operator approves exact custom requirements');
+  if (sent.session !== session || JSON.stringify(sent.proposal.declaration)!==JSON.stringify(custom))throw Error('next proposal discarded custom draft');
+  if (!approval().textContent.includes('draft-check'))throw Error('approval card lost submitted candidate');
+  const beforeApproval = structuredClone(ownTask());
+  const requestsBeforeApproval = window.__pocInference;
+  approval().querySelector('[data-requirements-decision="approve"]').click();
+  await until(() => !approval()?.querySelector('[data-requirements-decision="approve"]'), 'explicit operator approves exact custom requirements');
+  if (needsDeclaration) {
+    await until(() => window.__pocInference > requestsBeforeApproval && ownTask().requests > beforeApproval.requests &&
+      ownTask().status === 'paused', 'approval continues its task without Resume');
+  } else {
+    if (JSON.stringify(ownTask()) !== JSON.stringify(beforeApproval) || window.__pocInference !== requestsBeforeApproval)
+      throw Error('custom approval resumed an unrelated request pause');
+    checks.push('earlier machine approval permits Start; custom approval retains its unrelated task pause');
+  }
+  if (window.__pocMessages.some(message=>message.request?.task?.action === 'resume')) throw Error('approval required Resume');
   assertDraft(draft);
   $('lock').click();
   await until(() => $('store').dataset.state === 'locked' && $('poc-key-status').textContent === 'Key unset.', 'Lock ends custody on real page');
   $('passphrase').value = 'fixture passphrase for browser checks'; $('unlock').click();
   await until(() => $('store').dataset.state === 'unlocked', 'unlock after Lock');
-  await until(() => document.querySelector('[data-poc-declaration]'), 'same session after Lock');
-  if(document.querySelector('[data-poc-declaration]').value !== initial)throw Error('Lock retained unsubmitted declaration text');
+  await until(() => declaration(), 'same session after Lock');
+  ownTask();
+  if(declaration().value !== initial)throw Error('Lock retained unsubmitted declaration text');
   checks.push('Lock restores the admitted session and clears unsubmitted declaration text');
   setDraft(draft);
   checks.push('Lock preserves the session while clearing page drafts');
@@ -701,11 +759,17 @@ async function pageCases() {
   $('poc-model').value = 'model-a'; $('poc-key').value = 'fixture-worker-loss-key-9751';
   $('poc-inference-form').requestSubmit();
   await until(() => $('poc-key-status').textContent === 'Key set.', 'key held before forced worker loss');
-  return checks;
+  ownTask();
+  const retained = window.__pocReports.at(-1);
+  if (retained.tasks.length !== history.tasks.length + 1 || retained.sessions.length !== history.sessions.length + 1 ||
+      history.tasks.some(task => JSON.stringify(retained.tasks.find(saved => saved.id === task.id)) !== JSON.stringify(task)))
+    throw Error('page checks changed earlier task history');
+  checks.push('one Start retains its own task, checks and all earlier task history through Lock');
+  return {checks, session, task: started[0].id, history: history.tasks};
 }
 
 const workerSource = `import init, * as api from '/pkg/tau_web.js';
-(${cases.toString()})(api, init).then(checks => postMessage({checks}), error => postMessage({error:error.stack}));`;
+(${pageOnly ? pageFixture.toString() : cases.toString()})(api, init).then(checks => postMessage({checks}), error => postMessage({error:error.stack}));`;
 const pageSource = `window.result = new Promise((resolve, reject) => {
   const worker = new Worker('/worker.js', {type:'module'});
   const pending = new Map(), timings = [];
@@ -766,9 +830,9 @@ const server = createServer(async (request, response) => {
       // This fixture server is HTTP loopback. Remove only its response's CSP meta so
       // wasm can load over HTTP; the shipped HTTPS CSP is checked independently.
       if (name === 'index.html') text = text.replace(/<meta http-equiv="Content-Security-Policy"[^>]*>\n/, '');
-      if (name === 'worker.js') text = text.replace(
-        'await reportStore(await lifecycle_transition(data.lifecycle));',
-        'await reportStore(await lifecycle_transition(data.lifecycle)); postMessage({fixture_lifecycle_received:data.lifecycle});');
+      if (name === 'worker.js') text = `const fixtureFetch=globalThis.fetch.bind(globalThis);globalThis.fetch=async(input,options)=>{const url=input instanceof Request?input.url:new URL(input,location.href).href;if(url==='https://inference.invalid/v1/chat/completions'){postMessage({fixture_inference_received:true});return new Response('',{status:503});}if(!url.startsWith(location.origin+'/'))throw Error('external request refused');return fixtureFetch(input,options);};\n` + text.replace(
+        'await reportStore(report);',
+        'await reportStore(report); postMessage({fixture_lifecycle_received:data.lifecycle});');
       response.setHeader('Content-Type',name === 'index.html' ? 'text/html' : 'text/javascript');
       response.end(text);
     } else if (/^\/app\/pkg\/[a-zA-Z0-9_.-]+$/.test(path)) {
@@ -827,7 +891,7 @@ try {
     for (const callback of pending.values()) callback({error: true});
     pending.clear();
   });
-  const regressionNames = process.env.TAU_POC_CASE ? [process.env.TAU_POC_CASE] :
+  const regressionNames = pageOnly ? [] : process.env.TAU_POC_CASE ? [process.env.TAU_POC_CASE] :
     ['b1','b1-encoded','b2-first-command','b2-rotation-command','b2-first-collection','b2-rotation-collection','b2-first-held','b2-rotation-held','b2-echo-command','b2-first-freeze','b2-rotation-freeze','b2-first-end','b2-rotation-end','b2-first-append-error','b2-rotation-append-error'];
   for (const name of regressionNames) {
     const {browserContextId} = await call('Target.createBrowserContext');
@@ -867,31 +931,56 @@ try {
   }, sessionId);
   if (exceptionDetails || !Array.isArray(result.value?.checks)) throw Error('browser case failed: ' + (exceptionDetails?.exception?.description ?? result.description ?? 'no result'));
   console.log(`PoC browser checks passed: ${result.value.checks.length}`);
+  console.log(JSON.stringify({workerChecks:result.value.checks}));
   console.log(JSON.stringify({timings:result.value.timings}));
   await call('Page.addScriptToEvaluateOnNewDocument',{source:`
-    window.__pocWorkers=[];window.__pocMessages=[];window.__pocLifecycle=[];window.__pocReports=[];
+    window.__pocWorkers=[];window.__pocMessages=[];window.__pocLifecycle=[];window.__pocReports=[];window.__pocInference=0;
     const RealWorker=window.Worker;
     window.Worker=class extends RealWorker {
       constructor(...args){super(...args);window.__pocWorkers.push(this);
         this.addEventListener('message',event=>{
           if(event.data.fixture_lifecycle_received){window.__pocLifecycle.push(event.data.fixture_lifecycle_received);event.stopImmediatePropagation();}
+          if(event.data.fixture_inference_received){window.__pocInference++;event.stopImmediatePropagation();}
           if(event.data.store)window.__pocReports.push(event.data.store);
         });
       }
       postMessage(data,...args){
-        if(data.request?.lifecycle || data.request?.poc_propose_requirements)window.__pocMessages.push(structuredClone(data));
+        if(data.request)window.__pocMessages.push(structuredClone(data));
         return super.postMessage(data,...args);
       }
     };`},sessionId);
   await call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/app/`},sessionId);
   const pageResult = await call('Runtime.evaluate',{expression:'(' + pageCases.toString() + ')()',awaitPromise:true,returnByValue:true},sessionId);
-  if (pageResult.exceptionDetails || !Array.isArray(pageResult.result?.value)) throw Error('actual page check failed: ' + (pageResult.exceptionDetails?.exception?.description ?? 'no page result'));
-  console.log(JSON.stringify({pageChecks:pageResult.result.value}));
+  if (pageResult.exceptionDetails || !Array.isArray(pageResult.result?.value?.checks)) throw Error('actual page check failed: ' + (pageResult.exceptionDetails?.exception?.description ?? 'no page result'));
+  const expectedTask = pageResult.result.value;
+  console.log(JSON.stringify({pageChecks:expectedTask.checks}));
   await call('Runtime.evaluate',{expression:'window.__pocWorkers.at(-1).terminate()'},sessionId);
   await call('Page.reload',{},sessionId);
   const loss = await call('Runtime.evaluate',{expression:`new Promise((resolve,reject)=>{const start=performance.now();const poll=()=>{if(document.querySelector('#tau-store')?.dataset.state==='locked' && document.querySelector('#tau-poc-key-status')?.textContent==='Key unset.' && !document.querySelector('[data-poc-declaration]')) return resolve(true);if(performance.now()-start>15000)return reject(Error('worker-loss page watchdog'));setTimeout(poll,20);};poll();})`,awaitPromise:true,returnByValue:true},sessionId);
   if (loss.exceptionDetails || loss.result?.value !== true) throw Error('worker loss did not clear published custody');
   console.log('Real page worker-loss custody/draft clearing check passed');
+  const recovered = await call('Runtime.evaluate',{expression:`(async () => {
+    const expected = ${JSON.stringify(expectedTask)};
+    document.querySelector('#tau-passphrase').value = 'fixture passphrase for browser checks';
+    document.querySelector('#tau-unlock').click();
+    const start = performance.now();
+    while (document.querySelector('#tau-store')?.dataset.state !== 'unlocked' || !window.__pocReports.at(-1)?.tasks) {
+      if (performance.now()-start > 15000) throw Error('worker-loss task replay watchdog');
+      await new Promise(resolve=>setTimeout(resolve,20));
+    }
+    const report = window.__pocReports.at(-1);
+    const tasks = report.tasks.filter(task=>task.start_session === expected.session);
+    if (tasks.length !== 1 || tasks[0].id !== expected.task || JSON.stringify(tasks[0].checks) !== '["true"]' ||
+        report.tasks.length !== expected.history.length + 1 ||
+        expected.history.some(task=>JSON.stringify(report.tasks.find(saved=>saved.id===task.id)) !== JSON.stringify(task)))
+      throw Error('worker loss changed Start task identity, checks or earlier history');
+    if (document.querySelector('#tau-poc-key-status').textContent !== 'Key unset.' || window.__pocInference !== 0)
+      throw Error('worker loss restored key custody or dispatched without a key');
+    return ['worker loss replays the same Start session, task, checks and earlier history',
+      'worker loss retains keyless custody without a model request'];
+  })()`,awaitPromise:true,returnByValue:true},sessionId);
+  if (recovered.exceptionDetails || !Array.isArray(recovered.result?.value)) throw Error('worker-loss task recovery failed: ' + (recovered.exceptionDetails?.exception?.description ?? 'no result'));
+  console.log(JSON.stringify({workerLossChecks:recovered.result.value}));
   }
   await call('Browser.close').catch(() => {});
   await exited;

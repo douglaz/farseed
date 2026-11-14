@@ -490,7 +490,7 @@ pub(super) async fn run(
                     .page_predicate(
                         run,
                         &tab.session,
-                        "!!document.querySelector('[data-goal-accept]')",
+                        "!!document.querySelector('[data-start-accepted-goal]')",
                     )
                     .await?
                     .equals_true(),
@@ -614,7 +614,12 @@ pub(super) async fn run(
     let from = run.aggregator.requests.lock().unwrap().len();
     module(run,worker,"self.beforeGoalTurn=new Promise(ready=>m.test_hold_session_point('goal_turn',new Promise(release=>self.releaseGoalTurn=release),ready));return true;").await?;
     run.aggregator.state.lock().unwrap().script = vec![json!({"write_received_context":run.sshd.machine.root.join("goal-token-attempt").display().to_string()}), done()].into();
-    setup_cases::click(run, tab, "[data-machine=fixture] [data-goal-accept]").await?;
+    setup_cases::click(
+        run,
+        tab,
+        "[data-machine=fixture] [data-start-accepted-goal]",
+    )
+    .await?;
     module(run, worker, "await self.beforeGoalTurn;return true;").await?;
     let before_authority = run
         .inspect_state_at("state.goal.authority.before", worker)
@@ -771,7 +776,7 @@ pub(super) async fn run(
                         .page_predicate(
                             run,
                             &tab.session,
-                            "!!document.querySelector('[data-goal-accept]')",
+                            "!!document.querySelector('[data-start-accepted-goal]')",
                         )
                         .await?
                         .equals_true(),
@@ -788,7 +793,12 @@ pub(super) async fn run(
             state.fail = !refused;
             state.top_up = refused;
         }
-        setup_cases::click(run, tab, "[data-machine=fixture] [data-goal-accept]").await?;
+        setup_cases::click(
+            run,
+            tab,
+            "[data-machine=fixture] [data-start-accepted-goal]",
+        )
+        .await?;
         let mut label = Value::Null;
         {
             let observation = observer::Call::begin(
@@ -877,7 +887,7 @@ pub(super) async fn run(
                 observation.attempt(poll + 1);
                 if observation.poll(poll+1, observation.page_predicate(run,
                     &tab.session,
-                    "!!document.querySelector('[data-machine=fixture-other] [data-goal-accept]')",
+                    "!!document.querySelector('[data-machine=fixture-other] [data-start-accepted-goal]')",
                 )
                 .await?.equals_true()) {
                 break;
@@ -896,7 +906,12 @@ pub(super) async fn run(
             state.script = vec![call("done", json!({"machine":"fixture-other"}))].into();
         }
         let other_from = run.aggregator.requests.lock().unwrap().len();
-        setup_cases::click(run, tab, "[data-machine=fixture-other] [data-goal-accept]").await?;
+        setup_cases::click(
+            run,
+            tab,
+            "[data-machine=fixture-other] [data-start-accepted-goal]",
+        )
+        .await?;
         {
             let observation = observer::Call::begin(
                 "goal.status.other_done_visible",

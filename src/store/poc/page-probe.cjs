@@ -72,4 +72,6 @@ assert.equal(messages[0].task.action, 'resume');
 // An independently entered new goal on a fresh session still has its explicit start card.
 vm.runInContext('renderSetup({...payload, tasks: []});', context);
 assert.equal(all(elements.get('tau-setup')).filter(e => e.dataset.goalAccept).length, 0);
-assert.equal(all(elements.get('tau-task-setup')).filter(e => e.dataset.goalAccept).length, 1);
+assert.equal(all(elements.get('tau-task-setup')).filter(e => e.dataset.goalAccept).length, 0);
+assert.equal(all(elements.get('tau-task-setup')).filter(e => e.dataset.startAcceptedGoal).length, 1);
+assert(all(elements.get('tau-task-setup')).some(e => e.tag === 'button' && e.textContent === 'Start session'));

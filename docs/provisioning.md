@@ -258,11 +258,23 @@ including after awaited credit work; a stale timer cannot read a retired or repl
 It also checks on visibility return when eligible. This uses only
 `GET /api/v1/payment/{id}` and the existing authenticated payment/provenance validator. It
 never calls the mutating invoice route, issues an invoice, orders a machine, approves changed
-terms or runs general Resume. A paid reading ends automatic checks; explicit Refresh continues
-readiness/handoff. Unknown outcomes retain the same VM/payment and explicit recovery controls.
+terms or runs general Resume. A paid reading starts readiness-only reads every 60 seconds from the compiled
+`lnvps.published_key_poll_interval`, without rereading payment. The first paid Payment event
+includes `paid_at`, the local API clock in seconds, atomically with the reading. Replay restores
+that same instant; later paid readings cannot move it. Automatic reads and explicit Refresh stop
+unresolved first contact at `paid_at` plus the compiled three-hour `published_key_wait_max`,
+including hidden and locked time. This page has no paid-purchase reinstall or abandonment flow.
+Automatic readiness reads only the saved VM and saves its published pin/address Handoff; it
+never starts a task. Unchanged state, published key set and IPv4 suppress procurement Observations
+only after full validation. Every authenticated request still gets its own fresh nonce and
+protection record before dispatch; last-check time is report-only. Unknown outcomes retain the same VM/payment and explicit recovery controls.
 The existing one-second action floor, exchange/action bounds and lifecycle fences apply.
 Lock/retirement cancels timers and prevents further automatic checks. Provider-key re-entry
 after Unlock restores checking; it cannot redirect the saved purchase.
 
 A fresh served store has no fixture setup offer. Tests retain the offer; already-approved
 machine, session, goal and End controls remain visible.
+
+
+The PoC pin route supports Ed25519 only. CHN-R7 calls for the complete published
+Ed25519/RSA/ECDSA set; this is a named PoC departure, with no specification-conformance claim.

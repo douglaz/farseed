@@ -446,7 +446,7 @@ fn provisioning_payment_timestamps_and_exact_identity_refusals_preserve_saved_st
             ));
         }
         assert_eq!(
-            block_on(s.procurement_commit(Record::Payment(reading))).unwrap_err(),
+            block_on(s.procurement_commit(s.payment_record(reading, api.now()))).unwrap_err(),
             REFUSED
         );
         assert_eq!(s.procurement, saved, "{field}");
@@ -459,14 +459,15 @@ fn provisioning_payment_timestamps_and_exact_identity_refusals_preserve_saved_st
 fn provisioning_payment_timestamps_paid_cannot_regress() {
     let (mut s, mut api) = nanosecond_invoice();
     api.payments[0]["is_paid"] = json!(true);
-    block_on(s.procurement_commit(Record::Payment(api.payments[0].clone()))).unwrap();
+    block_on(s.procurement_commit(s.payment_record(api.payments[0].clone(), api.now()))).unwrap();
     let saved = s.procurement.clone();
     let files = s.storage.files();
     whole_second_reading(&mut api);
     for paid in [json!(false), Value::Null] {
         api.payments[0]["is_paid"] = paid;
         assert_eq!(
-            block_on(s.procurement_commit(Record::Payment(api.payments[0].clone()))).unwrap_err(),
+            block_on(s.procurement_commit(s.payment_record(api.payments[0].clone(), api.now())))
+                .unwrap_err(),
             REFUSED
         );
         assert_eq!(s.procurement, saved);
@@ -1438,7 +1439,7 @@ fn provisioning_associated_vm_and_payment_identities_are_immutable_after_replay(
     other_payment["id"] = json!("aabc");
     assert!(
         loaded
-            .procurement_projection(&Record::Payment(other_payment))
+            .procurement_projection(&s.payment_record(other_payment, api.now()))
             .is_err()
     );
     let mut other_creation = p.vm.clone().unwrap();
@@ -3105,8 +3106,10 @@ fn provisioning_close_local_refusals_write_and_send_nothing() {
             if case != "unexpired" {
                 api.payments[0]["is_paid"] = true.into();
                 if case == "paid" {
-                    block_on(s.procurement_commit(Record::Payment(api.payments[0].clone())))
-                        .unwrap();
+                    block_on(
+                        s.procurement_commit(s.payment_record(api.payments[0].clone(), api.now())),
+                    )
+                    .unwrap();
                 } else {
                     block_on(s.procurement_resume(&mut api, false)).unwrap();
                 }
@@ -3335,7 +3338,7 @@ fn provisioning_close_replay_checks_recorded_time_statuses_and_finality() {
         reused["id"] = json!(spelling);
         assert!(
             duplicate
-                .procurement_projection(&Record::Payment(reused))
+                .procurement_projection(&duplicate.payment_record(reused, api.now()))
                 .is_err(),
             "closed payment id cannot enter a new purchase with spelling {spelling}"
         );
@@ -3344,7 +3347,8 @@ fn provisioning_close_replay_checks_recorded_time_statuses_and_finality() {
     let mut next_payment = fixtures::payment(12);
     next_payment["id"] = json!("bbcc");
     next_payment["is_paid"] = json!(true);
-    block_on(duplicate.procurement_commit(Record::Payment(next_payment))).unwrap();
+    block_on(duplicate.procurement_commit(duplicate.payment_record(next_payment, api.now())))
+        .unwrap();
     let next_handoff = handoff(duplicate.procurement.as_ref().unwrap());
     block_on(duplicate.procurement_commit(next_handoff)).unwrap();
     let final_store = reopen(&duplicate);
@@ -3412,7 +3416,7 @@ fn provisioning_missing_refresh_keeps_earlier_paid_reading() {
             );
             assert!(!close_eligible(s.procurement.as_ref().unwrap(), u64::MAX));
             assert!(
-                matches!(purchase_events(&s).last().unwrap(),Event::Procurement(Record::Payment(pay)) if pay["is_paid"]==true)
+                matches!(purchase_events(&s).last().unwrap(),Event::Procurement(Record::Payment { payment: pay, .. }) if pay["is_paid"]==true)
             );
         } else if !saved_payment {
             assert!(close_eligible(s.procurement.as_ref().unwrap(), api.clock));
@@ -3450,4 +3454,352 @@ fn poc_machine_payment_poll_reads_only_saved_payment_without_effects() {
     let mut replayed = reopen(&store);
     block_on(replayed.procurement_payment_check(&mut api)).unwrap();
     assert_eq!(api.calls.len(), after);
+}
+
+fn paid_wait() -> (Store<MemoryStorage>, Fixture) {
+    let (mut store, mut api) = nanosecond_invoice();
+    api.payments[0]["is_paid"] = true.into();
+    api.clock += 3600;
+    block_on(store.procurement_payment_check(&mut api)).unwrap();
+    api.calls.clear();
+    (store, api)
+}
+fn observations(store: &Store<MemoryStorage>) -> usize {
+    purchase_events(store)
+        .iter()
+        .filter(|event| matches!(event, Event::Procurement(Record::Observation(_))))
+        .count()
+}
+
+#[test]
+fn provisioning_readiness_boundary_is_paid_only_and_stops_at_handoff() {
+    let mut store = ready();
+    let mut api = Fixture::new(false);
+    for stage in 0..5 {
+        let before = store.storage.files();
+        let traffic = api.calls.len();
+        block_on(store.procurement_readiness_check(&mut api)).unwrap();
+        assert_eq!(
+            store.storage.files(),
+            before,
+            "ineligible stage {stage} writes nothing"
+        );
+        assert_eq!(api.calls.len(), traffic);
+        match stage {
+            0 => approve(&mut store, &mut api),
+            1 => {
+                store.procurement.as_mut().unwrap().registration_sent = true;
+            }
+            2 => {
+                store.procurement.as_mut().unwrap().registration_sent = false;
+                assert!(issue_invoice(&mut store, &mut api).is_err());
+            }
+            3 => {
+                store.procurement.as_mut().unwrap().pending_selection =
+                    Some(api.current_selection.clone());
+            }
+            _ => {}
+        }
+    }
+    let (mut store, mut api) = paid_wait();
+    let mut pending = reopen(&store);
+    pending.procurement.as_mut().unwrap().pending_selection = Some(api.current_selection.clone());
+    let before = pending.storage.files();
+    block_on(pending.procurement_readiness_check(&mut api)).unwrap();
+    assert_eq!(pending.storage.files(), before);
+    assert!(api.calls.is_empty());
+    block_on(store.procurement_readiness_check(&mut api)).unwrap();
+    assert_eq!(api.calls, ["GET /api/v1/vm/11"]);
+    assert!(store.procurement.as_ref().unwrap().target.is_some());
+    let before = store.storage.files();
+    block_on(store.procurement_readiness_check(&mut api)).unwrap();
+    assert_eq!(store.storage.files(), before);
+    assert_eq!(api.calls.len(), 1);
+    assert!(
+        reopen(&store)
+            .procurement
+            .as_ref()
+            .unwrap()
+            .target
+            .is_some()
+    );
+}
+
+#[test]
+fn provisioning_readiness_paid_clock_is_atomic_immutable_and_fences_late_reads() {
+    let (store, mut api) = paid_wait();
+    let paid = store.procurement.as_ref().unwrap().paid_at.unwrap();
+    assert_eq!(paid, api.clock);
+    assert_eq!(protocol::readiness_poll_seconds(), 60);
+    assert_eq!(protocol::readiness_wait_seconds(), 10800);
+    assert!(purchase_events(&store).iter().any(|event| matches!(event, Event::Procurement(Record::Payment { payment, paid_at: Some(at) }) if payment["is_paid"] == true && *at == paid)));
+    let mut later = reopen(&store);
+    api.clock += 300;
+    block_on(later.procurement_commit(later.payment_record(api.payments[0].clone(), api.now())))
+        .unwrap();
+    assert_eq!(
+        reopen(&later).procurement.as_ref().unwrap().paid_at,
+        Some(paid)
+    );
+    for automatic in [true, false] {
+        let mut late = reopen(&store);
+        api.clock = paid + 10800;
+        api.calls.clear();
+        let error = if automatic {
+            block_on(late.procurement_readiness_check(&mut api))
+        } else {
+            block_on(late.procurement_resume(&mut api, false))
+        }
+        .unwrap_err();
+        assert_eq!(error, protocol::READINESS_STOP);
+        assert!(api.calls.is_empty());
+        assert!(late.procurement.as_ref().unwrap().target.is_none());
+        let mut crossing = reopen(&store);
+        api.clock = paid + 10799;
+        api.after_read_clock = Some(("/api/v1/vm/11".into(), paid + 10800));
+        let count = observations(&crossing);
+        let error = if automatic {
+            block_on(crossing.procurement_readiness_check(&mut api))
+        } else {
+            block_on(crossing.procurement_resume(&mut api, false))
+        }
+        .unwrap_err();
+        assert_eq!(error, protocol::READINESS_STOP);
+        assert_eq!(observations(&crossing), count);
+        assert!(crossing.procurement.as_ref().unwrap().target.is_none());
+    }
+    let mut before_deadline = reopen(&store);
+    api.clock = paid + 10799;
+    block_on(before_deadline.procurement_readiness_check(&mut api)).unwrap();
+    assert!(
+        before_deadline
+            .procurement
+            .as_ref()
+            .unwrap()
+            .target
+            .is_some()
+    );
+    let (mut failed, mut api) = nanosecond_invoice();
+    api.payments[0]["is_paid"] = true.into();
+    failed.storage.fault(Fault::Fail(1));
+    assert!(block_on(failed.procurement_payment_check(&mut api)).is_err());
+    let restored = reopen(&failed);
+    assert_eq!(restored.procurement.as_ref().unwrap().paid_at, None);
+    assert_eq!(
+        restored
+            .procurement
+            .as_ref()
+            .unwrap()
+            .payment
+            .as_ref()
+            .unwrap()["is_paid"],
+        false
+    );
+}
+
+#[test]
+fn provisioning_readiness_clock_ignores_invoice_dates_and_lost_append_reply() {
+    for offset in [-86400i64, 86400] {
+        let (mut store, mut api) = nanosecond_invoice();
+        api.clock = api.clock.checked_add_signed(offset).unwrap();
+        api.payments[0]["is_paid"] = true.into();
+        block_on(store.procurement_payment_check(&mut api)).unwrap();
+        let saved = reopen(&store);
+        assert_eq!(saved.procurement.as_ref().unwrap().paid_at, Some(api.clock));
+        assert_ne!(
+            api.clock,
+            timestamp(text(&api.payments[0], "created", 40).unwrap()).unwrap()
+        );
+    }
+    let (mut store, mut api) = nanosecond_invoice();
+    api.payments[0]["is_paid"] = true.into();
+    store.storage.fault(Fault::LandThenFail(3));
+    assert!(block_on(store.procurement_payment_check(&mut api)).is_err());
+    let saved = reopen(&store);
+    assert_eq!(saved.procurement.as_ref().unwrap().paid_at, Some(api.clock));
+    assert_eq!(
+        saved
+            .procurement
+            .as_ref()
+            .unwrap()
+            .payment
+            .as_ref()
+            .unwrap()["is_paid"],
+        true
+    );
+}
+
+#[test]
+fn provisioning_readiness_suppresses_only_valid_unchanged_observations_and_keeps_protection() {
+    let (mut store, mut api) = paid_wait();
+    let mut protected = Vec::new();
+    observe_readiness_protection(&store, &mut api);
+    let mut read = |store: &mut Store<MemoryStorage>, api: &mut Fixture| {
+        let material = format!("synthetic readiness authorization {}", protected.len());
+        api.prepared_protection =
+            Some(crate::poc::inference::EchoFilter::new(&[material.as_bytes()]).fingerprints());
+        protected.push(material);
+        block_on(store.procurement_readiness_check(api)).unwrap_err()
+    };
+    api.machines[0]["host_ssh_keys"] = json!([]);
+    read(&mut store, &mut api);
+    let baseline = observations(&store);
+    for _ in 0..3 {
+        api.clock += 60;
+        read(&mut store, &mut api);
+    }
+    assert_eq!(
+        observations(&store),
+        baseline,
+        "unchanged automatic readings append zero procurement Observations"
+    );
+    for (field, value) in [
+        ("status", json!({"state":"starting"})),
+        ("host_ssh_keys", json!([fixtures::publication()])),
+        ("ip_assignments", json!([{"ip":"192.0.2.20/24"}])),
+    ] {
+        let before = observations(&store);
+        api.machines[0][field] = value;
+        read(&mut store, &mut api);
+        assert_eq!(observations(&store), before + 1, "only {field} changed");
+    }
+    let before = observations(&store);
+    api.machines[0]["template"]["cpu"] = json!(999);
+    assert_eq!(
+        read(&mut store, &mut api),
+        REFUSED,
+        "invalid matching response must fail projection rather than enter the boot wait"
+    );
+    assert_eq!(
+        observations(&store),
+        before,
+        "matching status/key/address cannot conceal invalid complete response"
+    );
+    let restored = reopen(&store);
+    let protections = |store: &Store<MemoryStorage>| {
+        purchase_events(store)
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ProviderProtection(ref fingerprints) => Some(fingerprints.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let recorded = protections(&store);
+    assert_eq!(
+        recorded.len(),
+        api.calls.len(),
+        "one protection per dispatched request"
+    );
+    assert_eq!(
+        protections(&restored),
+        recorded,
+        "each protection record restores by type"
+    );
+    assert_eq!(observations(&restored), observations(&store));
+    for material in protected {
+        let value = json!({"name":material});
+        assert_ne!(store.protect_output(&value).unwrap(), value);
+        assert_ne!(
+            restored.protect_output(&value).unwrap(),
+            value,
+            "every request remains protected after replay"
+        );
+    }
+    assert_eq!(
+        purchase_events(&restored)
+            .iter()
+            .filter(|event| matches!(event, Event::Procurement(Record::Handoff { .. })))
+            .count(),
+        0,
+        "Handoff is counted separately from observations"
+    );
+    let (mut failed, mut api) = paid_wait();
+    api.protection_fault = Some((
+        "GET /api/v1/vm/11".into(),
+        failed.storage.clone(),
+        Fault::Fail(1),
+    ));
+    assert!(block_on(failed.procurement_readiness_check(&mut api)).is_err());
+    assert!(
+        api.calls.is_empty(),
+        "failed protection append sends no request"
+    );
+}
+
+#[test]
+fn provisioning_readiness_skips_reordered_keys_and_handoff_uses_recorded_publication() {
+    let (mut store, mut api) = paid_wait();
+    let extra =
+        json!({"key_type":"ssh-rsa","public_key":"test-only","fingerprint_sha256":"test-only"});
+    api.machines[0]["host_ssh_keys"]
+        .as_array_mut()
+        .unwrap()
+        .push(extra);
+    block_on(store.procurement_commit(Record::Observation(api.machines[0].clone()))).unwrap();
+    let recorded =
+        store.procurement.as_ref().unwrap().vm.as_ref().unwrap()["host_ssh_keys"].clone();
+    api.machines[0]["host_ssh_keys"]
+        .as_array_mut()
+        .unwrap()
+        .reverse();
+    let before = observations(&store);
+    block_on(store.procurement_readiness_check(&mut api)).unwrap();
+    assert_eq!(
+        observations(&store),
+        before,
+        "same-set reordered reading must be skipped"
+    );
+    assert_eq!(
+        store
+            .procurement
+            .as_ref()
+            .unwrap()
+            .publication
+            .as_ref()
+            .unwrap()["host_ssh_keys"],
+        recorded
+    );
+    assert!(
+        reopen(&store)
+            .procurement
+            .as_ref()
+            .unwrap()
+            .target
+            .is_some()
+    );
+}
+
+fn observe_readiness_protection(store: &Store<MemoryStorage>, api: &mut Fixture) {
+    let storage = store.storage.clone();
+    let key = store.key.0;
+    let id = store.id.clone();
+    let dispatches = std::cell::Cell::new(0usize);
+    api.prepared_protection = Some(
+        crate::poc::inference::EchoFilter::new(&[b"synthetic readiness protection"]).fingerprints(),
+    );
+    api.observe_dispatch = Some(Box::new(move || {
+        let files = storage.files();
+        let mut reader = Store::new(storage.clone(), DataKey(key), id.clone());
+        let mut protections = 0;
+        let mut last = false;
+        for number in 0..files.len() as u64 {
+            let Some(bytes) = files.get(&number.to_string()) else {
+                break;
+            };
+            last = matches!(
+                reader.open(number, bytes).unwrap(),
+                Event::ProviderProtection(_)
+            );
+            protections += usize::from(last);
+            reader.previous = Address(Sha256::digest(bytes).into());
+        }
+        dispatches.set(dispatches.get() + 1);
+        assert!(last, "a protection record precedes each dispatch");
+        assert_eq!(
+            protections,
+            dispatches.get(),
+            "exactly one fresh protection record per request"
+        );
+    }));
 }

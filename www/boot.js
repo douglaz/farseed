@@ -116,6 +116,7 @@ const goalOutcomes = new Map();
 const pocDeclarationDrafts = new Map();
 const creditGoalDrafts = new Map();
 const setupDrafts = new Map();
+const startDrafts = new Map();
 const taskLimitDrafts = new Map();
 let pocKeyRefusal = '';
 const snapshotWorker = () => {
@@ -123,6 +124,7 @@ const snapshotWorker = () => {
   const generation = current?.generation;
   return { postMessage: (data, transfer) => current?.sendAt ? current.sendAt(data, transfer, generation) : current?.postMessage(data, transfer) };
 };
+const readinessWait = store => ({starting:'The provider is starting the machine.',published_key:'The machine’s published host key has not appeared yet.',address:'Waiting for one allocated IPv4 address.',refused:'Readiness read refused. Review the machine diagnostic.',ready:'Saving the machine handoff.',checking:'Reading machine readiness.'}[store.readiness?.kind ?? 'checking'] ?? 'Readiness diagnostic is unavailable.');
 const stepNames = ['store', 'credit', 'machine', 'task'];
 const foldChoices = new Map();
 const rawFoldChoices = new Map();
@@ -165,10 +167,13 @@ const renderSteps = store => {
   const messages = {
     store: texts[store.state] ?? store.state,
     credit: store.credit_error || store.credit?.balance_text || (!store.credit?.account ? 'No inference credit yet.' : 'Inference credit balance not read yet.'),
-    machine: store.procurement?.phase ? `Saved purchase: ${store.procurement.phase}.` : store.poc_targets?.length ? 'Machine saved. Review it before Start session.' : 'Choose a new or existing machine.',
+    machine: store.readiness?.expired ? 'Published host-key wait expired after three hours. First contact is stopped.'
+      : store.readiness?.inactive ? `Readiness reads are not running: ${store.readiness.inactive}.`
+      : payReadiness(store.procurement ?? {}) ? `${readinessWait(store)} ${store.readiness?.checked_at ? `Last check: ${new Date(store.readiness.checked_at).toISOString()}.` : 'No readiness check has completed yet.'}`
+      : store.procurement?.phase ? `Saved purchase: ${store.procurement.phase}.` : store.poc_targets?.length ? 'Machine saved. Review it before Start session.' : 'Choose a new or existing machine.',
     task: store.tasks?.map(task => `${task.machine}: ${task.status}${task.pause_reason ? ' — ' + task.pause_reason : ''}`).join(' ') || (store.lifecycle_state === 'reconciling' ? 'Waiting to revalidate the saved session.' : sessions.length ? 'Session open. Set or continue its goal.' : 'No session started.'),
   };
-  if (!active) for (const name of ['credit', 'machine', 'task'].filter(name => name !== 'credit' || !unlocked)) messages[name] = unlocked ? 'Record the seed backup to continue.' : 'Open the local store to view this step.';
+  if (!active) for (const name of ['credit', 'machine', 'task'].filter(name => name !== 'credit' || !unlocked)) messages[name] = unlocked ? 'Record the seed backup to continue.' : name === 'machine' && store.state === 'locked' ? 'Readiness reads are not running: the store is locked.' : 'Open the local store to view this step.';
   for (const name of stepNames) {
     const step = document.querySelector(`[data-step="${name}"]`);
     step.dataset.current = String(current === name);
@@ -213,7 +218,7 @@ const renderSteps = store => {
     ...taskControls('[data-requirements-decision="approve"]'),
     ...(needsDeclaration ? taskControls('[data-poc-propose]') : []),
     ...taskControls('[data-task] button').filter(button => button.textContent === 'Resume'),
-    ...taskControls('[data-goal-accept], [data-goal-enter], [data-bind]'),
+    ...taskControls('[data-start-accepted-goal], [data-goal-enter], [data-bind]'),
     ...taskControls('#tau-poc-targets button').filter(button => button.textContent.startsWith('Start session ') &&
       !sessions.some(session => session.bound_set.some(machine => button.textContent === `Start session ${machine}`))),
     ...taskControls('[data-poc-propose], [data-end-session], [data-delivery-check], [data-task] button, #tau-poc-targets button'),
@@ -498,16 +503,11 @@ const renderSetup = (store) => {
           checks.value = setupDrafts.get(session.identity)?.[0] ?? '';
           paragraph(card, 'Verification commands, one per line. Choose checks that establish the requested service is working. Empty checks cannot establish success.');
           card.append(checks);
-          const accept = document.createElement('button');
-          accept.type = 'button';
-          accept.dataset.goalAccept = session.identity;
-          accept.dataset.pocAccept = session.identity;
-          accept.textContent = accepted ? 'Continue accepted task start' : 'Acting on a goal with no brief';
-          accept.addEventListener('click', () => {
-            accept.disabled = true;
-            worker.postMessage({ goal_accept: { session: session.identity, checks: checks.value.split('\n').filter(line => line.trim()) } });
-          });
-          card.append(accept);
+          paragraph(card, 'Acting on a goal with no brief');
+          const start = document.createElement('button'); start.type = 'button'; start.textContent = 'Start session';
+          start.dataset.startAcceptedGoal = session.identity;
+          start.addEventListener('click', () => { start.disabled = true; worker.postMessage({goal_accept:{session:session.identity, checks:checks.value.split('\n').filter(line => line.trim())}}); });
+          card.append(start);
         }
       } else {
         const words = document.createElement('textarea');
@@ -568,13 +568,14 @@ const renderSetup = (store) => {
       for (const label of session.standing_modes ?? []) paragraph(section, `Standing mode: ${label}.`);
     }
     else if (machine.class !== null && access && store.fixture_admission) {
+      const inputs = startInputs(section, machine.entry.machine);
       const button = document.createElement('button');
       button.type = 'button';
       button.dataset.bind = machine.entry.machine;
       button.textContent = `Start session ${machine.entry.machine}`;
       button.addEventListener('click', () => {
         button.disabled = true;
-        worker.postMessage({ bind: { machine: machine.entry.machine, inference_approval: store.fixture_admission } });
+        worker.postMessage({ bind: { machine: machine.entry.machine, inference_approval: store.fixture_admission, ...inputs() } });
       });
       paragraph(section, `Inference endpoint: ${store.fixture_admission.configuration.endpoint}; model: ${store.fixture_admission.configuration.model}.`);
       startDisclosure(section);
@@ -713,7 +714,8 @@ const renderTasks = (store) => {
     raise.addEventListener('click', () => { raise.disabled = true; worker.postMessage({ task: { action: 'raise', id: task.id, limits: { requests: Number(requests.value), steps: Number(steps.value) } } }); });
     const requestLabel = document.createElement('label'); requestLabel.textContent = 'Request limit'; requestLabel.append(requests);
     const stepLabel = document.createElement('label'); stepLabel.textContent = 'Step limit'; stepLabel.append(steps);
-    card.append(requestLabel, stepLabel, raise);
+    const details = document.createElement('details'); details.dataset.taskDetails = task.id; details.dataset.foldKey = JSON.stringify(['task',task.id,'limits']);
+    const summary = document.createElement('summary'); summary.textContent = 'Task details'; details.append(summary, requestLabel, stepLabel, raise); card.append(details);
     slot.append(card);
   }
 };
@@ -926,6 +928,15 @@ const renderProvider = (store, enabled) => {
         check.addEventListener('click', () => providerRequest({action:'payment_check'})); progress.append(check);
       }
     }
+    if (payReadiness(purchase)) {
+      const readiness = store.readiness;
+      if (readiness?.expired) paragraph(progress, 'Published host-key wait expired after three hours from recorded payment. First contact is stopped; this page cannot reinstall or abandon a paid purchase.');
+      else if (readiness?.inactive) paragraph(progress, `Readiness reads are not running: ${readiness.inactive}.`);
+      else {
+        paragraph(progress, readinessWait(store));
+        paragraph(progress, readiness?.checked_at ? `Last readiness check: ${new Date(readiness.checked_at).toISOString()}.` : 'No readiness check has completed yet.');
+      }
+    }
     if (purchase.public_keys) {
       paragraph(progress, deployed ? 'Registering the machine SSH public key with the provider does not enroll the relay. The deployment relay key is in use.' : 'Registering the machine SSH public key with the provider does not enroll the relay. Copy the separate relay public key and ask your relay operator to enroll it before configuration.');
       paragraph(progress, deployed ? 'Deployment relay public key:' : 'Relay public key — enroll this separately with the relay operator:');
@@ -984,6 +995,7 @@ const clearPocInputs = () => {
   pocDeclarationDrafts.clear();
   creditGoalDrafts.clear();
   setupDrafts.clear();
+  startDrafts.clear();
   taskLimitDrafts.clear();
   pocKeyRefusal = '';
   for (const field of $('poc').querySelectorAll('input')) {
@@ -994,6 +1006,25 @@ const clearPocInputs = () => {
   $('poc-elevation').value = $('poc-class').value = '';
   $('poc-public-keys').replaceChildren();
 };
+const payReadiness = purchase => purchase.payment?.is_paid && !purchase.target;
+
+const startInputs = (row, machine, initialGoal = '', documentSource = true, creditMode = false) => {
+  const goal = document.createElement('textarea'); if (creditMode) goal.dataset.creditGoal = machine; goal.dataset.startGoal = machine;
+  goal.setAttribute('aria-label', 'Goal before Start session'); goal.value = creditGoalDrafts.get(machine) ?? initialGoal;
+  goal.addEventListener('input', () => creditGoalDrafts.set(machine, goal.value));
+  const source = document.createElement('input'); source.type = 'url'; source.dataset.documentSource = '';
+  source.setAttribute('aria-label', 'Optional document source (https URL)');
+  const checks = document.createElement('textarea'); checks.dataset.startChecks = machine; checks.setAttribute('aria-label', 'Verification commands, one per line');
+  checks.value = startDrafts.get(machine)?.[0] ?? '';
+  checks.addEventListener('input', () => startDrafts.set(machine, [checks.value, source.value]));
+  source.value = startDrafts.get(machine)?.[1] ?? '';
+  source.addEventListener('input', () => startDrafts.set(machine, [checks.value, source.value]));
+  paragraph(row, 'Acting on a goal with no brief');
+  paragraph(row, 'Verification commands, one per line. Choose checks that establish the requested service is working. Empty checks cannot establish success.');
+  row.append(goal); if (documentSource) row.append(source); row.append(checks);
+  return () => ({goal:goal.value, document_source:source.value || null, checks:checks.value.split('\n').filter(line => line.trim())});
+};
+
 const renderPoc = (store) => {
   if (typeof store.credit_started_machine === 'string') creditGoalDrafts.delete(store.credit_started_machine);
   const worker = snapshotWorker();
@@ -1033,11 +1064,8 @@ const renderPoc = (store) => {
     else configuration.textContent = `Inference endpoint: ${store.poc_configuration?.configuration?.endpoint ?? 'unavailable'}; model: ${store.poc_configuration?.configuration?.model ?? 'unavailable'}.`;
     row.append(configuration);
     paragraph(row, useCredit ? `Start session approves this inference endpoint and model for ${target.machine}.` : `Start session approves inference using ${store.poc_configuration?.configuration?.model || 'the configured model'} on ${target.machine}.`);
-    let creditGoal;
+    const inputs = startInputs(row, target.machine, '', !useCredit, useCredit);
     if (useCredit) {
-      creditGoal = document.createElement('textarea'); creditGoal.dataset.creditGoal = target.machine;
-      creditGoal.setAttribute('aria-label', 'Goal before Start session'); creditGoal.value = creditGoalDrafts.get(target.machine) ?? '';
-      creditGoal.addEventListener('input', () => creditGoalDrafts.set(target.machine, creditGoal.value)); row.append(creditGoal);
       paragraph(row, store.credit.disclosure);
       if (readingCredit) paragraph(row, 'Reading inference credit balance…');
       else if (store.credit_error) paragraph(row, store.credit_error);
@@ -1050,8 +1078,8 @@ const renderPoc = (store) => {
       button.textContent = `${label} ${target.machine}`;
       button.addEventListener('click', () => {
         button.disabled = true;
-        if (kind === 'poc_bind' && useCredit) worker.postMessage({credit_request:{action:'start',machine:target.machine,goal:creditGoal.value,endpoint:$('poc-endpoint').value,model:$('poc-model').value}});
-        else worker.postMessage({ [kind]: { machine: target.machine } });
+        if (kind === 'poc_bind' && useCredit) worker.postMessage({credit_request:{action:'start',machine:target.machine,...inputs(),endpoint:$('poc-endpoint').value,model:$('poc-model').value}});
+        else worker.postMessage({ [kind]: { machine: target.machine, ...(kind === 'poc_bind' ? inputs() : {}) } });
       });
       if (kind === 'poc_bind') startDisclosure(row);
       row.append(button);
