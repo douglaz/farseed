@@ -1292,126 +1292,160 @@ fn poc_release_bound_never_withholds_after_terminal_commit() {
     poc_assert_release_invariant(185344, false);
 }
 
-#[test]
-fn poc_normal_job_settlement_preserves_full_output_and_replay_without_relaunch() {
-    for (size, stderr_size, key, rotated, textual_hex) in [
-        (65536, 0, true, false, false),
-        (262144, 0, true, false, false),
-        (393216, 0, false, false, false),
-        (262144, 16384, true, false, false),
-        (262144, 0, true, true, false),
-        (262144, 0, true, false, true),
-        (262144, 16384, true, true, false),
-        (327680, 24576, true, true, false),
-    ] {
-        eprintln!(
-            "ordinary settlement: stdout={size}, stderr={stderr_size}, key={key}, rotated={rotated}, textual_hex={textual_hex}"
-        );
-        let started = std::time::Instant::now();
-        let mut store = ready();
-        let output = if textual_hex {
-            hex::encode(poc_package_output(size / 2)).into_bytes()
-        } else {
-            poc_package_output(size)
-        };
-        let stderr = poc_package_output(stderr_size);
-        let mut evidence = poc_pending_job(&mut store, &output);
-        if let crate::jobs::Record::Present { stderr: field, .. } = &mut evidence.record {
-            *field = hex::encode(&stderr);
-        }
-        if rotated {
-            store.remember_poc_credential(b"previous-normal-key-482700");
-        }
-        if key {
-            store.remember_poc_credential(b"normal-synthetic-key-482700");
-        }
-        assert_eq!(block_on(store.collectable("machine-a")).unwrap().len(), 1);
-        assert!(block_on(store.check("machine-a")).is_err());
-        // A nonterminal observation remains collectable; only the truthful finish clears it.
-        let mut observation = evidence.clone();
-        if let crate::jobs::Record::Present {
-            exit_status, pid, ..
-        } = &mut observation.record
-        {
-            *exit_status = None;
-            *pid = 0;
-        }
-        for _ in 0..2 {
-            assert_eq!(
-                block_on(store.job_evidence(&observation)).unwrap().state,
-                crate::jobs::State::Incomplete
-            );
-        }
-        let uncommitted = block_on(crate::harness::BoundJournal::uncommitted(
-            &store,
-            &evidence,
-            "machine-a",
-            &store.dispatch.calls[&evidence.call].intent.command,
-        ))
-        .unwrap();
-        assert_eq!(uncommitted.number, None);
-        assert_eq!(uncommitted.stdout.as_bytes(), output);
-        assert_eq!(uncommitted.stderr.as_bytes(), stderr);
-        let report = block_on(store.job_evidence(&evidence)).unwrap();
-        assert_eq!(report.state, crate::jobs::State::Finished);
-        assert_eq!(report.exit_status, Some(7));
-        assert_eq!(report.stdout.as_bytes(), output);
-        assert_eq!(report.stderr.as_bytes(), stderr);
-        assert_eq!(report.evidence, evidence);
-        let released = block_on(crate::harness::BoundJournal::release(
-            &store,
-            serde_json::to_value(&report).unwrap(),
-        ))
-        .unwrap();
-        assert_eq!(released["stdout"].as_str().unwrap().as_bytes(), output);
-        assert_eq!(released["stderr"].as_str().unwrap().as_bytes(), stderr);
-        assert_eq!(released["record"]["stdout"], hex::encode(&output));
-        assert_eq!(released["record"]["stderr"], hex::encode(&stderr));
-        assert_eq!(released["exit_status"], 7);
-        assert_poc_decrypted_journal_private_counts(
-            &store,
-            &[
-                b"normal-synthetic-key-482700",
-                b"previous-normal-key-482700",
-            ],
-            2,
-        );
-
-        assert!(matches!(
-            store.dispatch.calls[&evidence.call].state,
-            crate::dispatch::CallState::Finished { exit_status: 7, .. }
-        ));
-        assert!(block_on(store.collectable("machine-a")).unwrap().is_empty());
-        block_on(store.check("machine-a")).unwrap();
-        let files = store.storage.files();
-        assert!(block_on(store.job_evidence(&evidence)).is_err());
-        assert_eq!(files, store.storage.files());
-        let recovered = reopen(&store).unwrap();
-        assert_eq!(recovered.dispatch.jobs.last().unwrap(), &report);
+fn assert_normal_job_settlement(
+    size: usize,
+    stderr_size: usize,
+    key: bool,
+    rotated: bool,
+    textual_hex: bool,
+) {
+    eprintln!(
+        "ordinary settlement: stdout={size}, stderr={stderr_size}, key={key}, rotated={rotated}, textual_hex={textual_hex}"
+    );
+    let started = std::time::Instant::now();
+    let mut store = ready();
+    let output = if textual_hex {
+        hex::encode(poc_package_output(size / 2)).into_bytes()
+    } else {
+        poc_package_output(size)
+    };
+    let stderr = poc_package_output(stderr_size);
+    let mut evidence = poc_pending_job(&mut store, &output);
+    if let crate::jobs::Record::Present { stderr: field, .. } = &mut evidence.record {
+        *field = hex::encode(&stderr);
+    }
+    if rotated {
+        store.remember_poc_credential(b"previous-normal-key-482700");
+    }
+    if key {
+        store.remember_poc_credential(b"normal-synthetic-key-482700");
+    }
+    assert_eq!(block_on(store.collectable("machine-a")).unwrap().len(), 1);
+    assert!(block_on(store.check("machine-a")).is_err());
+    // A nonterminal observation remains collectable; only the truthful finish clears it.
+    let mut observation = evidence.clone();
+    if let crate::jobs::Record::Present {
+        exit_status, pid, ..
+    } = &mut observation.record
+    {
+        *exit_status = None;
+        *pid = 0;
+    }
+    for _ in 0..2 {
         assert_eq!(
-            recovered.dispatch.calls.len(),
-            1,
-            "collection/replay never creates another intent"
-        );
-        assert_eq!(recovered.dispatch.terminals.len(), 1);
-        assert!(
-            block_on(recovered.collectable("machine-a"))
-                .unwrap()
-                .is_empty()
-        );
-        block_on(recovered.check("machine-a")).unwrap();
-        let replay_release = block_on(crate::harness::BoundJournal::release(
-            &recovered,
-            serde_json::to_value(&report).unwrap(),
-        ))
-        .unwrap();
-        assert_eq!(replay_release, released);
-        assert_eq!(recovered.storage.files(), files);
-        eprintln!(
-            "ordinary settlement/release/replay passed in {:?}",
-            started.elapsed()
+            block_on(store.job_evidence(&observation)).unwrap().state,
+            crate::jobs::State::Incomplete
         );
     }
+    let uncommitted = block_on(crate::harness::BoundJournal::uncommitted(
+        &store,
+        &evidence,
+        "machine-a",
+        &store.dispatch.calls[&evidence.call].intent.command,
+    ))
+    .unwrap();
+    assert_eq!(uncommitted.number, None);
+    assert_eq!(uncommitted.stdout.as_bytes(), output);
+    assert_eq!(uncommitted.stderr.as_bytes(), stderr);
+    let report = block_on(store.job_evidence(&evidence)).unwrap();
+    assert_eq!(report.state, crate::jobs::State::Finished);
+    assert_eq!(report.exit_status, Some(7));
+    assert_eq!(report.stdout.as_bytes(), output);
+    assert_eq!(report.stderr.as_bytes(), stderr);
+    assert_eq!(report.evidence, evidence);
+    let released = block_on(crate::harness::BoundJournal::release(
+        &store,
+        serde_json::to_value(&report).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(released["stdout"].as_str().unwrap().as_bytes(), output);
+    assert_eq!(released["stderr"].as_str().unwrap().as_bytes(), stderr);
+    assert_eq!(released["record"]["stdout"], hex::encode(&output));
+    assert_eq!(released["record"]["stderr"], hex::encode(&stderr));
+    assert_eq!(released["exit_status"], 7);
+    assert_poc_decrypted_journal_private_counts(
+        &store,
+        &[
+            b"normal-synthetic-key-482700",
+            b"previous-normal-key-482700",
+        ],
+        2,
+    );
+
+    assert!(matches!(
+        store.dispatch.calls[&evidence.call].state,
+        crate::dispatch::CallState::Finished { exit_status: 7, .. }
+    ));
+    assert!(block_on(store.collectable("machine-a")).unwrap().is_empty());
+    block_on(store.check("machine-a")).unwrap();
+    let files = store.storage.files();
+    assert!(block_on(store.job_evidence(&evidence)).is_err());
+    assert_eq!(files, store.storage.files());
+    let recovered = reopen(&store).unwrap();
+    assert_eq!(recovered.dispatch.jobs.last().unwrap(), &report);
+    assert_eq!(
+        recovered.dispatch.calls.len(),
+        1,
+        "collection/replay never creates another intent"
+    );
+    assert_eq!(recovered.dispatch.terminals.len(), 1);
+    assert!(
+        block_on(recovered.collectable("machine-a"))
+            .unwrap()
+            .is_empty()
+    );
+    block_on(recovered.check("machine-a")).unwrap();
+    let replay_release = block_on(crate::harness::BoundJournal::release(
+        &recovered,
+        serde_json::to_value(&report).unwrap(),
+    ))
+    .unwrap();
+    assert_eq!(replay_release, released);
+    assert_eq!(recovered.storage.files(), files);
+    eprintln!(
+        "ordinary settlement/release/replay passed in {:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn poc_normal_job_settlement_preserves_full_output_and_replay_without_relaunch_row_1() {
+    assert_normal_job_settlement(65536, 0, true, false, false);
+}
+
+#[test]
+fn poc_normal_job_settlement_preserves_full_output_and_replay_without_relaunch_row_2() {
+    assert_normal_job_settlement(262144, 0, true, false, false);
+}
+
+#[test]
+fn poc_normal_job_settlement_preserves_full_output_and_replay_without_relaunch_row_3() {
+    assert_normal_job_settlement(393216, 0, false, false, false);
+}
+
+#[test]
+fn poc_normal_job_settlement_preserves_full_output_and_replay_without_relaunch_row_4() {
+    assert_normal_job_settlement(262144, 16384, true, false, false);
+}
+
+#[test]
+fn poc_normal_job_settlement_preserves_full_output_and_replay_without_relaunch_row_5() {
+    assert_normal_job_settlement(262144, 0, true, true, false);
+}
+
+#[test]
+fn poc_normal_job_settlement_preserves_full_output_and_replay_without_relaunch_row_6() {
+    assert_normal_job_settlement(262144, 0, true, false, true);
+}
+
+#[test]
+fn poc_normal_job_settlement_preserves_full_output_and_replay_without_relaunch_row_7() {
+    assert_normal_job_settlement(262144, 16384, true, true, false);
+}
+
+#[test]
+fn poc_normal_job_settlement_preserves_full_output_and_replay_without_relaunch_row_8() {
+    assert_normal_job_settlement(327680, 24576, true, true, false);
 }
 
 #[test]

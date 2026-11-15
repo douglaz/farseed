@@ -67,10 +67,7 @@ fn wait_key(reason: &str) -> String {
     event[start..].to_owned()
 }
 
-#[test]
-fn poc_wait_admission_prevents_resume_stranding() {
-    // Fix all identifiers for the safe-key continuation and adoption assertions.
-    let _identifiers = FixedIdentifiers::new();
+fn wait_admission_rows() -> Vec<(String, String)> {
     let mut rows = Vec::new();
     for pattern in wait_shapes() {
         let reason = pattern
@@ -92,144 +89,313 @@ fn poc_wait_admission_prevents_resume_stranding() {
         ("{\"wait\":{\"why\":\"collection".into(), "collection returned no outcome for pending call {number} job {job}; pending identity retained".into()),
         ("remain\",\"running\":false}}}}}".into(), wait::COMMITTED_MISMATCH.into()),
     ]);
+    rows
+}
+
+fn assert_wait_admission_row(index: usize) {
+    // Each row owns its deterministic identifier stream.
+    let _identifiers = FixedIdentifiers::new();
+    let rows = wait_admission_rows();
+    let (key, pattern) = &rows[index];
     let mut admitted = 0;
     let mut stranded = 0;
     let mut safe_waits = 0;
-    for (key, pattern) in &rows {
-        assert!(
-            (16..=4096).contains(&key.len()) && key.bytes().all(|b| (0x21..=0x7e).contains(&b)),
-            "invalid probe {key:?}"
-        );
-        let mut store = ready();
-        let task = create_task(&mut store);
-        let proposed = proposal(&mut store, &task);
-        append(&mut store, &proposed, &task.start_session);
-        let pending = store.poc_task(&task.id).unwrap().pending.unwrap();
-        let reason = pattern
-            .replace("{number}", &pending.call.to_string())
-            .replace("{job}", &pending.job);
-        let files = store.storage.files();
-        let next = store.next;
-        let previous = store.previous.0;
-        let tasks = store.poc.clone();
-        let filters = store.poc_credential_filters.borrow().len();
-        let admission = store.poc_configuration_key(key.as_bytes());
-        super::journal_tests::unchanged(&store, &files, next, previous);
-        assert_eq!(store.poc, tasks);
-        assert_eq!(store.poc_credential_filters.borrow().len(), filters);
-        if let Err(error) = &admission {
-            assert!(!error.contains(key));
-        }
-        let mut runtime = WaitRuntime {
-            store,
-            reason,
-            before_wait: None,
-        };
-        if admission.is_ok() {
-            admitted += 1;
-            runtime.store.remember_poc_credential(key.as_bytes());
-            let result = block_on(run::resume(
-                &mut runtime,
-                &mut Script::default(),
-                &task.id,
-                &task.start_session,
-            ));
-            let (files, next, previous, before) = runtime
-                .before_wait
-                .take()
-                .expect("real runner reached Wait");
-            if result.is_err() {
-                stranded += 1;
-                super::journal_tests::unchanged(&runtime.store, &files, next, previous.0);
-                assert_eq!(runtime.store.poc_task(&task.id).unwrap(), before);
-            }
-            eprintln!(
-                "wait probe key={key:?} admitted=true resume_error={:?} wait_writes={}",
-                result.err(),
-                runtime.store.next - next
-            );
-        } else {
-            // Refusal preserves the old inventory. A seed-independent safe key can still Resume.
-            runtime
-                .store
-                .poc_configuration_key(b"safe~resume~credential~QZ")
-                .unwrap();
-            runtime
-                .store
-                .remember_poc_credential(b"safe~resume~credential~QZ");
-            let result = block_on(run::resume(
-                &mut runtime,
-                &mut Script::default(),
-                &task.id,
-                &task.start_session,
-            ))
-            .unwrap();
-            assert_eq!(
-                result.pause_reason.as_deref(),
-                Some(runtime.reason.as_str())
-            );
-            assert!(result.pending.is_some());
-            assert_eq!(runtime.store.dispatch.calls.len(), 1);
-            assert_eq!(reopen(&runtime.store).poc_task(&task.id).unwrap(), result);
-            safe_waits += 1;
-        }
-        let current = runtime.store.poc_task(&task.id).unwrap();
-        assert_eq!(
-            change(&mut runtime.store, &current, Change::Abandon).status,
-            Status::Abandoned
-        );
+    assert!(
+        (16..=4096).contains(&key.len()) && key.bytes().all(|b| (0x21..=0x7e).contains(&b)),
+        "invalid probe {key:?}"
+    );
+    let mut store = ready();
+    let task = create_task(&mut store);
+    let proposed = proposal(&mut store, &task);
+    append(&mut store, &proposed, &task.start_session);
+    let pending = store.poc_task(&task.id).unwrap().pending.unwrap();
+    let reason = pattern
+        .replace("{number}", &pending.call.to_string())
+        .replace("{job}", &pending.job);
+    let files = store.storage.files();
+    let next = store.next;
+    let previous = store.previous.0;
+    let tasks = store.poc.clone();
+    let filters = store.poc_credential_filters.borrow().len();
+    let admission = store.poc_configuration_key(key.as_bytes());
+    super::journal_tests::unchanged(&store, &files, next, previous);
+    assert_eq!(store.poc, tasks);
+    assert_eq!(store.poc_credential_filters.borrow().len(), filters);
+    if let Err(error) = &admission {
+        assert!(!error.contains(key));
     }
+    let mut runtime = WaitRuntime {
+        store,
+        reason,
+        before_wait: None,
+    };
+    if admission.is_ok() {
+        admitted += 1;
+        runtime.store.remember_poc_credential(key.as_bytes());
+        let result = block_on(run::resume(
+            &mut runtime,
+            &mut Script::default(),
+            &task.id,
+            &task.start_session,
+        ));
+        let (files, next, previous, before) = runtime
+            .before_wait
+            .take()
+            .expect("real runner reached Wait");
+        if result.is_err() {
+            stranded += 1;
+            super::journal_tests::unchanged(&runtime.store, &files, next, previous.0);
+            assert_eq!(runtime.store.poc_task(&task.id).unwrap(), before);
+        }
+        eprintln!(
+            "wait probe key={key:?} admitted=true resume_error={:?} wait_writes={}",
+            result.err(),
+            runtime.store.next - next
+        );
+    } else {
+        // Refusal preserves the old inventory. A seed-independent safe key can still Resume.
+        runtime
+            .store
+            .poc_configuration_key(b"safe~resume~credential~QZ")
+            .unwrap();
+        runtime
+            .store
+            .remember_poc_credential(b"safe~resume~credential~QZ");
+        let result = block_on(run::resume(
+            &mut runtime,
+            &mut Script::default(),
+            &task.id,
+            &task.start_session,
+        ))
+        .unwrap();
+        assert_eq!(
+            result.pause_reason.as_deref(),
+            Some(runtime.reason.as_str())
+        );
+        assert!(result.pending.is_some());
+        assert_eq!(runtime.store.dispatch.calls.len(), 1);
+        assert_eq!(reopen(&runtime.store).poc_task(&task.id).unwrap(), result);
+        safe_waits += 1;
+    }
+    let current = runtime.store.poc_task(&task.id).unwrap();
+    assert_eq!(
+        change(&mut runtime.store, &current, Change::Abandon).status,
+        Status::Abandoned
+    );
     eprintln!(
         "wait rows={} admitted={admitted} stranded={stranded} safe_waits={safe_waits}",
-        rows.len()
+        1
     );
     assert_eq!(
         admitted, 0,
         "fixed Wait envelope keys must be refused at admission"
     );
     assert_eq!(stranded, 0);
-    assert_eq!(safe_waits, rows.len());
+    assert_eq!(safe_waits, 1);
+}
+
+macro_rules! wait_admission_tests {
+    ($($name:ident: $row:literal;)*) => {
+        $(
+            #[test]
+            fn $name() {
+                assert_wait_admission_row($row);
+            }
+        )*
+
+        #[test]
+        fn poc_wait_admission_prevents_resume_stranding_coverage() {
+            let rows = wait_admission_rows();
+            let covered: &[usize] = &[$($row),*];
+            assert_eq!(rows.len(), covered.len(), "every probe row needs its own test");
+            for (expected, actual) in covered.iter().copied().enumerate() {
+                assert_eq!(expected, actual, "probe rows must be covered exactly once");
+            }
+        }
+    };
+}
+
+wait_admission_tests! {
+    poc_wait_admission_prevents_resume_stranding_row_000: 0;
+    poc_wait_admission_prevents_resume_stranding_row_001: 1;
+    poc_wait_admission_prevents_resume_stranding_row_002: 2;
+    poc_wait_admission_prevents_resume_stranding_row_003: 3;
+    poc_wait_admission_prevents_resume_stranding_row_004: 4;
+    poc_wait_admission_prevents_resume_stranding_row_005: 5;
+    poc_wait_admission_prevents_resume_stranding_row_006: 6;
+    poc_wait_admission_prevents_resume_stranding_row_007: 7;
+    poc_wait_admission_prevents_resume_stranding_row_008: 8;
+    poc_wait_admission_prevents_resume_stranding_row_009: 9;
+    poc_wait_admission_prevents_resume_stranding_row_010: 10;
+    poc_wait_admission_prevents_resume_stranding_row_011: 11;
+    poc_wait_admission_prevents_resume_stranding_row_012: 12;
+    poc_wait_admission_prevents_resume_stranding_row_013: 13;
+    poc_wait_admission_prevents_resume_stranding_row_014: 14;
+    poc_wait_admission_prevents_resume_stranding_row_015: 15;
+    poc_wait_admission_prevents_resume_stranding_row_016: 16;
+    poc_wait_admission_prevents_resume_stranding_row_017: 17;
+    poc_wait_admission_prevents_resume_stranding_row_018: 18;
+    poc_wait_admission_prevents_resume_stranding_row_019: 19;
+    poc_wait_admission_prevents_resume_stranding_row_020: 20;
+    poc_wait_admission_prevents_resume_stranding_row_021: 21;
+    poc_wait_admission_prevents_resume_stranding_row_022: 22;
+    poc_wait_admission_prevents_resume_stranding_row_023: 23;
+    poc_wait_admission_prevents_resume_stranding_row_024: 24;
+    poc_wait_admission_prevents_resume_stranding_row_025: 25;
+    poc_wait_admission_prevents_resume_stranding_row_026: 26;
+    poc_wait_admission_prevents_resume_stranding_row_027: 27;
+    poc_wait_admission_prevents_resume_stranding_row_028: 28;
+    poc_wait_admission_prevents_resume_stranding_row_029: 29;
+    poc_wait_admission_prevents_resume_stranding_row_030: 30;
+    poc_wait_admission_prevents_resume_stranding_row_031: 31;
+    poc_wait_admission_prevents_resume_stranding_row_032: 32;
+    poc_wait_admission_prevents_resume_stranding_row_033: 33;
+    poc_wait_admission_prevents_resume_stranding_row_034: 34;
+    poc_wait_admission_prevents_resume_stranding_row_035: 35;
+    poc_wait_admission_prevents_resume_stranding_row_036: 36;
+    poc_wait_admission_prevents_resume_stranding_row_037: 37;
+    poc_wait_admission_prevents_resume_stranding_row_038: 38;
+    poc_wait_admission_prevents_resume_stranding_row_039: 39;
+    poc_wait_admission_prevents_resume_stranding_row_040: 40;
+    poc_wait_admission_prevents_resume_stranding_row_041: 41;
+    poc_wait_admission_prevents_resume_stranding_row_042: 42;
+    poc_wait_admission_prevents_resume_stranding_row_043: 43;
+    poc_wait_admission_prevents_resume_stranding_row_044: 44;
+    poc_wait_admission_prevents_resume_stranding_row_045: 45;
+    poc_wait_admission_prevents_resume_stranding_row_046: 46;
+    poc_wait_admission_prevents_resume_stranding_row_047: 47;
+    poc_wait_admission_prevents_resume_stranding_row_048: 48;
+    poc_wait_admission_prevents_resume_stranding_row_049: 49;
+    poc_wait_admission_prevents_resume_stranding_row_050: 50;
+    poc_wait_admission_prevents_resume_stranding_row_051: 51;
+    poc_wait_admission_prevents_resume_stranding_row_052: 52;
+    poc_wait_admission_prevents_resume_stranding_row_053: 53;
+    poc_wait_admission_prevents_resume_stranding_row_054: 54;
+    poc_wait_admission_prevents_resume_stranding_row_055: 55;
+    poc_wait_admission_prevents_resume_stranding_row_056: 56;
+    poc_wait_admission_prevents_resume_stranding_row_057: 57;
+    poc_wait_admission_prevents_resume_stranding_row_058: 58;
+    poc_wait_admission_prevents_resume_stranding_row_059: 59;
+    poc_wait_admission_prevents_resume_stranding_row_060: 60;
+    poc_wait_admission_prevents_resume_stranding_row_061: 61;
+    poc_wait_admission_prevents_resume_stranding_row_062: 62;
+    poc_wait_admission_prevents_resume_stranding_row_063: 63;
+    poc_wait_admission_prevents_resume_stranding_row_064: 64;
+    poc_wait_admission_prevents_resume_stranding_row_065: 65;
+    poc_wait_admission_prevents_resume_stranding_row_066: 66;
+    poc_wait_admission_prevents_resume_stranding_row_067: 67;
+    poc_wait_admission_prevents_resume_stranding_row_068: 68;
+    poc_wait_admission_prevents_resume_stranding_row_069: 69;
+    poc_wait_admission_prevents_resume_stranding_row_070: 70;
+    poc_wait_admission_prevents_resume_stranding_row_071: 71;
+    poc_wait_admission_prevents_resume_stranding_row_072: 72;
+    poc_wait_admission_prevents_resume_stranding_row_073: 73;
+    poc_wait_admission_prevents_resume_stranding_row_074: 74;
+    poc_wait_admission_prevents_resume_stranding_row_075: 75;
+    poc_wait_admission_prevents_resume_stranding_row_076: 76;
+    poc_wait_admission_prevents_resume_stranding_row_077: 77;
+    poc_wait_admission_prevents_resume_stranding_row_078: 78;
+    poc_wait_admission_prevents_resume_stranding_row_079: 79;
+    poc_wait_admission_prevents_resume_stranding_row_080: 80;
+    poc_wait_admission_prevents_resume_stranding_row_081: 81;
+    poc_wait_admission_prevents_resume_stranding_row_082: 82;
+    poc_wait_admission_prevents_resume_stranding_row_083: 83;
+    poc_wait_admission_prevents_resume_stranding_row_084: 84;
+    poc_wait_admission_prevents_resume_stranding_row_085: 85;
+    poc_wait_admission_prevents_resume_stranding_row_086: 86;
+    poc_wait_admission_prevents_resume_stranding_row_087: 87;
+    poc_wait_admission_prevents_resume_stranding_row_088: 88;
+    poc_wait_admission_prevents_resume_stranding_row_089: 89;
+    poc_wait_admission_prevents_resume_stranding_row_090: 90;
+    poc_wait_admission_prevents_resume_stranding_row_091: 91;
+    poc_wait_admission_prevents_resume_stranding_row_092: 92;
+    poc_wait_admission_prevents_resume_stranding_row_093: 93;
+    poc_wait_admission_prevents_resume_stranding_row_094: 94;
+    poc_wait_admission_prevents_resume_stranding_row_095: 95;
+    poc_wait_admission_prevents_resume_stranding_row_096: 96;
+    poc_wait_admission_prevents_resume_stranding_row_097: 97;
+    poc_wait_admission_prevents_resume_stranding_row_098: 98;
+    poc_wait_admission_prevents_resume_stranding_row_099: 99;
+    poc_wait_admission_prevents_resume_stranding_row_100: 100;
+    poc_wait_admission_prevents_resume_stranding_row_101: 101;
+    poc_wait_admission_prevents_resume_stranding_row_102: 102;
+    poc_wait_admission_prevents_resume_stranding_row_103: 103;
+    poc_wait_admission_prevents_resume_stranding_row_104: 104;
+    poc_wait_admission_prevents_resume_stranding_row_105: 105;
+    poc_wait_admission_prevents_resume_stranding_row_106: 106;
+    poc_wait_admission_prevents_resume_stranding_row_107: 107;
+    poc_wait_admission_prevents_resume_stranding_row_108: 108;
+    poc_wait_admission_prevents_resume_stranding_row_109: 109;
+    poc_wait_admission_prevents_resume_stranding_row_110: 110;
+    poc_wait_admission_prevents_resume_stranding_row_111: 111;
+    poc_wait_admission_prevents_resume_stranding_row_112: 112;
+    poc_wait_admission_prevents_resume_stranding_row_113: 113;
+    poc_wait_admission_prevents_resume_stranding_row_114: 114;
+    poc_wait_admission_prevents_resume_stranding_row_115: 115;
+    poc_wait_admission_prevents_resume_stranding_row_116: 116;
+    poc_wait_admission_prevents_resume_stranding_row_117: 117;
+    poc_wait_admission_prevents_resume_stranding_row_118: 118;
+    poc_wait_admission_prevents_resume_stranding_row_119: 119;
+    poc_wait_admission_prevents_resume_stranding_row_120: 120;
+    poc_wait_admission_prevents_resume_stranding_row_121: 121;
+    poc_wait_admission_prevents_resume_stranding_row_122: 122;
+    poc_wait_admission_prevents_resume_stranding_row_123: 123;
+    poc_wait_admission_prevents_resume_stranding_row_124: 124;
+    poc_wait_admission_prevents_resume_stranding_row_125: 125;
+    poc_wait_admission_prevents_resume_stranding_row_126: 126;
+    poc_wait_admission_prevents_resume_stranding_row_127: 127;
+    poc_wait_admission_prevents_resume_stranding_row_128: 128;
+    poc_wait_admission_prevents_resume_stranding_row_129: 129;
+    poc_wait_admission_prevents_resume_stranding_row_130: 130;
+}
+
+fn assert_public_key_fresh_stores(key: String, open: bool) {
+    let mut refused = 0;
+    let mut adoption_refused = 0;
+    for _ in 0..256 {
+        let mut store = ready();
+        if open {
+            create_task(&mut store);
+        }
+        if store.poc_configuration_key(key.as_bytes()).is_err() {
+            refused += 1;
+        }
+        let mut adopted = ready();
+        if adopted.poc_configuration_key(key.as_bytes()).is_ok() {
+            adopted.remember_poc_credential(key.as_bytes());
+            let session = adopted.sessions[0].identity.clone();
+            if block_on(adopted.poc_create(&session, vec!["true".into()])).is_err() {
+                adoption_refused += 1;
+            }
+        } else {
+            adoption_refused += 1;
+        }
+    }
+    eprintln!(
+        "public key={key:?} open={open} stores=256 refused={refused} adoption_refused={adoption_refused}"
+    );
+    assert_eq!((refused, adoption_refused), (0, 0));
 }
 
 #[test]
-fn poc_wait_hex_admission_public_keys_across_fresh_stores() {
-    for key in [
-        "protectedoutputwithheld".to_owned(),
-        format!("sk-{}", "0123456789abcdef".repeat(3)),
-    ] {
-        for open in [false, true] {
-            let mut refused = 0;
-            let mut adoption_refused = 0;
-            for _ in 0..256 {
-                let mut store = ready();
-                if open {
-                    create_task(&mut store);
-                }
-                if store.poc_configuration_key(key.as_bytes()).is_err() {
-                    refused += 1;
-                }
-                let mut adopted = ready();
-                if adopted.poc_configuration_key(key.as_bytes()).is_ok() {
-                    adopted.remember_poc_credential(key.as_bytes());
-                    let session = adopted.sessions[0].identity.clone();
-                    if block_on(adopted.poc_create(&session, vec!["true".into()])).is_err() {
-                        adoption_refused += 1;
-                    }
-                } else {
-                    adoption_refused += 1;
-                }
-            }
-            eprintln!(
-                "public key={key:?} open={open} stores=256 refused={refused} adoption_refused={adoption_refused}"
-            );
-            // Accumulate every scenario before asserting, so the baseline receipt reports each cell.
-            PUBLIC_RESULTS.with_borrow_mut(|results| results.push((refused, adoption_refused)));
-        }
-    }
-    let results = PUBLIC_RESULTS.with_borrow_mut(std::mem::take);
-    assert_eq!(results, vec![(0, 0); 4]);
+fn poc_wait_hex_admission_public_keys_across_fresh_stores_protected_closed() {
+    assert_public_key_fresh_stores("protectedoutputwithheld".to_owned(), false);
 }
-thread_local! { static PUBLIC_RESULTS: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) }; }
+
+#[test]
+fn poc_wait_hex_admission_public_keys_across_fresh_stores_protected_open() {
+    assert_public_key_fresh_stores("protectedoutputwithheld".to_owned(), true);
+}
+
+#[test]
+fn poc_wait_hex_admission_public_keys_across_fresh_stores_hex_closed() {
+    assert_public_key_fresh_stores(format!("sk-{}", "0123456789abcdef".repeat(3)), false);
+}
+
+#[test]
+fn poc_wait_hex_admission_public_keys_across_fresh_stores_hex_open() {
+    assert_public_key_fresh_stores(format!("sk-{}", "0123456789abcdef".repeat(3)), true);
+}
 
 #[test]
 fn poc_wait_hex_exact_and_all_digit_forms_still_refuse() {

@@ -88,3 +88,6 @@ syn = { version = "2", features = ["full", "visit"] }
 opt-level = "s"
 lto = true
 codegen-units = 1
+
+[profile.dev.package.tracer]
+opt-level = 3
