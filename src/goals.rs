@@ -197,7 +197,7 @@ pub fn definitions() -> Value {
     json!([
         spec(
             "exec",
-            json!({"machine":machine,"command":{"type":"string"}}),
+            json!({"machine":machine,"command":{"type":"string","description":"A POSIX sh script run as root on the named machine; exit status, stdout and stderr come back."}}),
             &["machine", "command"]
         ),
         job,

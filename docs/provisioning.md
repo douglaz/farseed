@@ -101,6 +101,8 @@ listener can be declared with from=none. A pending read holds proposal generatio
 job identity across reload; collection or an explicit continuing disposition must settle it.
 A refused, nonzero, unparseable or explicitly disposed unknown read is reported as not read,
 without another attempt. Reject and Resume reuse the same observation.
+After the minimum and example, the proposal request gives per-port guidance on minimum coverage,
+loopback-only declarations and removal before handover.
 
 The proposal tool offers a complete typed declaration: version 2, inbound and outbound listener
 entries, system services with running-at-delivery or enabled-survives-reboot lifecycle, key material,
@@ -110,6 +112,8 @@ ad-hoc minimum and a filled example with a service and inbound/outbound entries,
 only, not a suggestion for the goal. Structural validity still passes through semantic admission.
 A refusal returns specific bounded field paths and expectations as that call's untrusted output,
 so the next proposal can correct the offending fields.
+After approval, each configuration request restates the exact handover read commands and passing
+conditions, including previously observed TCP ports that must be removed because they were not declared.
 
 Malformed tool replies run nothing. The task records a bounded reason and asks again automatically
 for the first two consecutive malformed replies; a usable call resets the count, even when its
