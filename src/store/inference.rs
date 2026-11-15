@@ -216,16 +216,16 @@ impl<S: Storage> Store<S> {
                     if let Some(spend) = &t.spend {
                         match crate::inference_limits::Decimal::parse(spend) {
                             Ok(spend) => limits.spent.add(&spend),
-                            Err(_) => limits.ended = Some("incompatible issuer usage".into()),
+                            Err(_) => limits.ended = Some(crate::poc::wait::ISSUER_USAGE.into()),
                         }
                     }
                     use crate::inference::ChargeRefusal;
                     match t.charge_refusal {
                         Some(ChargeRefusal::KeyCapExhausted) => {
-                            limits.ended = Some("session cap exhausted".into())
+                            limits.ended = Some(crate::poc::wait::CAP_EXHAUSTED.into())
                         }
                         Some(ChargeRefusal::KeyExpired) => {
-                            limits.ended = Some("session expired".into())
+                            limits.ended = Some(crate::poc::wait::SESSION_EXPIRED.into())
                         }
                         _ => {}
                     }
@@ -330,6 +330,7 @@ impl<S: Storage> Store<S> {
     }
 
     /// Stops dispatch before any await. Dropping the row-2 holdings zeroizes their buffers.
+    #[cfg(any(test, feature = "tracer"))]
     pub fn end_inference_sessions(&mut self) -> Vec<String> {
         self.inference.ended = true;
         self.clear_scan_working_copies();
@@ -872,7 +873,7 @@ impl<S: Storage> Store<S> {
             if let InferenceIntent::Mint { session, cap, expires, .. } = &intent
                 && (t.cap.as_ref() != Some(cap) || t.expires != Some(*expires) || t.unit.as_deref() != Some("account units"))
                 && let Some(limits) = self.inference.limits.borrow_mut().get_mut(session) {
-                limits.ended = Some("incompatible or missing issuer acceptance".into());
+                limits.ended = Some(crate::poc::wait::ISSUER_ACCEPTANCE.into());
             }
             if let InferenceIntent::Mint { session, .. } | InferenceIntent::Completion { session, .. } = &intent
                 && let Err(why) = self.check_session_authority(session, self.session_pair(session)) {

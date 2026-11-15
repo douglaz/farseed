@@ -103,14 +103,53 @@ async fn publication(generation: u64, session: String, report: String, post: boo
             }
             let safe = store.protect_output(&value)?;
             let mut current = local.report(None);
+            if safe["payment_timer"] == true {
+                current["payment_timer"] = true.into();
+            }
             if let Some(outcome) = safe.get("goal_outcome") {
                 if outcome["session"] != session {
                     return Err("publication session differs".into());
                 }
                 current["goal_outcome"] = outcome.clone();
             }
+            if let Some(error) = safe.get("credit_error") {
+                current["credit_error"] = error.clone();
+            }
             if let Some(error) = safe.get("error") {
                 current["error"] = error.clone();
+            }
+            if local.dispatch_refusal().is_none() {
+                if let Some(configuration) = safe.get("poc_configuration")
+                    && configuration.as_object().is_some_and(|v| v.len() == 1)
+                    && configuration["key_set"].is_boolean()
+                {
+                    current["poc_configuration"] = configuration.clone();
+                }
+                if let Some(keys) = safe.get("poc_keys") {
+                    current["poc_keys"] = keys.clone();
+                }
+                if let Some(catalogue) = safe.get("provider_catalogue") {
+                    current["provider_catalogue"] = catalogue.clone();
+                }
+                if safe["provider_selection_reviewed"] == true {
+                    current["provider_selection_reviewed"] = true.into();
+                }
+                if let Some(machine) = safe["credit_started_machine"].as_str()
+                    && current["sessions"].as_array().is_some_and(|sessions| {
+                        sessions.iter().any(|s| {
+                            s["credit_backed"] == true
+                                && s["session_state"] != "ended"
+                                && s["bound_set"]
+                                    .as_array()
+                                    .is_some_and(|set| set.iter().any(|m| m == machine))
+                                && s["identity"]
+                                    .as_str()
+                                    .is_some_and(crate::poc::credit::browser::has_key)
+                        })
+                    })
+                {
+                    current["credit_started_machine"] = machine.into();
+                }
             }
             Ok(current)
         } else {
@@ -119,12 +158,63 @@ async fn publication(generation: u64, session: String, report: String, post: boo
     })();
     let mut carries_result = result.is_ok() && !session.is_empty();
     let mut value = result.unwrap_or_else(|why| local.report(Some(&why)));
+    let display_step = serde_json::from_str::<Value>(&report)
+        .ok()
+        .and_then(|value| match value["page_error_step"].as_str() {
+            Some("store") => Some("store"),
+            Some("credit") => Some("credit"),
+            Some("machine") => Some("machine"),
+            Some("task") => Some("task"),
+            _ => None,
+        })
+        .unwrap_or(if session.is_empty() { "store" } else { "task" });
     #[cfg(feature = "tracer")]
     crate::testonly::session_point("publication_prepared").await;
     let mut last_refusal = None;
     loop {
+        if value.get("error").is_some() {
+            value["page_error_step"] = display_step.into();
+        }
         if !carries_result && let Some(history) = &history {
             value["goal_history"] = history.clone();
+        }
+        // Read-only custody survives suspension/reconciliation. It grants no authority,
+        // and is taken from the holder rather than trusting a page-supplied status.
+        let configuration = json!({"key_set":crate::poc::inference::key_is_set(),"configuration":crate::poc::inference::configuration()});
+        value["poc_configuration"] = local
+            .store()
+            .and_then(|store| store.protect_output(&configuration).ok())
+            .unwrap_or_else(|| json!({"key_set":crate::poc::inference::key_is_set()}));
+        let provider_configuration = json!({
+            "key_set":crate::poc::provisioning::browser::key_is_set(),
+            "relay_deployed":local.deployment_relay_present(),
+        });
+        value["provider_configuration"] = if let Some(store) = local.store() {
+            let mut fallback = provider_configuration;
+            fallback["recorded"] = store.provider_account().is_some().into();
+            store
+                .protect_output(&json!({
+                    "key_set":crate::poc::provisioning::browser::key_is_set(),
+                    "origin":store.procurement_origin(),
+                    "account":store.provider_account().map(|a| a.public()),
+                    "recorded":store.provider_account().is_some(),
+                    "relay_deployed":store.deployment_relay_present(),
+                }))
+                .unwrap_or(fallback)
+        } else {
+            provider_configuration
+        };
+        if value["procurement"]["payment"]["is_paid"] == true
+            && value["procurement"]["target"].is_null()
+        {
+            let readiness =
+                crate::poc::provisioning::browser::readiness_report(&value["procurement"]);
+            value["readiness"] = local
+                .store()
+                .and_then(|store| store.protect_output(&readiness).ok())
+                .unwrap_or_else(
+                    || json!({"kind":"refused","inactive":"diagnostic protection is unavailable"}),
+                );
         }
         let encoded = value.to_string();
         let message = if post {
@@ -147,6 +237,16 @@ async fn publication(generation: u64, session: String, report: String, post: boo
         // Encoding and scanning can consume lifetime too. Validate after all preparation,
         // under the same writer, immediately before the actual release.
         let final_check = (|| {
+            if value.get("provider_catalogue").is_some()
+                || value.get("provider_selection_reviewed").is_some()
+                || value.get("credit_started_machine").is_some()
+            {
+                let owner = crate::lifecycle::owner();
+                owner.ordinary()?;
+                if generation != owner.generation() {
+                    return Err("stale configuration publication".into());
+                }
+            }
             if carries_result {
                 let owner = crate::lifecycle::owner();
                 owner.ordinary()?;
@@ -191,6 +291,8 @@ pub async fn lifecycle_transition(event: String) -> String {
         "hidden" | "visible" => {}
         "freeze" => {
             owner.suspend();
+            crate::poc::inference::freeze();
+            crate::poc::provisioning::browser::freeze();
             super::wait::stop_all();
             super::goals::suspend();
             FETCHES.with_borrow(|fetches| {
@@ -697,9 +799,31 @@ pub async fn sweep_inference() {
 }
 
 #[wasm_bindgen]
+pub async fn retire_runtime() {
+    ENDING.set(true);
+    crate::lifecycle::owner().end();
+    crate::poc::inference::end();
+    crate::poc::provisioning::browser::end();
+    authority_changed();
+    super::goals::end();
+    super::wait::stop_all();
+    // A begun append owns this mutex until it completes whole, even if its reply is lost.
+    crate::worker::local().lock().await.retire();
+}
+
+pub(crate) fn session_ended(session: &str) {
+    crate::poc::inference::stop_session(session);
+    super::goals::end_session(session);
+    super::wait::stop_session(session);
+}
+
+#[cfg(feature = "tracer")]
+#[wasm_bindgen]
 pub async fn end_sessions() {
     ENDING.set(true);
     crate::lifecycle::owner().end();
+    crate::poc::inference::end();
+    crate::poc::provisioning::browser::end();
     authority_changed();
     super::goals::end();
     super::wait::stop_all();
@@ -857,7 +981,7 @@ pub async fn test_reinstall(action: String, input: String) -> Result<String, JsV
     let store = local.store().ok_or("locked")?;
     let result: Result<Value,String> = async {
         let entry="fixture";
-        let session=store.sessions().into_iter().find(|s| s["bound_set"]==json!([entry]))
+        let session=store.sessions().into_iter().find(|s| s["session_state"]!="ended" && s["bound_set"]==json!([entry]))
             .and_then(|s|s["identity"].as_str().map(str::to_owned)).ok_or("fixture binding")?;
         let id=value["approval"].as_u64().unwrap_or(0);
         let reset=value["reset"].as_str().unwrap_or("synthetic-reset");

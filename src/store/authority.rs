@@ -10,7 +10,7 @@ impl<S: Storage> Store<S> {
         session: &str,
     ) -> Result<(crate::lifecycle::Continuation, Rc<Session>), String> {
         if self.inference.ended || !self.authority.verification() {
-            return Err("sessions ended".into());
+            return Err(crate::poc::wait::SESSIONS_ENDED.into());
         }
         let live = self
             .sessions
@@ -29,6 +29,7 @@ impl<S: Storage> Store<S> {
         for session in self
             .sessions
             .iter()
+            .filter(|s| !s.ended.get())
             .map(|s| s.identity.clone())
             .collect::<Vec<_>>()
         {
@@ -116,16 +117,24 @@ impl<S: Storage> Store<S> {
     }
 
     pub fn check_session_authority(&self, session: &str, now: Pair) -> Result<(), String> {
+        if self.failed.is_some() {
+            return Err(
+                "journal append outcome uncertain; reopen to validate before further work".into(),
+            );
+        }
         if self.inference.ended {
-            return Err("sessions ended".into());
+            return Err(crate::poc::wait::SESSIONS_ENDED.into());
         }
         let live = self
             .sessions
             .iter()
             .find(|s| s.identity == session)
-            .ok_or("no live session")?;
+            .ok_or(crate::poc::wait::NO_SESSION)?;
         if live.ended.get() {
-            return Err("session ended".into());
+            return Err(crate::poc::wait::SESSION_ENDED.into());
+        }
+        if self.mint_attempted(session) && !self.inference.limits.borrow().contains_key(session) {
+            return Err("paid session readiness withheld after replay".into());
         }
         if let Some(limits) = self.inference.limits.borrow_mut().get_mut(session) {
             let result = limits.check(now);
@@ -154,6 +163,7 @@ impl<S: Storage> Store<S> {
         if let Some(views) = report["sessions"].as_array() {
             for view in views {
                 if view["session_state"] != "ended"
+                    && view["session_state"] != "waiting"
                     && view["inference_limits"]["state"] != "clock-withheld"
                     && let Some(identity) = view["identity"].as_str()
                 {
@@ -261,7 +271,7 @@ impl<S: Storage> Store<S> {
             let mut limits = self.inference.limits.borrow_mut();
             let limits = limits.get_mut(session).ok_or("no synthetic limits")?;
             match transition {
-                "ended" => limits.ended = Some("session ended".into()),
+                "ended" => limits.ended = Some(crate::poc::wait::SESSION_ENDED.into()),
                 "exhausted" => limits
                     .spent
                     .add(&crate::inference_limits::Decimal::parse(&limits.cap())?),

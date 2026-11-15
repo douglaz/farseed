@@ -230,8 +230,43 @@ pub async fn goal_accept(request: String) -> String {
         .to_string()
 }
 
+/// The page accepts a durable goal and can continue an interrupted start.
+#[wasm_bindgen]
+pub async fn accept_page_goal(session: String) -> String {
+    #[cfg(feature = "tracer")]
+    if !crate::poc::web::page_uses_runner(&session).await {
+        return goal_accept(json!({"session":session}).to_string()).await;
+    }
+    {
+        let result = async {
+            let continuation = crate::lifecycle::owner().continuation()?;
+            let local = local();
+            let mut writer = local.lock().await;
+            continuation.check()?;
+            if super::inference::ending() {
+                return Err("sessions ended".into());
+            }
+            if PENDING.with_borrow(|p| p.contains(&session)) {
+                return Err("document fetch pending".into());
+            }
+            if let Some(why) = writer.dispatch_refusal() {
+                return Err(why.into());
+            }
+            writer.store().ok_or("locked")?.poc_start(&session).await?;
+            Ok::<(), String>(())
+        }
+        .await;
+        local()
+            .lock()
+            .await
+            .report(result.as_ref().err().map(String::as_str))
+            .to_string()
+    }
+}
+
 #[wasm_bindgen]
 pub async fn requirements_answer(request: String) -> String {
+    let continuation = crate::lifecycle::owner().continuation();
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Answer {
@@ -255,6 +290,7 @@ pub async fn requirements_answer(request: String) -> String {
         crate::testonly::session_point("requirements_writer").await;
         let local = local();
         let mut local = local.lock().await;
+        continuation.as_ref().map_err(Clone::clone)?.check()?;
         if super::inference::ending() {
             return Err("sessions ended".into());
         }
@@ -273,7 +309,8 @@ pub async fn requirements_answer(request: String) -> String {
                     .await
             }
             Decision::Reject => store
-                .reject_requirements(&a.session, &a.machine, a.candidate)
+                .poc_reject_requirements(&a.session, &a.machine, a.candidate)
+                .await
                 .and(Err("proposal rejected".into())),
         };
         #[cfg(feature = "tracer")]
@@ -572,6 +609,8 @@ fn target(machine: &str) -> Target {
     Target {
         machine: machine.into(),
         relay: value["relay"].as_str().unwrap_or_default().into(),
+        profile: "v1".into(),
+        stored: false,
         host: value["host"].as_str().unwrap_or_default().into(),
         port: value["port"].as_u64().unwrap_or(0) as u16,
         user: value["user"].as_str().unwrap_or_default().into(),

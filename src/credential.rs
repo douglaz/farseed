@@ -34,6 +34,22 @@ pub struct AttestRecipientKey(pub(crate) [u8; 32]);
 /// Role 3: a relay pass's relay key, a secp256k1 secret, which signs the relay AUTH.
 pub struct RelayKey(pub(crate) [u8; 32]);
 
+impl RelayKey {
+    pub(crate) fn from_deployment(input: &[u8]) -> Option<Self> {
+        if input.len() != 64
+            || !input
+                .iter()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+        {
+            return None;
+        }
+        let mut bytes = zeroize::Zeroizing::new([0; 32]);
+        hex::decode_to_slice(input, bytes.as_mut()).ok()?;
+        k256::schnorr::SigningKey::from_bytes(bytes.as_ref()).ok()?;
+        Some(Self(*bytes))
+    }
+}
+
 /// Role 4: a declared handoff's post-harness credential, an RFC 8032 Ed25519 seed.
 pub struct PostHarnessCredential(pub(crate) [u8; 32]);
 
@@ -79,6 +95,11 @@ impl sealed::Sealed for SessionInferenceKey {}
 impl Credential for SessionInferenceKey {
     const ROW: u8 = 2;
     const NAME: &'static str = "Inference **session** key";
+}
+impl sealed::Sealed for crate::poc::provisioning::Account {}
+impl Credential for crate::poc::provisioning::Account {
+    const ROW: u8 = 1;
+    const NAME: &'static str = "Vendor API credential, used through a typed adapter";
 }
 impl Drop for SessionInferenceKey {
     fn drop(&mut self) {
@@ -350,6 +371,10 @@ mod tests {
             "Address",
             "a record's content address, SHA-256 of its stored ciphertext record: persisted in the next record",
         ),
+        (
+            "ExecutionIdentity",
+            "a public random execution discriminator, included in reference admission checks; never used as a signing/encryption key or a credential",
+        ),
     ];
 
     /// Every type implementing `Credential`: its bare name, row and `NAME`.
@@ -359,6 +384,7 @@ mod tests {
             (name, T::ROW, T::NAME)
         }
         vec![
+            entry::<crate::poc::provisioning::Account>(),
             entry::<crate::seed::Seed>(),
             entry::<SshClientKey>(),
             entry::<AttestSenderKey>(),

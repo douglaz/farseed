@@ -28,6 +28,7 @@ fn proposal(d: Value) -> Proposal {
 fn done() -> Tool {
     Tool::Done {
         machine: "fixture".into(),
+        checks: vec![],
     }
 }
 fn propose(s: &mut Store<MemoryStorage>, p: Proposal) {
@@ -210,7 +211,9 @@ fn declaration_pending_is_not_authority_and_exact_approval_survives_reopen() {
     assert_eq!(s.storage.files(), committed);
     let r = reopen(&s).unwrap();
     assert_eq!(r.dispatch.setup_view(), s.dispatch.setup_view());
-    assert!(r.sessions.is_empty() && r.pending_requirements.is_empty());
+    assert_eq!(r.sessions.len(), 1);
+    assert_eq!(r.sessions[0].identity, identity);
+    assert!(r.pending_requirements.is_empty());
 }
 
 #[test]
@@ -408,17 +411,27 @@ fn declaration_failures_and_landed_errors_release_no_authority_or_continuation()
     ] {
         let mut s = start();
         propose(&mut s, proposal(minimum()));
+        let identity = session(&s);
+        let pending = s.pending_requirements[&identity].proposal.clone();
         s.storage.fault(fault);
-        assert!(block_on(s.approve_requirements(&session(&s), "fixture", 42)).is_err());
+        assert!(block_on(s.approve_requirements(&identity, "fixture", 42)).is_err());
         assert!(s.dispatch.approved_entries["fixture"].declaration.is_none());
-        assert!(s.pending_requirements.is_empty());
+        assert_eq!(s.pending_requirements.len(), 1);
+        assert_eq!(s.pending_requirements[&identity].candidate, 42);
+        assert_eq!(s.pending_requirements[&identity].proposal, pending);
         assert!(s.failed.is_some());
+        let failed_files = s.storage.files();
+        assert!(block_on(s.approve_requirements(&identity, "fixture", 42)).is_err());
+        assert_eq!(s.storage.files(), failed_files);
         let r = reopen(&s).unwrap();
         assert_eq!(
             r.dispatch.approved_entries["fixture"].declaration.is_some(),
             matches!(fault, Fault::LandThenFail(3))
         );
-        assert!(r.pending_requirements.is_empty() && r.sessions.is_empty());
+        assert!(r.pending_requirements.is_empty());
+        assert_eq!(r.sessions.len(), 1);
+        assert_eq!(r.sessions[0].identity, identity);
+        assert!(!r.sessions[0].ended.get());
     }
 }
 
@@ -680,7 +693,7 @@ fn raw_record(s: &Store<MemoryStorage>, value: &Value) {
         .encrypt(
             &nonce.into(),
             Payload {
-                msg: &serde_json::to_vec(value).unwrap(),
+                msg: &serde_json::to_vec(&journal::journal(value)).unwrap(),
                 aad: record_aad(&s.id, EVENT, number, &previous).as_bytes(),
             },
         )
@@ -848,7 +861,9 @@ fn ended_pending_owner_does_not_bar_fresh_binding_but_uncertain_live_owner_still
         matches!(s.check_operation(&request),Err(crate::dispatch::RequestRefusal::InstallationFacts{why}) if why=="proposal approval pending")
     );
     s.synthetic_session_transition(&old, "ended").unwrap();
-    let fresh = block_on(s.bind("fixture")).unwrap();
+    assert!(block_on(s.admit_fixture("fixture")).is_err());
+    block_on(s.end_session(&old)).unwrap();
+    let fresh = block_on(s.admit_fixture("fixture")).unwrap();
     s.synthetic_confirm_limits(100).unwrap();
     assert!(s.pending_requirements.is_empty());
     assert!(block_on(s.approve_requirements(&old, "fixture", 42)).is_err());

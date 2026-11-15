@@ -40,6 +40,13 @@ pub fn needles() -> Vec<(String, Vec<u8>)> {
         crate::semantic_domains::auxiliary::auxiliary_absence(),
     );
     let mut needles = Vec::new();
+    for encoded in [
+        vec![0x31; 32],
+        hex::encode([0x31; 32]).into_bytes(),
+        STANDARD_NO_PAD.encode(hex::encode([0x31; 32])).into_bytes(),
+    ] {
+        needles.push(("provider fixture credential".into(), encoded));
+    }
     let phrases = std::iter::once("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
         .chain(include_str!("../../tests/vectors/seed-backup-collisions.txt").lines());
     for (fixture, mnemonic) in phrases.enumerate() {
@@ -116,6 +123,34 @@ pub fn needles() -> Vec<(String, Vec<u8>)> {
         "test_hold_move",
         "test_hold_job_read",
         "test_hold_session_point",
+        "test_poc_prepare_release",
+        "test_poc_release_counts",
+        "prepare_poc_release",
+        "poc_terminal_append",
+        "test_poc_model",
+        "test_poc_configuration",
+        "test_poc_inference_request",
+        "poc_model_configured",
+        "test_poc_profile",
+        "test_poc_register_credential",
+        "credit_mint_writer",
+        "credit_mint_return",
+        "test_credit_origin",
+        "test_credit_append_probe",
+        "test_procurement_origin",
+        "procurement_create_intent",
+        "procurement_associated",
+        "poc_model_next",
+        "fixture-call-",
+        "poc_progress_publication",
+        "poc_execution_return",
+        "pending_launch_committed",
+        "test_pending_context",
+        "pending_disposition_writer",
+        "poc_model_return",
+        "poc_inference_writer",
+        "poc_end_committed",
+        "poc_end_writer",
         "session_point",
         "session_point_receiver",
         "session_authentication",
@@ -434,6 +469,58 @@ mod tests {
             assert!(
                 super::absence(&dir)
                     .expect_err("planted inference needle escaped check-absence")
+                    .contains(needle)
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn poc_absence_detects_each_planted_release_needle() {
+        let dir = std::env::temp_dir().join(format!(
+            "tau-poc-release-absence-{}-{}",
+            std::process::id(),
+            hex::encode(crate::fixtures::urandom::<8>())
+        ));
+        std::fs::create_dir_all(dir.join("pkg")).unwrap();
+        for file in super::SERVED_FILES {
+            std::fs::write(dir.join(file), b"").unwrap();
+        }
+        assert!(super::absence(&dir).is_ok());
+        for needle in [
+            "test_credit_origin",
+            "test_credit_append_probe",
+            "credit_mint_writer",
+            "credit_mint_return",
+            "test_poc_prepare_release",
+            "test_poc_release_counts",
+            "prepare_poc_release",
+            "poc_terminal_append",
+            "test_poc_model",
+            "test_poc_configuration",
+            "test_poc_inference_request",
+            "poc_model_configured",
+            "test_poc_profile",
+            "test_poc_register_credential",
+            "poc_model_next",
+            "fixture-call-",
+            "poc_progress_publication",
+            "poc_execution_return",
+            "pending_launch_committed",
+            "test_pending_context",
+            "pending_disposition_writer",
+            "poc_model_return",
+            "poc_inference_writer",
+            "poc_end_committed",
+            "poc_end_writer",
+        ] {
+            std::fs::write(
+                dir.join("extra.js"),
+                format!("export const marker = {needle:?};"),
+            )
+            .unwrap();
+            assert!(
+                super::absence(&dir)
+                    .expect_err("planted release needle escaped check-absence")
                     .contains(needle)
             );
         }

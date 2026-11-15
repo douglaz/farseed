@@ -490,7 +490,7 @@ pub(super) async fn run(
                     .page_predicate(
                         run,
                         &tab.session,
-                        "!!document.querySelector('[data-goal-accept]')",
+                        "!!document.querySelector('[data-start-accepted-goal]')",
                     )
                     .await?
                     .equals_true(),
@@ -508,12 +508,7 @@ pub(super) async fn run(
     let record = opened
         .records
         .iter()
-        .find_map(|(_, b)| {
-            serde_json::from_slice::<Value>(b)
-                .ok()?
-                .get("goal")
-                .cloned()
-        })
+        .find_map(|(_, b)| crate::journal::event(b).ok()?.get("goal").cloned())
         .ok_or("missing goal record")
         .checked("goal.record.present")?;
     let state = run.inspect(worker).await?;
@@ -619,7 +614,12 @@ pub(super) async fn run(
     let from = run.aggregator.requests.lock().unwrap().len();
     module(run,worker,"self.beforeGoalTurn=new Promise(ready=>m.test_hold_session_point('goal_turn',new Promise(release=>self.releaseGoalTurn=release),ready));return true;").await?;
     run.aggregator.state.lock().unwrap().script = vec![json!({"write_received_context":run.sshd.machine.root.join("goal-token-attempt").display().to_string()}), done()].into();
-    setup_cases::click(run, tab, "[data-machine=fixture] [data-goal-accept]").await?;
+    setup_cases::click(
+        run,
+        tab,
+        "[data-machine=fixture] [data-start-accepted-goal]",
+    )
+    .await?;
     module(run, worker, "await self.beforeGoalTurn;return true;").await?;
     let before_authority = run
         .inspect_state_at("state.goal.authority.before", worker)
@@ -725,7 +725,7 @@ pub(super) async fn run(
         .records
         .iter()
         .skip(before_records)
-        .map(|(_, b)| serde_json::from_slice(b).unwrap())
+        .map(|(_, b)| crate::journal::event(b).unwrap())
         .collect();
     let mut kinds: Vec<&str> = own_records
         .iter()
@@ -776,7 +776,7 @@ pub(super) async fn run(
                         .page_predicate(
                             run,
                             &tab.session,
-                            "!!document.querySelector('[data-goal-accept]')",
+                            "!!document.querySelector('[data-start-accepted-goal]')",
                         )
                         .await?
                         .equals_true(),
@@ -793,7 +793,12 @@ pub(super) async fn run(
             state.fail = !refused;
             state.top_up = refused;
         }
-        setup_cases::click(run, tab, "[data-machine=fixture] [data-goal-accept]").await?;
+        setup_cases::click(
+            run,
+            tab,
+            "[data-machine=fixture] [data-start-accepted-goal]",
+        )
+        .await?;
         let mut label = Value::Null;
         {
             let observation = observer::Call::begin(
@@ -882,7 +887,7 @@ pub(super) async fn run(
                 observation.attempt(poll + 1);
                 if observation.poll(poll+1, observation.page_predicate(run,
                     &tab.session,
-                    "!!document.querySelector('[data-machine=fixture-other] [data-goal-accept]')",
+                    "!!document.querySelector('[data-machine=fixture-other] [data-start-accepted-goal]')",
                 )
                 .await?.equals_true()) {
                 break;
@@ -901,7 +906,12 @@ pub(super) async fn run(
             state.script = vec![call("done", json!({"machine":"fixture-other"}))].into();
         }
         let other_from = run.aggregator.requests.lock().unwrap().len();
-        setup_cases::click(run, tab, "[data-machine=fixture-other] [data-goal-accept]").await?;
+        setup_cases::click(
+            run,
+            tab,
+            "[data-machine=fixture-other] [data-start-accepted-goal]",
+        )
+        .await?;
         {
             let observation = observer::Call::begin(
                 "goal.status.other_done_visible",
@@ -1390,7 +1400,7 @@ run.inspect_state_at("state.goal.held.after", worker).await?.same_at("goal_cases
 
     let mut case = Case::new(
         "goal_cases.c012",
-        "goals stay historical after replay and failed documents supply no context",
+        "replay restores the original goal and failed documents supply no context",
     );
     *worker = run.reload("goal_cases.rs::reload#3", tab, worker).await?;
     module(
@@ -1421,7 +1431,11 @@ run.inspect_state_at("state.goal.held.after", worker).await?.same_at("goal_cases
         ),
     );
     binding_cases::prepare(run, tab, worker, PASSPHRASE).await?;
-    case.check("goal_cases.a049", "fresh bindings have no goal and no prefilled goal input",run.inspect(worker).await?["sessions"].as_array().unwrap().iter().all(|s|s["goal"].is_null()) && run.browser.evaluate(&tab.session,"(()=>{const fields=Array.from(document.querySelectorAll('[data-goal-text]'));return fields.length>0&&fields.every(e=>e.value==='');})()").await?==true);
+    let expected_goal = json!({"session":session,"text":"goal awaiting a document","document_source":source,"source":"operator_session_goal_card"});
+    case.check("goal_cases.a049", "original session restores its exact goal; unrelated empty goal fields stay blank",
+        run.inspect(worker).await?["sessions"].as_array().unwrap().iter().any(|s|
+            s["identity"] == *session && s["bound_set"] == json!(["fixture"]) && s["goal"] == expected_goal)
+            && run.browser.evaluate(&tab.session,&format!("(()=>{{const fields=Array.from(document.querySelectorAll('[data-goal-text]'));return document.querySelector('[data-goal-enter=\"{}\"]')===null&&fields.length>0&&fields.every(e=>e.value==='');}})()", session)).await?==true);
     for status in [307, 503] {
         let session = reset(run, tab, worker, &initial).await?;
         run.aggregator.state.lock().unwrap().document_status = status;

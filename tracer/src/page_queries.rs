@@ -6,16 +6,17 @@ static INPUTS: Mutex<Vec<Value>> = Mutex::new(Vec::new());
 
 fn source(site: &str) -> Option<(&'static str, &'static str)> {
     Some(match site {
-        "goal.card.accept_visible" | "goal.status.accept_visible" => {
-            ("true", "!!document.querySelector('[data-goal-accept]')")
-        }
+        "goal.card.accept_visible" | "goal.status.accept_visible" => (
+            "true",
+            "!!document.querySelector('[data-start-accepted-goal]')",
+        ),
         "goal.context.done_visible" => (
             "true",
             "document.querySelector('[data-goal-outcome]')?.textContent==='Goal loop ended: done.'",
         ),
         "goal.status.other_accept_visible" => (
             "true",
-            "!!document.querySelector('[data-machine=fixture-other] [data-goal-accept]')",
+            "!!document.querySelector('[data-machine=fixture-other] [data-start-accepted-goal]')",
         ),
         "goal.status.other_done_visible" => (
             "true",

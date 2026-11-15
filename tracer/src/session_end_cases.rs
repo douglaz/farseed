@@ -101,7 +101,7 @@ async fn reset_with_bindings(
     } else {
         origin(run, worker).await?;
         run.submit(tab, "unlock", PASSPHRASE).await?;
-        setup_cases::click(run, tab, "[data-bind=fixture]").await?;
+        setup_cases::bind_fixture(run, worker, "fixture").await?;
         let mut bound = false;
         {
             let observation = observer::Call::begin(
@@ -1011,7 +1011,7 @@ async fn rekey_append(
             .records
             .iter()
             .find(|(number, _)| Some(*number) == evidence["number"].as_u64())
-            .and_then(|(_, bytes)| serde_json::from_slice::<Value>(bytes).ok());
+            .and_then(|(_, bytes)| crate::journal::event(bytes).ok());
         case.check(
             "session_end_cases.a032",
             "independent reader proves exact original call job boot record and terminal",
@@ -1065,7 +1065,7 @@ pub(super) async fn run(
     let files = reader::build_at("file.session_end_cases.build.001", PASSPHRASE, &events);
     let identity = events[2]["setup"]["approval"]["entries"][0]["identity"].clone();
     let session = format!("session-{}", events.len());
-    events.push(json!({"exposure":{"session":session,"bound_set":[{"machine":"fixture","identity":identity}],"accepted_modes":["no_artifact_pin"]}}));
+    events.push(json!({"exposure":{"inference_approval":crate::file_recipes::synthetic_approval(),"session":session,"bound_set":[{"machine":"fixture","identity":identity}],"accepted_modes":["no_artifact_pin"]}}));
     let unpinned = reader::build_at("file.session_end_cases.build.002", PASSPHRASE, &events);
     cold_probe(run, tab, worker, &files, cases).await?;
     revoke_probe_control(run, tab, worker, &files, cases).await?;

@@ -258,6 +258,7 @@ fn real_job_terminal_historical_and_uncommitted_nested_routes_scan_raw_before_de
             },
             &crate::goals::Tool::Done {
                 machine: "fixture".into(),
+                checks: vec![],
             },
         )
         .unwrap();

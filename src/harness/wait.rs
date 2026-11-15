@@ -69,6 +69,7 @@ impl Drop for DispatchResult {
 
 #[derive(Default)]
 pub struct Stop {
+    session: RefCell<Option<String>>,
     stopped: Cell<bool>,
     ready: Notify,
     sockets: RefCell<BTreeMap<u64, web_sys::WebSocket>>,
@@ -88,6 +89,9 @@ impl Drop for SocketRegistration {
 }
 
 impl Stop {
+    pub(super) fn associate(&self, session: &str) {
+        *self.session.borrow_mut() = Some(session.into());
+    }
     pub fn new(machine: &str) -> Rc<Self> {
         Self::register(Some(machine))
     }
@@ -154,6 +158,19 @@ impl Stop {
     }
 }
 
+/// Durable End closes only waits associated with that original session.
+pub(super) fn stop_session(session: &str) {
+    WAITS.with_borrow(|waits| {
+        for (_, stop) in waits {
+            if let Some(stop) = stop.upgrade()
+                && stop.session.borrow().as_deref() == Some(session)
+            {
+                stop.fire();
+            }
+        }
+    });
+}
+
 /// Session end stops every registered wait before acquiring the store writer.
 pub(super) fn stop_all() {
     WAITS.with(|waits| {
@@ -178,5 +195,16 @@ pub fn stop_waits(machine: &str) -> usize {
             })
             .filter(|stop| stop.fire())
             .count()
+    })
+}
+
+/// Actual worker work only; durable inspection checkpoints do not keep this fence alive.
+pub(crate) fn inspection_active(session: &str) -> bool {
+    WAITS.with_borrow(|waits| {
+        waits.iter().any(|(_, weak)| {
+            weak.upgrade().is_some_and(|stop| {
+                !stop.stopped() && stop.session.borrow().as_deref() == Some(session)
+            })
+        })
     })
 }

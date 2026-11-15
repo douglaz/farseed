@@ -112,7 +112,7 @@ async fn prepare_with_enrolment(
             let _source_record = semantic::Slot::new("reader.aux.prepare_record", record);
             let event: Value = semantic::result(
                 "binding.prepare.record_json",
-                serde_json::from_slice(bytes).map_err(|e| e.to_string()),
+                crate::journal::event(bytes).map_err(|e| e.to_string()),
             )?;
             if let Some(entries) = event
                 .pointer("/setup/approval/entries")
@@ -169,22 +169,21 @@ async fn prepare_with_enrolment(
         let name = machine["entry"]["machine"].as_str().unwrap();
         observer::binding_input(call.id(), slot + 1, name);
         let state = run.inspect(worker).await?;
-        let bound = state["sessions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|s| s["bound_set"].as_array().unwrap().iter().any(|m| m == name));
+        let bound = state["sessions"].as_array().unwrap().iter().any(|s| {
+            s["session_state"] != "ended"
+                && s["bound_set"].as_array().unwrap().iter().any(|m| m == name)
+        });
         call.observe("binding_input", json!({"slot":slot+1,"bound":bound}));
         if bound {
             continue;
         }
-        setup_cases::click(run, tab, &format!("[data-bind={name:?}]")).await?;
+        setup_cases::bind_fixture(run, worker, name).await?;
         wait(run, worker, "binding.page.bound", |s| {
             s["sessions"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|s| s["bound_set"] == json!([name]))
+                .any(|s| s["session_state"] != "ended" && s["bound_set"] == json!([name]))
         })
         .await?;
     }
@@ -199,7 +198,7 @@ fn passes_at(caller: &'static str, opened: &reader::Opened) -> Result<Vec<u32>, 
         let _source_slot = semantic::Slot::new("reader.aux.pass_record", source_index);
         let event: Value = semantic::result(
             "binding.passes.record_json",
-            serde_json::from_slice(bytes).map_err(|e| e.to_string()),
+            crate::journal::event(bytes).map_err(|e| e.to_string()),
         )?;
         if let Some(id) = event.pointer("/allocation/reserve")
             && id["family"] == "passes"
@@ -285,28 +284,44 @@ pub(super) async fn run(
         &store_files(&run.dump_at("file.binding_cases.dump.005", tab).await?),
         pass,
     )?;
-    let refusal: Value = serde_json::from_slice(&opened.records[3].1).map_err(|e| e.to_string())?;
+    // Served requests resolve stored targets before connection admission.
+    let refusal_outcome = if tracer {
+        json!({"refused":"unbound","machine":"fixture"})
+    } else {
+        json!({"refused":"machine has no stored target or pin"})
+    };
+    let expected_records = if tracer {
+        json!([0, 1, 2, 3, 4])
+    } else {
+        json!([0, 1, 2])
+    };
     case.check(
         "binding_cases.a001",
         "unbound command and collection refuse without binding, intent or contact",
-        result["outcome"] == json!({"refused":"unbound","machine":"fixture"})
+        result["outcome"] == refusal_outcome
             && collected["outcome"] == result["outcome"]
             && state["sessions"] == json!([])
             && state["calls"] == json!([])
-            && state["records"] == json!([0, 1, 2, 3, 4])
+            && state["records"] == expected_records
             && observed.relay_accepted == 0
             && observed.ssh_connections == 0,
     );
     case.check(
         "binding_cases.a002",
-        "independent reader reads the journaled unbound refusal",
-        refusal == json!({"connection_refusal":{"machine":"fixture","reason":"unbound"}}),
+        "independent reader verifies the refusal append boundary",
+        if tracer {
+            let refusal: Value =
+                crate::journal::event(&opened.records[3].1).map_err(|e| e.to_string())?;
+            refusal == json!({"connection_refusal":{"machine":"fixture","reason":"unbound"}})
+        } else {
+            opened.records.len() == 3
+        },
     );
     prepare(run, tab, &mut worker, pass).await?;
     let state = run.inspect(&worker).await?;
     case.check(
         "binding_cases.a003",
-        "page binding gives each session only its machine client credential",
+        "fixture binding gives each session only its machine client credential",
         state["sessions"].as_array().is_some_and(|sessions| {
             sessions.len() == 2
                 && sessions.iter().all(|s| {
@@ -429,7 +444,7 @@ pub(super) async fn run(
             )?;
             let intent: Value = semantic::result(
                 "binding.authentication.intent_json",
-                serde_json::from_slice(&opened.records[call as usize].1).map_err(|e| e.to_string()),
+                crate::journal::event(&opened.records[call as usize].1).map_err(|e| e.to_string()),
             )?;
             let session = state["sessions"]
                 .as_array()
@@ -449,8 +464,11 @@ pub(super) async fn run(
         } else {
             case.check(
                 "binding_cases.a008",
-                "bound served command reaches the missing-pin gate without contact",
-                result["outcome"] == json!({"refused":"no-pin"}) && observed.relay_accepted == 0,
+                "bound served command requires a stored target and pin before contact",
+                result["outcome"] == refusal_outcome
+                    && observed.relay_accepted == 0
+                    && observed.ssh_connections == 0
+                    && run.inspect(&worker).await?["calls"] == json!([]),
             );
         }
     }
@@ -458,7 +476,7 @@ pub(super) async fn run(
 
     let mut case = Case::new(
         "binding_cases.c003",
-        &format!("exposure ledger survives restart without live bindings: {build}"),
+        &format!("exposure ledger and original bindings survive restart: {build}"),
     );
     let opened = reader::read_at(
         "reader.call.binding.exposure_ledger",
@@ -468,12 +486,7 @@ pub(super) async fn run(
     let ledger = opened
         .records
         .iter()
-        .filter_map(|(_, bytes)| {
-            serde_json::from_slice::<Value>(bytes)
-                .ok()?
-                .get("exposure")
-                .cloned()
-        })
+        .filter_map(|(_, bytes)| crate::journal::event(bytes).ok()?.get("exposure").cloned())
         .collect::<Vec<_>>();
     case.check(
         "binding_cases.a009",
@@ -497,10 +510,10 @@ pub(super) async fn run(
         .await?;
     case.check(
         "binding_cases.a010",
-        "replay preserves the ledger and never revives sessions",
+        "replay preserves the ledger and original session identities",
         crate::state_inputs::all!(
             after.same_at("binding_cases.a010", &before, &["/exposure_ledger"]),
-            after["sessions"] == json!([])
+            after["sessions"] == before["sessions"]
         ),
     );
     take(run.seen);
@@ -510,22 +523,26 @@ pub(super) async fn run(
     let seen = take(run.seen);
     case.check(
         "binding_cases.a011",
-        "an attempt after restart is unbound until another operator binding",
-        report["outcome"]["refused"] == "unbound"
-            && seen.relay_accepted == 0
-            && seen.ssh_connections == 0,
+        "the original binding permits the same pinned command after restart",
+        if tracer {
+            report["outcome"]["done"] == true && seen.ssh_connections == 1
+        } else {
+            report["outcome"] == refusal_outcome
+                && seen.relay_accepted == 0
+                && seen.ssh_connections == 0
+        },
     );
     prepare(run, tab, &mut worker, pass).await?;
     case.check(
         "binding_cases.a012",
-        "re-entry creates new session identities and ledger entries",
+        "re-entry keeps original identities without another admission",
         crate::state_inputs::all!(
             run.inspect(&worker).await?["exposure_ledger"]
                 .as_array()
                 .unwrap()
                 .len()
-                == 4,
-            !run.inspect_state_at("state.binding.rebind.after", &worker)
+                == 2,
+            run.inspect_state_at("state.binding.rebind.after", &worker)
                 .await?
                 .same_at("binding_cases.a012", &before, &["/sessions"])
         ),
@@ -534,7 +551,7 @@ pub(super) async fn run(
 
     let mut case = Case::new(
         "binding_cases.c004",
-        &format!("seed-backup re-display ends bindings: {build}"),
+        &format!("seed-backup re-display retires execution and retains bindings: {build}"),
     );
     setup_cases::click(run, tab, "#tau-redisplay").await?;
     worker = run.worker(tab, Some(&worker), false).await?;
@@ -547,16 +564,20 @@ pub(super) async fn run(
     let seen = take(run.seen);
     case.check(
         "binding_cases.a013",
-        "after re-display completes the session remains ended until rebinding",
-        report["outcome"]["refused"] == "unbound"
-            && run.inspect(&worker).await?["sessions"] == json!([])
-            && seen.relay_accepted == 0
-            && seen.ssh_connections == 0,
+        "after re-display completes the original session and binding remain",
+        run.inspect(&worker).await?["sessions"] == before["sessions"]
+            && if tracer {
+                report["outcome"]["done"] == true && seen.ssh_connections == 1
+            } else {
+                report["outcome"] == refusal_outcome
+                    && seen.relay_accepted == 0
+                    && seen.ssh_connections == 0
+            },
     );
     prepare(run, tab, &mut worker, pass).await?;
     case.check(
         "binding_cases.a014",
-        "the page can bind again",
+        "the page keeps both original sessions",
         run.inspect(&worker).await?["sessions"]
             .as_array()
             .unwrap()
@@ -572,9 +593,7 @@ pub(super) async fn run(
 }
 
 pub(super) fn replayed(before: &Value) -> Value {
-    let mut expected = before.clone();
-    expected["sessions"] = json!([]);
-    expected
+    before.clone()
 }
 
 fn machine_index(opened: &reader::Opened, machine: &str) -> Result<u32, String> {
@@ -593,7 +612,7 @@ fn machine_index(opened: &reader::Opened, machine: &str) -> Result<u32, String> 
         let _source_record = semantic::Slot::new("reader.aux.machine_index_record", record);
         let event: Value = semantic::result(
             "binding.machine_index.record_json",
-            serde_json::from_slice(bytes).map_err(|e| e.to_string()),
+            crate::journal::event(bytes).map_err(|e| e.to_string()),
         )?;
         if let Some(entries) = event
             .pointer("/setup/approval/entries")

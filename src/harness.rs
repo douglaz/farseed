@@ -17,6 +17,8 @@ pub(crate) mod inference;
 #[cfg(any(target_arch = "wasm32", test))]
 mod job_read;
 #[cfg(target_arch = "wasm32")]
+mod relay_io;
+#[cfg(target_arch = "wasm32")]
 mod run;
 #[cfg(target_arch = "wasm32")]
 mod wait;
@@ -28,6 +30,16 @@ pub use run::*;
 pub use wait::Stop;
 #[cfg(target_arch = "wasm32")]
 pub use wait::stop_waits;
+
+mod result;
+pub use result::Done;
+pub(crate) use result::release_forms;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) use result::response;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use result::{collected, dispatch_result, held_report};
+
+pub use crate::poc::targets::Target;
 
 /// Where the session's durable record goes: the local store's journal (`crate::store`). Box-plane
 /// work is recorded per command before transmission (`ARC-8`), and a failed append means the
@@ -157,3 +169,6 @@ pub trait BoundJournal: Journal {
         true
     }
 }
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) use wait::inspection_active;

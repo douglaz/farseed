@@ -46,6 +46,8 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 pub struct Seen {
     /// TCP connections the relay fixture accepted, counted at `accept`, before TLS.
     pub relay_accepted: u32,
+    pub relay_wire_errors: Vec<String>,
+    pub relay_binary_sizes: Vec<usize>,
     /// The paths of the connections that completed the WebSocket upgrade.
     pub relay_connections: Vec<String>,
     /// `(reason, the check of WIR-6 (paid-tcp-relay 844e834) that failed, close code)`.
@@ -239,7 +241,8 @@ struct SshSession {
 
 impl SshSession {
     fn admit(&self, user: &str, key: &PublicKey) -> Auth {
-        let admitted = user == tau_web::testonly::SSH_USER
+        let admitted = (user == tau_web::testonly::SSH_USER
+            || (user == "arch" && self.machine.root.join("provisioning").is_file()))
             && std::fs::read_to_string(self.machine.root.join("authorized_keys"))
                 .ok()
                 .is_some_and(|file| {
@@ -363,8 +366,30 @@ impl server::Handler for SshSession {
             return Ok(());
         }
         let mapped = self.machine.map(data);
-        let mut child = tokio::process::Command::new("sh")
-            .args(["-c", &mapped])
+        let mut command = tokio::process::Command::new("sh");
+        if self.machine.root.join("bin").is_dir() {
+            command.env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.machine.root.join("bin").display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
+        }
+        if mapped.len() > tau_web::jobs::MAX_LAUNCH_BYTES {
+            // Mapping machine paths to a longer scratch directory must not introduce
+            // an argument-size refusal absent from the original accepted launch.
+            let path = self
+                .machine
+                .root
+                .join(format!("exec-{}.sh", hex::encode(urandom::<16>())));
+            std::fs::write(&path, &mapped).expect("fixture script");
+            command.arg(path);
+        } else {
+            command.args(["-c", &mapped]);
+        }
+        let mut child = command
             .process_group(0)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -691,6 +716,8 @@ impl SessionGate {
 }
 
 pub struct Relay {
+    /// Only the provisioning fixture maps the documentation address to its own local sshd.
+    pub fixture_port: Arc<Mutex<Option<u16>>>,
     pub session_gate: Arc<SessionGate>,
     /// `wss://127.0.0.1:<port>/`, the URL the AUTH's `relay` tag must name.
     pub url: String,
@@ -705,6 +732,7 @@ pub struct Relay {
 }
 
 struct RelayState {
+    fixture_port: Arc<Mutex<Option<u16>>>,
     session_gate: Arc<SessionGate>,
     url: String,
     passes: Arc<Mutex<Vec<Pass>>>,
@@ -731,7 +759,9 @@ pub async fn relay(seen: Observed, tls: TlsAcceptor, passes: Vec<Pass>, hold: bo
         Semaphore::MAX_PERMITS
     }));
     let session_gate = Arc::new(SessionGate::default());
+    let fixture_port = Arc::new(Mutex::new(None));
     let state = Arc::new(RelayState {
+        fixture_port: fixture_port.clone(),
         session_gate: session_gate.clone(),
         url: url.clone(),
         passes: Arc::new(Mutex::new(passes)),
@@ -760,7 +790,17 @@ pub async fn relay(seen: Observed, tls: TlsAcceptor, passes: Vec<Pass>, hold: bo
                     *at.lock().expect("path lock") = request.uri().path().to_string();
                     Ok(response)
                 };
-                let Ok(ws) = tokio_tungstenite::accept_hdr_async(tls, callback).await else {
+                let Ok(ws) = tokio_tungstenite::accept_hdr_async_with_config(
+                    tls,
+                    callback,
+                    Some(
+                        tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                            .max_message_size(Some(65536))
+                            .max_frame_size(Some(65536)),
+                    ),
+                )
+                .await
+                else {
                     return;
                 };
                 let path = path.lock().expect("path lock").clone();
@@ -774,6 +814,7 @@ pub async fn relay(seen: Observed, tls: TlsAcceptor, passes: Vec<Pass>, hold: bo
         }
     });
     Relay {
+        fixture_port,
         session_gate,
         url,
         pace,
@@ -999,7 +1040,15 @@ async fn relay_connection(mut ws: Ws, path: &str, state: &RelayState, log: &Log)
     // 844e834). Until OK the socket is still read, and a binary frame closes it with 1002 and is
     // not forwarded (WIR-8), even one that is ready when the dial completes (`pre_ok`). WIR-8
     // says nothing of a text frame here, so it is logged and otherwise ignored.
-    let address = format!("{}:{}", path.0, path.1);
+    let fixture_port = *state.fixture_port.lock().unwrap();
+    let address = match fixture_port {
+        Some(port) if path.0 == "192.0.2.10" && path.1 == 22 => format!("127.0.0.1:{port}"),
+        Some(_) => {
+            close(&mut ws, 1008, log).await;
+            return;
+        }
+        None => format!("{}:{}", path.0, path.1),
+    };
     log.event(Event::Dial(address.clone()));
     let dial = async {
         let tcp = TcpStream::connect(&address).await?;
@@ -1066,6 +1115,7 @@ async fn relay_connection(mut ws: Ws, path: &str, state: &RelayState, log: &Log)
         tokio::select! {
             frame = ws.next() => match frame {
                 Some(Ok(Message::Binary(bytes))) => {
+                    observe(&log.seen, |seen| seen.relay_binary_sizes.push(bytes.len()));
                     if tcp.write_all(&bytes).await.is_err() {
                         break Some(1000);
                     }
@@ -1080,6 +1130,11 @@ async fn relay_connection(mut ws: Ws, path: &str, state: &RelayState, log: &Log)
                     break None;
                 }
                 Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    observe(&log.seen, |seen| seen.relay_wire_errors.push(error.to_string()));
+                    log.event(Event::Ended);
+                    break None;
+                }
                 _ => {
                     log.event(Event::Ended);
                     break None;

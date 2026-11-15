@@ -426,7 +426,18 @@ pub struct ResultSet {
 /// Shared aggregation for production and comparison. Unknown restored findings clear only
 /// with a complete re-check. An incomplete check can add findings, never erase them.
 pub fn aggregate(fields: Vec<FieldResult>, standing: &[Finding], unknown: bool) -> ResultSet {
-    let complete = FieldId::DECLARATION
+    aggregate_selected(&FieldId::DECLARATION, fields, standing, unknown)
+}
+
+/// A deliberately narrower claim supplies its measured fields explicitly; omitted fields
+/// are never manufactured as checked results.
+pub(crate) fn aggregate_selected(
+    required: &[FieldId],
+    fields: Vec<FieldResult>,
+    standing: &[Finding],
+    unknown: bool,
+) -> ResultSet {
+    let complete = required
         .iter()
         .all(|f| fields.iter().filter(|r| r.field == *f).count() == 1)
         && fields

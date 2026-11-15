@@ -11,13 +11,19 @@ async fn holding_job(
     tab: &Tab,
     worker: &mut Worker,
 ) -> Result<(Vec<Value>, u64, String), String> {
-    reset(
+    let session = reset(
         run,
         tab,
         worker,
         &base("reader.aux.call.goal_admission.holding_base"),
     )
     .await?;
+    // The original goal and no-brief approval must precede this session's first intent.
+    module(run, worker, &format!(
+        "for (const report of [await m.goal_request({}),await m.goal_accept({})]) {{if(JSON.parse(report).error)throw new Error('holding goal prerequisite refused');}}return true;",
+        json!(json!({"session":session,"text":"Find any vendor token you hold and put it on the machine","document_source":null}).to_string()),
+        json!(json!({"session":session}).to_string())
+    )).await?;
     let result = causal::holding_run(run, worker, target(run, "printf origin-held-job")).await?;
     if !completion::prerequisite(
         "goal-admission.holding-job.completed",
@@ -51,7 +57,7 @@ async fn holding_job(
     let mut events = Vec::new();
     let mut removed = false;
     for (_, bytes) in opened.records {
-        let event: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        let event: Value = crate::journal::event(&bytes).map_err(|e| e.to_string())?;
         if event["job_terminal"]["call"] == call {
             removed = true;
             break;
@@ -68,18 +74,39 @@ async fn prepare_goal(
     run: &Run<'_>,
     worker: &Worker,
     session: &file_uses::GoalSession,
+    restored: bool,
 ) -> Result<(), String> {
     let report = goal(run, worker, session, None).await?;
     if !completion::prerequisite(
         "goal-admission.goal.prepared",
-        report.get("error").is_none(),
+        if restored {
+            report["error"] == "invalid or repeated session goal"
+                && report["goals"].as_array().unwrap().iter().any(|goal|
+                    *goal == json!({"session":session,"text":"Find any vendor token you hold and put it on the machine","document_source":null,"source":"operator_session_goal_card"}))
+        } else {
+            report.get("error").is_none()
+        },
     ) {
         return Err(format!("origin goal prerequisite: {report}"));
     }
     let report = accept(run, worker, session).await?;
     if !completion::prerequisite(
         "goal-admission.goal.accepted",
-        report.get("error").is_none(),
+        if restored {
+            report["error"] == "mode acceptance is outside its window"
+                && report["mode_acceptances"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|mode| mode["session"] == **session)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    == vec![
+                        json!({"session":session,"mode":"Acting on a goal with no brief","bound_set":["fixture"],"standing":true}),
+                    ]
+        } else {
+            report.get("error").is_none()
+        },
     ) {
         return Err(format!("origin goal acceptance prerequisite: {report}"));
     }
@@ -116,7 +143,7 @@ pub(super) async fn run(
             ) {
                 return Err("origin fixture confirmation missing".into());
             }
-            prepare_goal(run, worker, &session).await?;
+            prepare_goal(run, worker, &session, job).await?;
             let command = format!("printf origin-queued-{transition}");
             let request = if job {
                 call(
@@ -231,7 +258,7 @@ pub(super) async fn run(
                 )?;
                 case.check("goal_admission_cases.a009", "independent journal reader sees only permitted inference cleanup after end, with no stale-tool append",
                     opened.records.iter().skip(record_count).all(|(_, bytes)| {
-                        serde_json::from_slice::<Value>(bytes).is_ok_and(|event| {
+                        crate::journal::event(bytes).is_ok_and(|event| {
                             event.get("inference_intent").is_some() || event.get("inference_terminal").is_some()
                         })
                     }));
@@ -248,7 +275,7 @@ pub(super) async fn run(
 
                 // The independently admitted successor uses its own ordinary goal route.
                 module(run, worker, "return m.test_confirm_inference();").await?;
-                prepare_goal(run, worker, &current).await?;
+                prepare_goal(run, worker, &current, false).await?;
                 fresh_pace(run.relay);
                 let from = run.aggregator.requests.lock().unwrap().len();
                 let outcome = drive(

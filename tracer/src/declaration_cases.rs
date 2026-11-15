@@ -46,7 +46,15 @@ pub(super) async fn prepare(
     )
     .await?;
     run.submit(tab, "unlock", PASSPHRASE).await?;
-    setup_cases::click(run, tab, "[data-bind=fixture]").await?;
+    inference_cases::end_replayed_paid(run, worker).await?;
+    let existing = run.inspect(worker).await?["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["session_state"] != "ended" && s["bound_set"] == json!(["fixture"]));
+    if !existing {
+        setup_cases::bind_fixture(run, worker, "fixture").await?;
+    }
     let binding_observer = observer::Call::begin(
         "declaration.prepare.binding",
         "declaration.prepare.binding",
@@ -57,7 +65,11 @@ pub(super) async fn prepare(
     for poll in 0..300 {
         binding_observer.attempt(poll + 1);
         let state = binding_observer.inspect(run, worker).await?;
-        let first = state["sessions"].as_array().and_then(|s| s.first());
+        let first = state["sessions"].as_array().and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|s| s["session_state"] != "ended" && s["bound_set"] == json!(["fixture"]))
+        });
         if binding_observer.poll(poll + 1, first.is_some()) {
             let s = first.unwrap();
             identity = s["identity"].as_str().map(str::to_owned);
@@ -126,7 +138,7 @@ pub(super) async fn prepare(
             run.browser
                 .evaluate(
                     &tab.session,
-                    &format!("!!document.querySelector('[data-goal-accept={session}]')"),
+                    &format!("!!document.querySelector('[data-start-accepted-goal={session}]')"),
                 )
                 .await?
                 == true,
@@ -145,7 +157,7 @@ pub(super) async fn start(
     script: Vec<Value>,
 ) -> Result<(), String> {
     run.aggregator.state.lock().unwrap().script = script.into();
-    setup_cases::click(run, tab, &format!("[data-goal-accept={session:?}]")).await
+    setup_cases::click(run, tab, &format!("[data-start-accepted-goal={session:?}]")).await
 }
 pub(super) async fn wait_card(
     site: &'static str,
@@ -345,31 +357,38 @@ pub(super) async fn run(
         case.finish(cases);
         return Ok(());
     }
-    let text = run
+    let preview = run
         .browser
         .evaluate(
             &tab.session,
-            "document.querySelector('[data-requirements-card]').textContent",
+            "(() => { const card = document.querySelector('[data-requirements-card]'); const prose = card.cloneNode(true); prose.querySelectorAll('details').forEach(node => node.remove()); return { visible: card.checkVisibility(), text: prose.textContent, declaration: JSON.parse(card.querySelector('[data-raw-json]').textContent) }; })()",
         )
         .await?;
-    let text = text.as_str().unwrap_or("");
+    let text = preview["text"].as_str().unwrap_or("");
+    let expected = [
+        "Installation preview. When handed over, the harness checks declared system services and TCP listeners only.",
+        "Departures from the ad-hoc minimum: service hermes; TCP port 443 (any); outgoing api.example TCP port 443.",
+        "It may answer on TCP port 22, for anyone on the internet.",
+        "It may answer on TCP port 443, for anyone on the internet.",
+        "hermes (a service of user operator) is running when handed over. A restart may stop it.",
+        "It may connect out to api.example on TCP port 443; this restriction is not measured.",
+        "Spendable key material is forbidden; no post-setup search runs here.",
+        "No keys of its own are expected.",
+        "No extra checks on later visits.",
+        "No extra checks at handover.",
+        "No default credential is listed to be changed.",
+        "Fixed lockdown checks, SSH password posture, local password entries, key-material searches, drift checks, outbound restrictions and default credentials are not checked in this PoC. No reboot is demonstrated.",
+        "Completion means Delivered (service and TCP checks only).",
+    ];
+    let missing: Vec<_> = expected
+        .iter()
+        .filter(|fragment| !text.contains(**fragment))
+        .collect();
+    println!("   installation preview missing fragments: {missing:?}");
     case.check(
         "declaration_cases.a002",
-        "plain-language card renders every typed fact and emptiness",
-        [
-            "version 2",
-            "tcp port 22 from any",
-            "tcp port 443 from any",
-            "api.example",
-            "hermes",
-            "user account operator",
-            "running at delivery",
-            "forbidden",
-            "explicit empty set",
-            "Default credentials: none",
-        ]
-        .iter()
-        .all(|v| text.contains(v)),
+        "visible installation preview names every permission, service and limitation with exact declaration Details",
+        preview["visible"] == true && missing.is_empty() && preview["declaration"] == d,
     );
     case.check("declaration_cases.a003", "buttons have no selected answer",run.browser.evaluate(&tab.session,"[...document.querySelectorAll('[data-requirements-decision]')].length===2 && [...document.querySelectorAll('[data-requirements-decision]')].every(b=>b.type==='button'&&!b.autofocus&&!b.hasAttribute('checked')&&!b.hasAttribute('selected')&&document.activeElement!==b)").await?==true);
     let before = store_files(&run.dump_at("file.declaration_cases.dump.002", tab).await?);
@@ -448,7 +467,7 @@ pub(super) async fn run(
     let records: Vec<Value> = read
         .records
         .iter()
-        .map(|(_, b)| serde_json::from_slice(b).unwrap())
+        .map(|(_, b)| crate::journal::event(b).unwrap())
         .collect();
     case.check(
         "declaration_cases.a009",
@@ -561,7 +580,11 @@ file_inputs::equal_primary("declaration_cases.a012.1", "declaration_cases.a012",
         state["setup"][0]["answer"] == "no"
             && state["setup"][0]["class"] == "multi_tenant"
             && state["setup"][0]["declaration"] == d
-            && state["sessions"] == json!([]),
+            && state["sessions"].as_array().unwrap().iter().any(|s| {
+                s["identity"] == json!(session)
+                    && s["pending_requirements"].is_null()
+                    && s["readiness_reason"] == "paid session readiness withheld after replay"
+            }),
     );
     reader::read_at("reader.call.declaration.tightened", &files, PASSPHRASE)?;
     case.finish(cases);
@@ -744,6 +767,7 @@ file_inputs::equal_primary("declaration_cases.a018.1", "declaration_cases.a018",
         } else {
             module(run,worker,&format!("self.approvalPoint=new Promise(ready=>m.test_hold_session_point({},new Promise(release=>self.releaseApproval=release),ready));return true;",json!(phase))).await?;
         }
+        let completions_before_answer = run.aggregator.count("/completion");
         let act = json!({"session":session,"machine":"fixture","candidate":pending["candidate"],"decision":"approve"});
         module(
             run,
@@ -769,7 +793,15 @@ file_inputs::equal_primary("declaration_cases.a018.1", "declaration_cases.a018",
         case.check(
             "declaration_cases.a022",
             "no companion done dispatch after cancellation or failed append",
-            result["done"] != true && result.get("refused").is_some(),
+            if phase == "failed_append" {
+                // Internal proposal retention is checked by poc_session_approval_append_failure_preserves_pending_and_replay_resolves_commit.
+                result == json!({"test_timeout":true})
+                    && run.inspect(worker).await?["sessions"].as_array().unwrap().iter().any(|s|
+                        s["identity"] == json!(session) && s["bound_set"] == json!(["fixture"])
+                            && s["session_state"] == "waiting" && s["pending_requirements"].is_null()
+                            && s["readiness_reason"] == "journal append outcome uncertain; reopen to validate before further work")
+                    && run.aggregator.count("/completion") == completions_before_answer
+            } else { result["done"] != true && result.get("refused").is_some() },
         );
         if !["failed_append", "requirements_dispatch"].contains(&phase) {
             case.check(
@@ -787,7 +819,7 @@ file_inputs::equal_primary("declaration_cases.a018.1", "declaration_cases.a018",
         let files = store_files(&run.dump_at("file.declaration_cases.dump.009", tab).await?);
         let opened = reader::read_at("reader.call.declaration.lifecycle", &files, PASSPHRASE)?;
         let approved = opened.records.iter().any(|(_, b)| {
-            serde_json::from_slice::<Value>(b)
+            crate::journal::event(b)
                 .unwrap()
                 .pointer("/setup/requirements")
                 .is_some()
@@ -804,9 +836,13 @@ file_inputs::equal_primary("declaration_cases.a018.1", "declaration_cases.a018",
         let state = run.inspect(worker).await?;
         case.check(
             "declaration_cases.a025",
-            "unlock restores facts only and no live waiter or goal loop",
-            state["sessions"] == json!([])
-                && state["setup"][0]["declaration"].is_object() == approved,
+            "unlock restores original session and committed facts without a pending waiter or another completion",
+            state["sessions"].as_array().unwrap().iter().any(|s|
+                s["identity"] == json!(session) && s["goal"].is_object()
+                    && s["pending_requirements"].is_null()
+                    && s["readiness_reason"] == "paid session readiness withheld after replay")
+                && state["setup"][0]["declaration"].is_object() == approved
+                && run.aggregator.count("/completion") == completions_before_answer,
         );
         case.finish(cases);
     }

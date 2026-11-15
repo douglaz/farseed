@@ -45,6 +45,7 @@ mod inference_reader;
 mod inputs;
 mod inventory;
 mod job_cases;
+mod journal;
 mod key_inputs;
 mod keys;
 mod logical_checks;
@@ -55,6 +56,7 @@ mod mode_cases;
 mod observer;
 mod operation_windows;
 mod page_queries;
+mod poc_fixture;
 mod predicate_inputs;
 mod reader;
 mod reader_checks;
@@ -108,6 +110,7 @@ async fn main() {
             Ok(())
         }),
         ["check-csp", dir] => checks::csp(Path::new(dir)),
+        ["poc-fixtures"] => poc_fixture::run().await,
         ["list"] => {
             println!("{}", catalogue::cases());
             Ok(())
@@ -551,7 +554,7 @@ const VIEW: &str = "(() => {
     return {
         status: ($('status').dataset.state ?? '').replace('harness-', ''),
         store: $('store').dataset.state ?? '',
-        text: $('store-state').textContent,
+        text: ['store-state', 'store-explanation', 'step-store-error', 'seed-completion'].map(id => $(id).textContent).filter(Boolean).join(' '),
         create: !$('create').hidden,
         unlock: !$('unlock').hidden,
         lock: !$('lock').hidden,
@@ -1071,7 +1074,10 @@ fn errors_since(browser: &cdp::Browser, from: usize, sessions: &[&str]) -> Vec<S
                 Some(e["params"]["args"].to_string())
             }
             "Log.entryAdded" if e["params"]["entry"]["level"] == "error" => {
-                Some(e["params"]["entry"]["text"].to_string())
+                let entry = &e["params"]["entry"];
+                // Missing optional deployment defaults are an exercised fallback, not a page exception.
+                if entry["source"] == "network" && entry["url"].as_str().is_some_and(|u|u.ends_with("/poc-defaults.json")) && entry["text"] == "Failed to load resource: the server responded with a status of 404 (Not Found)" { None }
+                else { Some(entry["text"].to_string()) }
             }
             _ => None,
         })
@@ -1190,7 +1196,7 @@ async fn run_cases(
     // The served build loads, and its harness worker runs a request on what it has stored.
     let mut case = Case::new(
         "main.c001",
-        "the served build loads, derives bound credentials and has no pin or request hook",
+        "the served build loads, requires a stored target and defines no request hook",
     );
     let from = browser.event_count();
     let (mut served_tab, mut served_worker) = run.open(served_origin, false).await?;
@@ -1274,9 +1280,9 @@ async fn run_cases(
     let observed = take(seen);
     case.check(
         "main.a009",
-        "served command before approval names no entry before contact or append",
+        "served command without an enrolled target refuses before contact or append",
         crate::state_inputs::all!(
-            report["outcome"] == json!({"refused":"no-entry","machine":"fixture"}),
+            report["outcome"] == json!({"refused":"machine has no stored target or pin"}),
             observed.relay_accepted == 0,
             observed.ssh_connections == 0,
             run.inspect_state_at("state.main.no_entry.after", &served_worker)
@@ -1297,9 +1303,10 @@ async fn run_cases(
         .await?;
     let observed = take(seen);
     show(&observed);
-    case.check("main.a010",
-        "called in its worker on the machine the tracer build pins, the served harness refused for the missing pin (CHN-R4)",
-        report == json!({ "outcome": { "refused": "no-pin" } }),
+    case.check(
+        "main.a010",
+        "fixture approval cannot substitute for an independently enrolled target and pin (CHN-R4)",
+        report == json!({ "outcome": { "refused": "machine has no stored target or pin" } }),
     );
     case.check(
         "main.a011",
@@ -1316,8 +1323,8 @@ async fn run_cases(
     let observed = take(seen);
     case.check(
         "main.a013",
-        "served collection refuses the missing pin before contact or append",
-        report == json!({"outcome":{"refused":"no-pin"}})
+        "served collection without an enrolled target and pin refuses before contact or append",
+        report == json!({"outcome":{"refused":"machine has no stored target or pin"}})
             && observed.relay_accepted == 0
             && observed.ssh_connections == 0
             && run.inspect(&served_worker).await?["records"] == json!([0, 1, 2, 3, 4, 5, 6, 7, 8]),
@@ -1367,7 +1374,7 @@ async fn run_cases(
     case.check("main.a018",
         "the worker's replayed state is record 0 alone",
         run.inspect(&worker).await?
-            == json!({ "state": "unlocked", "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "inference_calls": [], "observations": [], "receipts": [], "association_records": [], "current_installations": {}, "setup": [], "delivery": [], "setup_offer": tau_web::dispatch::fixture_setup(), "sessions":[],"goals":[],"exposure_ledger":[],"connection_refusals":[],"mode_acceptances":[],"signature_refusals":[],"installations":[] }),
+            == json!({ "state": "unlocked", "lifecycle_state":"running", "lifecycle_generation":"0", "fixture_admission":tau_web::binding::InferenceApproval::synthetic(), "seed_backup_owed": true, "seed_backup_completion": null, "seed_backup_stage": "showing_words", "locked": false, "records": [0], "commands": [], "calls": [], "terminals": [], "dispositions": [], "standing": {}, "jobs": [], "typed_calls": [], "inference_calls": [], "observations": [], "receipts": [], "association_records": [], "current_installations": {}, "setup": [], "delivery": [], "setup_offer": tau_web::dispatch::fixture_setup(), "sessions":[],"goals":[],"exposure_ledger":[],"connection_refusals":[],"mode_acceptances":[],"signature_refusals":[],"installations":[] }),
     );
     let host = reader::build_at(
         "file.main.build.002",
@@ -1804,7 +1811,7 @@ async fn run_cases(
         &store_files(&run.dump_at("file.main.dump.007", &tab).await?),
         PASSPHRASE,
     )?;
-    let intent: Value = serde_json::from_slice(
+    let intent: Value = crate::journal::event(
         &journal
             .records
             .iter()
@@ -2070,7 +2077,7 @@ async fn run_cases(
     let mut events: Vec<Value> = opened
         .records
         .iter()
-        .map(|(_, plaintext)| serde_json::from_slice(plaintext).map_err(|e| e.to_string()))
+        .map(|(_, plaintext)| crate::journal::event(plaintext).map_err(|e| e.to_string()))
         .collect::<Result<_, _>>()?;
     let call = events.len() as u64;
     events.push(json!({"intent":{"call":call,"machine":"fixture","command":hex::encode(COMMAND),"approval":{"harness_pin":{"machine":"fixture","fingerprint":pinned}}}}));
@@ -2755,12 +2762,11 @@ async fn run_cases(
         .await?;
     run.submit(&other, "unlock", PASSPHRASE).await?;
     let successor = run.inspect(&other_worker).await?;
-    let mut durable = held_by_holder.clone();
-    durable["sessions"] = json!([]);
+    let durable = held_by_holder.clone();
     case.check(
         "main.a098",
-        "and unlocks the same durable store without inheriting runtime session authority",
-        successor == durable && successor["sessions"] == json!([]),
+        "and unlocks the same durable store with the original logical sessions",
+        successor == durable,
     );
     (tab, worker) = (other, other_worker);
     case.finish(cases);
@@ -3399,9 +3405,8 @@ fn binaries(value: &Value, payloads: &mut Vec<Vec<u8>>, opaque: &mut Vec<String>
 
 /// What a recorded message carries: every needle in its text and in each binary payload's bytes,
 /// every one of `passphrases` in either, and every object the hook could not read. The one
-/// create or unlock message, exactly
-/// `{"to": {"create" or "unlock": <a passphrase's UTF-8 bytes>}}`, carries its passphrase and
-/// is no finding.
+/// current request envelope for create, unlock or re-display may carry the exact passphrase.
+/// Its transport metadata is still checked for secrets.
 fn findings(
     message: &Value,
     needles: &[(String, Vec<u8>)],
@@ -3411,13 +3416,32 @@ fn findings(
     let mut payloads = Vec::new();
     let mut opaque = Vec::new();
     let rest = binaries(message, &mut payloads, &mut opaque);
+    let request = rest
+        .as_object()
+        .filter(|o| o.len() == 1)
+        .and_then(|o| o.get("to"))
+        .and_then(Value::as_object)
+        .filter(|o| {
+            o.len() == 3
+                && o.get("incarnation").is_some_and(Value::is_string)
+                && o.get("generation").is_some_and(Value::is_string)
+        })
+        .and_then(|o| o.get("request"));
+    let has = |bytes: &[u8], p: &str| bytes.windows(p.len()).any(|w| w == p.as_bytes());
+    let text = rest.to_string();
+    let metadata_clear = || {
+        opaque.is_empty()
+            && reader::found(needles, text.as_bytes()).is_empty()
+            && !passphrases.iter().any(|p| has(text.as_bytes(), p))
+    };
     if let [bytes] = payloads.as_slice()
         && ["create", "unlock", "seed_backup_redisplay"]
             .iter()
-            .any(|kind| rest == json!({ "to": { *kind: null } }))
+            .any(|kind| request == Some(&json!({ *kind: null })))
         && let Some(carried) = passphrases
             .iter()
             .find(|p| p.as_bytes() == bytes.as_slice())
+        && metadata_clear()
     {
         return (Some(carried.to_string()), Vec::new());
     }
@@ -3436,7 +3460,8 @@ fn findings(
                         })
             });
     let reentry = matches!(payloads.as_slice(), [bytes] if std::str::from_utf8(bytes).is_ok())
-        && rest == json!({"to":{"seed_backup_reentry":null}});
+        && request == Some(&json!({"seed_backup_reentry":null}))
+        && metadata_clear();
     let filtered;
     let needles = if display || reentry {
         filtered = needles
@@ -3448,8 +3473,6 @@ fn findings(
     } else {
         needles
     };
-    let has = |bytes: &[u8], p: &str| bytes.windows(p.len()).any(|w| w == p.as_bytes());
-    let text = rest.to_string();
     let mut found: Vec<String> = reader::found(needles, text.as_bytes())
         .into_iter()
         .map(|w| format!("text: {w}"))
@@ -3487,8 +3510,10 @@ fn seed_backup_exceptions_exempt_only_displayed_mnemonics() {
     needles.extend(reader::seed_needles(controls[1]).unwrap());
     needles.extend(reader::encodings("the data key", &[42; 32]));
     needles.extend(reader::encodings("the passphrase", PASSPHRASE.as_bytes()));
-    let binary =
-        |text: &str| json!({"to":{"seed_backup_reentry":{"__tracerBinary":STANDARD.encode(text)}}});
+    let binary = |text: &str| {
+        json!({"to":{"incarnation":"fixture-execution","generation":"0",
+        "request":{"seed_backup_reentry":{"__tracerBinary":STANDARD.encode(text)}}}})
+    };
     for message in [
         json!({"from":{"seed_backup_display":controls[0]}}),
         binary(controls[0]),
@@ -3531,6 +3556,75 @@ fn seed_backup_exceptions_exempt_only_displayed_mnemonics() {
         .1
         .iter()
         .any(|f| f == "text: the passphrase, raw")
+    );
+}
+
+#[test]
+fn credential_message_exceptions_require_exact_current_envelopes() {
+    let needles = reader::encodings("the passphrase", PASSPHRASE.as_bytes());
+    let binary = || json!({"__tracerBinary":STANDARD.encode(PASSPHRASE)});
+    for kind in ["create", "unlock", "seed_backup_redisplay"] {
+        let message = json!({"to":{"incarnation":"fixture-execution","generation":"0",
+            "request":{kind:binary()}}});
+        let result = findings(&message, &needles, &[PASSPHRASE], &[]);
+        assert_eq!(result.0.as_deref(), Some(PASSPHRASE));
+        assert!(result.1.is_empty());
+        let mut controls = vec![json!({"to":{kind:binary()}})];
+        for field in ["incarnation", "generation"] {
+            let mut secret_metadata = message.clone();
+            secret_metadata["to"][field] = json!(PASSPHRASE);
+            controls.push(secret_metadata);
+            let mut missing = message.clone();
+            missing["to"].as_object_mut().unwrap().remove(field);
+            controls.push(missing);
+            let mut invalid = message.clone();
+            invalid["to"][field] = json!(0);
+            controls.push(invalid);
+        }
+        let mut extra = message.clone();
+        extra["to"]["request"]["also"] = json!(true);
+        controls.push(extra);
+        let mut extra = message.clone();
+        extra["to"]["also"] = json!(true);
+        controls.push(extra);
+        let mut extra = message.clone();
+        extra["from"] = json!({});
+        controls.push(extra);
+        let mut wrong_kind = message.clone();
+        wrong_kind["to"]["request"] = json!({"seed_backup_reentry":binary()});
+        controls.push(wrong_kind);
+        let mut extended = message.clone();
+        extended["to"]["request"][kind] =
+            json!({"__tracerBinary":STANDARD.encode(format!("{PASSPHRASE}extra"))});
+        controls.push(extended);
+        for control in controls {
+            let result = findings(&control, &needles, &[PASSPHRASE], &[]);
+            assert!(result.0.is_none());
+            assert!(!result.1.is_empty());
+        }
+    }
+    let phrase = include_str!("../../tests/vectors/seed-backup-collisions.txt")
+        .lines()
+        .next()
+        .unwrap();
+    let displayed = reader::mnemonic_needles(phrase);
+    let mut needles = reader::seed_needles(phrase).unwrap();
+    needles.extend(reader::encodings("the passphrase", PASSPHRASE.as_bytes()));
+    for field in ["incarnation", "generation"] {
+        let mut message = json!({"to":{"incarnation":"fixture-execution","generation":"0",
+            "request":{"seed_backup_reentry":{"__tracerBinary":STANDARD.encode(phrase)}}}});
+        message["to"][field] = json!(phrase);
+        assert!(
+            !findings(&message, &needles, &[PASSPHRASE], &displayed)
+                .1
+                .is_empty()
+        );
+    }
+    let legacy = json!({"to":{"seed_backup_reentry":{"__tracerBinary":STANDARD.encode(phrase)}}});
+    assert!(
+        !findings(&legacy, &needles, &[PASSPHRASE], &displayed)
+            .1
+            .is_empty()
     );
 }
 
@@ -3594,12 +3688,7 @@ async fn relocked(
     case.check(
         "main.a119",
         "after unlock, the replayed state lists every command recorded before",
-        view["store"] == "unlocked"
-            && replayed == {
-                let mut expected = before.clone();
-                expected["sessions"] = json!([]);
-                expected
-            },
+        view["store"] == "unlocked" && replayed == *before,
     );
     binding_cases::prepare(run, tab, worker, PASSPHRASE).await?;
     Ok(())
@@ -3625,7 +3714,7 @@ async fn settle_unresolved(
     let mut events: Vec<Value> = opened
         .records
         .iter()
-        .map(|(_, p)| serde_json::from_slice(p).map_err(|e| e.to_string()))
+        .map(|(_, p)| crate::journal::event(p).map_err(|e| e.to_string()))
         .collect::<Result<_, _>>()?;
     events.push(calls.disposition());
     run.put(

@@ -456,7 +456,7 @@ pub(super) async fn run(
     ]
     .into();
     module(run,worker,"self.hiddenGoalReady=new Promise(ready=>m.test_hold_session_point('goal_turn',new Promise(release=>self.releaseHiddenGoal=release),ready));return true;").await?;
-    setup_cases::click(run, tab, &format!("[data-goal-accept='{session}']")).await?;
+    setup_cases::click(run, tab, &format!("[data-start-accepted-goal='{session}']")).await?;
     module(run, worker, "await self.hiddenGoalReady;return true;").await?;
     let from = run.aggregator.requests.lock().unwrap().len();
     let other = run
@@ -533,7 +533,7 @@ pub(super) async fn run(
         .browser
         .evaluate(
             &tab.session,
-            "document.getElementById('tau-setup').textContent",
+            "document.getElementById('tau-task-setup').textContent",
         )
         .await?;
     case.check(
@@ -725,7 +725,7 @@ async fn boundaries(
             && stale.get("error").is_some(),
     );
     module(run,worker,&format!("const current=JSON.parse(await m.open());current.goal_outcome={{session:{},outcome:{{done:true}}}};await m.publish_report(self.oldGeneration,{},JSON.stringify(current));return true;",json!(session),json!(session))).await?;
-    case.check("lifecycle_cases.a031", "actual posted store message cannot render a stale done result",!run.browser.evaluate(&tab.session,"document.getElementById('tau-setup').textContent.includes('Goal loop ended: done.')").await?.as_bool().unwrap_or(true));
+    case.check("lifecycle_cases.a031", "actual posted store message cannot render a stale done result",!run.browser.evaluate(&tab.session,"document.getElementById('tau-task-setup').textContent.includes('Goal loop ended: done.')").await?.as_bool().unwrap_or(true));
     case.check(
         "lifecycle_cases.a032",
         "next eligible inference uses the original key without retrying lost request",
@@ -918,12 +918,10 @@ async fn dedicated_approvals(
         "lifecycle_cases.a041",
         "independent journal reader sees original approval and actual reset boundary",
         history.records.iter().any(|(_, bytes)| {
-            serde_json::from_slice::<Value>(bytes)
-                .ok()
-                .is_some_and(|e| {
-                    e.pointer("/dedicated_reinstall/dispatch/reset")
-                        == Some(&json!("synthetic-reset-a"))
-                })
+            crate::journal::event(bytes).ok().is_some_and(|e| {
+                e.pointer("/dedicated_reinstall/dispatch/reset")
+                    == Some(&json!("synthetic-reset-a"))
+            })
         }),
     );
     case.finish(cases);
@@ -933,7 +931,7 @@ async fn dedicated_approvals(
         let mut case = Case::new(
             "lifecycle_cases.c008",
             &format!(
-                "dedicated {how} ends old approval; a separately admitted successor alone can reset (CNF-86)"
+                "dedicated {how} preserves approval until explicit End; only a new session can reset (CNF-86)"
             ),
         );
         let a = dedicated(run, worker, "approve", json!({"reset":"ended-reset"})).await?;
@@ -946,10 +944,43 @@ async fn dedicated_approvals(
                 .await?;
         }
         resume(run, tab, worker).await?;
+        let restored = run.inspect(worker).await?;
+        let view = &restored["reinstall_approvals"];
+        let original_session = view[0]["session"]
+            .as_str()
+            .ok_or("missing original approval session")?;
+        case.check(
+            "lifecycle_cases.a042",
+            "replacement restores the original standing approval and its withdrawal offer",
+            view[0]["approval"] == a["approval"]
+                && view[0]["state"] == "standing"
+                && view[0]["withdrawal_offer"] == true
+                && restored["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["identity"] == original_session && s["session_state"] != "ended")
+                && run
+                    .browser
+                    .evaluate(
+                        &tab.session,
+                        &format!(
+                            "document.querySelector('[data-withdraw-reinstall=\"{}\"]')!==null",
+                            a["approval"]
+                        ),
+                    )
+                    .await?
+                    == true,
+        );
+        module(run, worker, &format!(
+            "const report=await m.task_request({});if(JSON.parse(report).error)throw new Error('fixture End refused');await m.publish_report(m.publication_generation(),'',report);return true;",
+            json!(json!({"action":"end-session","session":original_session}).to_string())
+        )).await?;
+        binding_cases::prepare(run, tab, worker, PASSPHRASE).await?;
         let view = run.inspect(worker).await?["reinstall_approvals"].clone();
         case.check(
             "lifecycle_cases.a042",
-            "actual successor shows no longer usable with no withdrawal offer",
+            "explicit End makes the original approval unusable with no withdrawal offer",
             view[0]["state"] == "no longer usable"
                 && view[0]["withdrawal_offer"] == false
                 && run

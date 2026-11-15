@@ -20,6 +20,7 @@ pub mod inference_limits;
 pub mod jobs;
 pub mod lifecycle;
 pub mod modes;
+pub mod poc;
 pub mod redaction;
 pub mod relay_auth;
 pub mod scan;
@@ -76,6 +77,13 @@ mod worker {
         local().lock().await.open().await.to_string()
     }
 
+    #[wasm_bindgen]
+    pub fn identify_execution(identity: String) -> Result<(), wasm_bindgen::JsValue> {
+        crate::lifecycle::owner()
+            .identify(identity)
+            .map_err(Into::into)
+    }
+
     /// Creates the store with the passphrase's UTF-8 bytes, which are zero-filled at once.
     #[wasm_bindgen]
     pub async fn create(passphrase: Uint8Array) -> String {
@@ -88,6 +96,21 @@ mod worker {
     pub async fn unlock(passphrase: Uint8Array) -> String {
         let passphrase = take(&passphrase);
         local().lock().await.unlock(passphrase).await.to_string()
+    }
+
+    #[wasm_bindgen]
+    pub async fn deployment_configure(
+        origin: Option<String>,
+        bytes: Uint8Array,
+        public_fields: String,
+    ) -> Result<bool, wasm_bindgen::JsValue> {
+        let secret = zeroize::Zeroizing::new(bytes.to_vec());
+        bytes.fill(0, 0, bytes.length());
+        local()
+            .lock()
+            .await
+            .deployment_configure(origin, &secret, &public_fields)
+            .map_err(Into::into)
     }
 
     /// The only mnemonic output: the dedicated seed-backup display message, or null.
@@ -133,6 +156,312 @@ mod worker {
             .seed_backup_redisplay(passphrase)
             .await
             .to_string()
+    }
+
+    #[wasm_bindgen]
+    pub async fn poc_configure(endpoint: String, model: String, key: Uint8Array) -> String {
+        let secret = zeroize::Zeroizing::new(key.to_vec());
+        key.fill(0, 0, key.length());
+        let result = crate::poc::inference::configure(endpoint, model, secret).await;
+        local()
+            .lock()
+            .await
+            .report(result.as_ref().err().map(String::as_str))
+            .to_string()
+    }
+
+    #[wasm_bindgen]
+    pub fn poc_key_is_set() -> bool {
+        crate::poc::inference::key_is_set()
+    }
+
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_poc_protect_output(value: String) -> String {
+        let local = local();
+        let mut local = local.lock().await;
+        let result = match (
+            local.store(),
+            serde_json::from_str::<serde_json::Value>(&value),
+        ) {
+            (Some(store), Ok(value)) => store.protect_output(&value),
+            _ => Err("protected output unavailable".into()),
+        };
+        result
+            .unwrap_or_else(|why| serde_json::json!({"withheld":why}))
+            .to_string()
+    }
+
+    /// Register scan custody without usable configuration so append checks remain independently
+    /// exercised even when conservative configuration admission already refuses the fixture.
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_poc_register_credential(key: Vec<u8>) -> Result<(), wasm_bindgen::JsValue> {
+        let key = zeroize::Zeroizing::new(key);
+        local()
+            .lock()
+            .await
+            .store()
+            .ok_or("locked")?
+            .remember_poc_credential(&key);
+        Ok(())
+    }
+
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_poc_job_evidence(
+        output: String,
+        stderr: String,
+        key: String,
+        previous_key: String,
+        command: Option<String>,
+        sudo: bool,
+    ) -> String {
+        crate::store::poc_targets::test_poc_job_evidence(
+            output,
+            stderr,
+            key,
+            previous_key,
+            command,
+            sudo,
+        )
+        .await
+        .unwrap_or_else(|why| serde_json::json!({"withheld":why}))
+        .to_string()
+    }
+
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_poc_prepare_release(
+        output: String,
+        held: bool,
+    ) -> Result<(), wasm_bindgen::JsValue> {
+        let local = local();
+        let mut local = local.lock().await;
+        let evidence = local
+            .store()
+            .ok_or("locked")?
+            .test_poc_prepare_release(output)
+            .await?;
+        crate::testonly::prepare_poc_release(evidence, held);
+        Ok(())
+    }
+
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_poc_release_counts() -> Result<String, wasm_bindgen::JsValue> {
+        Ok(local()
+            .lock()
+            .await
+            .store()
+            .ok_or("locked")?
+            .test_poc_release_counts()
+            .to_string())
+    }
+
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_poc_next(goal: String, machine: String, steps: String) -> String {
+        let Ok(steps) =
+            serde_json::from_str::<Vec<(String, crate::goals::Tool, serde_json::Value)>>(&steps)
+        else {
+            return serde_json::json!({"pause":"invalid completed steps"}).to_string();
+        };
+        let context = async {
+            if !crate::poc::inference::key_is_set() {
+                return Err("inference endpoint missing or key missing".to_string());
+            }
+            let local = local();
+            let mut writer = local.lock().await;
+            let store = writer.store().ok_or("locked")?;
+            store
+                .test_poc_inference_request(&machine, goal, steps)
+                .await
+        }
+        .await;
+        let (task, session) = match context {
+            Ok(context) => context,
+            Err(pause) => return serde_json::json!({"pause":pause}).to_string(),
+        };
+        match crate::poc::inference::next(&task, &session).await {
+            Ok((id, tool)) => serde_json::json!({"id":id,"tool":tool}).to_string(),
+            Err(reason) => serde_json::json!({"pause":reason}).to_string(),
+        }
+    }
+
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_poc_journal(needle: String) -> String {
+        local()
+            .lock()
+            .await
+            .store()
+            .expect("fixture unlocked")
+            .test_poc_journal(&needle)
+            .await
+            .expect("authenticated fixture journal")
+            .to_string()
+    }
+
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_approval_neighbor() -> String {
+        let local = local();
+        let mut writer = local.lock().await;
+        let result = writer
+            .store()
+            .expect("fixture unlocked")
+            .test_approval_neighbor()
+            .await;
+        writer
+            .report(result.as_ref().err().map(String::as_str))
+            .to_string()
+    }
+
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_pending_context(kind: String) -> String {
+        let local = local();
+        let mut writer = local.lock().await;
+        writer
+            .store()
+            .expect("fixture unlocked")
+            .test_pending_context(&kind)
+            .await
+            .expect("pending fixture context");
+        writer.report(None).to_string()
+    }
+
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_credit_append_probe(value: String) -> String {
+        let local = local();
+        let mut local = local.lock().await;
+        let result = local
+            .store()
+            .expect("fixture unlocked")
+            .test_credit_append_probe(value)
+            .await;
+        serde_json::json!({"refused":result.is_err()}).to_string()
+    }
+
+    /// Fixture-only corruption of the access projection to exercise the real admission
+    /// path. Nothing is appended and the valid projection is restored before returning.
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_poc_transport(machine: String, collect: bool, replacement: String) -> String {
+        let writer = local();
+        let old = if replacement.is_empty() {
+            None
+        } else {
+            let target: crate::poc::targets::TargetRecord = match serde_json::from_str(&replacement)
+            {
+                Ok(target) => target,
+                Err(_) => return serde_json::json!({"refused":"fixture schema"}).to_string(),
+            };
+            match writer
+                .lock()
+                .await
+                .store()
+                .expect("fixture unlocked")
+                .test_poc_replace_target(&machine, target)
+            {
+                Ok(old) => Some(old),
+                Err(why) => return serde_json::json!({"refused":why}).to_string(),
+            }
+        };
+        let target = crate::harness::Target {
+            machine: machine.clone(),
+            stored: true,
+            relay: String::new(),
+            profile: String::new(),
+            host: String::new(),
+            port: 0,
+            user: String::new(),
+        };
+        let mut journal = StoreJournal {
+            local: writer.clone(),
+            unavailable: false,
+        };
+        let pins = crate::poc::targets::StoredPins::default();
+        let report = if collect {
+            match crate::harness::collect_jobs(&pins, &mut journal, &target, false).await {
+                Ok(records) => serde_json::json!({"collected":records}),
+                Err(why) => why.to_json(),
+            }
+        } else {
+            crate::harness::report(
+                &crate::harness::run_command(
+                    &pins,
+                    &mut journal,
+                    &target,
+                    b"printf ok",
+                    None,
+                    false,
+                )
+                .await,
+            )
+        };
+        if let Some(old) = old {
+            writer
+                .lock()
+                .await
+                .store()
+                .expect("fixture unlocked")
+                .test_poc_replace_target(&machine, old)
+                .expect("fixture restored");
+        }
+        report.to_string()
+    }
+
+    /// Corrupt only the fixture projection after binding; no durable target changes.
+    #[cfg(feature = "tracer")]
+    #[wasm_bindgen]
+    pub async fn test_poc_profile(
+        machine: String,
+        profile: String,
+    ) -> Result<(), wasm_bindgen::JsValue> {
+        let local = local();
+        let mut writer = local.lock().await;
+        let store = writer.store().ok_or("locked")?;
+        let mut target = store.poc_target(&machine).ok_or("fixture target")?.clone();
+        target.profile = profile;
+        store.test_poc_replace_target(&machine, target)?;
+        Ok(())
+    }
+
+    #[wasm_bindgen]
+    pub async fn poc_enroll(request: String) -> String {
+        local().lock().await.poc_enroll(&request).await.to_string()
+    }
+
+    #[wasm_bindgen]
+    pub async fn poc_bind(machine: String) -> String {
+        local().lock().await.poc_bind(&machine).await.to_string()
+    }
+
+    #[wasm_bindgen]
+    pub async fn poc_accept(request: String) -> String {
+        local().lock().await.poc_accept(&request).await.to_string()
+    }
+
+    #[wasm_bindgen]
+    pub async fn poc_propose_requirements(request: String) -> String {
+        local()
+            .lock()
+            .await
+            .poc_propose_requirements(&request)
+            .to_string()
+    }
+
+    #[wasm_bindgen]
+    pub async fn poc_public_keys(machine: String) -> String {
+        let local = local();
+        let mut local = local.lock().await;
+        let keys = local.poc_public_keys(&machine);
+        let mut report = local.report(None);
+        report["poc_keys"] = keys;
+        report.to_string()
     }
 
     #[wasm_bindgen]
@@ -250,7 +579,9 @@ mod worker {
             origin.clone()
         } else {
             store.synthetic_session_transition(&session, &transition)?;
-            store.bind(&origin.bound_set[0]).await?;
+            // Re-entry requires durable End even after synthetic readiness loss.
+            store.end_session(&session).await?;
+            store.admit_fixture(&origin.bound_set[0]).await?;
             store
                 .connection_session(&origin.bound_set[0])
                 .await
@@ -505,6 +836,50 @@ mod worker {
         request_operation(request, false).await
     }
 
+    #[wasm_bindgen]
+    pub async fn task_request(request: String) -> String {
+        crate::poc::web::request(request).await
+    }
+
+    /// Preserve the existing page exercises in builds that include the browser fixtures.
+    #[wasm_bindgen]
+    pub async fn run_page_goal(session: String) -> String {
+        run_page_goal_with(session, crate::poc::web::Response::default()).await
+    }
+    pub(crate) async fn run_page_goal_with(
+        session: String,
+        response: crate::poc::web::Response,
+    ) -> String {
+        #[cfg(feature = "tracer")]
+        if !crate::poc::web::page_uses_runner(&session).await {
+            return crate::harness::goals::run_goal(session).await;
+        }
+        {
+            let result = async {
+                let task = local()
+                    .lock()
+                    .await
+                    .store()
+                    .ok_or("locked")?
+                    .poc_page_start(&session)
+                    .await?;
+                crate::poc::web::publish_progress(&session).await;
+                if task.status == crate::store::poc::Status::Paused {
+                    return Ok(serde_json::json!({"task":task.id}));
+                }
+                let request = serde_json::json!({"action":"resume","id":task.id,"session":session})
+                    .to_string();
+                let report = crate::poc::web::request_with(request, response).await;
+                let report = serde_json::from_str(&report).map_err(|_| "task report")?;
+                Ok::<_, String>(crate::poc::run::page_outcome(&task.id, &report))
+            }
+            .await;
+            result
+                .unwrap_or_else(|why| serde_json::json!({"refused":why}))
+                .to_string()
+        }
+    }
+
     /// Stop the current unresolved-command waits on this machine. Settles nothing.
     #[wasm_bindgen]
     pub fn stop_waits(machine: String) -> usize {
@@ -522,7 +897,11 @@ mod worker {
         request: String,
         collect: bool,
     ) -> Result<String, wasm_bindgen::JsValue> {
+        // No await separates reservation and registration's check on this worker thread.
+        // Retain it through final scanning/encoding, including every early return.
+        let _response = crate::poc::inference::CommandResponse::reserve();
         let continuation = crate::lifecycle::owner().continuation();
+        #[cfg(feature = "tracer")]
         use crate::harness::Target;
         let request: serde_json::Value = serde_json::from_str(&request)
             .map_err(|e| wasm_bindgen::JsValue::from_str(&format!("request: {e}")))?;
@@ -536,15 +915,57 @@ mod worker {
             return Ok(serde_json::json!({"outcome":{"refused":"request"}}).to_string());
         }
         let text = |name: &str| request[name].as_str().unwrap_or_default().to_string();
+        #[cfg(feature = "tracer")]
         let target = Target {
             machine: text("machine"),
             relay: text("relay"),
+            profile: "v1".into(),
+            stored: false,
             host: text("host"),
             port: request["port"]
                 .as_u64()
                 .and_then(|p| u16::try_from(p).ok())
                 .unwrap_or(0),
             user: text("user"),
+        };
+        #[cfg(not(feature = "tracer"))]
+        let (target, pins) = {
+            let local = local();
+            let mut local = local.lock().await;
+            let Some(store) = local.store() else {
+                return Ok(serde_json::json!({"outcome":{"refused":"locked"}}).to_string());
+            };
+            match crate::poc::targets::resolve(store, &text("machine")) {
+                Ok(resolved) => resolved,
+                Err(reason) => {
+                    store
+                        .ensure_scan_references()
+                        .await
+                        .map_err(wasm_bindgen::JsValue::from)?;
+                    let safe = (|| {
+                        // Protect the dynamic value separately to retain the refusal category
+                        // when the credential filter replaces an entire matching string.
+                        let reason = if let Some(profile) =
+                            reason.strip_prefix("unsupported relay profile: ")
+                        {
+                            let profile = store.protect_output(&serde_json::json!(profile))?;
+                            format!(
+                                "unsupported relay profile: {}",
+                                profile.as_str().ok_or("profile protection")?
+                            )
+                        } else {
+                            reason
+                        };
+                        store.protect_output(&serde_json::json!({"outcome":{"refused":reason}}))
+                    })()
+                    .unwrap_or_else(|why: String| serde_json::json!({"outcome":{"refused":why}}));
+                    let encoded = safe.to_string();
+                    if !store.has_live_sessions() {
+                        store.clear_scan_working_copies();
+                    }
+                    return Ok(encoded);
+                }
+            }
         };
         let command = text("command");
         let local = local();
@@ -560,20 +981,20 @@ mod worker {
         #[cfg(not(feature = "tracer"))]
         let report = {
             if collect {
-                match crate::harness::collect_jobs(&NoPins, &mut journal, &target).await {
-                    Ok(records) => serde_json::json!({"outcome":{"collected":records}}),
+                match crate::harness::collect_jobs(&pins, &mut journal, &target).await {
+                    Ok(records) => crate::harness::response(crate::harness::collected(records)),
                     Err(refusal) => serde_json::json!({"outcome":refusal.to_json()}),
                 }
             } else {
                 let outcome = crate::harness::run_command(
-                    &NoPins,
+                    &pins,
                     &mut journal,
                     &target,
                     command.as_bytes(),
                     None,
                 )
                 .await;
-                serde_json::json!({ "outcome": crate::harness::report(&outcome) })
+                crate::harness::response(crate::harness::report(&outcome))
             }
         };
         #[cfg(feature = "tracer")]
@@ -631,8 +1052,7 @@ mod worker {
             }
         }
     }
-
-    /// The served build has no host-key pin source until twr-ggw.43.
+    /// The legacy goal loop has no stored target configuration.
     #[cfg(not(feature = "tracer"))]
     pub(crate) struct NoPins;
 
