@@ -35,6 +35,7 @@ pub struct State {
     pub routing_refusal: bool,
     pub echo: bool,
     pub script: std::collections::VecDeque<Value>,
+    pub poc_declaration: Option<Value>,
     pub document: String,
     pub document_status: u16,
     pub hold_document: bool,
@@ -74,6 +75,7 @@ impl State {
             routing_refusal: false,
             echo: false,
             script: Default::default(),
+            poc_declaration: None,
             document: String::new(),
             document_status: 200,
             hold_document: false,
@@ -210,7 +212,19 @@ impl State {
                 self.credit_hundredths -= 1;
                 let mut reply = json!({"id":if self.no_report {"chatcmpl-fixture"} else {"gen-fixture"},"object":"chat.completion","model":"fixture-model","choices":[{"index":0,"message":{"role":"assistant","content":if self.echo {key.value.as_str()} else {"fixture response"}},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":5,"total_tokens":8}});
                 let mut escaped_key = None;
-                if let Some(mut call) = self.script.pop_front() {
+                let proposal_only = serde_json::from_slice::<Value>(body).ok().is_some_and(|v| {
+                    v["tools"].as_array().is_some_and(|tools| {
+                        tools.len() == 1 && tools[0]["function"]["name"] == "propose_declaration"
+                    })
+                });
+                let call = if proposal_only && self.poc_declaration.is_some() {
+                    Some(
+                        json!({"id":format!("declaration-{}",key.spent),"type":"function","function":{"name":"propose_declaration","arguments":json!({"machine":"machine-a","declaration":self.poc_declaration}).to_string()}}),
+                    )
+                } else {
+                    self.script.pop_front()
+                };
+                if let Some(mut call) = call {
                     crate::state_inputs::script_item(&call);
                     // Script directives belong to this fixture, never the harness wire.
                     if let Some(path) = call.get("write_received_context").and_then(Value::as_str) {

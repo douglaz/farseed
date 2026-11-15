@@ -252,10 +252,15 @@ impl<S: Storage> Store<S> {
         self.admit_with_credit(machine, &[], approval, credit).await
     }
 
-    /// Operator-authored declaration candidate. It uses the ordinary goal/session,
+    /// Typed declaration candidate from the task proposal. It uses the ordinary goal/session,
     /// classification, access and journaled requirements approval checks.
     pub fn poc_propose_requirements(&mut self, session: &str, value: &Value) -> Result<(), String> {
         let proposal = crate::declaration::Proposal::parse(value)?;
+        if let crate::declaration::Proposal::Declaration { declaration, .. } = &proposal {
+            crate::poc::completion::proposal(
+                &serde_json::to_value(declaration).map_err(|_| "declaration encoding")?,
+            )?;
+        }
         if !matches!(proposal, crate::declaration::Proposal::Declaration { .. }) {
             return Err("PoC requires a declaration proposal".into());
         }
@@ -268,9 +273,11 @@ impl<S: Storage> Store<S> {
             .poc_requirement_candidate
             .checked_add(1)
             .ok_or("proposal counter exhausted")?;
+        let candidate = candidate.max(self.next);
         self.poc_requirement_candidate = candidate;
         let tool = crate::goals::Tool::Done {
             machine: proposal.machine().into(),
+            checks: vec![],
         };
         self.propose_requirements(session, candidate, proposal, &tool)
     }
@@ -497,8 +504,6 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         #[serde(deny_unknown_fields)]
         struct Request {
             session: String,
-            #[serde(default)]
-            checks: Vec<String>,
         }
         let result = async {
             if let Some(why) = self.dispatch_refusal() {
@@ -510,10 +515,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             let request: Request =
                 serde_json::from_str(request).map_err(|_| "invalid PoC acceptance")?;
             let store = self.store().ok_or("locked")?;
-            store
-                .poc_start(&request.session, request.checks)
-                .await
-                .map(|_| ())
+            store.poc_start(&request.session).await.map(|_| ())
         }
         .await;
         self.report(result.as_ref().err().map(String::as_str))

@@ -150,9 +150,9 @@ async function startWording(c, {request, report, session}) {
     assert.ok(await c.evaluate("document.querySelector('#tau-poc-targets').textContent.includes('Start session approves inference using example-model on machine-a.')"), 'no account and ended session retain BYO approval');
     assert.equal(await c.evaluate("[...document.querySelectorAll('#tau-poc-targets p')].find(n=>n.textContent.startsWith('Inference endpoint:'))?.textContent"),`Inference endpoint: ${c.inferenceEndpoint}; model: example-model.`,kind+' retains the BYO endpoint and model line');
     assert.equal(await c.evaluate(startButton+'.disabled'),false,kind+' retains enabled BYO Start');
-    await c.invoke(()=>{document.querySelector('#tau-poc-targets [data-start-goal]').value='Inspect the service';document.querySelector('#tau-poc-targets [data-start-checks]').value='true\nfalse';document.querySelector('#tau-poc-targets [data-document-source]').value='https://example.invalid/goal';});
+    await c.invoke(()=>{document.querySelector('#tau-poc-targets [data-start-goal]').value='Inspect the service';document.querySelector('#tau-poc-targets [data-document-source]').value='https://example.invalid/goal';});
     const sent = await c.evaluate(`(() => {const worker=fixtureWorkers.at(-1),original=worker.sendAt,sent=[];worker.sendAt=data=>sent.push(data);try{${startButton}.click();}finally{worker.sendAt=original;}return sent;})()`);
-    assert.deepEqual(sent,[{poc_bind:{machine:'machine-a',goal:'Inspect the service',document_source:'https://example.invalid/goal',checks:['true','false']}}]);
+    assert.deepEqual(sent,[{poc_bind:{machine:'machine-a',goal:'Inspect the service',document_source:'https://example.invalid/goal'}}]);
   }
   assert.equal(base.sessions[0].identity,session);
   c.check(true,'Lock and reload balance holds, failed and zero reads, configuration choices and ended-session boundary retain the correct Start path');
@@ -367,15 +367,15 @@ async function edgeFocusSession(c, {request, report, session}) {
   }
   if(['edge-focus-target','edge-focus-limits'].includes(c.name)) {
     await c.wait('fixtureReports.at(-1)?.tasks?.[0]?.pause_reason');
-    await c.wait("document.querySelector('[data-poc-declaration]')");
+    await c.wait("document.querySelector('[data-requirements-decision=approve]')");
   }
   c.credit.state.status='New';
   await request({action:'invoice',amount:1000});
   await settlePolls(c);
   const fields = {
-    'edge-focus-target':['[data-credit-goal]','[data-poc-declaration]'],
+    'edge-focus-target':['[data-credit-goal]'],
     'edge-focus-goal':['#tau-poc-targets [data-start-goal]','#tau-poc-targets [data-document-source]'],
-    'edge-focus-verification':['[data-credit-goal]','[aria-label="Verification commands, one per line"]'],
+    'edge-focus-verification':['[data-credit-goal]'],
     'edge-focus-limits':['[aria-label="Task request limit"]','[aria-label="Task step limit"]'],
   }[c.name];
   for(const field of fields)await focusField(c,field);

@@ -367,7 +367,7 @@ impl server::Handler for SshSession {
         }
         let mapped = self.machine.map(data);
         let mut command = tokio::process::Command::new("sh");
-        if self.machine.root.join("provisioning").is_file() {
+        if self.machine.root.join("bin").is_dir() {
             command.env(
                 "PATH",
                 format!(

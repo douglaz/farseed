@@ -2566,9 +2566,6 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             }
             if !store.poc_targets.is_empty() {
                 report["poc_targets"] = store.poc_targets_view();
-                report["poc_declaration_candidate"] =
-                    serde_json::to_value(crate::declaration::ad_hoc_minimum())
-                        .expect("candidate serializes");
             }
             if !store.poc.is_empty() {
                 report["tasks"] = serde_json::to_value(

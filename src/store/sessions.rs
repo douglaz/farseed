@@ -151,7 +151,7 @@ mod tests {
         let session = nested.sessions[0].identity.clone();
         block_on(nested.enter_goal(&session, "check a service".into(), None)).unwrap();
         block_on(nested.accept_mode(&session, Mode::NoBrief)).unwrap();
-        let task = block_on(nested.poc_create(&session, vec!["true".into()])).unwrap();
+        let task = block_on(nested.poc_create(&session)).unwrap();
         let task =
             block_on(nested.poc_change(&task.id, task.revision, poc::Change::Request)).unwrap();
         let change = poc::Change::Propose {
@@ -223,7 +223,7 @@ mod tests {
         block_on(s.enter_goal(&session, "install a small service".into(), None)).unwrap();
         block_on(s.accept_mode(&session, Mode::NoBrief)).unwrap();
         s.fixture_requirements("fixture");
-        let task = block_on(s.poc_create(&session, vec!["true".into()])).unwrap();
+        let task = block_on(s.poc_create(&session)).unwrap();
         let task = block_on(s.poc_change(&task.id, task.revision, poc::Change::Request)).unwrap();
         let mut r = reopen(&s);
         assert_eq!(r.sessions[0].identity, session);
@@ -377,6 +377,7 @@ mod tests {
                 proposal.clone(),
                 &crate::goals::Tool::Done {
                     machine: "fixture".into(),
+                    checks: vec![],
                 },
             )
             .unwrap();

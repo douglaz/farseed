@@ -377,8 +377,8 @@ export async function creditProof(c) {
   await call('Emulation.setDeviceMetricsOverride',{width:360,height:844,deviceScaleFactor:1,mobile:true},sessionId);
   await phoneSnapshot(c,'credit-before-start-360');
  }
- const startChecks=name.startsWith('credit-mint-verification-') ? `while [ ! -f '${info.directory}/continue' ]; do sleep 0.1; done; printf installed` : (['credit-restart-history','credit-approval-mint','credit-mint-pause','credit-ensure-contention','credit-balance-loss-mint','credit-refusals'].includes(name)||name.startsWith('edge-')||name.startsWith('credit-mint-collection')) ? 'true' : `test -f '${info.directory}/verified'`;
- await invoke(checks=>{document.querySelector('#tau-poc-targets [data-start-checks]').value=checks;},startChecks);
+ state.onMint=async key=>{await control({inference:{key:key.api_key,commands:[]}});};
+ if(name.startsWith('credit-mint-verification-'))await control({reads:{hold:true}});
  if(name==='credit-lifecycle')state.delay=1200;
  if(name==='credit-late-lock'||name==='credit-late-end')await hold('credit_mint_return');
  if(name==='credit-late-lock')await workerEvaluate(`globalThis.fixtureOriginalSend=self.postMessage.bind(self);self.postMessage=(value,...transfer)=>{if(value?.runtime_retired===true)globalThis.fixtureRetirementAck=value;else fixtureOriginalSend(value,...transfer);};`);
@@ -407,6 +407,7 @@ export async function creditProof(c) {
   assert.equal(await evaluate("document.querySelector('#tau-poc-key').value"),'');check(true,'Lock retires a pending mint without actionable handback');return;
  }
  await wait('fixtureReports.at(-1)?.sessions?.[0]?.credit_backed && fixtureReports.at(-1)?.poc_configuration?.key_set');
+ await wait("fixtureEvents.some(e=>e.fixture_credit_complete==='start')");
  const session=(await report()).sessions[0].identity;
  if(name.startsWith('edge-')){await wait("fixtureEvents.some(e=>e.fixture_credit_complete==='start')");await edgeSession(c,{request,report,workerCall,journal,session});return;}
  if(process.env.TAU_LAYOUT_CREDIT==='1'){assert.equal(await evaluate("document.querySelector('[data-credit-new-key]')?.tagName"),'BUTTON');await phoneSnapshot(c,'credit-session');}
@@ -452,7 +453,7 @@ export async function creditProof(c) {
   await wait('fixtureReports.at(-1)?.tasks?.[0]?.pause_reason');
   await invoke(()=>[...document.querySelectorAll('#tau-poc-targets button')].find(b=>b.textContent==='Show public keys machine-a').click());
   const keys=await wait('fixtureReports.at(-1)?.poc_keys');assert.equal((await control({keys})).installed,true);
-  await click('[data-poc-propose]');await wait("document.querySelector('[data-requirements-decision=approve]')");
+  await wait("document.querySelector('[data-requirements-decision=approve]')");
   if(name==='credit-approval-mint'){
    state.mintMode='refused';const failed=await request({action:'new_key',session});
    assert.equal(failed.credit_error,"Couldn't create this session's inference key.");
@@ -464,6 +465,7 @@ export async function creditProof(c) {
    assert.equal(state.mintCalls,attempts,'approval does not clear the failed-mint latch');
    assert.equal((await report()).tasks[0].requests,before.requests,'failed-mint approval consumes no inference request');
    assert.equal((await report()).tasks[0].pause_reason,"Couldn't create this session's inference key.");
+   state.onMint=async key=>{await control({inference:{key:key.api_key,commands:[null]}});};
    await control({inference:{key:'synthetic-session-credential-'+(attempts+1)+'-482700',commands:[null]}});
    await invoke(()=>[...document.querySelectorAll('[data-task] button')].find(b=>b.textContent==='Resume').click());
    await wait("fixtureReports.at(-1)?.tasks?.[0]?.status==='complete'");
@@ -479,18 +481,19 @@ export async function creditProof(c) {
   const starts=await evaluate("fixtureEvents.filter(e=>e.fixture_credit_complete==='start').length");
   const sends=(await control({inspect:true})).inference_requests;
   state.onMint=async key=>{await control({inference:{key:key.api_key,commands:[null]}});};
-  await invoke(()=>{document.querySelector('[data-credit-goal]').value='Check this machine again';document.querySelector('#tau-poc-targets [data-start-checks]').value='printf next-session';[...document.querySelectorAll('#tau-poc-targets button')].find(b=>b.textContent==='Start session machine-a').click();});
+  await invoke(()=>{document.querySelector('[data-credit-goal]').value='Check this machine again';[...document.querySelectorAll('#tau-poc-targets button')].find(b=>b.textContent==='Start session machine-a').click();});
   await wait(`fixtureEvents.filter(e=>e.fixture_credit_complete==='start').length>${starts}`);
   const current=(await report()).tasks.find(t=>t.start_session!==session);
   assert.ok(current,'the second Start admits a new task');
   assert.equal(current.machine,old.machine);assert.notEqual(current.start_session,session);
-  assert.deepEqual(current.checks,['printf next-session']);
+
   assert.deepEqual((await report()).tasks.find(t=>t.id===old.id),old,'historical completed task stays unchanged');
   assert.deepEqual(await evaluate('fixtureEvents.filter(e=>e.fixture_start_order).at(-1).fixture_start_order'),[session,current.start_session],'fixture deterministically places ended history first');
-  const startsRun=[{session,checks:['true']},{session:current.start_session,checks:['printf next-session']}];
-  assert.deepEqual(await evaluate('fixtureEvents.filter(e=>e.fixture_start_run).map(e=>e.fixture_start_run)'),startsRun,'each successful Start continues only its own task and checks');
+  const startsRun=[{session},{session:current.start_session}];
+  assert.deepEqual(await evaluate('fixtureEvents.filter(e=>e.fixture_start_run).map(e=>e.fixture_start_run)'),startsRun,'each successful Start continues only its own task');
   assert.ok(!await evaluate("fixtureReports.some(r=>r.store_error?.includes('ended session'))"),'Start never publishes an ended-session refusal');
   await wait(`fixtureReports.at(-1)?.tasks?.find(t=>t.id===${JSON.stringify(current.id)})?.status==='complete'`);
+  assert.deepEqual((await report()).tasks.find(t=>t.id===current.id).checks,['ss -H -n -l -t -u']);
   assert.ok(!await evaluate("document.querySelector('[data-requirements-decision=approve]')"),'the approved machine needs no further declaration approval');
   assert.deepEqual((await report()).tasks.find(t=>t.id===old.id),old);
   assert.equal((await control({inspect:true})).inference_requests,sends+1);
@@ -501,8 +504,8 @@ export async function creditProof(c) {
  if(name==='credit-mint-pause'||name==='credit-ensure-contention'||name==='credit-balance-loss-mint'){
   await hold('poc_inference_writer');
    await wait('fixtureReports.at(-1)?.tasks?.[0]?.pause_reason');
-  await click('[data-poc-propose]');await wait("document.querySelector('[data-requirements-decision=approve]')");await click('[data-requirements-decision=approve]');await wait("!document.querySelector('[data-requirements-decision=approve]')");await point('poc_inference_writer');
-  const original=(await workerCall('open','')).tasks[0];assert.equal(original.requests,1);
+  await wait("document.querySelector('[data-requirements-decision=approve]')");await click('[data-requirements-decision=approve]');await wait("!document.querySelector('[data-requirements-decision=approve]')");await point('poc_inference_writer');
+  const original=(await workerCall('open','')).tasks[0];assert.equal(original.requests,2);
   state.mintMode=name==='credit-mint-pause'?'refused':'normal';await call('Page.reload',{},sessionId);await wait("document.querySelector('#tau-store')?.dataset.state==='locked'");
   await workerEvaluate(`globalThis.fixtureCreditRefusal={status:503,error:'private-prefix'}`);
   if(name==='credit-balance-loss-mint')state.mode='balance-lost';
@@ -518,7 +521,7 @@ export async function creditProof(c) {
    await release('poc_progress_publication');
    assert.equal(state.mintCalls,1,'automatic key work waits behind refresh');
    state.onBalance=null;state.releaseBalance();
-   await wait(`fixtureReports.at(-1)?.tasks?.[0]?.requests===2 && fixtureReports.at(-1)?.tasks?.[0]?.pause_reason==='inference provider request refused (HTTP 503)'`);
+   await wait(`fixtureReports.at(-1)?.tasks?.[0]?.requests===3 && fixtureReports.at(-1)?.tasks?.[0]?.pause_reason==='inference provider request refused (HTTP 503)'`);
    assert.equal(state.mintCalls,2);assert.equal((await report()).tasks[0].id,original.id);
    assert.equal((await report()).tasks[0].start_session,original.start_session);assert.equal((await report()).tasks[0].pending,null);
    check(true,'eligible keyless work waits behind a held refresh and continues once without a phantom Request');return;
@@ -530,14 +533,14 @@ export async function creditProof(c) {
   if(name==='credit-balance-loss-mint'){assert.equal((await report()).credit.balance,null);assert.equal((await report()).credit.can_start,false);}
   await request({action:'check'});await message({lifecycle:'resume'});await new Promise(r=>setTimeout(r,250));assert.equal(state.mintCalls,attempts,'prerequisite wakeups do not retry a failed mint');
   state.mode='normal';state.mintMode='normal';await invoke(()=>[...document.querySelectorAll('[data-task] button')].find(b=>b.textContent==='Resume').click());
-  await wait(`fixtureReports.at(-1)?.tasks?.[0]?.requests===2 && fixtureReports.at(-1)?.tasks?.[0]?.pause_reason==='inference provider request refused (HTTP 503)'`);
+  await wait(`fixtureReports.at(-1)?.tasks?.[0]?.requests===3 && fixtureReports.at(-1)?.tasks?.[0]?.pause_reason==='inference provider request refused (HTTP 503)'`);
   assert.equal(state.mintCalls,attempts+1);assert.equal((await report()).tasks[0].id,original.id);
   check(true,'one failed automatic mint pauses without consuming inference; explicit Resume retries under a new name');return;
  }
  if(name==='credit-refusals'){
   await workerEvaluate(`globalThis.fixtureCreditRefusal={status:401,error:'API key expired'}`);
    await wait('fixtureReports.at(-1)?.tasks?.[0]?.pause_reason');
-  await click('[data-poc-propose]');await wait("document.querySelector('[data-requirements-decision=approve]')");await click('[data-requirements-decision=approve]');await wait("!document.querySelector('[data-requirements-decision=approve]')");
+  await wait("document.querySelector('[data-requirements-decision=approve]')");await click('[data-requirements-decision=approve]');await wait("!document.querySelector('[data-requirements-decision=approve]')");
   await wait('fixtureReports.at(-1)?.tasks?.[0]?.requests>0 && fixtureReports.at(-1)?.tasks?.[0]?.pause_reason');
   assert.equal((await report()).tasks[0].pause_reason,"This session's inference key expired.");
   for(const [status,error,balance,expected] of [
@@ -576,7 +579,7 @@ export async function creditProof(c) {
   const verifying=name.startsWith('credit-mint-verification-');
   const mode=name.slice((verifying?'credit-mint-verification-':'credit-mint-collection-').length);
   await control({inference:{key:state.keys[0].api_key,commands:verifying?[null]:[command,null]}});
-   await wait('fixtureReports.at(-1)?.tasks?.[0]?.pause_reason');await click('[data-poc-propose]');await wait("document.querySelector('[data-requirements-decision=approve]')");await click('[data-requirements-decision=approve]');await wait("!document.querySelector('[data-requirements-decision=approve]')");
+   await wait('fixtureReports.at(-1)?.tasks?.[0]?.pause_reason');await wait("document.querySelector('[data-requirements-decision=approve]')");await click('[data-requirements-decision=approve]');await wait("!document.querySelector('[data-requirements-decision=approve]')");
   await hold('credit_mint_writer');
   await message({credit_request:{action:'new_key',session}});await point('credit_mint_writer');
   await invoke(()=>[...document.querySelectorAll('[data-task] button')].find(b=>b.textContent==='Resume').click());
@@ -607,7 +610,7 @@ export async function creditProof(c) {
  }
  await control({inference:{key:state.keys.at(-1).api_key,commands:[command,null]}});
  state.onMint=async key=>{await control({inference:{key:key.api_key,commands:[null]}});await new Promise(r=>setTimeout(r,info.relay_spacing_ms+50));};
- await wait('fixtureReports.at(-1)?.tasks?.[0]?.pause_reason');await click('[data-poc-propose]');await wait("document.querySelector('[data-requirements-decision=\"approve\"]')");await click('[data-requirements-decision="approve"]');await wait("!document.querySelector('[data-requirements-decision=\"approve\"]')");
+ await wait('fixtureReports.at(-1)?.tasks?.[0]?.pause_reason');await wait("document.querySelector('[data-requirements-decision=\"approve\"]')");await click('[data-requirements-decision="approve"]');await wait("!document.querySelector('[data-requirements-decision=\"approve\"]')");
  await wait('fixtureReports.at(-1)?.tasks?.[0]?.pending');
  const original=(await report()).tasks[0];
  let launched=false;

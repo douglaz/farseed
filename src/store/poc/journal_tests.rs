@@ -173,7 +173,7 @@ fn poc_journal_creation_checks_future_goal_before_create_for_retained_generation
         let files = s.storage.files();
         let next = s.next;
         let previous = s.previous.0;
-        let error = block_on(s.poc_create(&session, vec!["true".into()])).unwrap_err();
+        let error = block_on(s.poc_create(&session)).unwrap_err();
         assert!(!error.contains(std::str::from_utf8(key).unwrap()));
         unchanged(&s, &files, next, previous);
         assert!(s.poc.is_empty());
@@ -318,7 +318,7 @@ fn poc_journal_resume_wait_admission_and_adoption_are_atomic() {
         let next = s.next;
         let previous = s.previous.0;
         assert_eq!(
-            block_on(s.poc_create(&session, vec!["true".into()])).unwrap_err(),
+            block_on(s.poc_create(&session)).unwrap_err(),
             "task refused"
         );
         unchanged(&s, &files, next, previous);
@@ -388,7 +388,7 @@ fn poc_journal_resume_command_admission_and_adoption_are_atomic() {
         let next = s.next;
         let previous = s.previous.0;
         assert_eq!(
-            block_on(s.poc_create(&session, vec!["true".into()])).unwrap_err(),
+            block_on(s.poc_create(&session)).unwrap_err(),
             "task refused"
         );
         unchanged(&s, &files, next, previous);

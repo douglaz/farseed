@@ -226,11 +226,12 @@ export async function layoutObserver(c, state) {
   c.check(await c.evaluate("fixtureReports.at(-1).tasks.length===1 && !document.querySelector('[data-goal-accept]')"),'one Start saves a task without a separate no-brief button');
  }
  if(state==='requirements') {
-  const draft=await c.evaluate("document.querySelector('[data-poc-declaration]').value+'  '");
-  await c.invoke(draft=>{const input=document.querySelector('[data-poc-declaration]');input.value=draft;input.dispatchEvent(new Event('input',{bubbles:true}));},draft);
+  const candidate=await c.evaluate("JSON.stringify(fixtureReports.at(-1).sessions[0].pending_requirements)");
+  const exact=await c.evaluate("document.querySelector('[data-requirements-card] details pre').textContent");
   const n=await c.evaluate('fixtureReports.length');await c.message({lifecycle:'hidden'});await c.message({lifecycle:'visible'});await c.wait(`fixtureReports.length>${n}`);
-  assert.equal(await c.evaluate("document.querySelector('[data-poc-declaration]').value"),draft,'declaration draft survives ordinary reports');
-  c.check(await c.evaluate("['approve','reject'].every(value=>document.querySelector('[data-requirements-decision='+value+']')?.tagName==='BUTTON') && document.querySelector('[data-poc-propose]')?.tagName==='BUTTON' && document.querySelector('[data-poc-declaration]')?.tagName==='TEXTAREA'"),'requirements and declaration controls retain their roles');
+  assert.equal(await c.evaluate("JSON.stringify(fixtureReports.at(-1).sessions[0].pending_requirements)"),candidate,'candidate identity survives ordinary reports');
+  assert.equal(await c.evaluate("document.querySelector('[data-requirements-card] details pre').textContent"),exact,'exact candidate in Details survives ordinary reports');
+  c.check(await c.evaluate("['approve','reject'].every(value=>document.querySelector('[data-requirements-decision='+value+']')?.tagName==='BUTTON') && !document.querySelector('[data-poc-propose],[data-poc-declaration]')"),'requirements and declaration controls retain their roles');
   c.check(await c.evaluate("document.querySelector('[data-requirements-decision=approve]').classList.contains('main-action')"),'requirements approval is emphasized before Resume and End');
  }
  if(state==='running') {
@@ -339,7 +340,7 @@ export async function fixtureLayout(c) {
  }
  await c.wait("document.querySelector('[data-bind=fixture]')");
  await phoneSnapshot(c,'fixture-before-start');
- await c.invoke(()=>{document.querySelector('[data-start-goal="fixture"]').value='Inspect the fixture';document.querySelector('[data-start-checks="fixture"]').value='true';});
+ await c.invoke(()=>{document.querySelector('[data-start-goal="fixture"]').value='Inspect the fixture';});
  await c.click('[data-bind=fixture]');await c.wait('fixtureReports.at(-1)?.sessions?.length===1');
  const session=await c.evaluate('fixtureReports.at(-1).sessions[0].identity');
  assert.equal(await c.workerEvaluate(`(async()=>{const m=await import(new URL('./pkg/tau_web.js',location.href));return m.test_inference_account(new TextEncoder().encode('synthetic-limit-entry'));})()`),true,'existing local limit fixture initialized');
@@ -420,7 +421,10 @@ export async function deliveryLayout(c) {
  let service={name:'sample',scope:{kind:'system'},lifecycle:'enabled-survives-reboot'};
  const declaration={version:2,listeners:{inbound:[{proto:'tcp',port:22,from:'any'}],outbound:[]},services:[service],key_material:{spendable:false,permitted:[]},drift_checks:[],required:[],default_credentials:'none'};
  const propose=async d=>{
-  await c.invoke(d=>{const input=document.querySelector('[data-poc-declaration]');input.value=JSON.stringify(d);input.dispatchEvent(new Event('input',{bubbles:true}));document.querySelector('[data-poc-propose]').click();},d);
+  const request=JSON.stringify({session,proposal:{kind:'declaration',machine,declaration:d}});
+  const result=await c.workerEvaluate(`(async()=>{const m=await import('./pkg/tau_web.js');return JSON.parse(await m.poc_propose_requirements(${JSON.stringify(request)}));})()`);
+  assert.ok(!result.error,'stage-one fixture declaration accepted');
+  await c.workerEvaluate(`(async()=>{const m=await import('./pkg/tau_web.js');await m.publish_report(m.publication_generation(),${JSON.stringify(session)},${JSON.stringify(JSON.stringify(result))});return true;})()`);
   await c.wait("document.querySelector('[data-requirements-decision=approve]')");
   await c.click('[data-requirements-decision=approve]');await c.wait("!document.querySelector('[data-requirements-decision=approve]')");
  };

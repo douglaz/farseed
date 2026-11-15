@@ -1,7 +1,7 @@
 // The harness worker alone holds the seed and keys. Only the dedicated seed-backup display
 // carries words to the page; re-entry and passphrase buffers are zero-filled by the module.
 import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, accept_page_goal, TaskPublication, requirements_answer, delivery_request, retire_runtime, sweep_inference, lifecycle_transition, publication_generation, publish_report, verify_inference_clock, withdraw_reinstall } from './pkg/tau_web.js';
-import { identify_execution, wake_tasks, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_propose_requirements } from './pkg/tau_web.js';
+import { identify_execution, wake_tasks, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept } from './pkg/tau_web.js';
 import { credit_request, retry_ended_credit } from './pkg/tau_web.js';
 import { deployment_configure, provider_configure, provider_key_is_set, provider_visibility, provider_action_delay, provider_request } from './pkg/tau_web.js';
 
@@ -196,7 +196,7 @@ const reportStore = (report, generation = publication_generation(), session = ''
 const exactMembers = (value, names) => value && typeof value === 'object' &&
   !Array.isArray(value) && Object.keys(value).length === names.length &&
   names.every(name => Object.hasOwn(value, name));
-const startFields = value => typeof value.goal === 'string' && Array.isArray(value.checks) && value.checks.every(check => typeof check === 'string') && (value.document_source === null || typeof value.document_source === 'string');
+const startFields = value => typeof value.goal === 'string' && (value.document_source === null || typeof value.document_source === 'string');
 
 const startGoal = async (report, inputs, machine) => {
   let current = JSON.parse(report);
@@ -208,7 +208,7 @@ const startGoal = async (report, inputs, machine) => {
     current = JSON.parse(report);
     if (current.error) return report;
   }
-  const accepted = JSON.parse(await accept_page_goal(session.identity, JSON.stringify(inputs.checks ?? [])));
+  const accepted = JSON.parse(await accept_page_goal(session.identity));
   if (!accepted.error) accepted.page_start_session = session.identity;
   return JSON.stringify(accepted);
 };
@@ -253,7 +253,7 @@ onmessage = async ({ data: envelope }) => {
   let report;
   const step = data.poc_configure || data.credit_request ? 'credit'
     : data.provider_configure || data.provider_request || data.poc_enroll || data.setup_approve || data.setup_answer ? 'machine'
-    : data.poc_bind || data.poc_public_keys || data.poc_accept || data.poc_propose_requirements || data.bind || data.verify_clock || data.withdraw_reinstall || data.task || data.goal || data.requirements_answer || data.delivery || data.goal_accept ? 'task' : 'store';
+    : data.poc_bind || data.poc_public_keys || data.poc_accept || data.bind || data.verify_clock || data.withdraw_reinstall || data.task || data.goal || data.requirements_answer || data.delivery || data.goal_accept ? 'task' : 'store';
   const session = data.task?.action === 'end-session' ? '' : data.goal?.session ?? data.goal_accept?.session ?? data.requirements_answer?.session ?? data.delivery?.session ?? data.task?.session ?? '';
   if (data.create instanceof Uint8Array) report = await create(data.create);
   else if (data.unlock instanceof Uint8Array) report = await unlock(data.unlock);
@@ -308,21 +308,20 @@ onmessage = async ({ data: envelope }) => {
       report = JSON.stringify(current);
     }
   }
-  else if (typeof data.poc_bind?.machine === 'string' && (exactMembers(data.poc_bind,['machine']) || exactMembers(data.poc_bind,['machine','goal','checks','document_source']) && startFields(data.poc_bind))) {
+  else if (typeof data.poc_bind?.machine === 'string' && (exactMembers(data.poc_bind,['machine']) || exactMembers(data.poc_bind,['machine','goal','document_source']) && startFields(data.poc_bind))) {
     if (typeof data.poc_bind.goal === 'string' && !data.poc_bind.goal.trim()) { const current=JSON.parse(await open());current.error='Enter a goal before Start session.';report=JSON.stringify(current); }
     else report = await poc_bind(data.poc_bind.machine);
     if (typeof data.poc_bind.goal === 'string') report = await startGoal(report, data.poc_bind, data.poc_bind.machine);
   }
   else if (exactMembers(data.poc_public_keys, ['machine']) && typeof data.poc_public_keys.machine === 'string') report = await poc_public_keys(data.poc_public_keys.machine);
   else if (exactMembers(data.poc_accept, ['session']) && typeof data.poc_accept.session === 'string') report = await poc_accept(JSON.stringify(data.poc_accept));
-  else if (exactMembers(data.poc_propose_requirements, ['session', 'proposal']) && typeof data.poc_propose_requirements.session === 'string') report = await poc_propose_requirements(JSON.stringify(data.poc_propose_requirements));
   else if (data.setup_approve === true) report = await setup_approve();
   else if (data.setup_answer && typeof data.setup_answer === 'object') report = await setup_answer(JSON.stringify(data.setup_answer));
   else if (data.bind && typeof data.bind === 'object') {
-    const {goal, checks, document_source, ...binding} = data.bind;
+    const {goal, document_source, ...binding} = data.bind;
     if (typeof goal === 'string' && !goal.trim()) { const current=JSON.parse(await open());current.error='Enter a goal before Start session.';report=JSON.stringify(current); }
-    else report = await bind(JSON.stringify(exactMembers(data.bind,['machine','inference_approval','goal','checks','document_source']) && startFields(data.bind) ? binding : data.bind));
-    if (typeof goal === 'string') report = await startGoal(report, {goal, checks, document_source}, binding.machine);
+    else report = await bind(JSON.stringify(exactMembers(data.bind,['machine','inference_approval','goal','document_source']) && startFields(data.bind) ? binding : data.bind));
+    if (typeof goal === 'string') report = await startGoal(report, {goal, document_source}, binding.machine);
   }
   else if (typeof data.verify_clock === 'string') {
     const result = JSON.parse(await verify_inference_clock(data.verify_clock));
@@ -346,12 +345,12 @@ onmessage = async ({ data: envelope }) => {
   else if (data.requirements_answer && typeof data.requirements_answer === 'object') report = await requirements_answer(JSON.stringify(data.requirements_answer));
   else if (data.delivery && typeof data.delivery === 'object') report = await delivery_request(JSON.stringify(data.delivery));
   else if (data.goal_accept && typeof data.goal_accept === 'object') {
-    report = await accept_page_goal(data.goal_accept.session, JSON.stringify(data.goal_accept.checks ?? []));
+    report = await accept_page_goal(data.goal_accept.session);
     await reportStore(report, generation, session, step);
     if (!JSON.parse(report).error) {
       const publication = new TaskPublication();
       try {
-        const outcome = JSON.parse(await publication.run_goal(data.goal_accept.session, JSON.stringify(data.goal_accept.checks ?? [])));
+        const outcome = JSON.parse(await publication.run_goal(data.goal_accept.session));
         const finalGeneration = publication_generation();
         const current = JSON.parse(await open());
         if (outcome.task && outcome.refused) current.error = outcome.refused;
@@ -376,7 +375,7 @@ onmessage = async ({ data: envelope }) => {
       if (startSession) {
         const publication = new TaskPublication();
         try {
-          const outcome = JSON.parse(await publication.run_goal(startSession, JSON.stringify(started?.checks ?? data.bind?.checks ?? data.poc_bind?.checks ?? [])));
+          const outcome = JSON.parse(await publication.run_goal(startSession));
           const current = JSON.parse(await open());
           if (outcome.refused) current.error = outcome.refused;
           if (!outcome.task) current.goal_outcome = {session:startSession,outcome};

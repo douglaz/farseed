@@ -230,17 +230,15 @@ pub async fn goal_accept(request: String) -> String {
         .to_string()
 }
 
-/// The page start validates checks before accepting and can continue an interrupted start.
+/// The page accepts a durable goal and can continue an interrupted start.
 #[wasm_bindgen]
-pub async fn accept_page_goal(session: String, checks: String) -> String {
+pub async fn accept_page_goal(session: String) -> String {
     #[cfg(feature = "tracer")]
     if !crate::poc::web::page_uses_runner(&session).await {
         return goal_accept(json!({"session":session}).to_string()).await;
     }
     {
         let result = async {
-            let checks = serde_json::from_str::<Vec<String>>(&checks)
-                .map_err(|_| "verification checks must be a list of commands")?;
             let continuation = crate::lifecycle::owner().continuation()?;
             let local = local();
             let mut writer = local.lock().await;
@@ -254,11 +252,7 @@ pub async fn accept_page_goal(session: String, checks: String) -> String {
             if let Some(why) = writer.dispatch_refusal() {
                 return Err(why.into());
             }
-            writer
-                .store()
-                .ok_or("locked")?
-                .poc_start(&session, checks)
-                .await?;
+            writer.store().ok_or("locked")?.poc_start(&session).await?;
             Ok::<(), String>(())
         }
         .await;
@@ -315,7 +309,8 @@ pub async fn requirements_answer(request: String) -> String {
                     .await
             }
             Decision::Reject => store
-                .reject_requirements(&a.session, &a.machine, a.candidate)
+                .poc_reject_requirements(&a.session, &a.machine, a.candidate)
+                .await
                 .and(Err("proposal rejected".into())),
         };
         #[cfg(feature = "tracer")]

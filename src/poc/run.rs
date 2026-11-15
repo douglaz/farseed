@@ -206,10 +206,22 @@ pub async fn resume(
         return runtime
             .change(
                 &current,
-                Change::Pause(match result {
-                    Err(why) => why,
-                    Ok(()) => "command returned without a durable task intent".into(),
-                }),
+                if current
+                    .proposal
+                    .as_ref()
+                    .is_some_and(|p| p.report.is_some())
+                {
+                    Change::SkipReport(
+                        result.err().unwrap_or_else(|| {
+                            "command returned without a durable task intent".into()
+                        }),
+                    )
+                } else {
+                    Change::Pause(match result {
+                        Err(why) => why,
+                        Ok(()) => "command returned without a durable task intent".into(),
+                    })
+                },
             )
             .await;
     }

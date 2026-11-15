@@ -421,7 +421,8 @@ mod tests {
             s.check_tool(
                 &session(&s),
                 &Tool::Done {
-                    machine: "fixture-other".into()
+                    machine: "fixture-other".into(),
+                    checks: vec![]
                 }
             )
             .is_err()
@@ -644,6 +645,9 @@ mod tests {
             }
             match tool {
                 Tool::Done { .. } => json!({"done":true}),
+                Tool::ProposeDeclaration { .. } => {
+                    json!({"refused":"operation unavailable in this runner"})
+                }
                 Tool::Exec { command, machine } => {
                     // The shared check used by the command path; no browser transport here.
                     if let Err(why) = self.store.check(machine).await {

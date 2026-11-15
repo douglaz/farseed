@@ -86,7 +86,13 @@ pub enum Tool {
         arguments: BTreeMap<String, String>,
     },
     #[serde(rename = "done")]
-    Done { machine: String },
+    Done {
+        machine: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        checks: Vec<String>,
+    },
+    #[serde(rename = "propose_declaration")]
+    ProposeDeclaration { machine: String, declaration: Value },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +119,11 @@ impl Tool {
             return Err("tool schema".into());
         }
         let tool: Self = serde_json::from_value(value.clone()).map_err(|_| "tool schema")?;
+        if let Self::Done { checks, .. } = &tool
+            && (checks.len() > 4 || checks.iter().any(|c| c.trim().is_empty() || c.len() > 8192))
+        {
+            return Err("done accepts at most four commands of 1 to 8192 bytes".into());
+        }
         if let Self::Job { job, arguments, .. } = &tool {
             let Some(args) = arguments.as_object() else {
                 return Err("job arguments".into());
@@ -153,7 +164,8 @@ impl Tool {
             Self::Exec { machine, .. }
             | Self::Job { machine, .. }
             | Self::Typed { machine, .. }
-            | Self::Done { machine } => machine,
+            | Self::Done { machine, .. }
+            | Self::ProposeDeclaration { machine, .. } => machine,
         }
     }
 }

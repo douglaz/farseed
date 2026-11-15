@@ -843,12 +843,11 @@ mod worker {
 
     /// Preserve the existing page exercises in builds that include the browser fixtures.
     #[wasm_bindgen]
-    pub async fn run_page_goal(session: String, checks: String) -> String {
-        run_page_goal_with(session, checks, crate::poc::web::Response::default()).await
+    pub async fn run_page_goal(session: String) -> String {
+        run_page_goal_with(session, crate::poc::web::Response::default()).await
     }
     pub(crate) async fn run_page_goal_with(
         session: String,
-        checks: String,
         response: crate::poc::web::Response,
     ) -> String {
         #[cfg(feature = "tracer")]
@@ -857,14 +856,12 @@ mod worker {
         }
         {
             let result = async {
-                let checks: Vec<String> =
-                    serde_json::from_str(&checks).map_err(|_| "verification checks")?;
                 let task = local()
                     .lock()
                     .await
                     .store()
                     .ok_or("locked")?
-                    .poc_page_start(&session, checks)
+                    .poc_page_start(&session)
                     .await?;
                 crate::poc::web::publish_progress(&session).await;
                 if task.status == crate::store::poc::Status::Paused {

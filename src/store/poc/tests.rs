@@ -23,7 +23,7 @@ fn ready_without_requirements() -> Store<MemoryStorage> {
 }
 pub(super) fn create_task(s: &mut Store<MemoryStorage>) -> Task {
     let session = s.sessions[0].identity.clone();
-    block_on(s.poc_create(&session, vec!["systemctl is-active example.service".into()])).unwrap()
+    block_on(s.poc_create(&session)).unwrap()
 }
 fn reopen(s: &Store<MemoryStorage>) -> Store<MemoryStorage> {
     block_on(unlock(
@@ -59,6 +59,7 @@ fn exec(command: &str) -> Tool {
 fn done() -> Tool {
     Tool::Done {
         machine: "fixture".into(),
+        checks: vec![],
     }
 }
 fn change(s: &mut Store<MemoryStorage>, task: &Task, c: Change) -> Task {
@@ -305,7 +306,6 @@ impl Fixture {
         let record = Record::Create {
             id: hex::encode(random::<24>().unwrap()),
             session: session.clone(),
-            checks: vec!["systemctl is-active example.service".into()],
             limits,
         };
         let number = block_on(store.commit(&Event::Poc(record.clone()))).unwrap();
@@ -420,7 +420,12 @@ impl Runtime for Fixture {
         let pending = self.task(&task.id);
         assert_eq!(pending.pending.as_ref().unwrap().call, call);
         let job = pending.pending.as_ref().unwrap().job.clone();
-        let record = record(&pending, Some(self.exit), "service active");
+        let output = if pending.proposal.as_ref().unwrap().check.is_some() {
+            ""
+        } else {
+            "service active"
+        };
+        let record = record(&pending, Some(self.exit), output);
         {
             let mut remote = self.remote.borrow_mut();
             *remote.sends.entry(job.clone()).or_default() += 1;
@@ -518,10 +523,7 @@ fn poc_task_replay_old_journal_and_atomic_failed_append() {
     let task = create_task(&mut store);
     assert_eq!(reopen(&store).poc_task(&task.id).unwrap(), task);
     let session = store.sessions[0].identity.clone();
-    assert_eq!(
-        block_on(store.poc_create(&session, task.checks.clone())).unwrap(),
-        task
-    );
+    assert_eq!(block_on(store.poc_create(&session)).unwrap(), task);
     let proposed = proposal(&mut store, &task);
     let files = store.storage.files();
     for fault in [
@@ -715,10 +717,7 @@ fn poc_done_verifies_with_tracked_jobs_and_never_completes_on_failed_or_empty_ch
         .unwrap();
         assert_eq!(verified.verification.len(), 1);
         assert_eq!(verified.verification[0].exit_status, Some(exit));
-        assert_eq!(
-            verified.verification[0].command,
-            "systemctl is-active example.service"
-        );
+        assert_eq!(verified.verification[0].command, "ss -H -n -l -t -u");
         assert_ne!(verified.status, Status::Complete);
         let session = f.reload();
         for _ in 0..3 {
@@ -744,24 +743,12 @@ fn poc_done_verifies_with_tracked_jobs_and_never_completes_on_failed_or_empty_ch
         assert!(f.remote.borrow().sends.values().all(|v| *v == 1));
     }
     let mut s = ready();
-    let session = s.sessions[0].identity.clone();
-    let task = block_on(s.poc_create(&session, vec![])).unwrap();
-    let task = change(&mut s, &task, Change::Request);
-    let task = change(
-        &mut s,
-        &task,
-        Change::Propose {
-            call_id: "done".into(),
-            tool: done(),
-        },
-    );
+    let task = create_task(&mut s);
+    let task = completion_tests::finish_request(&mut s, &task, done());
     let task = change(&mut s, &task, Change::PrepareCheck);
-    assert_eq!(task.status, Status::Paused);
-    assert!(
-        task.pause_reason
-            .unwrap()
-            .contains("no verification checks")
-    );
+    assert_eq!(task.checks, ["ss -H -n -l -t -u"]);
+    assert!(task.proposal.is_some());
+    assert_ne!(task.status, Status::Complete);
 }
 
 #[test]
@@ -1131,7 +1118,7 @@ fn poc_credential_boundaries_cover_creation_commands_results_pauses_transcripts_
     let mut s = ready();
     let session = s.sessions[0].identity.clone();
     let files = s.storage.files();
-    assert!(block_on(s.poc_create(&session, vec![format!("echo {secret}")])).is_err());
+    assert!(block_on(s.enter_goal(&session, secret.into(), None)).is_err());
     assert_eq!(s.storage.files(), files);
     let (mut f, task, session) = Fixture::new();
     let refused = block_on(run::resume(
@@ -1602,7 +1589,7 @@ fn poc_protected_progress_precedes_command_and_check_results_and_allows_abandon(
                 );
                 assert_eq!(pending.verifying, verifying);
                 if verifying {
-                    assert_eq!(shown["verification"][0]["command"], task.checks[0]);
+                    assert_eq!(shown["verification"][0]["command"], "ss -H -n -l -t -u");
                     assert!(shown["verification"][0]["exit_status"].is_null());
                 }
                 drop(reports);
@@ -1743,7 +1730,7 @@ fn poc_ended_task_cannot_resume_or_start_a_second_task_in_its_session() {
         let mut store = reopen(&f.store.borrow());
         let files = store.storage.files();
         assert!(store.poc_authority(&task.id, &session).is_err());
-        assert!(block_on(store.poc_start(&session, vec![])).is_err());
+        assert_eq!(block_on(store.poc_start(&session)).unwrap(), ended);
         assert_eq!(store.storage.files(), files);
         assert_eq!(store.goal(&session).unwrap().text, task.goal);
         assert_eq!(reopen(&store).poc_task(&task.id).unwrap(), ended);
@@ -1821,12 +1808,12 @@ fn poc_unavailable_and_wrong_machine_steps_need_no_installation_declaration() {
     }
     let current = f.task(&task.id);
     assert_eq!(
-        current.completed[0].2["content"]["unavailable"],
-        "operation unavailable in this task runner"
+        current.completed[0].2["content"]["refused"],
+        "propose the installation declaration before commands or done"
     );
     assert_eq!(
-        current.completed[1].2["content"]["unavailable"],
-        "operation unavailable in this task runner"
+        current.completed[1].2["content"]["refused"],
+        "propose the installation declaration before commands or done"
     );
     assert_eq!(current.completed[2].2["content"]["refused"], "bound set");
     assert!(
@@ -1844,114 +1831,23 @@ fn poc_unavailable_and_wrong_machine_steps_need_no_installation_declaration() {
 }
 
 #[test]
-fn poc_exec_and_check_propose_requirements_and_require_explicit_approval() {
-    for verification in [false, true] {
-        let (mut f, _, _) = Fixture::new();
+fn poc_exec_and_done_refuse_without_substituting_a_declaration() {
+    for tool in [exec("install-example-service"), done()] {
         let mut store = ready_without_requirements();
-        let session = store.sessions[0].identity.clone();
         let task = create_task(&mut store);
-        *f.store.borrow_mut() = store;
-        let mut model = Script::one(
-            "next",
-            if verification {
-                done()
-            } else {
-                exec("install-example-service")
-            },
-        );
-        if verification {
-            block_on(run::resume(&mut f, &mut model, &task.id, &session)).unwrap();
-        }
-        let paused = block_on(run::resume(&mut f, &mut model, &task.id, &session)).unwrap();
-        assert_eq!(paused.status, Status::Paused);
-        assert!(
-            paused
-                .pause_reason
-                .as_ref()
-                .unwrap()
-                .contains("installation facts: approved declaration missing")
-        );
-        assert!(paused.proposal.is_some());
-        assert!(f.remote.borrow().sends.is_empty());
-        let pending = f.store.borrow().pending_requirements_view(&session);
-        assert_eq!(pending["proposal"]["machine"], "fixture");
-        assert_eq!(pending["proposal"]["kind"], "declaration");
-        let candidate = pending["candidate"].as_u64().unwrap();
-        let still_pending = block_on(run::resume(
-            &mut f,
-            &mut Script::default(),
-            &task.id,
-            &session,
-        ))
-        .unwrap();
-        assert!(
-            still_pending
-                .pause_reason
-                .as_ref()
-                .unwrap()
-                .contains("proposal approval pending; review the open requirements card")
-        );
-        assert!(
-            !still_pending
-                .pause_reason
-                .as_ref()
-                .unwrap()
-                .contains("fresh accepted")
-        );
-        assert_eq!(still_pending.steps, paused.steps);
-        assert_eq!(still_pending.requests, paused.requests);
-        assert_eq!(still_pending.proposal, paused.proposal);
-        assert!(f.remote.borrow().sends.is_empty());
+        let task = completion_tests::finish_request(&mut store, &task, tool);
+        assert!(task.proposal.is_none());
         assert_eq!(
-            reopen(&f.store.borrow()).poc_task(&task.id).unwrap(),
-            still_pending
+            task.completed[0].2["content"]["refused"],
+            "propose the installation declaration before commands or done"
         );
-        // Rejection consumes no authority to send. Resume offers the same visible flow again.
-        f.store
-            .borrow_mut()
-            .reject_requirements(&session, "fixture", candidate)
-            .unwrap();
-        let rejected = block_on(run::resume(
-            &mut f,
-            &mut Script::default(),
-            &task.id,
-            &session,
-        ))
-        .unwrap();
-        assert!(rejected.pending.is_none());
         assert!(
-            rejected
-                .pause_reason
-                .as_ref()
-                .unwrap()
-                .contains("approved declaration missing")
+            store
+                .pending_requirements_view(&task.start_session)
+                .is_null()
         );
-        assert_eq!(
-            (rejected.requests, rejected.steps),
-            (paused.requests, paused.steps)
-        );
-        assert!(f.remote.borrow().sends.is_empty());
-        let pending = f.store.borrow().pending_requirements_view(&session);
-        block_on(f.store.borrow_mut().approve_requirements(
-            &session,
-            "fixture",
-            pending["candidate"].as_u64().unwrap(),
-        ))
-        .unwrap();
-        let finished = block_on(run::resume(
-            &mut f,
-            &mut Script::default(),
-            &task.id,
-            &session,
-        ))
-        .unwrap();
-        assert!(finished.pending.is_none());
-        assert_eq!(f.remote.borrow().sends.values().sum::<u32>(), 1);
-        assert_eq!(finished.steps, if verification { 2 } else { 1 });
-        assert_eq!(
-            reopen(&f.store.borrow()).poc_task(&task.id).unwrap(),
-            finished
-        );
+        assert!(store.dispatch.calls.is_empty());
+        assert_eq!(reopen(&store).poc_task(&task.id).unwrap(), task);
     }
 }
 
@@ -1960,8 +1856,25 @@ fn poc_requirements_approval_after_session_loss_cannot_send() {
     let mut store = ready_without_requirements();
     let session = store.sessions[0].identity.clone();
     let task = create_task(&mut store);
-    let task = proposal(&mut store, &task);
-    assert!(store.poc_prepare_execution(&task, &session).is_err());
+    let task = completion_tests::finish_request(
+        &mut store,
+        &task,
+        Tool::ProposeDeclaration {
+            machine: "fixture".into(),
+            declaration: json!(crate::declaration::ad_hoc_minimum()),
+        },
+    );
+    store
+        .propose_requirements(
+            &session,
+            42,
+            crate::declaration::Proposal::Declaration {
+                machine: "fixture".into(),
+                declaration: crate::declaration::ad_hoc_minimum(),
+            },
+            &task.proposal.as_ref().unwrap().tool,
+        )
+        .unwrap();
     let pending = store.pending_requirements_view(&session);
     store.sessions[0].ended.set(true);
     assert!(
@@ -1972,10 +1885,15 @@ fn poc_requirements_approval_after_session_loss_cannot_send() {
         ))
         .is_err()
     );
+    let mut attempted = task.clone();
+    attempted.proposal.as_mut().unwrap().tool = Tool::Exec {
+        machine: "fixture".into(),
+        command: "true".into(),
+    };
     assert!(
         block_on(store.poc_append(
             &binding(&task, &session),
-            &entry(&task, &session),
+            &entry(&attempted, &session),
             &approval()
         ))
         .is_err()
@@ -2160,48 +2078,29 @@ fn poc_structured_refusal_and_collection_causes_are_protected_before_progress() 
 }
 
 #[test]
-fn poc_page_start_preflights_correctable_checks_and_continues_partial_acceptance() {
-    for checks in [vec!["x".repeat(8193)], vec!["check".into(); 17]] {
-        let mut store = crate::store::inference::tests::ready();
-        let session = store.sessions[0].identity.clone();
-        block_on(store.enter_goal(&session, "install and run a small service".into(), None))
-            .unwrap();
-        let files = store.storage.files();
-        let error = block_on(store.poc_start(&session, checks)).unwrap_err();
-        assert!(error.contains("verification"), "{error}");
-        assert_eq!(
-            store.storage.files(),
-            files,
-            "invalid checks never consume acceptance"
-        );
-        let checks = vec!["systemctl is-active example.service".into()];
-        // This is the same preflight/acceptance boundary used by the page start helper.
-        block_on(store.poc_accept_start(&session, &checks)).unwrap();
-        assert_eq!(
-            store.poc.len(),
-            1,
-            "acceptance atomically records the task inputs"
-        );
-        assert_eq!(
-            store
-                .conduct_acceptances
-                .iter()
-                .filter(|a| a.session == session)
-                .count(),
-            1
-        );
-        let task = block_on(store.poc_start(&session, checks.clone())).unwrap();
-        assert_eq!(task.goal, "install and run a small service");
-        assert_eq!(block_on(store.poc_start(&session, checks)).unwrap(), task);
-        assert!(block_on(store.poc_start(&session, vec!["different-check".into()])).is_err());
-        assert_eq!(store.poc.len(), 1);
-        assert!(store.dispatch.calls.is_empty());
-        assert_eq!(reopen(&store).poc_task(&task.id).unwrap(), task);
-        assert!(
-            block_on(store.accept_mode(&session, Mode::NoBrief)).is_err(),
-            "legacy acceptance stays one-shot"
-        );
-    }
+fn poc_page_start_goal_only_continues_partial_acceptance() {
+    let mut store = crate::store::inference::tests::ready();
+    let session = store.sessions[0].identity.clone();
+    block_on(store.enter_goal(&session, "install and run a small service".into(), None)).unwrap();
+    block_on(store.poc_accept_start(&session)).unwrap();
+    let task = block_on(store.poc_start(&session)).unwrap();
+    assert_eq!(task.goal, "install and run a small service");
+    assert!(task.checks.is_empty());
+    let files = store.storage.files();
+    assert_eq!(block_on(store.poc_start(&session)).unwrap(), task);
+    assert_eq!(store.storage.files(), files);
+    assert_eq!(store.poc.len(), 1);
+    assert_eq!(
+        store
+            .conduct_acceptances
+            .iter()
+            .filter(|a| a.session == session)
+            .count(),
+        1
+    );
+    assert!(store.dispatch.calls.is_empty());
+    assert_eq!(reopen(&store).poc_task(&task.id).unwrap(), task);
+    assert!(block_on(store.accept_mode(&session, Mode::NoBrief)).is_err());
 }
 
 #[test]
@@ -2275,13 +2174,7 @@ fn poc_repeated_page_start_after_send_keeps_the_original_task_and_job() {
                 .is_pending()
         );
         let pending = control.task(&task.id);
-        let again = block_on(
-            control
-                .store
-                .borrow_mut()
-                .poc_start(&session, task.checks.clone()),
-        )
-        .unwrap();
+        let again = block_on(control.store.borrow_mut().poc_start(&session)).unwrap();
         assert_eq!(again, pending);
         assert_eq!(control.remote.borrow().sends.values().sum::<u32>(), 1);
     }
@@ -2384,28 +2277,9 @@ fn poc_reload_original_session_cannot_start_another_task_pending_or_settled() {
         assert_eq!(continued.pending, before.pending);
         assert_continuation_page(&store, &continued);
         let files = store.storage.files();
-        for checks in [continued.checks.clone(), vec!["different-check".into()]] {
-            if checks == continued.checks {
-                assert_eq!(
-                    block_on(store.poc_start(&fresh, checks.clone())).unwrap(),
-                    continued
-                );
-            } else {
-                assert!(block_on(store.poc_start(&fresh, checks.clone())).is_err());
-            }
-            if checks == continued.checks {
-                assert_eq!(
-                    block_on(store.poc_create(&fresh, checks.clone())).unwrap(),
-                    continued
-                );
-            } else {
-                assert!(block_on(store.poc_create(&fresh, checks.clone())).is_err());
-            }
-            assert_eq!(
-                block_on(store.poc_accept_start(&fresh, &checks)).is_ok(),
-                checks == continued.checks
-            );
-        }
+        assert_eq!(block_on(store.poc_start(&fresh)).unwrap(), continued);
+        assert_eq!(block_on(store.poc_create(&fresh)).unwrap(), continued);
+        assert!(block_on(store.poc_accept_start(&fresh)).is_ok());
         assert_eq!(store.storage.files(), files);
         assert_eq!(store.poc.len(), 1);
         assert_eq!(store.dispatch.calls.len(), 1);
@@ -2430,7 +2304,7 @@ fn poc_reload_original_session_cannot_start_another_task_pending_or_settled() {
         assert_ne!(new_session, session);
         assert!(!next.goals.iter().any(|goal| goal.session == new_session));
         block_on(next.enter_goal(&new_session, "check another service".into(), None)).unwrap();
-        let new_task = block_on(next.poc_start(&new_session, before.checks)).unwrap();
+        let new_task = block_on(next.poc_start(&new_session)).unwrap();
         assert_ne!(new_task.id, task.id);
         assert_eq!(next.poc.len(), 2);
         assert!(
@@ -2456,11 +2330,11 @@ fn poc_start_acceptance_and_inputs_replay_atomically_even_when_append_reply_is_l
         let session = store.sessions[0].identity.clone();
         block_on(store.enter_goal(&session, "install and run a small service".into(), None))
             .unwrap();
-        let checks = vec!["systemctl is-active example.service".into()];
+        let checks: Vec<String> = vec![];
         if let Some(fault) = fault {
             store.storage.fault(fault);
         }
-        let result = block_on(store.poc_start(&session, checks.clone()));
+        let result = block_on(store.poc_start(&session));
         if fault.is_some() {
             assert!(result.is_err());
             assert!(store.poc.is_empty());
@@ -2471,7 +2345,7 @@ fn poc_start_acceptance_and_inputs_replay_atomically_even_when_append_reply_is_l
                     .any(|a| a.session == session)
             );
             assert!(
-                block_on(store.poc_start(&session, checks.clone())).is_err(),
+                block_on(store.poc_start(&session)).is_err(),
                 "append failure leaves the writer fail closed"
             );
         }
@@ -3273,7 +3147,7 @@ mod disposition_tests;
 fn poc_new_start_records_higher_defaults_and_retains_brake() {
     let mut store = ready_without_requirements();
     let session = store.sessions[0].identity.clone();
-    let task = block_on(store.poc_start(&session, vec!["true".into()])).unwrap();
+    let task = block_on(store.poc_start(&session)).unwrap();
     assert_eq!(
         task.limits,
         Limits {
@@ -3291,17 +3165,36 @@ fn poc_new_start_records_higher_defaults_and_retains_brake() {
 fn poc_requirements_approval_releases_only_its_declaration_pause_and_replays() {
     let mut store = ready_without_requirements();
     let session = store.sessions[0].identity.clone();
-    let task = block_on(store.poc_page_start(&session, vec!["true".into()])).unwrap();
+    let task = block_on(store.poc_page_start(&session)).unwrap();
     let other_session = block_on(store.admit_fixture("fixture-other")).unwrap();
     store.synthetic_confirm_limits(100).unwrap();
     block_on(store.enter_goal(&other_session, "check another machine".into(), None)).unwrap();
-    let other = block_on(store.poc_start(&other_session, vec!["true".into()])).unwrap();
+    let other = block_on(store.poc_start(&other_session)).unwrap();
     let other = change(&mut store, &other, Change::Pause("operator pause".into()));
-    let proposed = proposal(&mut store, &task);
-    let why = store
-        .poc_prepare_execution(&proposed, &session)
-        .unwrap_err();
-    let paused = change(&mut store, &proposed, Change::Pause(why));
+    let proposed = completion_tests::finish_request(
+        &mut store,
+        &task,
+        Tool::ProposeDeclaration {
+            machine: "fixture".into(),
+            declaration: json!(crate::declaration::ad_hoc_minimum()),
+        },
+    );
+    store
+        .propose_requirements(
+            &session,
+            42,
+            crate::declaration::Proposal::Declaration {
+                machine: "fixture".into(),
+                declaration: crate::declaration::ad_hoc_minimum(),
+            },
+            &proposed.proposal.as_ref().unwrap().tool,
+        )
+        .unwrap();
+    let paused = change(
+        &mut store,
+        &proposed,
+        Change::Pause(crate::poc::wait::APPROVAL_PENDING.into()),
+    );
     let candidate = store.pending_requirements_view(&session)["candidate"]
         .as_u64()
         .unwrap();
@@ -3311,7 +3204,17 @@ fn poc_requirements_approval_releases_only_its_declaration_pause_and_replays() {
         .reject_requirements(&session, "fixture", candidate)
         .unwrap();
     assert_eq!(store.poc_task(&task.id).unwrap(), paused);
-    let _ = store.poc_prepare_execution(&paused, &session);
+    store
+        .propose_requirements(
+            &session,
+            43,
+            crate::declaration::Proposal::Declaration {
+                machine: "fixture".into(),
+                declaration: crate::declaration::ad_hoc_minimum(),
+            },
+            &paused.proposal.as_ref().unwrap().tool,
+        )
+        .unwrap();
     let candidate = store.pending_requirements_view(&session)["candidate"]
         .as_u64()
         .unwrap();
@@ -3329,3 +3232,5 @@ fn poc_requirements_approval_releases_only_its_declaration_pause_and_replays() {
     assert_eq!(replay.poc_task(&other.id).unwrap(), other);
     assert!(store.dispatch.calls.is_empty());
 }
+
+mod completion_tests;

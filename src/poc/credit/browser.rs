@@ -510,8 +510,6 @@ enum Action {
         machine: String,
         goal: String,
         #[serde(default)]
-        checks: Vec<String>,
-        #[serde(default)]
         document_source: Option<String>,
         endpoint: String,
         model: String,
@@ -545,7 +543,7 @@ pub async fn credit_request(request: String) -> String {
         };
         fence.check()?;
         match action {
-            Action::Start { machine, goal, checks, document_source, endpoint, model } => {
+            Action::Start { machine, goal, document_source, endpoint, model } => {
                 let config = Configuration::new(endpoint,model)?;
                 let session = {
                     let local = crate::worker::local(); let mut local = local.lock().await;
@@ -562,7 +560,7 @@ pub async fn credit_request(request: String) -> String {
                     if document_source.is_some() { return Err("Document source is unavailable for credit Start.".into()); }
                     store.enter_goal(&session,goal,None).await?;
                     fence.check()?;
-                    store.poc_start(&session,checks).await?;
+                    store.poc_start(&session).await?;
                     session
                 };
                 mint(&session,false,&fence).await?;

@@ -1927,6 +1927,7 @@ pub(crate) async fn approve_fixture_contract<S: tau_web::store::Storage>(
             },
             &Tool::Done {
                 machine: machine.into(),
+                checks: vec![],
             },
         )
         .unwrap();

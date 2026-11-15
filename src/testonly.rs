@@ -301,19 +301,34 @@ pub(crate) fn prepare_poc_release(evidence: crate::jobs::Evidence, held_release:
 
 #[cfg(target_arch = "wasm32")]
 thread_local! {
-    static POC_MODEL: std::cell::RefCell<Option<(String, u64)>> = const { std::cell::RefCell::new(None) };
+    static POC_MODEL: std::cell::RefCell<Option<(String, u64, bool)>> = const { std::cell::RefCell::new(None) };
 }
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub fn test_poc_model(command: String) {
-    POC_MODEL.with_borrow_mut(|model| *model = Some((command, 0)));
+    POC_MODEL.with_borrow_mut(|model| *model = Some((command, 0, false)));
 }
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn poc_model_next(machine: &str) -> Option<(String, crate::goals::Tool)> {
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn test_poc_model_clear() {
+    POC_MODEL.with_borrow_mut(|model| *model = None);
+}
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn poc_model_next(
+    machine: &str,
+    needs_declaration: bool,
+) -> Option<(String, crate::goals::Tool)> {
     POC_MODEL.with_borrow_mut(|model| {
-        let (command, count) = model.as_mut()?;
+        let (command, count, executed) = model.as_mut()?;
         *count += 1;
-        let tool = if *count == 1 {
+        let tool = if needs_declaration {
+            crate::goals::Tool::ProposeDeclaration {
+                machine: machine.into(),
+                declaration: serde_json::to_value(crate::declaration::ad_hoc_minimum())
+                    .expect("minimum"),
+            }
+        } else if !*executed {
+            *executed = true;
             crate::goals::Tool::Exec {
                 machine: machine.into(),
                 command: command.clone(),
@@ -321,6 +336,7 @@ pub(crate) fn poc_model_next(machine: &str) -> Option<(String, crate::goals::Too
         } else {
             crate::goals::Tool::Done {
                 machine: machine.into(),
+                checks: vec![],
             }
         };
         Some((format!("fixture-call-{count}"), tool))

@@ -89,10 +89,35 @@ This bounded flow selects one supported published key; full family/history quali
 CHN-R7 is deferred, alongside vendor-account recovery and renewal-policy mutation.
 
 Enroll the displayed relay public key separately with the relay operator. Provider SSH-key
-registration does not enroll a relay pass. Configure inference and Start session for the handed-off machine, enter the goal and
-verification commands, accept it, propose the installation declaration, approve its requirements
-card and Resume. The existing task, verification and detached-job collection path remains in use.
-Only successful verification completes a task. Procurement and task state are separate; task
+registration does not enroll a relay pass. Configure inference, enter the goal and Start session
+for the handed-off machine. The first request proposes a typed installation declaration without
+reading the machine. Review the installation preview and exact declaration in Details, then
+Approve these requirements. Approval continues only that task. Reject pauses it; Resume requests
+a new proposal with the rejection in its history. A machine's approved declaration is reused on
+later Starts, without amendment.
+
+After done, up to four optional functional reports run once, before harness-composed service
+and listener reads. Reports do not judge delivery. The harness reads system service activity,
+enablement where promised, and TCP/UDP listeners; every TCP listener counts, including stock and
+loopback listeners. Inbound entries are permissions, so an unused allowed port is no finding.
+Only a complete read set without findings completes a task as
+`Delivered (service and TCP checks only)`. This is narrower than ARC-17 Delivered.
+Settled differences pause as `Handed over with findings`; incomplete reads pause as
+`Findings unknown until a complete re-check`. Only a complete explicit re-check can clear findings;
+it does not rerun optional reports. Reads, outcomes and verdict survive reload in the task journal.
+
+This PoC makes no conformance claim. The bundle is not signed here, and its fixed lockdown checks
+(lockdown.toml:13–49) do not run: signed lockdown evidence is missing. Drift checks, UDP-listener
+judgment, outbound restrictions, key material and default credentials lack evidence. Outbound,
+key-material and credential values are declared and displayed, never read or counted as passed.
+No reboot is demonstrated, so each enabled-survives-reboot service always carries
+`enabled, restart not demonstrated` on delivery. User-scope services and every unspecified field
+are refused at proposal. The declaration format permits unspecified fields but blocks delivery;
+the harness retains that guard for declarations already in force. DNS outbound hosts and
+default-credential lists other than none are admitted and shown as not checked, departing from
+the declaration format's proposal refusal until a suitable read exists.
+
+Procurement and task state are separate; task
 Stop task cannot erase an uncertain create or stop remote effects or billing. Handoff reload
 replays the target without ordering. Lock retires the execution and clears working keys; an
 unended configuration session retains its machine. Unlock restores that original session and

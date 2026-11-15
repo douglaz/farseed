@@ -1584,7 +1584,7 @@ fn poc_job_lossy_text_cannot_reintroduce_a_placed_secret() {
 }
 
 #[test]
-fn poc_page_single_acceptance_keeps_checks_and_waits_for_operator_declaration() {
+fn poc_page_single_acceptance_keeps_goal_and_waits_for_model_declaration() {
     let mut local = Local::new(MemoryStorage::default(), Fixed);
     block_on(local.open());
     assert_eq!(block_on(local.create(pass()))["state"], "unlocked");
@@ -1594,18 +1594,12 @@ fn poc_page_single_acceptance_keeps_checks_and_waits_for_operator_declaration() 
     enroll(store);
     let session = block_on(store.poc_bind("machine-a")).unwrap();
     block_on(store.enter_goal(&session, "Inspect a service".into(), None)).unwrap();
-    let request = json!({"session":session,"checks":["true"]}).to_string();
+    let request = json!({"session":session}).to_string();
     assert!(block_on(local.poc_accept(&request)).get("error").is_none());
-    let task = block_on(
-        local
-            .store()
-            .unwrap()
-            .poc_page_start(&session, vec!["true".into()]),
-    )
-    .unwrap();
+    let task = block_on(local.store().unwrap().poc_page_start(&session)).unwrap();
     assert_eq!(task.requests, 0);
-    assert_eq!(task.checks, ["true"]);
-    assert_eq!(task.status, crate::store::poc::Status::Paused);
+    assert!(task.checks.is_empty());
+    assert_eq!(task.status, crate::store::poc::Status::Running);
     assert!(
         local
             .store()
@@ -1618,13 +1612,7 @@ fn poc_page_single_acceptance_keeps_checks_and_waits_for_operator_declaration() 
             .get("error")
             .is_some()
     );
-    let same = block_on(
-        local
-            .store()
-            .unwrap()
-            .poc_start(&session, vec!["true".into()]),
-    )
-    .unwrap();
+    let same = block_on(local.store().unwrap().poc_start(&session)).unwrap();
     assert_eq!(same.id, task.id);
     assert_eq!(
         local
@@ -1635,5 +1623,105 @@ fn poc_page_single_acceptance_keeps_checks_and_waits_for_operator_declaration() 
             .filter(|acceptance| acceptance.session == session)
             .count(),
         1
+    );
+}
+
+#[test]
+fn completion_target_proposal_approval_rejection_and_goal_only_start() {
+    use crate::goals::Tool;
+    use crate::store::poc::{Change, Status};
+    let mut store = ready();
+    enroll(&mut store);
+    let session = block_on(store.poc_bind("machine-a")).unwrap();
+    block_on(store.enter_goal(&session, "Run a local queue service".into(), None)).unwrap();
+    let mut task = block_on(store.poc_start(&session)).unwrap();
+    let configuration = crate::poc::inference::Configuration::new(
+        "https://127.0.0.1/completion".into(),
+        "fixture".into(),
+    )
+    .unwrap();
+    let body = crate::poc::inference::request(
+        &store,
+        &configuration,
+        &task.goal,
+        &task.machine,
+        &task.completed,
+        &[],
+    )
+    .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+    assert_eq!(body["tools"][0]["function"]["name"], "propose_declaration");
+    for attempt in 0..2 {
+        task = block_on(store.poc_change(&task.id, task.revision, Change::Request)).unwrap();
+        task = block_on(store.poc_propose(
+            &task,
+            &session,
+            format!("declaration-{attempt}"),
+            Tool::ProposeDeclaration {
+                machine: "machine-a".into(),
+                declaration: json!(crate::declaration::ad_hoc_minimum()),
+            },
+        ))
+        .unwrap();
+        let why = store.poc_prepare_execution(&task, &session).unwrap_err();
+        task = block_on(store.poc_change(&task.id, task.revision, Change::Pause(why))).unwrap();
+        let pending = store.pending_requirements_view(&session);
+        assert_eq!(pending["proposal"]["kind"], "declaration");
+        assert!(store.dispatch.calls.is_empty());
+        let candidate = pending["candidate"].as_u64().unwrap();
+        if attempt == 0 {
+            block_on(store.poc_reject_requirements(&session, "machine-a", candidate)).unwrap();
+            task = store.poc_task(&task.id).unwrap();
+            assert_eq!(task.status, Status::Paused);
+            assert!(task.proposal.is_none());
+            assert!(task.completed[0].2["content"].get("rejected").is_some());
+            let replay = block_on(unlock(
+                MemoryStorage::with_files(store.storage.files()),
+                &Fixed,
+                pass(),
+            ))
+            .unwrap();
+            assert_eq!(replay.poc_task(&task.id).unwrap(), task);
+            let context = crate::poc::inference::request(
+                &store,
+                &configuration,
+                &task.goal,
+                &task.machine,
+                &task.completed,
+                &[],
+            )
+            .unwrap();
+            assert!(String::from_utf8_lossy(&context).contains("rejected"));
+            assert!(
+                store.dispatch.approved_entries["machine-a"]
+                    .declaration
+                    .is_none()
+            );
+        } else {
+            block_on(store.approve_requirements(&session, "machine-a", candidate)).unwrap();
+            task = store.poc_task(&task.id).unwrap();
+            assert_eq!(task.status, Status::Running);
+            assert!(task.proposal.is_none());
+            assert_eq!(task.completed[1].2["content"]["approved"], true);
+        }
+    }
+    let body = crate::poc::inference::request(
+        &store,
+        &configuration,
+        &task.goal,
+        &task.machine,
+        &task.completed,
+        &[],
+    )
+    .unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+    assert!(
+        body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["function"]["name"] != "propose_declaration")
     );
 }

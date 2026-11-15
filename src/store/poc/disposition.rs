@@ -328,6 +328,12 @@ impl<S: Storage> Store<S> {
                 }
                 check.excerpt = "Outcome unknown; owner recorded a continuing assumption.".into();
             }
+            if let Some(index) = proposal.report {
+                task.reports[index].status = "outcome unknown".into();
+                task.reports[index].excerpt =
+                    "Owner recorded a continuing assumption; this report will not be repeated."
+                        .into();
+            }
             task.completed.push((
                 proposal.call_id,
                 proposal.tool,

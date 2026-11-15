@@ -28,6 +28,7 @@ fn proposal(d: Value) -> Proposal {
 fn done() -> Tool {
     Tool::Done {
         machine: "fixture".into(),
+        checks: vec![],
     }
 }
 fn propose(s: &mut Store<MemoryStorage>, p: Proposal) {

@@ -100,10 +100,6 @@
       "tag": "textarea"
     },
     {
-      "selector": "[data-start-checks]",
-      "tag": "textarea"
-    },
-    {
       "selector": "[data-start-accepted-goal]",
       "tag": "button",
       "type": "button"
@@ -168,15 +164,6 @@
     },
     {
       "selector": "[data-credit-new-key]",
-      "tag": "button",
-      "type": "button"
-    },
-    {
-      "selector": "[data-poc-declaration]",
-      "tag": "textarea"
-    },
-    {
-      "selector": "[data-poc-propose]",
       "tag": "button",
       "type": "button"
     },

@@ -113,7 +113,6 @@ let redisplay = false;
 let ceremony = false;
 let suspended = false;
 const goalOutcomes = new Map();
-const pocDeclarationDrafts = new Map();
 const creditGoalDrafts = new Map();
 const setupDrafts = new Map();
 const startDrafts = new Map();
@@ -331,6 +330,35 @@ const updateInferenceFacts = () => {
   }
 };
 for (const name of ['poc-endpoint', 'poc-model']) $(name).addEventListener('input', updateInferenceFacts);
+const installationPreview = (parent, d) => {
+  paragraph(parent, 'Installation preview. When handed over, the harness checks declared system services and TCP listeners only.');
+  const departures = document.createElement('strong');
+  const extraPorts = Array.isArray(d.listeners.inbound) ? d.listeners.inbound.filter(e => !(e.proto === 'tcp' && e.port === 22 && e.from === 'any')) : [];
+  const services = Array.isArray(d.services) ? d.services : [];
+  departures.textContent = `Departures from the ad-hoc minimum: ${[...services.map(e => `service ${e.name}`), ...extraPorts.map(e => `${e.proto.toUpperCase()} port ${e.port} (${e.from})`), ...(Array.isArray(d.listeners.outbound) ? d.listeners.outbound.map(e => `outgoing ${e.host} ${e.proto.toUpperCase()} port ${e.port}`) : []), ...(d.key_material.spendable === true ? ['spendable key material permitted'] : []), ...(Array.isArray(d.key_material.permitted) ? d.key_material.permitted.map(e => `${e.kind} at ${e.where}`) : []), ...(Array.isArray(d.default_credentials) ? d.default_credentials.map(e => `default credential ${e}`) : [])].join('; ') || 'none'}.`;
+  parent.append(departures);
+  const list = (value, empty, entry) => {
+    if (value === 'unspecified') paragraph(parent, 'Not stated yet; delivery is blocked.');
+    else if (!value.length) paragraph(parent, empty);
+    else for (const e of value) paragraph(parent, entry(e));
+  };
+  list(d.listeners.inbound, 'No port is permitted to answer.', e => `It may answer on ${e.proto.toUpperCase()} port ${e.port}, ${e.from === 'any' ? 'for anyone on the internet' : e.from === 'none' ? 'only from inside the server itself' : 'meant for its peers only; who can reach it is not checked'}.`);
+  paragraph(parent, 'Every TCP listener counts, including loopback and stock-image listeners. Anything answering outside these permissions is a finding. An allowed port need not have a listener. UDP listeners are recorded, not judged.');
+  list(d.services, 'No service is promised.', e => `${e.name} (${e.scope.kind === 'system' ? 'a system service' : `a service of user ${e.scope.account}`}) ${e.lifecycle === 'running-at-delivery' ? 'is running when handed over. A restart may stop it.' : 'must be running and enabled for boot; enabled, restart not demonstrated.'}`);
+  paragraph(parent, 'Outgoing connections — not checked in this PoC.');
+  list(d.listeners.outbound, 'No restriction on outgoing connections is declared; none is checked.', e => `It may connect out to ${e.host === 'any' ? 'any address' : e.host} on ${e.proto.toUpperCase()} port ${e.port}; this restriction is not measured.`);
+  paragraph(parent, `Money keys — not checked in this PoC. ${d.key_material.spendable === false ? 'Spendable key material is forbidden; no post-setup search runs here.' : 'Spendable key material is permitted by this declaration.'}`);
+  paragraph(parent, 'Other keys — not checked in this PoC.');
+  list(d.key_material.permitted, 'No keys of its own are expected. Its SSH keys and application keys are counted separately; no search runs here.', e => `Expected: ${e.kind} at ${e.where}.`);
+  paragraph(parent, `Later checks — not checked in this PoC. ${Array.isArray(d.drift_checks) && !d.drift_checks.length ? 'No extra checks on later visits.' : 'Not stated.'}`);
+  paragraph(parent, `Extra checks: ${Array.isArray(d.required) && !d.required.length ? 'No extra checks at handover.' : 'Not stated.'}`);
+  paragraph(parent, 'Default passwords — not checked in this PoC.');
+  if (d.default_credentials === 'none') paragraph(parent, 'No default credential is listed to be changed.');
+  else list(d.default_credentials, 'No default credential is listed to be changed.', e => `Declared changed from its default: ${e}; not measured.`);
+  paragraph(parent, 'Fixed lockdown checks, SSH password posture, local password entries, key-material searches, drift checks, outbound restrictions and default credentials are not checked in this PoC. No reboot is demonstrated.');
+  paragraph(parent, 'Completion means Delivered (service and TCP checks only). Differences leave the task paused as Handed over with findings. Incomplete reads leave Findings unknown until a complete re-check.');
+  rawDetails(parent, d, ['installation-candidate', parent.dataset.requirementsCard]);
+};
 const renderDeclaration = (parent, d) => {
   paragraph(parent, `Delivery declaration version ${d.version}.`);
   const list = (label, value, empty, entry) => {
@@ -497,16 +525,11 @@ const renderSetup = (store) => {
         if (started) {
           paragraph(card, `Session task ${started.id}. Use Resume on that task.`);
         } else if (!accepted || !started) {
-          paragraph(card, accepted ? 'Start was accepted. Continue with verification commands for this same goal and machine.' : 'No brief is available.');
-          const checks = document.createElement('textarea');
-          checks.setAttribute('aria-label', 'Verification commands, one per line');
-          checks.value = setupDrafts.get(session.identity)?.[0] ?? '';
-          paragraph(card, 'Verification commands, one per line. Choose checks that establish the requested service is working. Empty checks cannot establish success.');
-          card.append(checks);
+          paragraph(card, accepted ? 'Start was accepted. Continue with this same goal and machine.' : 'No brief is available.');
           paragraph(card, 'Acting on a goal with no brief');
           const start = document.createElement('button'); start.type = 'button'; start.textContent = 'Start session';
           start.dataset.startAcceptedGoal = session.identity;
-          start.addEventListener('click', () => { start.disabled = true; worker.postMessage({goal_accept:{session:session.identity, checks:checks.value.split('\n').filter(line => line.trim())}}); });
+          start.addEventListener('click', () => { start.disabled = true; worker.postMessage({goal_accept:{session:session.identity}}); });
           card.append(start);
         }
       } else {
@@ -536,7 +559,7 @@ const renderSetup = (store) => {
         const approval = document.createElement('section');
         approval.dataset.requirementsCard = session.identity;
         paragraph(approval, `Approve intended requirements for ${pending.proposal.machine}. These are proposed requirements, not measured results.`);
-        if (pending.proposal.kind === 'declaration') renderDeclaration(approval, pending.proposal.declaration);
+        if (pending.proposal.kind === 'declaration') installationPreview(approval, pending.proposal.declaration);
         else paragraph(approval, 'Tighten this machine from single-purpose to multi-tenant. It must remain bound alone and cannot hold spendable or private tenant material.');
         for (const [decision, text] of [['approve', 'Approve these requirements'], ['reject', 'Reject these requirements']]) {
           const button = document.createElement('button');
@@ -598,6 +621,7 @@ const renderCommandResult = (result) => {
   }
   const card = document.createElement('section');
   card.dataset.commandResult = String(result.call);
+  if (result.optional_report) paragraph(card, 'Checks the AI wrote — not part of Delivered');
   paragraph(card, `Recorded call ${result.call}; job ${result.job}; exit ${result.exit_status ?? 'unknown'}.${result.historical ? ' Historical result; no current action authority.' : ''}`);
   for (const field of ['stdout', 'stderr']) {
     paragraph(card, field);
@@ -635,18 +659,30 @@ const renderTasks = (store) => {
     card.dataset.task = task.id;
     paragraph(card, `Task ${task.id}: ${task.status}; machine ${task.machine}.`);
     paragraph(card, task.goal);
-    paragraph(card, `Requests ${task.requests}/${task.limits.requests}; steps ${task.steps}/${task.limits.steps}. Verification commands count as steps.`);
-    for (const [id, tool, outcome] of task.completed) { paragraph(card, `Completed call ${id}.`); rawDetails(card, {tool, outcome}, ['task', task.id, 'completed', id]); }
-    if (task.proposal) { paragraph(card, `Next call ${task.proposal.call_id}.`); rawDetails(card, task.proposal.tool, ['task', task.id, 'proposal', task.proposal.call_id]); }
-    if (task.pending) paragraph(card, `Pending job ${task.pending.job}; journal call ${task.pending.call}. Resume inspects this job without launching it again.`);
+    paragraph(card, `Requests ${task.requests}/${task.limits.requests}; steps ${task.steps}/${task.limits.steps}. Harness reads and optional reports count as steps.`);
+    for (const [id, tool, outcome] of task.completed.filter(([id]) => !id.startsWith('$report:'))) { paragraph(card, `Completed call ${id}.`); rawDetails(card, {tool: tool.name === 'done' ? {name: tool.name, arguments: {machine: tool.arguments.machine}} : tool, outcome}, ['task', task.id, 'completed', id]); }
+    if (task.proposal && task.proposal.report == null) { paragraph(card, `Next call ${task.proposal.call_id}.`); rawDetails(card, task.proposal.tool, ['task', task.id, 'proposal', task.proposal.call_id]); }
+    if (task.pending && task.proposal?.report == null) paragraph(card, `Pending job ${task.pending.job}; journal call ${task.pending.call}. Resume inspects this job without launching it again.`);
     if (task.pause_reason) paragraph(card, task.pause_reason);
-    for (const check of task.verification) paragraph(card, `Verification: ${check.command}; job ${check.job}; exit ${check.exit_status ?? 'unknown'}; ${check.excerpt}`);
-    for (const [, , result] of task.completed) {
+    for (const check of task.verification) paragraph(card, `Harness read: ${check.command}; job ${check.job}; exit ${check.exit_status ?? 'unknown'}; ${check.excerpt}`);
+    if (task.verdict) paragraph(card, task.verdict);
+    for (const finding of task.findings ?? []) paragraph(card, finding.detail);
+    for (const note of task.notes ?? []) paragraph(card, `${note.service.name}: ${note.text}`);
+    let reports;
+    if (task.reports?.length) {
+      reports = document.createElement('section');
+      paragraph(reports, 'Checks the AI wrote — not part of Delivered');
+      if (task.pending && task.proposal?.report != null) paragraph(reports, `Pending job ${task.pending.job}; journal call ${task.pending.call}. Resume inspects this job without launching it again.`);
+      for (const report of task.reports) paragraph(reports, `${report.command}; ${report.status}; exit ${report.exit_status ?? 'unknown'}; ${report.excerpt}`);
+      card.append(reports);
+    }
+    for (const [id, , result] of task.completed) {
       if (result.content?.outcome === 'unknown' && result.content?.disposition) {
         const outcome = result.content;
-        paragraph(card, `Call ${outcome.call}; job ${outcome.job}; outcome unknown. Disposition record ${outcome.disposition}; assumption ${outcome.continuation}.`);
-        if (outcome.machine_held) paragraph(card, `The machine remains held by other unresolved calls: ${outcome.remaining_unresolved.join(', ')}.`);
-        paragraph(card, outcome.uncertainty);
+        const parent = id.startsWith('$report:') ? reports : card;
+        paragraph(parent, `Call ${outcome.call}; job ${outcome.job}; outcome unknown. Disposition record ${outcome.disposition}; assumption ${outcome.continuation}.`);
+        if (outcome.machine_held) paragraph(parent, `The machine remains held by other unresolved calls: ${outcome.remaining_unresolved.join(', ')}.`);
+        paragraph(parent, outcome.uncertainty);
       }
     }
     if (['complete', 'abandoned'].includes(task.status)) { slot.append(card); continue; }
@@ -662,8 +698,8 @@ const renderTasks = (store) => {
       action('Resume', { action: 'resume', session: session.identity });
     } else if ((store.sessions ?? []).some(s => s.identity === task.start_session && s.session_state === 'ended')) paragraph(card, `Session ${task.start_session} is ended. This task remains history and cannot continue.`);
     else paragraph(card, `Unlock to restore session ${task.start_session}.`);
-    if (session && (task.verification.some(check => check.exit_status !== null && check.exit_status !== 0) || task.disposed_check_retry)) {
-      action('Prepare verification retry', { action: 'retry-checks', session: session.identity });
+    if (session && task.verifying && task.status === 'paused' && !task.pending) {
+      action('Prepare complete re-check', { action: 'retry-checks', session: session.identity });
     }
     if (session && store.lifecycle_state !== 'ended' && task.disposition_offer) {
       const offer = task.disposition_offer;
@@ -992,7 +1028,6 @@ const clearPocInputs = () => {
   $('provider-selection-view').replaceChildren();
   $('provider-progress').replaceChildren();
   $('provider-key').value = '';
-  pocDeclarationDrafts.clear();
   creditGoalDrafts.clear();
   setupDrafts.clear();
   startDrafts.clear();
@@ -1014,15 +1049,11 @@ const startInputs = (row, machine, initialGoal = '', documentSource = true, cred
   goal.addEventListener('input', () => creditGoalDrafts.set(machine, goal.value));
   const source = document.createElement('input'); source.type = 'url'; source.dataset.documentSource = '';
   source.setAttribute('aria-label', 'Optional document source (https URL)');
-  const checks = document.createElement('textarea'); checks.dataset.startChecks = machine; checks.setAttribute('aria-label', 'Verification commands, one per line');
-  checks.value = startDrafts.get(machine)?.[0] ?? '';
-  checks.addEventListener('input', () => startDrafts.set(machine, [checks.value, source.value]));
   source.value = startDrafts.get(machine)?.[1] ?? '';
-  source.addEventListener('input', () => startDrafts.set(machine, [checks.value, source.value]));
+  source.addEventListener('input', () => startDrafts.set(machine, ['', source.value]));
   paragraph(row, 'Acting on a goal with no brief');
-  paragraph(row, 'Verification commands, one per line. Choose checks that establish the requested service is working. Empty checks cannot establish success.');
-  row.append(goal); if (documentSource) row.append(source); row.append(checks);
-  return () => ({goal:goal.value, document_source:source.value || null, checks:checks.value.split('\n').filter(line => line.trim())});
+  row.append(goal); if (documentSource) row.append(source);
+  return () => ({goal:goal.value, document_source:source.value || null});
 };
 
 const renderPoc = (store) => {
@@ -1040,14 +1071,6 @@ const renderPoc = (store) => {
   if (restored && store.poc_configuration?.key_set !== true) { $('poc-endpoint').value = restored.endpoint; $('poc-model').value = restored.model; }
   $('poc-key-status').textContent = store.poc_configuration?.key_set === true ? 'Key set.' : store.poc_configuration?.key_set === false ? 'Key unset.' : 'Key status unavailable.';
   if (['locked', 'none', 'refused', 'lost', 'starting'].includes(store.state) || store.lifecycle_state === 'ended') clearPocInputs();
-  // Working/lifecycle reports can omit sessions. Prune only a full unlocked report;
-  // a surviving suspended worker retains the same session's unsubmitted text.
-  if (store.state === 'unlocked' && Array.isArray(store.sessions)) {
-    const live = new Set(store.sessions.filter(s => s.session_state !== 'ended').map(s => s.identity));
-    for (const identity of pocDeclarationDrafts.keys()) {
-      if (!live.has(identity)) pocDeclarationDrafts.delete(identity);
-    }
-  }
   const targets = $('poc-targets');
   targets.replaceChildren();
   for (const target of store.poc_targets ?? []) {
@@ -1089,29 +1112,6 @@ const renderPoc = (store) => {
       const button = document.createElement('button'); button.type = 'button'; button.textContent = 'New key'; button.dataset.creditNewKey = session.identity; button.disabled = !enabled;
       button.addEventListener('click', () => { button.disabled = true; worker.postMessage({credit_request: {action:'new_key', session:session.identity}}); });
       row.append(button);
-    }
-    for (const session of store.sessions ?? []) {
-      if (session.session_state === 'ended' || !(session.bound_set ?? []).includes(target.machine) || !session.goal) continue;
-      if (!(session.standing_modes ?? []).includes('Acting on a goal with no brief')) continue;
-      paragraph(row, 'Declaration candidate: edit the JSON for your intended installation, then propose it. The next card requires explicit approval; these are requirements, not measurements.');
-      const declaration = document.createElement('textarea');
-      declaration.dataset.pocDeclaration = session.identity;
-      declaration.setAttribute('aria-label', 'Installation declaration candidate JSON');
-      declaration.disabled = !enabled;
-      declaration.value = pocDeclarationDrafts.get(session.identity) ?? JSON.stringify(store.poc_declaration_candidate, null, 2);
-      declaration.addEventListener('input', () => pocDeclarationDrafts.set(session.identity, declaration.value));
-      const propose = document.createElement('button');
-      propose.type = 'button'; propose.disabled = !enabled;
-      propose.dataset.pocPropose = session.identity;
-      propose.textContent = 'Propose installation declaration';
-      propose.addEventListener('click', () => {
-        try {
-          pocDeclarationDrafts.set(session.identity, declaration.value);
-          worker.postMessage({poc_propose_requirements: {session: session.identity,
-            proposal: {kind: 'declaration', machine: target.machine, declaration: JSON.parse(declaration.value)}}});
-        } catch { paragraph(row, 'Declaration must be valid JSON.'); }
-      });
-      row.append(declaration, propose);
     }
     targets.append(row);
   }

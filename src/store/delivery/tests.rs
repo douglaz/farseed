@@ -30,6 +30,7 @@ fn approve(s: &mut Store<MemoryStorage>, session: &str, d: Declaration, n: u64) 
         },
         &Tool::Done {
             machine: "fixture".into(),
+            checks: vec![],
         },
     )
     .unwrap();
@@ -359,6 +360,7 @@ fn delivery_historical_clean_check_never_hides_unknown_new_findings_or_changed_a
                     },
                     &Tool::Done {
                         machine: "fixture".into(),
+                        checks: vec![],
                     },
                 )
                 .unwrap();
@@ -608,6 +610,7 @@ fn delivery_forbidden_amendments_refuse_approval_append_and_replay() {
             },
             &Tool::Done {
                 machine: "fixture".into(),
+                checks: vec![],
             },
         )
         .unwrap();
@@ -631,7 +634,8 @@ fn delivery_forbidden_amendments_refuse_approval_append_and_replay() {
                 3,
                 proposal.clone(),
                 &Tool::Done {
-                    machine: "fixture".into()
+                    machine: "fixture".into(),
+                    checks: vec![]
                 }
             )
             .is_err(),

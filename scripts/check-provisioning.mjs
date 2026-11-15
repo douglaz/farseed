@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {minimum} from './completion-page.mjs';
 import {purchaseSnapshot} from './layout-page.mjs';
 const layoutProof=process.env.TAU_LAYOUT_PROOF==='1';
 import {createServer} from 'node:https';
@@ -153,8 +154,9 @@ qualification: try {
         check(req.headers.authorization==='Bearer '+inference,'inference fixture authorization');
         const request=JSON.parse(body);const encoded=JSON.stringify(request);
         for(const value of [secret,other,...authForms,...(scenario==='relay-deployment'?relayForms:[])])check(!encoded.includes(value),'no provider or deployment relay credential in model context');
-        const tool=modelCalls++===0?'exec':'done';
-        const argumentsValue=tool==='exec'?{machine:'machine-a',command:'true'}:{machine:'machine-a'};
+        const proposing=request.tools.length===1&&request.tools[0].function.name==='propose_declaration';
+        const tool=proposing?'propose_declaration':modelCalls++===0?'exec':'done';
+        const argumentsValue=proposing?{machine:'machine-a',declaration:minimum}:tool==='exec'?{machine:'machine-a',command:'true'}:{machine:'machine-a'};
         res.setHeader('Content-Type','application/json');res.end(JSON.stringify({choices:[{finish_reason:'tool_calls',message:{role:'assistant',content:null,tool_calls:[{id:'call-'+modelCalls,type:'function',function:{name:tool,arguments:JSON.stringify(argumentsValue)}}]}}]}));return;
       }
       const publicKey=JSON.parse(Buffer.from(req.headers.authorization.slice(6),'base64')).pubkey;
@@ -883,7 +885,7 @@ if (${readinessCase}) {
             if(originCase){assert.deepEqual(current.procurement.target,savedTarget);assert.deepEqual(current.procurement.identity,identity);check(current.procurement.origin===providerOrigin&&current.procurement.publication.origin===providerOrigin,'replayed Handoff retains authority');originChecks++;}
             await control({keys:current.procurement.public_keys});
             await invoke(url=>{document.querySelector('#tau-poc-endpoint').value=url;document.querySelector('#tau-poc-model').value='fixture-a';document.querySelector('#tau-poc-key').value='fixture~inference~key~482700';document.querySelector('#tau-poc-inference-form').requestSubmit();},providerOrigin+'/inference');await wait('reports.at(-1)?.poc_configuration?.key_set');
-            await invoke(()=>{document.querySelector('#tau-poc-targets [data-start-goal]').value='Check a small service';document.querySelector('#tau-poc-targets [data-start-checks]').value='true';[...document.querySelectorAll('#tau-poc-targets button')].find(b=>b.textContent==='Start session machine-a').click();});await wait('reports.at(-1)?.tasks?.length===1');await wait("document.querySelector('[data-poc-propose]')");await click('[data-poc-propose]');await wait("document.querySelector('[data-requirements-decision=approve]')");
+            await invoke(()=>{document.querySelector('#tau-poc-targets [data-start-goal]').value='Check a small service';[...document.querySelectorAll('#tau-poc-targets button')].find(b=>b.textContent==='Start session machine-a').click();});await wait('reports.at(-1)?.tasks?.length===1');await wait("document.querySelector('[data-requirements-decision=approve]')");
             if(scenario==='mismatched-host')await control({wrong_host_key:true});
             if(scenario==='pending-custody')await message({fixture:{hold:'poc_model_return'}});
             await click('[data-requirements-decision=approve]');await wait("!document.querySelector('[data-requirements-decision=approve]')");

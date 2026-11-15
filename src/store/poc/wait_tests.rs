@@ -364,7 +364,7 @@ fn assert_public_key_fresh_stores(key: String, open: bool) {
         if adopted.poc_configuration_key(key.as_bytes()).is_ok() {
             adopted.remember_poc_credential(key.as_bytes());
             let session = adopted.sessions[0].identity.clone();
-            if block_on(adopted.poc_create(&session, vec!["true".into()])).is_err() {
+            if block_on(adopted.poc_create(&session)).is_err() {
                 adoption_refused += 1;
             }
         } else {
@@ -406,7 +406,7 @@ fn poc_wait_hex_exact_and_all_digit_forms_still_refuse() {
     let key = b"exact~hex~credential~QZ";
     block_on(store.enter_goal(&session, hex::encode(key), None)).unwrap();
     block_on(store.accept_mode(&session, Mode::NoBrief)).unwrap();
-    block_on(store.poc_create(&session, vec!["true".into()])).unwrap();
+    block_on(store.poc_create(&session)).unwrap();
     assert!(store.poc_configuration_key(key).is_err());
     // 'Q' encodes as 51: the hex representation is all digits even though the key is not.
     let digits = b"QQQQQQQQQQQQQQQQ";

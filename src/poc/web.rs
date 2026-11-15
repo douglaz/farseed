@@ -356,7 +356,14 @@ async fn committed(
         return Ok(None);
     };
     store.ensure_scan_references().await?;
-    let value = serde_json::json!({"command_result":report});
+    let mut value = serde_json::json!({"command_result":report});
+    if task
+        .proposal
+        .as_ref()
+        .is_some_and(|proposal| proposal.report.is_some())
+    {
+        value["command_result"]["optional_report"] = true.into();
+    }
     let mut safe = store.protect_output(&value)?;
     if store.current_command_results(&mut safe) {
         safe = store.protect_output(&safe)?;
@@ -547,7 +554,6 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
         action: String,
         id: Option<String>,
         session: Option<String>,
-        checks: Option<Vec<String>>,
         limits: Option<crate::store::poc::Limits>,
         confirmation: Option<crate::store::poc::disposition::Confirmation>,
         continuation: Option<crate::dispatch::Continuation>,
@@ -679,10 +685,7 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
             match request.action.as_str() {
                 "start" => {
                     store
-                        .poc_start(
-                            request.session.as_deref().ok_or("session required")?,
-                            request.checks.unwrap_or_default(),
-                        )
+                        .poc_start(request.session.as_deref().ok_or("session required")?)
                         .await?;
                 }
                 "end-session" => {
@@ -775,7 +778,15 @@ impl run::Model for Configured {
         // the next request, whose adapter detects changes and aborts honestly.
         self.response.borrow_mut().take();
         #[cfg(feature = "tracer")]
-        if let Some(next) = crate::testonly::poc_model_next(&task.machine) {
+        if let Some(next) = crate::testonly::poc_model_next(
+            &task.machine,
+            local()
+                .lock()
+                .await
+                .store()
+                .ok_or("locked")?
+                .poc_needs_declaration(&task.machine),
+        ) {
             *self.response.borrow_mut() = Some(crate::poc::inference::CommandResponse::reserve());
             return Ok(next);
         }
@@ -854,8 +865,8 @@ impl TaskPublication {
         )
         .await
     }
-    pub async fn run_goal(&self, session: String, checks: String) -> String {
-        crate::worker::run_page_goal_with(session, checks, self.response.clone()).await
+    pub async fn run_goal(&self, session: String) -> String {
+        crate::worker::run_page_goal_with(session, self.response.clone()).await
     }
     pub async fn publish(&self, generation: u64, session: String, report: String) {
         // Take ownership before awaiting the publisher: destruction covers every exit,

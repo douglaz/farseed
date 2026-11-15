@@ -184,7 +184,6 @@ impl<S: Storage> Store<S> {
                 &Event::Poc(Record::Create {
                     id: id.into(),
                     session: session.into(),
-                    checks: checks.clone(),
                     limits: Limits {
                         requests: domains.decimal(),
                         steps: domains.decimal(),
@@ -196,7 +195,6 @@ impl<S: Storage> Store<S> {
                 &Event::Poc(Record::Start {
                     id: id.into(),
                     session: session.into(),
-                    checks: checks.clone(),
                     limits: Limits {
                         requests: domains.decimal(),
                         steps: domains.decimal(),
@@ -213,6 +211,8 @@ impl<S: Storage> Store<S> {
             Change::Request,
             Change::PrepareCheck,
             Change::RetryChecks,
+            Change::RejectDeclaration,
+            Change::SkipReport(String::new()),
             Change::Settle,
             Change::Inspect,
             Change::Wait {
@@ -317,7 +317,7 @@ fn emit(
 mod tests {
     use super::*;
     #[test]
-    fn poc_journal_admission_covers_empty_tasks_retained_goals_checks_and_seed() {
+    fn poc_journal_admission_covers_empty_tasks_retained_goals_and_seed() {
         let mut s = crate::store::inference::tests::ready();
         let session = s.sessions[0].identity.clone();
         block_on(s.enter_goal(&session, "install and run a small service".into(), None)).unwrap();
@@ -327,14 +327,8 @@ mod tests {
             s.poc_configuration_key(b"\"expected\":18446744073709551615,\"change\":")
                 .is_err()
         );
-        let task =
-            block_on(s.poc_create(&session, vec!["systemctl is-active example.service".into()]))
-                .unwrap();
-        for key in [
-            task.goal.as_bytes(),
-            task.checks[0].as_bytes(),
-            s.seed().unwrap().id().as_bytes(),
-        ] {
+        let task = block_on(s.poc_create(&session)).unwrap();
+        for key in [task.goal.as_bytes(), s.seed().unwrap().id().as_bytes()] {
             assert!(s.poc_configuration_key(key).is_err());
         }
     }

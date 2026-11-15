@@ -357,31 +357,38 @@ pub(super) async fn run(
         case.finish(cases);
         return Ok(());
     }
-    let text = run
+    let preview = run
         .browser
         .evaluate(
             &tab.session,
-            "document.querySelector('[data-requirements-card]').textContent",
+            "(() => { const card = document.querySelector('[data-requirements-card]'); const prose = card.cloneNode(true); prose.querySelectorAll('details').forEach(node => node.remove()); return { visible: card.checkVisibility(), text: prose.textContent, declaration: JSON.parse(card.querySelector('[data-raw-json]').textContent) }; })()",
         )
         .await?;
-    let text = text.as_str().unwrap_or("");
+    let text = preview["text"].as_str().unwrap_or("");
+    let expected = [
+        "Installation preview. When handed over, the harness checks declared system services and TCP listeners only.",
+        "Departures from the ad-hoc minimum: service hermes; TCP port 443 (any); outgoing api.example TCP port 443.",
+        "It may answer on TCP port 22, for anyone on the internet.",
+        "It may answer on TCP port 443, for anyone on the internet.",
+        "hermes (a service of user operator) is running when handed over. A restart may stop it.",
+        "It may connect out to api.example on TCP port 443; this restriction is not measured.",
+        "Spendable key material is forbidden; no post-setup search runs here.",
+        "No keys of its own are expected.",
+        "No extra checks on later visits.",
+        "No extra checks at handover.",
+        "No default credential is listed to be changed.",
+        "Fixed lockdown checks, SSH password posture, local password entries, key-material searches, drift checks, outbound restrictions and default credentials are not checked in this PoC. No reboot is demonstrated.",
+        "Completion means Delivered (service and TCP checks only).",
+    ];
+    let missing: Vec<_> = expected
+        .iter()
+        .filter(|fragment| !text.contains(**fragment))
+        .collect();
+    println!("   installation preview missing fragments: {missing:?}");
     case.check(
         "declaration_cases.a002",
-        "plain-language card renders every typed fact and emptiness",
-        [
-            "version 2",
-            "tcp port 22 from any",
-            "tcp port 443 from any",
-            "api.example",
-            "hermes",
-            "user account operator",
-            "running at delivery",
-            "forbidden",
-            "explicit empty set",
-            "Default credentials: none",
-        ]
-        .iter()
-        .all(|v| text.contains(v)),
+        "visible installation preview names every permission, service and limitation with exact declaration Details",
+        preview["visible"] == true && missing.is_empty() && preview["declaration"] == d,
     );
     case.check("declaration_cases.a003", "buttons have no selected answer",run.browser.evaluate(&tab.session,"[...document.querySelectorAll('[data-requirements-decision]')].length===2 && [...document.querySelectorAll('[data-requirements-decision]')].every(b=>b.type==='button'&&!b.autofocus&&!b.hasAttribute('checked')&&!b.hasAttribute('selected')&&document.activeElement!==b)").await?==true);
     let before = store_files(&run.dump_at("file.declaration_cases.dump.002", tab).await?);

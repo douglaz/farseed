@@ -413,7 +413,7 @@ async function cases(api, init) {
       mode = undefined;
       const r = await measured('request ' + size, () => next([['prior',{name:'exec',arguments:{machine:'machine-a',command:'true'}},value]]));
       check(r.tool?.name === 'exec', 'ordinary request ' + size + ' usable: ' + r.pause);
-      const excerpt = requests.at(-1).body.messages.at(-1).content;
+      const excerpt = requests.at(-1).body.messages.find(message=>message.role==='tool' && message.tool_call_id==='prior').content;
       check(r.tool?.name === 'exec' && excerpt.includes(output.slice(0,40)), 'ordinary transcript reaches model with useful excerpt');
     }
   }
@@ -549,7 +549,7 @@ async function cases(api, init) {
   await endPublication.request(JSON.stringify({action:'end-session',session:existing.identity}));endPublication.free();
   const bound = JSON.parse(await api.poc_bind('machine-a'));
   const session = bound.sessions.find(s => s.session_state!=='ended' && s.bound_set.includes('machine-a')).identity;
-  const proposed = {kind:'declaration',machine:'machine-a',declaration:bound.poc_declaration_candidate};
+  const proposed = {kind:'declaration',machine:'machine-a',declaration:{version:2,listeners:{inbound:[{proto:'tcp',port:22,from:'any'}],outbound:[]},services:[],key_material:{spendable:false,permitted:[]},required:[],drift_checks:[],default_credentials:'none'}};
   check(Boolean(JSON.parse(await api.poc_propose_requirements(JSON.stringify({session,proposal:proposed}))).error), 'declaration refuses without goal and acting authority');
   await api.goal_request(JSON.stringify({session,text:'Install a small service',document_source:null}));
   check(!JSON.parse(await api.poc_accept(JSON.stringify({session}))).error, 'explicit PoC acting acceptance');
@@ -623,7 +623,7 @@ async function pageFixture(api, init) {
   return ['isolated page fixture created and target enrolled'];
 }
 
-async function pageCases() {
+async function pageCases(needsDeclaration) {
   const checks = [];
   const $ = id => document.getElementById('tau-' + id);
   const until = async (predicate, label) => {
@@ -643,16 +643,15 @@ async function pageCases() {
   $('poc-inference-form').requestSubmit();
   await until(() => $('poc-key-status').textContent === 'Key set.', 'configured key reported by real page publication');
   if ($('poc-key').value !== '') throw Error('page key input was retained');
-  // One Start records the goal, checks and no-brief acceptance before declaration approval.
+  // One Start records a goal; the model proposes its declaration before any commands.
   const history = structuredClone(window.__pocReports.at(-1));
-  history.sessions ??= [];
-  history.tasks ??= [];
+  history.sessions ??= []; history.tasks ??= [];
   const earlierSessions = new Set(history.sessions.map(session => session.identity));
   const earlierTasks = new Set(history.tasks.map(task => task.id));
-  document.querySelector('#tau-poc-targets [data-start-goal="machine-a"]').value = 'Inspect a small service';
-  document.querySelector('#tau-poc-targets [data-start-checks="machine-a"]').value = 'true';
+  const goal = () => document.querySelector('#tau-poc-targets [data-start-goal="machine-a"]');
+  goal().value = 'Inspect a small service';
   [...$('poc-targets').querySelectorAll('button')].find(b=>b.textContent==='Start session machine-a').click();
-  await until(() => document.querySelector('[data-poc-declaration]'), 'visible editable declaration candidate');
+  await until(() => window.__pocReports.at(-1)?.tasks?.some(t=>!earlierTasks.has(t.id)), 'one Start admits its task');
   const report = window.__pocReports.at(-1);
   const sessions = report.sessions.filter(session => !earlierSessions.has(session.identity));
   if (sessions.length !== 1 || sessions[0].session_state === 'ended' ||
@@ -660,32 +659,28 @@ async function pageCases() {
   const session = sessions[0].identity;
   const started = report.tasks.filter(task => !earlierTasks.has(task.id));
   if (started.length !== 1 || started[0].start_session !== session || started[0].machine !== 'machine-a' ||
-      started[0].goal !== 'Inspect a small service' || JSON.stringify(started[0].checks) !== '["true"]' ||
+      started[0].goal !== 'Inspect a small service' || started[0].checks.length !== 0 ||
       !sessions[0].standing_modes.includes('Acting on a goal with no brief') ||
-      document.querySelector('[data-poc-accept], [data-goal-accept]')) throw Error('one Start did not retain its task and checks');
+      document.querySelector('[data-poc-accept], [data-goal-accept], [data-start-checks], [data-poc-declaration], [data-poc-propose]'))
+    throw Error('one Start did not retain its goal-only task');
   const ownTask = () => {
     const tasks = window.__pocReports.at(-1)?.tasks?.filter(task => task.start_session === session);
-    if (tasks?.length !== 1 || tasks[0].id !== started[0].id ||
-        JSON.stringify(tasks[0].checks) !== '["true"]') throw Error('Start task identity or checks changed');
+    if (tasks?.length !== 1 || tasks[0].id !== started[0].id || tasks[0].goal !== 'Inspect a small service')
+      throw Error('Start task identity or goal changed');
     return tasks[0];
   };
-  const declaration = () => document.querySelector(`[data-poc-declaration="${session}"]`);
-  const propose = () => document.querySelector(`[data-poc-propose="${session}"]`);
   const approval = () => document.querySelector(`[data-requirements-card="${session}"]`);
-  const declarationPauses = new Set([
-    'propose and explicitly approve the installation declaration to continue',
-    'installation facts: approved declaration missing; review the proposed requirements and approve explicitly to continue',
-  ]);
-  await until(() => ownTask().status === 'paused' &&
-    (declarationPauses.has(ownTask().pause_reason) || (ownTask().requests > 0 && window.__pocInference > 0)),
-  'new session reaches its own declaration or request pause');
-  const needsDeclaration = declarationPauses.has(ownTask().pause_reason);
-  const initial = declaration().value;
-  const custom = JSON.parse(initial);
-  custom.services = [{name:'draft-check',scope:{kind:'system'},lifecycle:'running-at-delivery'}];
-  const draft = JSON.stringify(custom,null,2);
-  const setDraft = text => { const field=declaration();field.value=text;field.dispatchEvent(new Event('input',{bubbles:true})); };
-  const assertDraft = text => { if(declaration()?.value !== text)throw Error('declaration draft lost'); };
+  if (needsDeclaration) {
+    await until(() => approval()?.querySelector('[data-requirements-decision="approve"]'), 'model candidate displayed for explicit approval');
+  } else {
+    await until(() => ownTask().status === 'paused' && ownTask().requests === 1, 'approved machine starts directly with its journaled declaration');
+    if (approval() || ownTask().completed.some(step=>step[1].name==='propose_declaration'))
+      throw Error('approved machine requested another declaration');
+  }
+  const candidate = JSON.stringify(window.__pocReports.at(-1).sessions.find(s=>s.identity===session).pending_requirements);
+  const draft = 'Another service goal, not yet submitted';
+  const setDraft = text => { goal().value=text; goal().dispatchEvent(new Event('input',{bubbles:true})); };
+  const assertDraft = text => { if(goal()?.value !== text)throw Error('goal draft lost'); };
   setDraft(draft);
   const reports = window.__pocReports.length;
   [...$('poc-targets').querySelectorAll('button')].find(b=>b.textContent==='Show public keys machine-a').click();
@@ -701,60 +696,39 @@ async function pageCases() {
     if ($('poc-key-status').textContent !== 'Key set.') throw Error('visibility cycle lost key custody');
   }
   delete document.visibilityState;
-  checks.push('ordinary hide/visible preserves exact custom draft and key custody');
+  checks.push('ordinary hide/visible preserves goal draft, candidate and key custody');
   document.dispatchEvent(new Event('freeze'));
   await until(() => ['suspended','reconciling'].includes($('store-state').dataset.lifecycle), 'freeze report reaches page');
   if ($('poc-key-status').textContent !== 'Key set.') throw Error('freeze falsely reported key unset');
   const enabled = [...$('poc').querySelectorAll('input,select,button')].filter(control=>!control.disabled);
-  // Start now creates the task too; its existing End session control remains available.
-  if (enabled.length !== 1 || !enabled[0].matches('[data-end-session]') || enabled[0].textContent !== 'End session') throw Error('suspended controls enabled: ' + enabled.map(control=>control.id || control.textContent).join(', '));
+  if (enabled.length !== 1 || !enabled[0].matches('[data-end-session]') || enabled[0].textContent !== 'End session')
+    throw Error('suspended controls enabled: ' + enabled.map(control=>control.id || control.textContent).join(', '));
   checks.push('freeze reports retained custody, disables work controls and retains End session');
   document.dispatchEvent(new Event('resume'));
   await until(() => !$('poc-endpoint').disabled, 'resume restores authority without key re-entry');
   if ($('poc-key-status').textContent !== 'Key set.') throw Error('resume lost key custody');
   assertDraft(draft);
-  // Valid custom candidate survives a real refused proposal report, then the next click
-  // submits that exact same candidate. The deliberately unknown session must refuse.
-  const beforeRefusal = window.__pocReports.length;
-  window.__pocWorkers.at(-1).postMessage({poc_propose_requirements:{session:'unknown-session',proposal:{kind:'declaration',machine:'machine-a',declaration:custom}}});
-  await until(() => window.__pocReports.length > beforeRefusal && Boolean(window.__pocReports.at(-1).store_error), 'proposal concretely refused');
-  assertDraft(draft);
-  const invalid = JSON.stringify({...custom,version:1},null,2);
-  setDraft(invalid);
-  const beforeInvalid = window.__pocReports.length;
-  propose().click();
-  await until(() => window.__pocReports.length > beforeInvalid && Boolean(window.__pocReports.at(-1).store_error), 'editable invalid proposal refused in same session');
-  assertDraft(invalid);
-  setDraft(draft);
-  propose().click();
-  await until(() => approval()?.querySelector('[data-requirements-decision="approve"]'), 'custom proposal displayed for explicit approval');
-  const sent = window.__pocMessages.map(m=>m.request).filter(m=>m?.poc_propose_requirements).at(-1).poc_propose_requirements;
-  if (sent.session !== session || JSON.stringify(sent.proposal.declaration)!==JSON.stringify(custom))throw Error('next proposal discarded custom draft');
-  if (!approval().textContent.includes('draft-check'))throw Error('approval card lost submitted candidate');
+  if (JSON.stringify(window.__pocReports.at(-1).sessions.find(s=>s.identity===session).pending_requirements)!==candidate)
+    throw Error('lifecycle or unrelated report replaced the candidate identity');
+  if (needsDeclaration) {
   const beforeApproval = structuredClone(ownTask());
   const requestsBeforeApproval = window.__pocInference;
   approval().querySelector('[data-requirements-decision="approve"]').click();
-  await until(() => !approval()?.querySelector('[data-requirements-decision="approve"]'), 'explicit operator approves exact custom requirements');
-  if (needsDeclaration) {
-    await until(() => window.__pocInference > requestsBeforeApproval && ownTask().requests > beforeApproval.requests &&
-      ownTask().status === 'paused', 'approval continues its task without Resume');
-  } else {
-    if (JSON.stringify(ownTask()) !== JSON.stringify(beforeApproval) || window.__pocInference !== requestsBeforeApproval)
-      throw Error('custom approval resumed an unrelated request pause');
-    checks.push('earlier machine approval permits Start; custom approval retains its unrelated task pause');
-  }
+  await until(() => !approval()?.querySelector('[data-requirements-decision="approve"]'), 'explicit operator approves exact model candidate');
+  await until(() => window.__pocInference > requestsBeforeApproval && ownTask().requests > beforeApproval.requests &&
+    ownTask().status === 'paused', 'approval continues its task without Resume');
   if (window.__pocMessages.some(message=>message.request?.task?.action === 'resume')) throw Error('approval required Resume');
+  }
   assertDraft(draft);
   $('lock').click();
   await until(() => $('store').dataset.state === 'locked' && $('poc-key-status').textContent === 'Key unset.', 'Lock ends custody on real page');
   $('passphrase').value = 'fixture passphrase for browser checks'; $('unlock').click();
   await until(() => $('store').dataset.state === 'unlocked', 'unlock after Lock');
-  await until(() => declaration(), 'same session after Lock');
+  await until(() => goal(), 'same target after Lock');
   ownTask();
-  if(declaration().value !== initial)throw Error('Lock retained unsubmitted declaration text');
-  checks.push('Lock restores the admitted session and clears unsubmitted declaration text');
+  if(goal().value !== '')throw Error('Lock retained unsubmitted goal text');
+  checks.push('Lock restores the admitted session and clears unsubmitted goal text');
   setDraft(draft);
-  checks.push('Lock preserves the session while clearing page drafts');
   $('poc-endpoint').value = 'https://inference.invalid/v1/chat/completions';
   $('poc-model').value = 'model-a'; $('poc-key').value = 'fixture-worker-loss-key-9751';
   $('poc-inference-form').requestSubmit();
@@ -764,7 +738,7 @@ async function pageCases() {
   if (retained.tasks.length !== history.tasks.length + 1 || retained.sessions.length !== history.sessions.length + 1 ||
       history.tasks.some(task => JSON.stringify(retained.tasks.find(saved => saved.id === task.id)) !== JSON.stringify(task)))
     throw Error('page checks changed earlier task history');
-  checks.push('one Start retains its own task, checks and all earlier task history through Lock');
+  checks.push('one Start retains its own goal-only task and all earlier task history through Lock');
   return {checks, session, task: started[0].id, history: history.tasks};
 }
 
@@ -830,7 +804,7 @@ const server = createServer(async (request, response) => {
       // This fixture server is HTTP loopback. Remove only its response's CSP meta so
       // wasm can load over HTTP; the shipped HTTPS CSP is checked independently.
       if (name === 'index.html') text = text.replace(/<meta http-equiv="Content-Security-Policy"[^>]*>\n/, '');
-      if (name === 'worker.js') text = `const fixtureFetch=globalThis.fetch.bind(globalThis);globalThis.fetch=async(input,options)=>{const url=input instanceof Request?input.url:new URL(input,location.href).href;if(url==='https://inference.invalid/v1/chat/completions'){postMessage({fixture_inference_received:true});return new Response('',{status:503});}if(!url.startsWith(location.origin+'/'))throw Error('external request refused');return fixtureFetch(input,options);};\n` + text.replace(
+      if (name === 'worker.js') text = `const fixtureFetch=globalThis.fetch.bind(globalThis);globalThis.fetch=async(input,options)=>{const url=input instanceof Request?input.url:new URL(input,location.href).href;if(url==='https://inference.invalid/v1/chat/completions'){postMessage({fixture_inference_received:true});const request=JSON.parse(options?.body??await input.clone().text());if(request.tools.length===1&&request.tools[0].function.name==='propose_declaration')return Response.json({choices:[{message:{role:'assistant',content:null,tool_calls:[{id:'page-declaration',type:'function',function:{name:'propose_declaration',arguments:JSON.stringify({machine:'machine-a',declaration:{version:2,listeners:{inbound:[{proto:'tcp',port:22,from:'any'}],outbound:[]},services:[],key_material:{spendable:false,permitted:[]},required:[],drift_checks:[],default_credentials:'none'}})}}]}}]});return new Response('',{status:503});}if(!url.startsWith(location.origin+'/'))throw Error('external request refused');return fixtureFetch(input,options);};\n` + text.replace(
         'await reportStore(report);',
         'await reportStore(report); postMessage({fixture_lifecycle_received:data.lifecycle});');
       response.setHeader('Content-Type',name === 'index.html' ? 'text/html' : 'text/javascript');
@@ -950,7 +924,7 @@ try {
       }
     };`},sessionId);
   await call('Page.navigate', {url:`http://127.0.0.1:${server.address().port}/app/`},sessionId);
-  const pageResult = await call('Runtime.evaluate',{expression:'(' + pageCases.toString() + ')()',awaitPromise:true,returnByValue:true},sessionId);
+  const pageResult = await call('Runtime.evaluate',{expression:'(' + pageCases.toString() + ')(' + JSON.stringify(pageOnly) + ')',awaitPromise:true,returnByValue:true},sessionId);
   if (pageResult.exceptionDetails || !Array.isArray(pageResult.result?.value?.checks)) throw Error('actual page check failed: ' + (pageResult.exceptionDetails?.exception?.description ?? 'no page result'));
   const expectedTask = pageResult.result.value;
   console.log(JSON.stringify({pageChecks:expectedTask.checks}));
@@ -970,13 +944,13 @@ try {
     }
     const report = window.__pocReports.at(-1);
     const tasks = report.tasks.filter(task=>task.start_session === expected.session);
-    if (tasks.length !== 1 || tasks[0].id !== expected.task || JSON.stringify(tasks[0].checks) !== '["true"]' ||
+    if (tasks.length !== 1 || tasks[0].id !== expected.task || tasks[0].checks.length !== 0 ||
         report.tasks.length !== expected.history.length + 1 ||
         expected.history.some(task=>JSON.stringify(report.tasks.find(saved=>saved.id===task.id)) !== JSON.stringify(task)))
-      throw Error('worker loss changed Start task identity, checks or earlier history');
+      throw Error('worker loss changed Start task identity, goal-only shape or earlier history');
     if (document.querySelector('#tau-poc-key-status').textContent !== 'Key unset.' || window.__pocInference !== 0)
       throw Error('worker loss restored key custody or dispatched without a key');
-    return ['worker loss replays the same Start session, task, checks and earlier history',
+    return ['worker loss replays the same Start session, goal-only task and earlier history',
       'worker loss retains keyless custody without a model request'];
   })()`,awaitPromise:true,returnByValue:true},sessionId);
   if (recovered.exceptionDetails || !Array.isArray(recovered.result?.value)) throw Error('worker-loss task recovery failed: ' + (recovered.exceptionDetails?.exception?.description ?? 'no result'));
