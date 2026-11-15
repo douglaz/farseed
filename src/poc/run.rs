@@ -60,12 +60,20 @@ pub trait Model {
     async fn ready(&mut self, _task: &Task, _session: &str) -> Result<(), String> {
         Ok(())
     }
-    async fn next(&mut self, task: &Task, session: &str) -> Result<(String, Tool), String>;
+    async fn next(
+        &mut self,
+        task: &Task,
+        session: &str,
+    ) -> Result<(String, Tool), super::inference::ReplyError>;
 }
 
 pub struct Unconfigured;
 impl Model for Unconfigured {
-    async fn next(&mut self, _: &Task, _: &str) -> Result<(String, Tool), String> {
+    async fn next(
+        &mut self,
+        _: &Task,
+        _: &str,
+    ) -> Result<(String, Tool), super::inference::ReplyError> {
         Err("no inference endpoint configured".into())
     }
 }
@@ -99,6 +107,7 @@ pub trait Runtime {
     async fn load(&mut self, id: &str) -> Result<Task, String>;
     async fn authority(&mut self, id: &str, session: &str) -> Result<(), String>;
     async fn change(&mut self, task: &Task, change: Change) -> Result<Task, String>;
+    async fn prepare(&mut self, task: &Task, session: &str) -> Result<Task, String>;
     async fn propose(
         &mut self,
         task: &Task,
@@ -154,30 +163,40 @@ pub async fn resume(
             task = runtime.change(&task, Change::PrepareCheck).await?;
         } else {
             model.ready(&task, session).await?;
-            task = runtime.change(&task, Change::Request).await?;
-            if !task.requesting {
-                return Ok(task);
-            }
-            // The durable request count is consumed even if this future is lost.
-            let next = model.next(&task, session).await;
-            if let Err(why) = runtime.authority(id, session).await {
-                return pause_authority(runtime, &task, why).await;
-            }
-            task = match next {
-                Ok((call_id, tool)) => match runtime.propose(&task, session, call_id, tool).await {
-                    Ok(task) => task,
-                    Err(why) => {
+            task = runtime.prepare(&task, session).await?;
+            if task.proposal.is_none() {
+                task = runtime.change(&task, Change::Request).await?;
+                if !task.requesting {
+                    return Ok(task);
+                }
+                // The durable request count is consumed even if this future is lost.
+                let next = model.next(&task, session).await;
+                if let Err(why) = runtime.authority(id, session).await {
+                    return pause_authority(runtime, &task, why).await;
+                }
+                task = match next {
+                    Ok((call_id, tool)) => {
+                        match runtime.propose(&task, session, call_id, tool).await {
+                            Ok(task) => task,
+                            Err(why) => {
+                                return runtime
+                                    .change(&task, Change::Pause(concrete_pause(why)))
+                                    .await;
+                            }
+                        }
+                    }
+                    Err(super::inference::ReplyError::Malformed { reason, cut_off }) => {
+                        return runtime
+                            .change(&task, Change::Malformed { reason, cut_off })
+                            .await;
+                    }
+                    Err(super::inference::ReplyError::Pause(why)) => {
                         return runtime
                             .change(&task, Change::Pause(concrete_pause(why)))
                             .await;
                     }
-                },
-                Err(why) => {
-                    return runtime
-                        .change(&task, Change::Pause(concrete_pause(why)))
-                        .await;
-                }
-            };
+                };
+            }
         }
     }
     if task.proposal.is_some() {
@@ -206,7 +225,13 @@ pub async fn resume(
         return runtime
             .change(
                 &current,
-                if current
+                if current.preparing_read() {
+                    Change::SkipRead(
+                        result.err().unwrap_or_else(|| {
+                            "read returned without a durable task intent".into()
+                        }),
+                    )
+                } else if current
                     .proposal
                     .as_ref()
                     .is_some_and(|p| p.report.is_some())

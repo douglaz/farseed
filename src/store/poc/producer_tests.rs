@@ -9,6 +9,9 @@ struct ProducerRuntime {
     observations: usize,
 }
 impl Runtime for ProducerRuntime {
+    async fn prepare(&mut self, _: &Task, _: &str) -> Result<Task, String> {
+        panic!("pending inspection cannot prepare a new action")
+    }
     async fn load(&mut self, id: &str) -> Result<Task, String> {
         self.store.poc_task(id)
     }

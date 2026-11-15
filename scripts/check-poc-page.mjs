@@ -57,13 +57,14 @@ async function resumeProof(c) {
   check(await evaluate("fixtureReports.at(-1).mode_acceptances.some(a=>a.session===fixtureReports.at(-1).tasks[0].start_session&&a.mode==='Acting on a goal with no brief')"),'lost Start reply replays committed no-brief acceptance');
   await configure(normal);await wait("document.querySelector('[data-requirements-decision=approve]')");
   const recovered=await control({inspect:true});
-  check(recovered.inference_requests===1&&recovered.launches.length===0,'interrupted Start resumes its accepted request and proposes the missing machine declaration before any command');
+  check(recovered.inference_requests===1&&recovered.launches.length===1&&recovered.launches[0].command==='ss -H -n -l -t -u','interrupted Start resumes its accepted request and proposes the missing machine declaration after the single harness listeners read');
   check(await evaluate(`fixtureReports.at(-1).tasks.length===1&&fixtureReports.at(-1).tasks[0].id===${JSON.stringify(saved.id)}`),'interrupted Start retains the same task and session');
-  check((await control({inspect:true})).launches.length===0,'declaration approval stays explicit after interrupted Start');
+  check((await control({inspect:true})).launches.length===1,'declaration approval stays explicit after interrupted Start');
   return;
  }
  await wait('fixtureReports.at(-1)?.tasks?.[0]?.pause_reason');
  await wait('fixtureEvents.some(e=>e.fixture_start_complete)');
+ await wait("document.querySelector('[data-requirements-decision=approve]')");
  if(name==='start-defaults') {
   const before=await journal();const original=await evaluate('fixtureReports.at(-1).tasks[0]');
   await invoke(()=>{document.querySelector('#tau-poc-targets [data-start-goal]').value='Another goal';[...document.querySelectorAll('#tau-poc-targets button')].find(b=>b.textContent==='Start session machine-a').click();});
@@ -76,6 +77,8 @@ async function resumeProof(c) {
  
  await wait("document.querySelector('[data-requirements-decision=\"approve\"]')");
  await observe('requirements');
+ assert.deepEqual((await control({inspect:true})).launches.map(l=>l.command),['ss -H -n -l -t -u']);
+ const beforeApprovalContacts=(await control({inspect:true})).contacts;
  if(name==='start-approval') {
   const before=await evaluate('JSON.stringify(fixtureReports.at(-1).tasks)');
   await click('[data-requirements-decision="reject"]');await wait("!document.querySelector('[data-requirements-decision=approve]')");
@@ -152,7 +155,7 @@ async function resumeProof(c) {
   check(await evaluate(`JSON.stringify(fixtureReports.at(-1).tasks[0])===${JSON.stringify(JSON.stringify(activated))}`),'committed approval activates its task; retired queued Resume leaves its budget and work unchanged');
   check(afterQueued.records===beforeQueued.records+2 && afterQueued.poc_requests===beforeQueued.poc_requests+1 && afterQueued.poc_pauses===beforeQueued.poc_pauses,'approval and its one fresh Request append; retired Resume appends no extra Request, proposal or Pause');
   const queuedEffects=await control({inspect:true});
-  check(queuedEffects.inference_requests===1 && queuedEffects.contacts===0 && queuedEffects.launches.length===0,'retired Resume makes no inference or relay contact');
+  check(queuedEffects.inference_requests===1 && queuedEffects.contacts===beforeApprovalContacts && queuedEffects.launches.length===1,'retired Resume makes no inference or relay contact');
   await release('poc_inference_writer');
  }
  if(name==='resume-stale-fetch') await hold('poc_inference_writer');
@@ -172,7 +175,7 @@ async function resumeProof(c) {
  if(name==='start-defaults') {
   await wait("fixtureReports.at(-1)?.tasks?.[0]?.status==='complete'");
   const task=await evaluate('fixtureReports.at(-1).tasks[0]');
-  check(task.requests===13 && task.steps===14 && task.limits.requests===100 && task.limits.steps===200,'one Start and requirements approval complete beyond the former ten-request allowance');
+  check(task.requests===13 && task.steps===15 && task.limits.requests===100 && task.limits.steps===200,'one Start and requirements approval complete beyond the former ten-request allowance');
   check(await evaluate("!document.querySelector('[data-goal-accept]') && fixtureReports.at(-1).tasks.length===1 && fixtureReports.at(-1).mode_acceptances.some(a=>a.session===fixtureReports.at(-1).tasks[0].start_session)"),'durable acceptance and one task without a separate no-brief press');
   const snapshots=await evaluate('fixtureEvents.filter(e=>e.fixture_model_admission).map(e=>e.fixture_model_admission)');
   check(snapshots.length===13 && snapshots.every(s=>s.accepted),'acceptance is committed before every loopback model request');
@@ -208,7 +211,7 @@ async function resumeProof(c) {
   if(launched.launches.some(j=>j.job===job))break;
   await new Promise(resolve=>setTimeout(resolve,25));
  }
- check(launched.launches.length===1 && launched.launches[0].job===job,'one original remote launch');
+ check(launched.launches.length===2 && launched.launches[1].job===job,'one original remote launch');
  check(await evaluate("document.querySelectorAll('[data-pending-assumption]').length===0"),'running work offers no pending assumption');
  if(name==='resume-end') {
   await click('[data-end-session]');await wait("fixtureReports.at(-1)?.sessions?.[0]?.session_state==='ended'");
@@ -219,7 +222,7 @@ async function resumeProof(c) {
    await new Promise(resolve=>setTimeout(resolve,25));
   }
   check(stopped.ssh_ends===stopped.ssh_connections,'durable selected End closes the active browser transport');
-  check(stopped.launches.length===1 && stopped.inference_requests===2,'End does not repeat the accepted job or request more inference');
+  check(stopped.launches.length===2 && stopped.inference_requests===2,'End does not repeat the accepted job or request more inference');
   await reopen();
   check(await evaluate('fixtureReports.at(-1).sessions[0].session_state===\'ended\' && fixtureReports.at(-1).tasks[0].pending!==null'),'replay preserves End and the unresolved remote-job history without keys');
   await control({release:true});
@@ -310,7 +313,7 @@ async function resumeProof(c) {
  const completed=await evaluate('fixtureReports.at(-1).tasks[0]');
  const seen=await control({inspect:true});
  check(completed.id===original.id && completed.start_session===session && completed.verification.every(v=>v.exit_status===0),'eligible continuation and verification complete the same task');
- check(seen.launches.filter(j=>j.job===job).length===1 && seen.launches.length===2,'one original launch plus one distinct verification command');
+ check(seen.launches.filter(j=>j.job===job).length===1 && seen.launches.length===3,'one original launch plus the before-setup and verification reads');
  if(name==='resume-freeze') {
   await hold('publication_prepared');
   await message({fixture:{publish:session}});await point('publication_prepared');
@@ -343,7 +346,7 @@ async function pendingProof(c) {
  await point('pending_launch_committed');
  const pending=await evaluate('fixtureReports.at(-1).tasks[0]');
  const {call,job}=pending.pending;
- check((await control({inspect:true})).launches.length===0,'deterministic cut after task intent and before any launch bytes');
+ check((await control({inspect:true})).launches.length===1,'deterministic cut after task intent and before this command sends launch bytes');
  await evaluate('window.cutWorker=fixtureWorkers.at(-1)');
  await click('#tau-lock');
  await release('pending_launch_committed');
@@ -389,7 +392,7 @@ async function pendingProof(c) {
   await message({task:{action:'dispose-pending',id:confirmation.task,session,confirmation,continuation:assumption}});
   await wait(`fixtureEvents.filter(e=>e.fixture_action_complete).length>${actions}`);
   check((await journal()).records===files.records,'seed backup ceremony refuses a current-generation disposition without append');
-  check((await control({inspect:true})).launches.length===0,'seed backup ceremony launches nothing');
+  check((await control({inspect:true})).launches.length===1,'seed backup ceremony launches nothing');
   return;
  }
  if(name==='pending-stale') await hold('pending_disposition_writer');
@@ -412,7 +415,7 @@ async function pendingProof(c) {
   const disposed=final.completed.find(step=>step[0]===pending.proposal.call_id)[2].content;
   check(disposed.machine_held && disposed.remaining_unresolved.length===1,'result retains remaining hold');
   check(await evaluate('document.querySelector("[data-task]").textContent.includes("machine remains held by other unresolved calls")'),'card retains remaining hold');
-  check((await control({inspect:true})).launches.length===0,'remaining hold prevents another launch');
+  check((await control({inspect:true})).launches.length===1,'remaining hold prevents another launch');
   return;
  }
  await wait("fixtureReports.at(-1)?.tasks?.[0]?.status==='complete'");
@@ -425,7 +428,7 @@ async function pendingProof(c) {
  const observed=await control({inspect:true});
  check(observed.inference_requests===3,'confirmation automatically makes a new model request');
  check(observed.launches.every(launch=>launch.job!==job),'disposed job is never launched');
- check(observed.launches.length===1 && observed.launches[0].job!==job,'only the distinct normal verification job launches');
+ check(observed.launches.length===2 && observed.launches[1].job!==job,'only the before-setup read and distinct normal verification job launch');
  check(JSON.stringify(observed.inference_bodies.at(-1)).includes('outcome') && JSON.stringify(observed.inference_bodies.at(-1)).includes('unknown') && JSON.stringify(observed.inference_bodies.at(-1)).includes(job),'new request carries disposed outcome history');
  check(await evaluate(`document.querySelector('[data-task]').textContent.includes(${JSON.stringify(assumption)})`),'card retains selected assumption');
 }
@@ -672,6 +675,8 @@ try{
  await wait(`fixtureReports.at(-1)?.tasks?.length===1 && fixtureReports.at(-1)?.tasks[0].pause_reason`);
 await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
  await wait('fixtureEvents.some(e=>e.fixture_start_complete)');
+ const beforeSetup=await control({inspect:true});
+ assert.deepEqual(beforeSetup.launches.map(l=>l.command),['ss -H -n -l -t -u']);
  if(['resolver','configuration'].includes(name))await message({fixture:{clear_model:true}});
  if(name==='approval-refusal') {
   const key='"setup":{"requirements":';
@@ -694,7 +699,7 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
   check(JSON.stringify(pending)===JSON.stringify(report.sessions.map(s=>s.pending_requirements)),'approval refusal preserves exact pending proposal');
   check(JSON.stringify(setup)===JSON.stringify(report.setup),'approval refusal preserves declaration state');
   check(await evaluate(`!!document.querySelector('[data-requirements-decision="approve"]')`),'approval card remains visible');
-  check((await control({inspect:true})).launches.length===0,'refused approval launches no command');
+  check((await control({inspect:true})).launches.length===1,'refused approval launches no command');
   count=await evaluate('fixtureReports.length');await click('[data-requirements-decision="reject"]');await wait('fixtureReports.length>'+count);
   check(await evaluate('fixtureReports.at(-1).sessions.every(s=>!s.pending_requirements)'),'explicit local rejection remains usable');
   await evaluate('fixtureWorkers.at(-1).terminate()');await closeBrowser(browser,()=>call('Browser.close'));
@@ -745,11 +750,11 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
   const approvals=await evaluate("fixtureEvents.filter(e=>e.fixture_action==='requirements').length");
   await click('[data-requirements-decision="approve"]');
   await wait(`fixtureEvents.filter(e=>e.fixture_action==='requirements').length>${approvals}`);
-  check((await control({inspect:true})).launches.length===1,'approval continues the ordinary accepted key once');
+  check((await control({inspect:true})).launches.length===2,'approval continues the ordinary accepted key once');
   await resume();await actionComplete();
-  check((await control({inspect:true})).launches.length===1,'ordinary accepted key runs Command once');
+  check((await control({inspect:true})).launches.length===2,'ordinary accepted key runs Command once');
   await resume();await actionComplete();
-  check((await control({inspect:true})).launches.length===1,'Resume never duplicates original command');
+  check((await control({inspect:true})).launches.length===2,'Resume never duplicates original command');
  }else if(name==='goal-span'){
   await reloadUnlock();
   const report=await evaluate('fixtureReports.at(-1)');
@@ -769,7 +774,7 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
   await message({task:{action:'abandon',id:task.id}});await actionComplete();
   check(await evaluate("fixtureReports.at(-1).tasks[0].status==='abandoned'"),'Stop task remains effective');
  }else if(name==='job-span'){
-  for(let attempt=0;attempt<600;attempt++){if((await control({inspect:true})).launches.length===1)break;await new Promise(r=>setTimeout(r,100));}
+  for(let attempt=0;attempt<600;attempt++){if((await control({inspect:true})).launches.length===2)break;await new Promise(r=>setTimeout(r,100));}
   await reloadUnlock();
   await acceptActing();
   const report=await evaluate('fixtureReports.at(-1)');
@@ -784,14 +789,14 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
   await resume();await actionComplete();
   const after=await journal(key);
   const end=await evaluate('fixtureReports.at(-1)');
-  const posted=await evaluate('fixtureEvents.filter(e=>e.command_result).length');
+  const posted=await evaluate('fixtureEvents.filter(e=>e.command_result&&e.command_result.job!==fixtureReports.at(-1).tasks[0].completed[0][2].content.job).length');
   console.log(JSON.stringify({probe:'job-span',keyBytes:key.length,keySet:configured.poc_configuration.key_set,configError:configured.store_error??null,before,after,storeError:end.store_error??null,status:end.tasks[0].status,pause:end.tasks[0].pause_reason,pending:!!end.tasks[0].pending,posted}));
   check(!before.contains && !after.contains,'job envelope never appends accepted credential');
   check(end.tasks[0].pending?.job===task.pending.job,'refused evidence retains original pending job');
   actionCount=await evaluate('fixtureEvents.filter(e=>e.fixture_action_complete).length');
   await message({task:{action:'abandon',id:task.id}});await actionComplete();
   check(await evaluate("fixtureReports.at(-1).tasks[0].status==='abandoned'"),'local Abandon after job refusal remains effective');
-  check((await control({inspect:true})).launches.length===1,'original job launched only once');
+  check((await control({inspect:true})).launches.length===2,'original job launched only once');
  }else if(name==='future-revision'){
   const task=await evaluate('fixtureReports.at(-1).tasks[0]');
   const key=task.id.slice(-4)+'","expected":'+(task.revision+1)+',';
@@ -806,7 +811,7 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
   check(!raised.store_error&&raised.tasks[0].revision===task.revision+1,'Raise remains usable');
   const abandoned=await action({action:'abandon'});
   check(!abandoned.store_error&&abandoned.tasks[0].status==='abandoned','Abandon remains usable');
-  check((await control({inspect:true})).launches.length===0,'metadata controls launch no command');
+  check((await control({inspect:true})).launches.length===1,'metadata controls launch no command');
  }else if(name==='metadata-key'){
   const task=await evaluate('fixtureReports.at(-1).tasks[0]');
   const needle=JSON.stringify({poc:{change:{id:task.id,expected:task.revision,change:'abandon'}}});
@@ -822,21 +827,21 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
   check(configured.store_error?.includes('task references')&&configured.poc_configuration.key_set,'colliding configuration refuses before replacing usable custody');
   check(await evaluate(`document.querySelector('#tau-poc-key').value===''&&fixtureReports.at(-1).tasks[0].status==='abandoned'`),'input clears and Abandon remains usable after collision refusal');
   check(after.contains&&after.records===before.records+1,'safe complete Abandon event appended exactly once');
-  check((await control({inspect:true})).launches.length===0,'metadata controls launch no command');
+  check((await control({inspect:true})).launches.length===1,'metadata controls launch no command');
  }else if(['reload-key','reload-control','keyless-collection','reload-progress','mismatched-terminal'].includes(name)){
   const collecting=name==='keyless-collection';
 
   if(collecting){
     for(let attempt=0;attempt<600;attempt++){
-      if((await control({inspect:true})).launches.length===1)break;
+      if((await control({inspect:true})).launches.length===2)break;
       await new Promise(resolve=>setTimeout(resolve,100));
     }
   }else{await point('poc_terminal_append');await release('poc_terminal_append');await point('poc_execution_return');}
   await message({fixture:{counts:true}});
   const beforeLoss=await wait('fixtureEvents.find(e=>e.fixture_counts)?.fixture_counts');
-  const original=(await control({inspect:true})).launches[0];
-  check(original&&beforeLoss.terminals===(collecting?0:1)&&beforeLoss.collectable===(collecting?1:0),'crash boundary retains original durable job');
-  check(await evaluate('fixtureEvents.filter(e=>e.command_result).length===0'),'worker lost before first result post');
+  const original=(await control({inspect:true})).launches[1];
+  check(original&&beforeLoss.terminals===(collecting?1:2)&&beforeLoss.collectable===(collecting?1:0),'crash boundary retains original durable job');
+  check(await evaluate('fixtureEvents.filter(e=>e.command_result&&e.command_result.job!==fixtureReports.at(-1).tasks[0].completed[0][2].content.job).length===0'),'worker lost before first result post');
   await evaluate('fixtureWorkers.at(-1).terminate()');await call('Page.reload',{},sessionId);
   await wait(`document.querySelector('#tau-store')?.dataset.state==='locked'`);
   await new Promise(resolve=>setTimeout(resolve,info.relay_spacing_ms+50));
@@ -844,7 +849,7 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
   await invoke(()=>{document.querySelector('#tau-passphrase').value='durable fixture passphrase';document.querySelector('#tau-unlock').click();});
   await wait(`fixtureReports.at(-1)?.tasks?.length===1`);
   if(name==='mismatched-terminal'){
-    await wait("fixtureEvents.filter(e=>e.command_result).length===1 && fixtureReports.at(-1)?.tasks?.[0]?.pause_reason?.includes('Stop task')");
+    await wait("fixtureEvents.filter(e=>e.command_result&&e.command_result.job!==fixtureReports.at(-1).tasks[0].completed[0][2].content.job).length===1 && fixtureReports.at(-1)?.tasks?.[0]?.pause_reason?.includes('Stop task')");
     const configureReport=async(refused=true)=>{const before=await evaluate('fixtureReports.length');await configure(normal);return wait(`fixtureReports.slice(${before}).find(r=>${refused?"r.store_error?.includes('Stop task')":"!r.store_error && r.poc_configuration?.key_set"})`);};
     const beforeResume=await configureReport();
     await acceptActing();
@@ -854,12 +859,12 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
     await invoke(()=>[...document.querySelectorAll('[data-task] button')].find(b=>b.textContent==='Stop task').click());await actionComplete();
     const abandoned=await evaluate('fixtureReports.at(-1).tasks[0]');
     const configured=await configureReport(false);
-    const released=await evaluate('fixtureEvents.filter(e=>e.command_result).map(e=>e.command_result)');
+    const released=await evaluate('fixtureEvents.filter(e=>e.command_result&&e.command_result.job!==fixtureReports.at(-1).tasks[0].completed[0][2].content.job).map(e=>e.command_result)');
     console.log(JSON.stringify({beforeRefusal:beforeResume.store_error,afterRefusal:afterResume.store_error,pause:paused.pause_reason,releases:released.length}));
     check(released.length===1&&released[0].agreement==='finding','mismatched original terminal releases protected advisory finding');
-    check(paused.completed.length===1&&JSON.stringify(paused.pending)===JSON.stringify(abandoned.pending)&&abandoned.status==='abandoned','Abandon retains original pending identity without settling mismatched work');
+    check(paused.completed.length===2&&JSON.stringify(paused.pending)===JSON.stringify(abandoned.pending)&&abandoned.status==='abandoned','Abandon retains original pending identity without settling mismatched work');
     check(!configured.store_error&&configured.poc_configuration.key_set,'configuration succeeds after explicit Abandon');
-    check((await control({inspect:true})).launches.length===1,'mismatch recovery never relaunches command');
+    check((await control({inspect:true})).launches.length===2,'mismatch recovery never relaunches command');
     check([beforeResume,afterResume].every(r=>r.store_error?.includes('Stop task')&&r.store_error?.includes('holds remain')&&!r.poc_configuration.key_set),'mismatch configuration refusal gives actionable Abandon guidance');
     check(paused.pause_reason.includes('Stop task')&&paused.pause_reason.includes('holds remain'),'mismatch pause explains local escape and retained remote effects');
   }else{
@@ -882,17 +887,17 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
     check(await evaluate(`fixtureReports.at(-1).store_error==='inference configuration refused: command response pending; retry after it completes'&&!fixtureReports.at(-1).poc_configuration.key_set`),'keyless production collection reserves inventory without inference');
     await control({release:true});
   }
-  await wait('fixtureReports.at(-1)?.tasks?.[0]?.pending===null && fixtureEvents.filter(e=>e.command_result).length===1');
+  await wait('fixtureReports.at(-1)?.tasks?.[0]?.pending===null && fixtureEvents.filter(e=>e.command_result&&e.command_result.job!==fixtureReports.at(-1).tasks[0].completed[0][2].content.job).length===1');
   const recovered=await evaluate('fixtureReports.at(-1).tasks[0]');
-  const released=await evaluate('fixtureEvents.filter(e=>e.command_result).map(e=>e.command_result)');
+  const released=await evaluate('fixtureEvents.filter(e=>e.command_result&&e.command_result.job!==fixtureReports.at(-1).tasks[0].completed[0][2].content.job).map(e=>e.command_result)');
   console.log(JSON.stringify({recovered,releases:released.length,fixture:await control({inspect:true})}));
-  check(recovered.pending===null&&recovered.completed.length===2&&recovered.status==='running'&&recovered.requests===2,'original result checkpoints without spending a request while the key is missing');
+  check(recovered.pending===null&&recovered.completed.length===3&&recovered.status==='running'&&recovered.requests===2,'original result checkpoints without spending a request while the key is missing');
   check(released.length===1&&released[0].stdout===output&&released[0].exit_status===0,'recovery releases one useful full result');
   check(await evaluate(`Array.from(document.querySelectorAll('[data-command-result] pre')).some(e=>e.textContent===${JSON.stringify(output)})`),'recovered result renders in actual page');
   await resume();await actionComplete();
-  check(await evaluate('fixtureEvents.filter(e=>e.command_result).length===1'),'second Resume does not republish or relaunch');
+  check(await evaluate('fixtureEvents.filter(e=>e.command_result&&e.command_result.job!==fixtureReports.at(-1).tasks[0].completed[0][2].content.job).length===1'),'second Resume does not republish or relaunch');
   const seen=await control({inspect:true});
-  check(seen.launches.length===1&&seen.launches[0].job===original.job,'recovery never repeats original execution');
+  check(seen.launches.length===2&&seen.launches[1].job===original.job,'recovery never repeats original execution');
   check(seen.execs.filter(e=>e.startsWith('# tau-web job read '+original.job)).length===(collecting?1:0),'only unresolved remote job uses collection');
   await message({fixture:{done:true}});
   const before=await evaluate('fixtureReports.length');await configure(normal);await wait(`fixtureReports.length>${before}`);
@@ -904,7 +909,7 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
     console.log(JSON.stringify({afterConfiguredResume:{error:report.store_error,status:report.tasks[0].status,pause:report.tasks[0].pause_reason,completed:report.tasks[0].completed.length}}));
     check(!report.store_error&&report.tasks[0].status==='paused'&&report.tasks[0].verdict==='Handed over with findings','configured inference continues from retained history to a measured finding');
     check(JSON.stringify(report.tasks[0].completed.slice(0,history.length))===JSON.stringify(history),'configured inference preserves original history');
-    check((await control({inspect:true})).launches.length===2,'configured continuation adds only the harness listener read');
+    check((await control({inspect:true})).launches.length===3,'configured continuation adds only the harness listener read');
     const before=await evaluate('fixtureEvents.filter(e=>e.fixture_action_complete).length');
     await invoke(()=>[...document.querySelectorAll('[data-task] button')].find(b=>b.textContent==='Stop task').click());
     await wait(`fixtureEvents.filter(e=>e.fixture_action_complete).length>${before}`);
@@ -935,10 +940,10 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
   await actionComplete();
   await wait(`fixtureReports.at(-1)?.tasks?.[0]?.status==='paused'`);
   check(await evaluate(`fixtureReports.at(-1).tasks[0].completed.length>0`),'committed result survives page publication');
-  const released=await evaluate('fixtureEvents.filter(event=>event.command_result).map(event=>event.command_result)');
+  const released=await evaluate('fixtureEvents.filter(event=>event.command_result&&event.command_result.job!==fixtureReports.at(-1).tasks[0].completed[0][2].content.job).map(event=>event.command_result)');
   check(released.length===2&&released[0].stdout===output&&released[0].stderr===''&&released[0].exit_status===0,'full terminal output survives actual final result publication');
   check(await evaluate(`Array.from(document.querySelectorAll('[data-command-result] pre')).some(element=>element.textContent===${JSON.stringify(output)})`),'actual page renders the complete released output');
-  check(counts.terminals===(name==='publication'?2:1)&&counts.launches===(name==='publication'?2:1)&&counts.collectable===0,'response boundary retains exactly the original job and any completed harness read');
+  check(counts.terminals===(name==='publication'?3:2)&&counts.launches===(name==='publication'?3:2)&&counts.collectable===0,'response boundary retains exactly the original job and any completed harness read');
   const before=await evaluate('fixtureReports.length');await configure(attempted.at(-1));await wait(`fixtureReports.length>${before}`);
   check(await evaluate(`!fixtureReports.at(-1).store_error && document.querySelector('#tau-poc-key-status').textContent==='Key set.'`),'same configuration succeeds after final release');
   if(['first-key','first-key-checks'].includes(name)){
@@ -966,34 +971,34 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
   console.log(JSON.stringify({configuration:report.store_error,key_set:report.poc_configuration?.key_set,pending:report.tasks[0].pending,fixture:await control({inspect:true})}));
   check(!report.store_error&&report.poc_configuration.key_set===true,'missing inference prerequisite has no command reservation and accepts configuration');
   check(await evaluate(`document.querySelector('#tau-poc-key').value==='' && document.querySelector('#tau-poc-key-status').textContent==='Key set.'`),'page clears the new key and reports actual custody');
-  await wait(`fixtureReports.at(-1)?.tasks?.[0]?.status==='paused' && fixtureReports.at(-1).tasks[0].completed.length===3`);
-  check(await evaluate('fixtureReports.at(-1).tasks[0].completed.length===3'),'key resupply continues the approved task successfully');
+  await wait(`fixtureReports.at(-1)?.tasks?.[0]?.status==='paused' && fixtureReports.at(-1).tasks[0].completed.length===4`);
+  check(await evaluate('fixtureReports.at(-1).tasks[0].completed.length===4'),'key resupply continues the approved task successfully');
  }else if(name==='resolver'){
   await wait("fixtureEvents.some(e=>e.fixture_action==='requirements')");
   const report=await evaluate('fixtureReports.at(-1)');
   const text=JSON.stringify(report), secret='unsupported-key-4827';
   check(report.store_error?.includes('unsupported relay profile')&&report.tasks[0].status==='running'&&!report.tasks[0].pending,'runner reports unsupported-profile refusal after releasing only the declaration pause');
   check(!text.includes(secret)&&!text.includes(Buffer.from(secret).toString('base64').replace(/=+$/,'')),'runner protects both dynamic profile and composed refusal under current inventory');
-  check((await control({inspect:true})).contacts===0&&report.tasks[0].requests===1,'runner resolver refuses before contact or inference');
+  check((await control({inspect:true})).contacts===beforeSetup.contacts&&report.tasks[0].requests===1,'runner resolver refuses before contact or inference');
  }else if(name==='aggregate'){
   await wait("fixtureEvents.some(e=>e.fixture_action==='requirements')");
   await message({fixture:{counts:true}});const counts=await wait('fixtureEvents.find(event=>event.fixture_counts)?.fixture_counts');
   const report=await evaluate('fixtureReports.at(-1)');
   console.log(JSON.stringify({counts,report}));
-  check(counts.terminals===3&&counts.collectable===0&&counts.launches===3,'both distinct command results and the harness listener read commit once');
-  const released=await evaluate('fixtureEvents.filter(event=>event.command_result).map(event=>event.command_result)');
+  check(counts.terminals===4&&counts.collectable===0&&counts.launches===4,'both distinct command results and the harness listener read commit once');
+  const released=await evaluate('fixtureEvents.filter(event=>event.command_result&&event.command_result.job!==fixtureReports.at(-1).tasks[0].completed[0][2].content.job).map(event=>event.command_result)');
   check([output,secondOutput].every(output=>released.some(row=>row.stdout===output)),'each full committed result leaves the real worker despite aggregate history capacity');
   check(released.length===3&&new Set(released.map(row=>row.call)).size===3,'one individual publication for each committed result');
-  check(await evaluate('document.querySelectorAll("[data-command-result]").length===3'),'actual page displays both independently released results');
+  check(await evaluate('document.querySelectorAll("[data-command-result]").length===4'),'actual page displays both independently released results');
  }else if(name==='interruption'){
   await resume();await wait(`fixtureReports.at(-1)?.tasks?.[0]?.pending`);
   let seen;
   for(let attempt=0;attempt<600;attempt++){
-    seen=await control({inspect:true});if(seen.launches.length===1)break;
+    seen=await control({inspect:true});if(seen.launches.length===2)break;
     await new Promise(resolve=>setTimeout(resolve,100));
   }
-  check(seen.launches.length===1,'one original launch before interruption');
-  const originalJob=seen.launches[0].job;
+  check(seen.launches.length===2,'one original launch before interruption');
+  const originalJob=seen.launches[1].job;
   await evaluate('fixtureWorkers.at(-1).terminate()');await call('Page.reload',{},sessionId);
   await wait(`document.querySelector('#tau-store')?.dataset.state==='locked'`);
   await new Promise(resolve=>setTimeout(resolve,info.relay_spacing_ms+50));
@@ -1013,7 +1018,7 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
   const busy=await wait(`fixtureReports.slice(${busyBefore}).find(r=>r.store_error==='inference configuration refused: command response pending; retry after it completes')`);
   check(!busy.poc_configuration.key_set && await evaluate(`document.querySelector('#tau-poc-key').value==='' && document.querySelector('#tau-poc-key-status').textContent==='Key unset.'`),'page configuration stays truthful and clears input while collection waits');
   await control({release:true});
-  await wait('fixtureReports.at(-1)?.tasks?.[0]?.pending===null && fixtureReports.at(-1)?.tasks?.[0]?.completed?.length===2');
+  await wait('fixtureReports.at(-1)?.tasks?.[0]?.pending===null && fixtureReports.at(-1)?.tasks?.[0]?.completed?.length===3');
   await new Promise(resolve=>setTimeout(resolve,info.relay_spacing_ms+50));
   await configure(normal);await wait(`fixtureReports.at(-1)?.poc_configuration?.key_set`);
   let afterCollection=await evaluate('fixtureReports.at(-1).tasks[0]');
@@ -1041,11 +1046,11 @@ await wait(`document.querySelector('[data-requirements-decision="approve"]')`);
   const task=await evaluate('fixtureReports.at(-1).tasks[0]');console.log(JSON.stringify({task,fixture:await control({inspect:true})}));
   const seen=await control({inspect:true});
   if(name==='wire-too-long') {
-    check(task.completed.length===1&&task.completed[0][1].name==='propose_declaration'&&task.pending===null&&task.pause_reason.includes('too long'),'one byte above largest command refuses with LaunchTooLong');
-    check(seen.contacts===0&&seen.execs.length===0,'oversized launch refuses before any relay contact');
+    check(task.completed.length===2&&task.completed[1][1].name==='propose_declaration'&&task.pending===null&&task.pause_reason.includes('too long'),'one byte above largest command refuses with LaunchTooLong');
+    check(seen.contacts===beforeSetup.contacts&&seen.execs.length===beforeSetup.execs.length,'oversized launch refuses before any relay contact');
   } else {
     check(task.completed.length>0,'accepted command reaches bounded relay: '+task.pause_reason);
-    check(seen.launches.length===2&&seen.launches[0].command===command&&seen.launches[1].command==='ss -H -n -l -t -u','boundary command launched exactly once');
+    check(seen.launches.length===3&&seen.launches[1].command===command&&seen.launches[2].command==='ss -H -n -l -t -u','boundary command launched exactly once');
     check(seen.binary_sizes.length>0&&Math.max(...seen.binary_sizes)<=65536&&seen.wire_errors.length===0,'every message and frame remains within 65536 bytes');
   }
  }

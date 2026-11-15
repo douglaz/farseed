@@ -160,15 +160,7 @@ fn poc_request_restores_useful_facts_without_seed_allocation_associations() {
         "fixture".into(),
     )
     .unwrap();
-    let body = crate::poc::inference::request(
-        &s,
-        &config,
-        &task.goal,
-        &task.machine,
-        &task.completed,
-        &[],
-    )
-    .unwrap();
+    let body = crate::poc::inference::request_for_task(&s, &config, &task, &[]).unwrap();
     let text = std::str::from_utf8(&body).unwrap();
     for form in [
         seed.clone(),
@@ -223,7 +215,7 @@ fn poc_request_restores_useful_facts_without_seed_allocation_associations() {
 
 #[derive(Default)]
 struct Script {
-    calls: VecDeque<Result<(String, Tool), String>>,
+    calls: VecDeque<Result<(String, Tool), crate::poc::inference::ReplyError>>,
     seen: Vec<Vec<Step>>,
     hold: bool,
     release: Option<Rc<Cell<bool>>>,
@@ -237,7 +229,11 @@ impl Script {
     }
 }
 impl Model for Script {
-    async fn next(&mut self, task: &Task, _session: &str) -> Result<(String, Tool), String> {
+    async fn next(
+        &mut self,
+        task: &Task,
+        _session: &str,
+    ) -> Result<(String, Tool), crate::poc::inference::ReplyError> {
         assert_eq!(task.goal, "install and run a small service");
         assert_eq!(task.machine, "fixture");
         self.seen.push(task.completed.to_vec());
@@ -384,6 +380,9 @@ impl Runtime for Fixture {
                 .poc_change(&task.id, task.revision, c),
         )
     }
+    async fn prepare(&mut self, task: &Task, session: &str) -> Result<Task, String> {
+        block_on(self.store.borrow_mut().poc_prepare_next(task, session))
+    }
     async fn propose(
         &mut self,
         task: &Task,
@@ -420,11 +419,12 @@ impl Runtime for Fixture {
         let pending = self.task(&task.id);
         assert_eq!(pending.pending.as_ref().unwrap().call, call);
         let job = pending.pending.as_ref().unwrap().job.clone();
-        let output = if pending.proposal.as_ref().unwrap().check.is_some() {
-            ""
-        } else {
-            "service active"
-        };
+        let output =
+            if pending.proposal.as_ref().unwrap().check.is_some() || pending.preparing_read() {
+                ""
+            } else {
+                "service active"
+            };
         let record = record(&pending, Some(self.exit), output);
         {
             let mut remote = self.remote.borrow_mut();
@@ -1778,6 +1778,16 @@ fn poc_unavailable_and_wrong_machine_steps_need_no_installation_declaration() {
     let session = store.sessions[0].identity.clone();
     let task = create_task(&mut store);
     *f.store.borrow_mut() = store;
+    let observed = block_on(run::resume(
+        &mut f,
+        &mut Script::default(),
+        &task.id,
+        &session,
+    ))
+    .unwrap();
+    assert_eq!(observed.requests, 0);
+    assert_eq!(observed.steps, 1);
+    assert_eq!(observed.completed[0].1, exec("ss -H -n -l -t -u"));
     let tools = [
         Tool::Job {
             machine: "fixture".into(),
@@ -1802,28 +1812,28 @@ fn poc_unavailable_and_wrong_machine_steps_need_no_installation_declaration() {
             &session,
         ))
         .unwrap();
-        assert_eq!(step.steps, i as u32 + 1);
-        assert_eq!(step.completed.len(), i + 1);
+        assert_eq!(step.steps, i as u32 + 2);
+        assert_eq!(step.completed.len(), i + 2);
         assert_eq!(step.status, Status::Running);
     }
     let current = f.task(&task.id);
     assert_eq!(
-        current.completed[0].2["content"]["refused"],
-        "propose the installation declaration before commands or done"
-    );
-    assert_eq!(
         current.completed[1].2["content"]["refused"],
         "propose the installation declaration before commands or done"
     );
-    assert_eq!(current.completed[2].2["content"]["refused"], "bound set");
+    assert_eq!(
+        current.completed[2].2["content"]["refused"],
+        "propose the installation declaration before commands or done"
+    );
+    assert_eq!(current.completed[3].2["content"]["refused"], "bound set");
     assert!(
         f.store
             .borrow()
             .pending_requirements_view(&session)
             .is_null()
     );
-    assert!(f.store.borrow().dispatch.calls.is_empty());
-    assert!(f.remote.borrow().sends.is_empty());
+    assert_eq!(f.store.borrow().dispatch.calls.len(), 1);
+    assert_eq!(f.remote.borrow().sends.len(), 1);
     assert_eq!(
         reopen(&f.store.borrow()).poc_task(&task.id).unwrap(),
         current
@@ -3234,3 +3244,5 @@ fn poc_requirements_approval_releases_only_its_declaration_pause_and_replays() {
 }
 
 mod completion_tests;
+
+mod correction_tests;

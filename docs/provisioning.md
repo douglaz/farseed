@@ -90,8 +90,34 @@ CHN-R7 is deferred, alongside vendor-account recovery and renewal-policy mutatio
 
 Enroll the displayed relay public key separately with the relay operator. Provider SSH-key
 registration does not enroll a relay pass. Configure inference, enter the goal and Start session
-for the handed-off machine. The first request proposes a typed installation declaration without
-reading the machine. Review the installation preview and exact declaration in Details, then
+for the handed-off machine. Before the first proposal request, the harness attempts one listeners
+read through the ordinary recorded job path. This departs from U2b's zero-dispatch-before-approval
+flow with one harness read before the proposal; approval still precedes installation and every
+model command. The request contains parsed TCP listening sockets as untrusted observations,
+including stock and loopback sockets, with interface suffixes removed. UDP and raw output are
+excluded from this context. Observation grants no permission to keep or expose a socket: declare
+listeners that will remain, and remove the others after approval, before done. A loopback-only
+listener can be declared with from=none. A pending read holds proposal generation and retains its
+job identity across reload; collection or an explicit continuing disposition must settle it.
+A refused, nonzero, unparseable or explicitly disposed unknown read is reported as not read,
+without another attempt. Reject and Resume reuse the same observation.
+
+The proposal tool offers a complete typed declaration: version 2, inbound and outbound listener
+entries, system services with running-at-delivery or enabled-survives-reboot lifecycle, key material,
+empty required and drift_checks lists, and default_credentials as none or identifier strings.
+Every object is closed and every declared field is required. The request includes the complete
+ad-hoc minimum and a filled example with a service and inbound/outbound entries, labelled shape
+only, not a suggestion for the goal. Structural validity still passes through semantic admission.
+A refusal returns specific bounded field paths and expectations as that call's untrusted output,
+so the next proposal can correct the offending fields.
+
+Malformed tool replies run nothing. The task records a bounded reason and asks again automatically
+for the first two consecutive malformed replies; a usable call resets the count, even when its
+proposal is refused. Three in a row pause with the last reason and explain that Resume asks the
+model again. Resume starts a new count; reload retains the count and reason. Request and step
+limits still apply. Transport, authorization, refusal and protection failures retain their pauses.
+
+Review the installation preview and exact declaration in Details, then
 Approve these requirements. Approval continues only that task. Reject pauses it; Resume requests
 a new proposal with the rejection in its history. A machine's approved declaration is reused on
 later Starts, without amendment.

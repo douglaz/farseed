@@ -1,15 +1,19 @@
 import assert from 'node:assert/strict';
-export const completionCases = ['delivery-web','delivery-local','delivery-report-failure','delivery-report-stopped','delivery-reject','delivery-unknown'];
+export const completionCases = ['delivery-web','delivery-local','delivery-report-failure','delivery-report-stopped','delivery-reject','delivery-unknown','delivery-correction'];
 export const minimum = {version:2,listeners:{inbound:[{proto:'tcp',port:22,from:'any'}],outbound:[]},services:[],key_material:{spendable:false,permitted:[]},drift_checks:[],required:[],default_credentials:'none'};
 export async function completionProof(c) {
  const {name,info,inferenceEndpoint,call,sessionId,evaluate,invoke,wait,click,configure,control,check,pageOrigin,message,hold,point,release}=c;
- const local=name==='delivery-local', service=local?'redis':'nginx',port=local?6379:80;
+ const correction=name==='delivery-correction';
+ const local=name==='delivery-local', service=correction?'example-unit':local?'redis':'nginx',port=correction?8123:local?6379:80;
  const d=structuredClone(minimum);
  d.listeners.inbound.push({proto:'tcp',port,from:local?'none':'any'});
  d.services.push({name:service,scope:{kind:'system'},lifecycle:'enabled-survives-reboot'});
+ if(correction)d.listeners.inbound.push({proto:'tcp',port:53,from:'none'});
  const reports=name==='delivery-report-failure'?[`sleep ${info.relay_spacing_ms/1000+0.05}; printf functional-output-482700; exit 1`]:name==='delivery-report-stopped'?[`systemctl stop ${service}; printf success`]:[];
  await control({reads:{listeners:`tcp LISTEN 0 128 ${local?'127.0.0.1':'0.0.0.0'}:${port} *:*\n`}});
- await control({inference:{key:'normal-synthetic-key-482700',declaration:d,commands:[{checks:reports}]}});
+ const stock='tcp LISTEN 0 128 0.0.0.0:22 *:*\ntcp LISTEN 0 128 127.0.0.53%lo:53 *:*\ntcp LISTEN 0 128 127.0.0.54:53 *:*\ntcp LISTEN 0 128 0.0.0.0:5355 *:*\ntcp LISTEN 0 128 [::]:5355 *:*\nudp UNCONN 0 0 0.0.0.0:5353 *:*\n';
+ if(correction)await control({reads:{listeners:stock,'listeners-after':stock.split('\n').filter(s=>!s.includes(':5355')&&!s.startsWith('udp')).join('\n')+`tcp LISTEN 0 128 0.0.0.0:${port} *:*\n`}});
+ await control({inference:{key:'normal-synthetic-key-482700',declaration:d,correction,commands:[...(correction?['systemctl stop example-stock']:[]),{checks:reports}]}});
  await call('Page.navigate',{url:pageOrigin+'/'},sessionId);
  await wait("document.querySelector('#tau-store')?.dataset.state==='none'");
  await invoke(()=>{document.querySelector('#tau-passphrase').value=document.querySelector('#tau-confirm').value='durable fixture passphrase';document.querySelector('#tau-create').click();});
@@ -20,10 +24,10 @@ export async function completionProof(c) {
  await wait('fixtureReports.at(-1)?.poc_targets?.length===1');
  await invoke(()=>[...document.querySelectorAll('#tau-poc-targets button')].find(b=>b.textContent==='Show public keys machine-a').click());
  const keys=await wait('fixtureReports.at(-1)?.poc_keys');assert.equal((await control({keys})).installed,true);
- await invoke(goal=>{document.querySelector('#tau-poc-targets [data-start-goal]').value=goal;[...document.querySelectorAll('#tau-poc-targets button')].find(b=>b.textContent==='Start session machine-a').click();},local?'Run a Redis server for programs on this machine only, started at boot':'Serve a small page with nginx, started at boot');
+ await invoke(goal=>{window.fixtureDeliveryPresses=[];document.addEventListener('click',e=>{const b=e.target.closest('button');if(b)fixtureDeliveryPresses.push(b.textContent);});document.querySelector('#tau-poc-targets [data-start-goal]').value=goal;[...document.querySelectorAll('#tau-poc-targets button')].find(b=>b.textContent==='Start session machine-a').click();},correction?'Run example-unit on port 8123, started at boot':local?'Run a Redis server for programs on this machine only, started at boot':'Serve a small page with nginx, started at boot');
  await wait("document.querySelector('[data-requirements-decision=approve]')");
  assert.equal(await evaluate("document.querySelectorAll('[data-start-checks],[data-poc-declaration],[data-poc-propose]').length"),0);
- assert.equal((await control({inspect:true})).launches.length,0);
+ assert.deepEqual((await control({inspect:true})).launches.map(l=>l.command),['ss -H -n -l -t -u']);
  const preview=await evaluate("document.querySelector('[data-requirements-card]').innerText");
  assert.ok(preview.includes(service)&&preview.includes(`TCP port ${port}`)&&preview.includes('not checked in this PoC'));
  assert.ok(await evaluate(`document.querySelector('[data-requirements-card] strong').textContent.includes(${JSON.stringify(service)})`));
@@ -31,12 +35,12 @@ export async function completionProof(c) {
  if(name==='delivery-reject') {
   await click('[data-requirements-decision=reject]');
   await wait("fixtureReports.at(-1)?.tasks?.[0]?.pause_reason?.includes('rejected')");
-  assert.equal((await control({inspect:true})).launches.length,0);
-  assert.equal(await evaluate('fixtureReports.at(-1).tasks[0].completed[0][2].content.rejected.includes("rejected")'),true);
+  assert.deepEqual((await control({inspect:true})).launches.map(l=>l.command),['ss -H -n -l -t -u']);
+  assert.equal(await evaluate('fixtureReports.at(-1).tasks[0].completed[1][2].content.rejected.includes("rejected")'),true);
   await invoke(()=>[...document.querySelectorAll('[data-task] button')].find(b=>b.textContent==='Resume').click());
   await wait("document.querySelector('[data-requirements-decision=approve]')");
   assert.ok(JSON.stringify((await control({inspect:true})).inference_bodies.at(-1)).includes('rejected'));
-  assert.equal((await control({inspect:true})).launches.length,0);
+  assert.deepEqual((await control({inspect:true})).launches.map(l=>l.command),['ss -H -n -l -t -u']);
  }
  if(name==='delivery-unknown')await hold('pending_launch_committed');
  await click('[data-requirements-decision=approve]');
@@ -59,7 +63,7 @@ export async function completionProof(c) {
   assert.equal(task.verdict,null);assert.equal(task.status,'paused');
   assert.equal(task.verification[0].observation,null);
   await assertVisibleResult(task,'Findings unknown until a complete re-check',false);
-  assert.equal((await control({inspect:true})).launches.length,0);
+  assert.deepEqual((await control({inspect:true})).launches.map(l=>l.command),['ss -H -n -l -t -u']);
   check(true,'unsettled harness read shows unknown wording in the visible task card');
   return;
  }
@@ -116,6 +120,22 @@ export async function completionProof(c) {
  assert.ok(await evaluate("document.querySelector('[data-task]').innerText.includes('enabled, restart not demonstrated')"));
  const observed=await control({inspect:true});
  assert.deepEqual(observed.inference_bodies[0].tools.map(t=>t.function.name),['propose_declaration']);
- assert.ok(observed.inference_bodies.slice(name==='delivery-reject'?2:1).every(b=>b.tools.map(t=>t.function.name).join(',')==='exec,done'));
+ assert.ok(observed.inference_bodies.slice(correction?3:name==='delivery-reject'?2:1).every(b=>b.tools.map(t=>t.function.name).join(',')==='exec,done'));
+ if(correction) {
+  assert.deepEqual(await evaluate('fixtureDeliveryPresses'),['Start session machine-a','Approve these requirements']);
+  assert.equal(observed.inference_requests,5);
+  assert.deepEqual(task.completed.filter(s=>!s[0].startsWith('$')).map(s=>s[1].name),['propose_declaration','propose_declaration','exec','done']);
+  assert.equal(task.completed.filter(s=>s[0].startsWith('$before:')).length,1);
+  assert.equal(task.before_setup.observation.value.filter(s=>s.proto==='tcp').length,5);
+  assert.ok(task.before_setup.observation.value.some(s=>s.port===5355));
+  assert.ok(!task.verification.at(-1).observation.value.some(s=>s.port===5355));
+  assert.deepEqual(observed.launches.filter(l=>l.command==='systemctl stop example-stock').map(l=>l.command),['systemctl stop example-stock']);
+  const requests=observed.inference_bodies;
+  assert.ok(JSON.stringify(requests[1]).includes('Your last reply could not be used: inference tool arguments malformed JSON. Reply with exactly one call to an offered tool.'));
+  assert.ok(JSON.stringify(requests[2]).includes('declaration.listeners.outbound[0].to'));
+  assert.ok(!JSON.stringify(requests).includes('{unusable-fixture-arguments'));
+  console.log(JSON.stringify({case:name,offeredSchema:requests[0].tools[0].function.parameters,shapeExample:requests[0].messages.map(m=>m.content).find(s=>typeof s==='string'&&s.startsWith('Filled declaration example'))}));
+  check(true,'format correction and specific refusal feedback lead to one approval and delivery after removal of an observed stock listener');
+ }
  check(true,'goal-only Start, exact installation preview, explicit approval, journaled reads and qualified delivery');
 }

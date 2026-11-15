@@ -225,7 +225,7 @@ pub fn user_account(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
 }
-fn host(s: &str) -> bool {
+pub(crate) fn host(s: &str) -> bool {
     if s == "any" {
         return true;
     }

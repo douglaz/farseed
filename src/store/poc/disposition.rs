@@ -277,6 +277,7 @@ impl<S: Storage> Store<S> {
             {
                 return Err("pending disposition identity differs".into());
             }
+            let before_setup = task.preparing_read();
             let proposal = task
                 .proposal
                 .take()
@@ -333,6 +334,9 @@ impl<S: Storage> Store<S> {
                 task.reports[index].excerpt =
                     "Owner recorded a continuing assumption; this report will not be repeated."
                         .into();
+            }
+            if before_setup {
+                task.before_setup.as_mut().expect("attempt").settled = true;
             }
             task.completed.push((
                 proposal.call_id,

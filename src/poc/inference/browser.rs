@@ -265,10 +265,10 @@ async fn body(
 pub(crate) async fn next(
     task: &crate::store::poc::Task,
     session: &str,
-) -> Result<(String, crate::goals::Tool), String> {
-    let goal = task.goal.as_str();
+) -> Result<(String, crate::goals::Tool), ReplyError> {
     let machine = task.machine.as_str();
-    let steps = task.completed.as_slice();
+    let history = model_steps(task);
+    let steps = history.as_slice();
     let continuation = crate::lifecycle::owner().continuation()?;
     let revision = REVISION.get();
     let config = CONFIG
@@ -322,7 +322,7 @@ pub(crate) async fn next(
             return Err(INCOMPLETE.into());
         }
         with_request_key(session, store.credit_session(session), |key| {
-            let body = request(store, &config, goal, machine, steps, &[key])?;
+            let body = request_for_task(store, &config, task, &[key])?;
             let filter = EchoFilter::new(&[key]);
             let init = web_sys::RequestInit::new();
             init.set_method("POST");
@@ -387,9 +387,10 @@ pub(crate) async fn next(
                         crate::poc::credit::REFUSED.into()
                     } else {
                         http_failure(status)
-                    });
+                    }
+                    .into());
                 }
-                Err(why) => return Err(why),
+                Err(why) => return Err(why.into()),
             }
         };
         if is_credit && !(200..300).contains(&status) {
@@ -397,20 +398,19 @@ pub(crate) async fn next(
                 crate::poc::credit::browser::refusal(status, &bytes, session).await
             } else {
                 http_failure(status)
-            });
+            }
+            .into());
         }
-        // Only these envelopes can reach normalization/release. Unused provider metadata
-        // has no durable or publication sink; discard it before repeated protection. The
-        // full response read remains bounded, and model values are still refused, not repaired.
+        // Protect the entire successful reply before classification, including unused metadata.
+        // The full response read remains bounded; no response body is retained in task facts.
         let bytes = if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
-            if let Some(object) = value.as_object_mut() {
-                object.retain(|name, _| {
-                    if (200..300).contains(&status) {
-                        name == "choices"
-                    } else {
-                        name == "error"
-                    }
-                });
+            if (200..300).contains(&status) && filter.value(&value)? != value {
+                return Err("inference proposal contains protected material".into());
+            }
+            if !(200..300).contains(&status)
+                && let Some(object) = value.as_object_mut()
+            {
+                object.retain(|name, _| name == "error");
             }
             Zeroizing::new(serde_json::to_vec(&value).map_err(|_| "inference response encoding")?)
         } else if (200..300).contains(&status) {
@@ -422,7 +422,7 @@ pub(crate) async fn next(
         let filtered = match filter.protect_bytes(&bytes) {
             Ok(filtered) => filtered,
             Err(_) if !(200..300).contains(&status) => Zeroizing::new(Vec::new()),
-            Err(why) => return Err(why),
+            Err(why) => return Err(why.into()),
         };
         if (200..300).contains(&status) && *filtered != *bytes {
             return Err("inference proposal contains protected material".into());
@@ -443,8 +443,16 @@ pub(crate) async fn next(
         let store = local.store().ok_or(INCOMPLETE)?;
         store.check_inference_request(task, session)?;
         with_request_key(session, is_credit, |key| {
-            complete_response(store, status, &bytes, machine, steps, &[key], &filter)
-        })
+            Ok(complete_response(
+                store,
+                status,
+                &bytes,
+                machine,
+                steps,
+                &[key],
+                &filter,
+            ))
+        })?
     };
     let result = match futures_util::future::select(Box::pin(exchange), Box::pin(ready)).await {
         futures_util::future::Either::Left((result, _)) => result,
@@ -458,17 +466,16 @@ pub(crate) async fn next(
                     .get()
                     .is_some_and(|status| status != 0 && !(200..300).contains(&status)) =>
         {
-            Err(
-                if is_credit
-                    && received_status
-                        .get()
-                        .is_some_and(|s| matches!(s, 401 | 402 | 403 | 429))
-                {
-                    crate::poc::credit::REFUSED.into()
-                } else {
-                    http_failure(received_status.get().expect("known status"))
-                },
-            )
+            Err(if is_credit
+                && received_status
+                    .get()
+                    .is_some_and(|s| matches!(s, 401 | 402 | 403 | 429))
+            {
+                crate::poc::credit::REFUSED.into()
+            } else {
+                http_failure(received_status.get().expect("known status"))
+            }
+            .into())
         }
         result => result,
     }

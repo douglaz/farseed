@@ -186,6 +186,14 @@ impl<P: PinSource> Runtime for Web<'_, P> {
         self.continuation.check()?;
         Ok(changed)
     }
+    async fn prepare(&mut self, task: &Task, session: &str) -> Result<Task, String> {
+        let local = local();
+        let mut writer = local.lock().await;
+        self.continuation.check()?;
+        let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
+        store.check_task_session(task, session)?;
+        store.poc_prepare_next(task, session).await
+    }
     async fn propose(
         &mut self,
         task: &Task,
@@ -407,7 +415,17 @@ impl Journal for ScopedJournal {
         self.base.check_signature(machine, command).await
     }
     async fn check(&self, machine: &str) -> Result<(), AppendRefusal> {
-        self.base.check(machine).await
+        let local = local();
+        let mut writer = local.lock().await;
+        self.continuation.check().map_err(AppendRefusal::Storage)?;
+        if let Some(why) = writer.dispatch_refusal() {
+            return Err(AppendRefusal::Storage(why.into()));
+        }
+        writer
+            .store()
+            .ok_or_else(|| AppendRefusal::Storage(crate::poc::wait::LOCKED.into()))?
+            .poc_check_command(&self.binding, machine)
+            .await
     }
     async fn append(&mut self, _: &Entry, _: &Approval) -> Result<u64, AppendRefusal> {
         Err(AppendRefusal::Storage(
@@ -773,7 +791,7 @@ impl run::Model for Configured {
         &mut self,
         task: &Task,
         session: &str,
-    ) -> Result<(String, crate::goals::Tool), String> {
+    ) -> Result<(String, crate::goals::Tool), crate::poc::inference::ReplyError> {
         // Progress has released the preceding result. Configuration may change during
         // the next request, whose adapter detects changes and aborts honestly.
         self.response.borrow_mut().take();

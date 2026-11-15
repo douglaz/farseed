@@ -36,6 +36,7 @@ pub struct State {
     pub echo: bool,
     pub script: std::collections::VecDeque<Value>,
     pub poc_declaration: Option<Value>,
+    pub poc_correction: bool,
     pub document: String,
     pub document_status: u16,
     pub hold_document: bool,
@@ -76,6 +77,7 @@ impl State {
             echo: false,
             script: Default::default(),
             poc_declaration: None,
+            poc_correction: false,
             document: String::new(),
             document_status: 200,
             hold_document: false,
@@ -217,7 +219,14 @@ impl State {
                         tools.len() == 1 && tools[0]["function"]["name"] == "propose_declaration"
                     })
                 });
-                let call = if proposal_only && self.poc_declaration.is_some() {
+                let call = if proposal_only && self.poc_correction {
+                    let request: Value = serde_json::from_slice(body).expect("fixture request");
+                    Some(correction_call(
+                        &request,
+                        self.poc_declaration.as_ref().expect("fixture declaration"),
+                        key.spent,
+                    ))
+                } else if proposal_only && self.poc_declaration.is_some() {
                     Some(
                         json!({"id":format!("declaration-{}",key.spent),"type":"function","function":{"name":"propose_declaration","arguments":json!({"machine":"machine-a","declaration":self.poc_declaration}).to_string()}}),
                     )
@@ -496,6 +505,87 @@ async fn serve(
     };
     stream.write_all(format!("HTTP/1.1 {status} Fixture\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Authorization, Content-Type, X-Inference-Account\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{location}Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await?;
     stream.shutdown().await
+}
+
+// This fixture changes format only when its request contains the corresponding feedback.
+fn correction_call(request: &Value, declaration: &Value, turn: u64) -> Value {
+    let schema =
+        &request["tools"][0]["function"]["parameters"]["properties"]["declaration"]["properties"];
+    let service = &schema["services"]["items"];
+    let closed = |v: &Value| v["type"] == "object" && v["additionalProperties"] == false;
+    let typed = closed(service)
+        && service["required"] == json!(["name", "scope", "lifecycle"])
+        && service["properties"].as_object().is_some_and(|p| {
+            p.keys().map(String::as_str).collect::<Vec<_>>() == ["lifecycle", "name", "scope"]
+        })
+        && service["properties"]["name"]["type"] == "string"
+        && closed(&service["properties"]["scope"])
+        && service["properties"]["scope"]["required"] == json!(["kind"])
+        && service["properties"]["scope"]["properties"]["kind"]["enum"] == json!(["system"])
+        && service["properties"]["lifecycle"]["type"] == "string"
+        && service["properties"]["lifecycle"]["enum"]
+            == json!(["running-at-delivery", "enabled-survives-reboot"])
+        && ["inbound", "outbound"].into_iter().all(|direction| {
+            let item = &schema["listeners"]["properties"][direction]["items"];
+            closed(item)
+                && item["properties"]["proto"]["enum"] == json!(["tcp", "udp"])
+                && item["properties"]["port"]["type"] == "integer"
+                && item["properties"]["port"]["minimum"] == 1
+                && item["properties"]["port"]["maximum"] == 65535
+                && if direction == "inbound" {
+                    item["required"] == json!(["proto", "port", "from"])
+                        && item["properties"]["from"]["enum"] == json!(["any", "peers", "none"])
+                } else {
+                    item["required"] == json!(["proto", "host", "port"])
+                        && item["properties"]["host"]["type"] == "string"
+                }
+        });
+    let messages = request["messages"].as_array().expect("fixture messages");
+    let filled = messages
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .filter_map(|s| {
+            s.split_once("shape only, not a suggestion for this goal: ")
+                .map(|(_, v)| v)
+        })
+        .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+        .any(|v| v["services"].as_array().is_some_and(|a| !a.is_empty()));
+    if !typed || !filled {
+        return json!({"fixture_message":{"refusal":"fixture requires the complete offered structure and example"}});
+    }
+    let refused = messages
+        .iter()
+        .rev()
+        .filter(|m| m["role"] == "tool")
+        .find_map(|m| {
+            m["content"]
+                .as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        })
+        .and_then(|v| v["content"]["refused"].as_str().map(str::to_owned));
+    let corrected = refused.as_ref().is_some_and(|s| {
+        s.contains("declaration.services[0].listen")
+            || s.contains("declaration.listeners.outbound[0].to")
+    });
+    let feedback = messages.iter().any(|m| m["content"].as_str().is_some_and(|s| s.contains("Your last reply could not be used: inference tool arguments malformed JSON. Reply with exactly one call to an offered tool.")));
+    let arguments = if corrected {
+        json!({"machine":"machine-a","declaration":declaration}).to_string()
+    } else if feedback || refused.is_some() {
+        let mut invalid = declaration.clone();
+        invalid["services"][0]["scope"] = json!("system");
+        invalid["services"][0]["lifecycle"] =
+            json!({"restart":"example-restart","start":"example-start"});
+        invalid["services"][0]["listen"] = json!([{"bind":"127.0.0.1","port":8123,"proto":"tcp"}]);
+        invalid["services"][0]["running"] = json!(true);
+        invalid["services"][0]["notes"] = json!("neutral fixture");
+        invalid["listeners"]["outbound"] =
+            json!([{"proto":"tcp","to":"example.invalid","port":8124}]);
+        invalid["required"] = json!(["example requirement"]);
+        json!({"machine":"machine-a","declaration":invalid}).to_string()
+    } else {
+        "{unusable-fixture-arguments".into()
+    };
+    json!({"id":format!("declaration-{turn}"),"type":"function","function":{"name":"propose_declaration","arguments":arguments}})
 }
 
 #[cfg(test)]

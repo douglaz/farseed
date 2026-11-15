@@ -96,12 +96,12 @@ fn completion_proposal_admission_returns_each_refusal_without_commands() {
         (
             "/required",
             json!([{"check":"true"}]),
-            "no signed bundle check entries",
+            "expected empty array",
         ),
         (
             "/drift_checks",
             json!([{"command":"true"}]),
-            "no signed bundle check entries",
+            "expected empty array",
         ),
         ("/listeners/inbound", json!([]), "preserve"),
         (
@@ -119,15 +119,22 @@ fn completion_proposal_admission_returns_each_refusal_without_commands() {
         (
             "/services/0/name",
             json!("sh -c 'touch /tmp/marker'"),
-            "service name",
+            "declaration.services[0].name",
         ),
-        ("/listeners/inbound/0/port", json!(0), "inbound port"),
+        (
+            "/listeners/inbound/0/port",
+            json!(0),
+            "declaration.listeners.inbound[0].port",
+        ),
     ] {
         let mut candidate = good.clone();
         *candidate.pointer_mut(pointer).unwrap() = value;
         variants.push((candidate, reason));
     }
-    variants.push((json!({"version":2}), "declaration schema"));
+    variants.push((
+        json!({"version":2}),
+        "declaration.listeners: missing required field",
+    ));
     for (candidate, reason) in variants {
         let mut store = ready_without_requirements();
         let task = create_task(&mut store);

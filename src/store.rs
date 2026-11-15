@@ -533,6 +533,21 @@ pub async fn unlock<S: Storage>(
 }
 
 impl<S: Storage> Store<S> {
+    pub(crate) fn check_box_job(&self, machine: &str) -> Result<(), AppendRefusal> {
+        if self.inference.ended {
+            return Err(AppendRefusal::Storage(
+                crate::poc::wait::SESSIONS_ENDED.into(),
+            ));
+        }
+        self.dispatch
+            .check_command(machine)
+            .map_err(AppendRefusal::Policy)?;
+        if self.pending_machine(machine) {
+            return Err(AppendRefusal::Storage("proposal approval pending".into()));
+        }
+        Ok(())
+    }
+
     fn new(storage: S, key: DataKey, id: String) -> Store<S> {
         let authority = crate::lifecycle::owner();
         authority.seal_identity();

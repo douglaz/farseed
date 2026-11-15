@@ -111,8 +111,12 @@ pub fn unstated(d: &Declaration) -> Option<&'static str> {
         .find_map(|(name, missing)| missing.then_some(name))
 }
 pub fn proposal(value: &serde_json::Value) -> Result<Declaration, String> {
-    let declaration = Declaration::parse(value)?;
-    declaration.validate_ad_hoc_minimum()?;
+    super::proposal::structure(value)?;
+    let declaration =
+        Declaration::parse(value).map_err(|why| super::proposal::semantic(value, &why))?;
+    declaration
+        .validate_ad_hoc_minimum()
+        .map_err(|why| super::proposal::semantic(value, &why))?;
     if let Some(name) = unstated(&declaration) {
         return Err(format!("{name}: not stated"));
     }

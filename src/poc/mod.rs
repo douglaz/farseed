@@ -7,6 +7,7 @@ pub mod completion;
     )
 )]
 pub mod inference;
+pub(crate) mod proposal;
 #[cfg_attr(
     not(target_arch = "wasm32"),
     allow(

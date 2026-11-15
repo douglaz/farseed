@@ -16,7 +16,7 @@ pub async fn run() -> Result<(), String> {
     for (name, script) in [
         (
             "systemctl",
-            "#!/bin/sh\ncd \"$(dirname \"$0\")/..\" || exit 2\ncase \"$1\" in\n is-active) cat active; exit \"$(cat active-exit)\";;\n is-enabled) cat enabled; exit \"$(cat enabled-exit)\";;\n stop) printf inactive > active; exit 0;;\n *) exit 2;;\nesac\n",
+            "#!/bin/sh\ncd \"$(dirname \"$0\")/..\" || exit 2\ncase \"$1\" in\n is-active) cat active; exit \"$(cat active-exit)\";;\n is-enabled) cat enabled; exit \"$(cat enabled-exit)\";;\n stop) if [ \"$2\" = example-stock ]; then cp listeners-after listeners; else printf inactive > active; fi; exit 0;;\n *) exit 2;;\nesac\n",
         ),
         (
             "ss",
@@ -116,6 +116,7 @@ pub async fn run() -> Result<(), String> {
             if let Some(declaration) = config.get("declaration") {
                 state.poc_declaration = Some(declaration.clone());
             }
+            state.poc_correction = config["correction"] == true;
             state.hold_completion = config["hold"] == true;
             json!({"inference_configured":true})
         } else if let Some(reads) = value.get("reads") {
@@ -126,6 +127,7 @@ pub async fn run() -> Result<(), String> {
                 "enabled-exit",
                 "listeners",
                 "listeners-exit",
+                "listeners-after",
             ] {
                 if let Some(value) = reads[name].as_str() {
                     std::fs::write(sshd.machine.root.join(name), value)

@@ -285,7 +285,12 @@ mod worker {
         };
         match crate::poc::inference::next(&task, &session).await {
             Ok((id, tool)) => serde_json::json!({"id":id,"tool":tool}).to_string(),
-            Err(reason) => serde_json::json!({"pause":reason}).to_string(),
+            Err(crate::poc::inference::ReplyError::Pause(reason)) => {
+                serde_json::json!({"pause":reason}).to_string()
+            }
+            Err(crate::poc::inference::ReplyError::Malformed { reason, cut_off }) => {
+                serde_json::json!({"malformed":reason,"cut_off":cut_off}).to_string()
+            }
         }
     }
 

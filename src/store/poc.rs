@@ -63,6 +63,19 @@ pub struct OptionalReport {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Malformed {
+    pub count: u32,
+    pub reason: String,
+    pub cut_off: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BeforeSetup {
+    pub settled: bool,
+    pub observation: Option<crate::poc::completion::Observation>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Task {
     pub id: String,
     pub start_session: String,
@@ -87,11 +100,26 @@ pub struct Task {
     pub verdict: Option<String>,
     pub verifying: bool,
     pub requesting: bool,
+    pub malformed: Option<Malformed>,
+    pub before_setup: Option<BeforeSetup>,
     /// Compare-and-append token: stale requests cannot publish or arm a command.
     pub revision: u64,
     pub inspection_record: Option<u64>,
 }
 impl Task {
+    pub fn preparing_read(&self) -> bool {
+        self.before_setup.as_ref().is_some_and(|r| !r.settled)
+            && self.proposal.as_ref().is_some_and(|p| {
+                p.call_id.starts_with("$before:")
+                    && p.check.is_none()
+                    && p.report.is_none()
+                    && p.tool
+                        == (Tool::Exec {
+                            machine: self.machine.clone(),
+                            command: crate::poc::completion::Read::Listeners.command(),
+                        })
+            })
+    }
     /// The page card shows bounded excerpts; complete outcomes remain in the journal
     /// and the command evidence view. Repeating them here can exhaust a whole report.
     pub(super) fn view(&self) -> Value {
@@ -141,6 +169,9 @@ pub struct Binding {
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum Change {
     Request,
+    PrepareRead,
+    SkipRead(String),
+    Malformed { reason: String, cut_off: bool },
     Propose { call_id: String, tool: Tool },
     PrepareCheck,
     RetryChecks,
@@ -251,12 +282,8 @@ impl<S: Storage> Store<S> {
             }
         }
     }
-    pub(crate) fn poc_inference_facts(&self, machine: &str, goal: &str) -> Option<Value> {
-        let task = self.poc.values().find(|t| {
-            t.machine == machine
-                && t.goal == goal
-                && !self.ended_sessions.contains(&t.start_session)
-        })?;
+    pub(crate) fn poc_inference_facts(&self, task: &Task) -> Option<Value> {
+        let machine = task.machine.as_str();
         let exposure = self
             .exposure_ledger
             .iter()
@@ -422,6 +449,14 @@ impl<S: Storage> Store<S> {
         if !task.requesting || task.pending.is_some() || task.proposal.is_some() {
             return Err("no current task request".into());
         }
+        if self.poc_needs_declaration(&task.machine) {
+            if !task.before_setup.as_ref().is_some_and(|r| r.settled) {
+                return Err("listeners observation has not settled".into());
+            }
+            self.dispatch
+                .check_command(&task.machine)
+                .map_err(|why| format!("{why:?}"))?;
+        }
         Ok(())
     }
     pub fn poc_authority(&self, id: &str, session: &str) -> Result<Rc<Session>, String> {
@@ -526,7 +561,41 @@ impl<S: Storage> Store<S> {
             )?;
             return Err(crate::poc::wait::APPROVAL_PENDING.into());
         }
-        self.poc_tool(&task.id, session, tool)
+        if task.preparing_read() {
+            self.poc_safe(tool)
+        } else {
+            self.poc_tool(&task.id, session, tool)
+        }
+    }
+
+    pub async fn poc_prepare_next(&mut self, task: &Task, session: &str) -> Result<Task, String> {
+        self.poc_authority(&task.id, session)?;
+        if self.poc_needs_declaration(&task.machine) && task.before_setup.is_none() {
+            self.poc_change(&task.id, task.revision, Change::PrepareRead)
+                .await
+        } else {
+            Ok(task.clone())
+        }
+    }
+
+    pub async fn poc_check_command(
+        &self,
+        binding: &Binding,
+        machine: &str,
+    ) -> Result<(), AppendRefusal> {
+        self.poc_binding_current(binding)
+            .map_err(AppendRefusal::Storage)?;
+        let task = self
+            .poc_task(&binding.task)
+            .map_err(AppendRefusal::Storage)?;
+        if task.machine != machine {
+            return Err(AppendRefusal::Storage("task machine differs".into()));
+        }
+        if task.preparing_read() {
+            self.check_box_job(machine)
+        } else {
+            self.check(machine).await
+        }
     }
 
     pub fn poc_needs_declaration(&self, machine: &str) -> bool {
@@ -639,7 +708,15 @@ impl<S: Storage> Store<S> {
         mut change: Change,
     ) -> Result<Task, String> {
         match &mut change {
-            Change::Pause(why) | Change::Wait { why, .. } => {
+            Change::Malformed { reason, .. } => {
+                if reason.is_empty() || reason.len() > 512 {
+                    return Err("malformed-reply reason exceeds its bound".into());
+                }
+                if self.protect_output(&json!(reason))? != json!(reason) {
+                    return Err("malformed-reply reason contains protected material".into());
+                }
+            }
+            Change::Pause(why) | Change::Wait { why, .. } | Change::SkipRead(why) => {
                 *why = self
                     .protect_output(&json!(why))
                     .ok()
@@ -718,8 +795,10 @@ impl<S: Storage> Store<S> {
             .proposal
             .as_ref()
             .ok_or_else(|| AppendRefusal::Storage("missing task proposal".into()))?;
-        self.poc_tool(&binding.task, &binding.session, &proposal.tool)
-            .map_err(AppendRefusal::Storage)?;
+        if !task.preparing_read() {
+            self.poc_tool(&binding.task, &binding.session, &proposal.tool)
+                .map_err(AppendRefusal::Storage)?;
+        }
         if task.pending.is_some()
             || task.revision != binding.revision
             || entry.provenance.as_ref().and_then(|p| p.session.as_deref())
@@ -728,7 +807,7 @@ impl<S: Storage> Store<S> {
             return Err(AppendRefusal::Storage("stale task command".into()));
         }
         self.check_signature(&entry.machine, &entry.command).await?;
-        self.check(&entry.machine).await?;
+        self.poc_check_command(binding, &entry.machine).await?;
         let intent = Intent {
             call: self.next,
             machine: entry.machine.clone(),
@@ -830,6 +909,8 @@ impl<S: Storage> Store<S> {
                 verification: vec![],
                 verifying: false,
                 requesting: false,
+                malformed: None,
+                before_setup: None,
                 revision: 0,
                 inspection_record: None,
             });
@@ -915,6 +996,51 @@ impl<S: Storage> Store<S> {
             }
             Record::Change { change, .. } => {
                 match change {
+                    Change::PrepareRead => {
+                        if task.before_setup.is_some()
+                            || task.proposal.is_some()
+                            || task.pending.is_some()
+                            || task.verifying
+                            || !self.poc_needs_declaration(&task.machine)
+                        {
+                            return Err("pre-proposal listeners read is not eligible".into());
+                        }
+                        task.requesting = false;
+                        if task.steps >= task.limits.steps {
+                            task.pause("step limit reached; raise limits and Resume");
+                        } else if task.requests >= task.limits.requests {
+                            task.pause("request limit reached; raise limits and Resume");
+                        } else {
+                            task.steps += 1;
+                            task.before_setup = Some(BeforeSetup {
+                                settled: false,
+                                observation: None,
+                            });
+                            task.proposal = Some(Proposal {
+                                call_id: format!("$before:{}", task.steps),
+                                tool: Tool::Exec {
+                                    machine: task.machine.clone(),
+                                    command: crate::poc::completion::Read::Listeners.command(),
+                                },
+                                check: None,
+                                report: None,
+                            });
+                            task.active();
+                        }
+                    }
+                    Change::SkipRead(why) => {
+                        if !task.preparing_read() || task.pending.is_some() {
+                            return Err("no refused pre-proposal read".into());
+                        }
+                        task.before_setup.as_mut().expect("attempt").settled = true;
+                        let p = task.proposal.take().expect("read");
+                        task.completed.push((
+                            p.call_id,
+                            p.tool,
+                            crate::goals::untrusted("tool_output", json!({"refused":why})),
+                        ));
+                        task.active();
+                    }
                     Change::Abandon => {
                         task.status = Status::Abandoned;
                         task.pause_reason = Some(
@@ -959,8 +1085,52 @@ impl<S: Storage> Store<S> {
                         } else if task.requests >= task.limits.requests {
                             task.pause("request limit reached; raise limits and Resume");
                         } else {
+                            if task.status == Status::Paused
+                                && task.malformed.as_ref().is_some_and(|m| m.count >= 3)
+                            {
+                                task.malformed = None;
+                            }
                             task.requests += 1;
                             task.requesting = true;
+                            task.active();
+                        }
+                    }
+                    Change::Malformed { reason, cut_off } => {
+                        if !task.requesting
+                            || task.pending.is_some()
+                            || task.proposal.is_some()
+                            || reason.is_empty()
+                            || reason.len() > 512
+                        {
+                            return Err(
+                                "no current request or invalid malformed-reply reason".into()
+                            );
+                        }
+                        let count = task.malformed.as_ref().map_or(1, |m| m.count + 1);
+                        if count > 3 {
+                            return Err("malformed-reply bound exhausted".into());
+                        }
+                        task.requesting = false;
+                        task.malformed = Some(Malformed {
+                            count,
+                            reason: reason.clone(),
+                            cut_off: *cut_off,
+                        });
+                        if count == 3 {
+                            const PREFIX: &str = "3 malformed replies in a row; last reason: ";
+                            const SUFFIX: &str = ". Resume asks the model again.";
+                            let available = 512 - PREFIX.len() - SUFFIX.len();
+                            let last = if reason.len() > available {
+                                let mut end = available - "…".len();
+                                while !reason.is_char_boundary(end) {
+                                    end -= 1;
+                                }
+                                format!("{}…", &reason[..end])
+                            } else {
+                                reason.clone()
+                            };
+                            task.pause(format!("{PREFIX}{last}{SUFFIX}"));
+                        } else {
                             task.active();
                         }
                     }
@@ -969,6 +1139,7 @@ impl<S: Storage> Store<S> {
                             return Err("no current task request".into());
                         }
                         task.requesting = false;
+                        task.malformed = None;
                         let wire = serde_json::to_value(tool).map_err(|_| "tool encoding")?;
                         Tool::parse(&wire)?;
                         if call_id.is_empty()
@@ -995,8 +1166,8 @@ impl<S: Storage> Store<S> {
                             } else {
                                 let admission = match tool {
                                 Tool::ProposeDeclaration { declaration, .. } => {
-                                    if !self.poc_needs_declaration(&task.machine) { Err("installation declaration is already approved".into()) }
-                                    else { crate::poc::completion::proposal(declaration).and_then(|declaration| self.dispatch.check_proposal(&crate::declaration::Proposal::Declaration { machine: task.machine.clone(), declaration })) }
+                                    if !self.poc_needs_declaration(&task.machine) { Err("declaration: installation declaration is already approved".into()) }
+                                    else { crate::poc::completion::proposal(declaration).and_then(|parsed| self.dispatch.check_proposal(&crate::declaration::Proposal::Declaration { machine: task.machine.clone(), declaration: parsed }).map_err(|why| crate::poc::proposal::semantic(declaration, &why))) }
                                 }
                                 _ if self.poc_needs_declaration(&task.machine) => Err("propose the installation declaration before commands or done".into()),
                                 _ => Ok(()),
@@ -1205,6 +1376,7 @@ impl<S: Storage> Store<S> {
                         {
                             return Err(crate::poc::wait::UNTRUSTWORTHY.into());
                         }
+                        let before_setup = task.preparing_read();
                         let proposal = task.proposal.take().ok_or(crate::poc::wait::NO_PROPOSAL)?;
                         let exit = report.exit_status.ok_or(crate::poc::wait::NO_EXIT)?;
                         let outcome = json!({"call":pending.call,"job":pending.job,"exit_status":exit,"stdout":report.stdout,"stderr":report.stderr});
@@ -1212,6 +1384,14 @@ impl<S: Storage> Store<S> {
                         // make its bytes depend on credentials that disappear at worker restart.
                         if self.protect_output(&outcome)? != outcome {
                             return Err(crate::poc::wait::CHECKPOINT_PROTECTION.into());
+                        }
+                        if before_setup {
+                            let attempt = task.before_setup.as_mut().expect("attempt");
+                            attempt.settled = true;
+                            attempt.observation = Some(
+                                crate::poc::completion::Read::Listeners
+                                    .observe(exit, &report.stdout),
+                            );
                         }
                         if let Some(index) = proposal.check {
                             let check = task

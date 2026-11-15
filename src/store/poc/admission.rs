@@ -209,6 +209,16 @@ impl<S: Storage> Store<S> {
                 steps: domains.decimal(),
             }),
             Change::Request,
+            Change::PrepareRead,
+            Change::SkipRead(String::new()),
+            Change::Malformed {
+                reason: String::new(),
+                cut_off: false,
+            },
+            Change::Malformed {
+                reason: String::new(),
+                cut_off: true,
+            },
             Change::PrepareCheck,
             Change::RetryChecks,
             Change::RejectDeclaration,
