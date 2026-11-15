@@ -38,6 +38,8 @@ impl Drop for CommandResponse {
 
 struct Pending {
     session: String,
+    task: String,
+    retry: Cell<Option<u32>>,
     controller: web_sys::AbortController,
     stopped: Cell<bool>,
     ready: Notify,
@@ -45,6 +47,7 @@ struct Pending {
 impl Pending {
     fn stop(&self) {
         self.stopped.set(true);
+        self.retry.set(None);
         self.controller.abort();
         self.ready.notify_waiters();
     }
@@ -59,6 +62,25 @@ impl Pending {
             _ => Err(INCOMPLETE.into()),
         }
     }
+}
+
+/// Add only live, in-memory wait status to the page projection.
+pub(crate) fn retry_progress(report: &mut Value) {
+    let Some(tasks) = report.get_mut("tasks").and_then(Value::as_array_mut) else {
+        return;
+    };
+    REQUESTS.with_borrow(|requests| {
+        for pending in requests.iter().filter_map(std::rc::Weak::upgrade) {
+            if let Some(retry) = pending.retry.get()
+                && !pending.stopped.get()
+                && let Some(task) = tasks.iter_mut().find(|task| {
+                    task["id"] == pending.task && task["start_session"] == pending.session
+                })
+            {
+                task["inference_retry"] = format!("Provider busy, retrying ({retry} of 5).").into();
+            }
+        }
+    });
 }
 
 pub(crate) fn freeze() {
@@ -79,6 +101,15 @@ pub(crate) fn stop_session(session: &str) {
     REQUESTS.with_borrow(|requests| {
         for pending in requests.iter().filter_map(std::rc::Weak::upgrade) {
             if pending.session == session {
+                pending.stop();
+            }
+        }
+    });
+}
+pub(crate) fn stop_task(task: &str) {
+    REQUESTS.with_borrow(|requests| {
+        for pending in requests.iter().filter_map(std::rc::Weak::upgrade) {
+            if pending.task == task {
                 pending.stop();
             }
         }
@@ -197,6 +228,40 @@ struct Registration {
     timer: i32,
     _callback: Closure<dyn FnMut()>,
 }
+impl Registration {
+    async fn retry_wait(&mut self, retry: u32) -> Result<(), String> {
+        self.worker.clear_timeout_with_handle(self.timer);
+        self.pending.retry.set(Some(retry));
+        let result = async {
+            let (send, receive) = tokio::sync::oneshot::channel();
+            let mut send = Some(send);
+            let callback = Closure::<dyn FnMut()>::new(move || {
+                if let Some(send) = send.take() {
+                    let _ = send.send(());
+                }
+            });
+            self.timer = self
+                .worker
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    callback.as_ref().unchecked_ref(),
+                    1_000 << (retry - 1),
+                )
+                .map_err(|_| INCOMPLETE)?;
+            self._callback = callback;
+            self.pending
+                .until(async {
+                    crate::poc::web::publish_progress(&self.pending.session).await;
+                    receive.await.map_err(|_| INCOMPLETE.to_string())
+                })
+                .await?
+        }
+        .await;
+        self.worker.clear_timeout_with_handle(self.timer);
+        self.pending.retry.set(None);
+        crate::poc::web::publish_progress(&self.pending.session).await;
+        result
+    }
+}
 impl Drop for Registration {
     fn drop(&mut self) {
         self.pending.stop();
@@ -261,7 +326,9 @@ async fn body(
     Ok(output)
 }
 
-/// One request, never retried here. Completed steps remain owned by the durable caller.
+/// Only a fast provider-unavailable answer permits up to five re-sends after waits of
+/// 1–16 seconds, each validated like a first send. Lost, aborted or timed-out replies
+/// are never retried. Completed steps remain owned by the durable caller.
 pub(crate) async fn next(
     task: &crate::store::poc::Task,
     session: &str,
@@ -277,206 +344,250 @@ pub(crate) async fn next(
     let local = crate::worker::local();
     #[cfg(feature = "tracer")]
     crate::testonly::session_point("poc_inference_writer").await;
-    let pending = Rc::new(Pending {
-        session: session.into(),
-        controller: web_sys::AbortController::new().map_err(|_| INCOMPLETE)?,
-        stopped: Cell::new(false),
-        ready: Notify::new(),
-    });
-    let worker: web_sys::WorkerGlobalScope = js_sys::global().unchecked_into();
-    let weak = Rc::downgrade(&pending);
-    let callback = Closure::<dyn FnMut()>::new(move || {
-        if let Some(pending) = weak.upgrade() {
-            pending.stop();
-        }
-    });
-    let timer = worker
-        .set_timeout_with_callback_and_timeout_and_arguments_0(
-            callback.as_ref().unchecked_ref(),
-            60_000,
-        )
-        .map_err(|_| INCOMPLETE)?;
-    let registration = Registration {
-        pending: pending.clone(),
-        worker: worker.clone(),
-        timer,
-        _callback: callback,
-    };
-    REQUESTS.with_borrow_mut(|requests| requests.push(Rc::downgrade(&pending)));
-
-    let (promise, filter, is_credit) = {
-        let mut local = pending.until(local.lock()).await?;
-        continuation.check()?;
+    for retries in 0..=5 {
+        continuation.check().map_err(|_| INCOMPLETE)?;
         if revision != REVISION.get() {
             return Err(INCOMPLETE.into());
         }
-        if let Some(why) = local.dispatch_refusal() {
-            return Err(why.into());
-        }
-        let store = local.store().ok_or("locked")?;
-        store.check_inference_request(task, session)?;
-        store.ensure_scan_references().await?;
-        store.check_inference_request(task, session)?;
-        continuation.check()?;
-        if revision != REVISION.get() || pending.stopped.get() {
-            return Err(INCOMPLETE.into());
-        }
-        with_request_key(session, store.credit_session(session), |key| {
-            let body = request_for_task(store, &config, task, &[key])?;
-            let filter = EchoFilter::new(&[key]);
-            let init = web_sys::RequestInit::new();
-            init.set_method("POST");
-            init.set_signal(Some(&pending.controller.signal()));
-            init.set_mode(web_sys::RequestMode::Cors);
-            init.set_credentials(web_sys::RequestCredentials::Omit);
-            init.set_cache(web_sys::RequestCache::NoStore);
-            init.set_redirect(web_sys::RequestRedirect::Error);
-            let headers = web_sys::Headers::new().map_err(|_| INCOMPLETE)?;
-            headers
-                .set("Content-Type", "application/json")
-                .map_err(|_| INCOMPLETE)?;
-            let authorization = Zeroizing::new(format!(
-                "Bearer {}",
-                std::str::from_utf8(key).map_err(|_| "inference key invalid")?
-            ));
-            headers
-                .set("Authorization", &authorization)
-                .map_err(|_| INCOMPLETE)?;
-            init.set_headers(&headers);
-            let body = js_sys::Uint8Array::from(body.as_slice());
-            init.set_body(&body);
-            let request = web_sys::Request::new_with_str_and_init(&config.endpoint, &init)
-                .map_err(|_| INCOMPLETE)?;
-            body.fill(0, 0, body.length());
-            let _ = headers.delete("Authorization");
-            continuation.check()?;
-            store.check_inference_request(task, session)?;
-            Ok::<_, String>((
-                worker.fetch_with_request(&request),
-                filter,
-                store.credit_session(session),
-            ))
-        })?
-    };
-
-    let ready = pending.ready.notified();
-    let received_status = Cell::new(None);
-    let exchange = async {
-        let response: web_sys::Response = JsFuture::from(promise)
-            .await
-            .map_err(|_| INCOMPLETE)?
-            .dyn_into()
+        let pending = Rc::new(Pending {
+            session: session.into(),
+            task: task.id.clone(),
+            retry: Cell::new(None),
+            controller: web_sys::AbortController::new().map_err(|_| INCOMPLETE)?,
+            stopped: Cell::new(false),
+            ready: Notify::new(),
+        });
+        let worker: web_sys::WorkerGlobalScope = js_sys::global().unchecked_into();
+        let weak = Rc::downgrade(&pending);
+        let callback = Closure::<dyn FnMut()>::new(move || {
+            if let Some(pending) = weak.upgrade() {
+                pending.stop();
+            }
+        });
+        let timer = worker
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                callback.as_ref().unchecked_ref(),
+                60_000,
+            )
             .map_err(|_| INCOMPLETE)?;
-        continuation.check().map_err(|_| INCOMPLETE)?;
-        if revision != REVISION.get() || pending.stopped.get() {
-            return Err(INCOMPLETE.into());
-        }
-        let status = response.status();
-        received_status.set(Some(status));
-        if status == 0 {
-            return Err(INCOMPLETE.into());
-        }
-        // Authentication refusal is established by the status, even if its body never ends.
-        let bytes = if matches!(status, 401 | 403) && !is_credit {
-            Zeroizing::new(Vec::new())
-        } else {
-            match body(&response, &pending).await {
-                Ok(body) => body,
-                Err(_) if !(200..300).contains(&status) => {
-                    return Err(if is_credit && matches!(status, 401 | 402 | 403 | 429) {
-                        crate::poc::credit::REFUSED.into()
-                    } else {
-                        http_failure(status)
-                    }
-                    .into());
-                }
-                Err(why) => return Err(why.into()),
-            }
+        let mut registration = Registration {
+            pending: pending.clone(),
+            worker: worker.clone(),
+            timer,
+            _callback: callback,
         };
-        if is_credit && !(200..300).contains(&status) {
-            return Err(if matches!(status, 401 | 402 | 403 | 429) {
-                crate::poc::credit::browser::refusal(status, &bytes, session).await
-            } else {
-                http_failure(status)
+        REQUESTS.with_borrow_mut(|requests| requests.push(Rc::downgrade(&pending)));
+
+        let admission_error = |why: String| if retries == 0 { why } else { INCOMPLETE.into() };
+        let (promise, filter, is_credit) = {
+            let mut local = pending.until(local.lock()).await?;
+            continuation.check().map_err(admission_error)?;
+            if revision != REVISION.get() {
+                return Err(INCOMPLETE.into());
             }
-            .into());
-        }
-        // Protect the entire successful reply before classification, including unused metadata.
-        // The full response read remains bounded; no response body is retained in task facts.
-        let bytes = if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
-            if (200..300).contains(&status) && filter.value(&value)? != value {
+            if let Some(why) = local.dispatch_refusal() {
+                return Err(admission_error(why.into()).into());
+            }
+            let store = local
+                .store()
+                .ok_or_else(|| admission_error("locked".into()))?;
+            store
+                .check_inference_request(task, session)
+                .map_err(admission_error)?;
+            store.ensure_scan_references().await?;
+            store
+                .check_inference_request(task, session)
+                .map_err(admission_error)?;
+            continuation.check().map_err(admission_error)?;
+            if revision != REVISION.get() || pending.stopped.get() {
+                return Err(INCOMPLETE.into());
+            }
+            with_request_key(session, store.credit_session(session), |key| {
+                let body = request_for_task(store, &config, task, &[key])?;
+                let filter = EchoFilter::new(&[key]);
+                let init = web_sys::RequestInit::new();
+                init.set_method("POST");
+                init.set_signal(Some(&pending.controller.signal()));
+                init.set_mode(web_sys::RequestMode::Cors);
+                init.set_credentials(web_sys::RequestCredentials::Omit);
+                init.set_cache(web_sys::RequestCache::NoStore);
+                init.set_redirect(web_sys::RequestRedirect::Error);
+                let headers = web_sys::Headers::new().map_err(|_| INCOMPLETE)?;
+                headers
+                    .set("Content-Type", "application/json")
+                    .map_err(|_| INCOMPLETE)?;
+                let authorization = Zeroizing::new(format!(
+                    "Bearer {}",
+                    std::str::from_utf8(key).map_err(|_| "inference key invalid")?
+                ));
+                headers
+                    .set("Authorization", &authorization)
+                    .map_err(|_| INCOMPLETE)?;
+                init.set_headers(&headers);
+                let body = js_sys::Uint8Array::from(body.as_slice());
+                init.set_body(&body);
+                let request = web_sys::Request::new_with_str_and_init(&config.endpoint, &init)
+                    .map_err(|_| INCOMPLETE)?;
+                body.fill(0, 0, body.length());
+                let _ = headers.delete("Authorization");
+                continuation.check().map_err(admission_error)?;
+                store
+                    .check_inference_request(task, session)
+                    .map_err(admission_error)?;
+                Ok::<_, String>((
+                    worker.fetch_with_request(&request),
+                    filter,
+                    store.credit_session(session),
+                ))
+            })?
+        };
+
+        let ready = pending.ready.notified();
+        let received_status = Cell::new(None);
+        let exchange = async {
+            let response: web_sys::Response = JsFuture::from(promise)
+                .await
+                .map_err(|_| INCOMPLETE)?
+                .dyn_into()
+                .map_err(|_| INCOMPLETE)?;
+            continuation.check().map_err(|_| INCOMPLETE)?;
+            if revision != REVISION.get() || pending.stopped.get() {
+                return Err(INCOMPLETE.into());
+            }
+            let status = response.status();
+            received_status.set(Some(status));
+            if status == 0 {
+                return Err(INCOMPLETE.into());
+            }
+            // Authentication refusal is established by the status, even if its body never ends.
+            let bytes = if matches!(status, 401 | 403) && !is_credit {
+                Zeroizing::new(Vec::new())
+            } else {
+                match body(&response, &pending).await {
+                    Ok(body) => body,
+                    Err(_) if !(200..300).contains(&status) => {
+                        return Err(if is_credit && matches!(status, 401 | 402 | 403 | 429) {
+                            crate::poc::credit::REFUSED.into()
+                        } else {
+                            http_failure(status)
+                        }
+                        .into());
+                    }
+                    Err(why) => return Err(why.into()),
+                }
+            };
+            if is_credit && !(200..300).contains(&status) {
+                return Err(if matches!(status, 401 | 402 | 403 | 429) {
+                    crate::poc::credit::browser::refusal(status, &bytes, session).await
+                } else {
+                    http_failure(status)
+                }
+                .into());
+            }
+            // Protect the entire successful reply before classification, including unused metadata.
+            // The full response read remains bounded; no response body is retained in task facts.
+            let bytes = if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
+                if (200..300).contains(&status) && filter.value(&value)? != value {
+                    return Err("inference proposal contains protected material".into());
+                }
+                if !(200..300).contains(&status)
+                    && let Some(object) = value.as_object_mut()
+                {
+                    object.retain(|name, _| name == "error");
+                }
+                Zeroizing::new(
+                    serde_json::to_vec(&value).map_err(|_| "inference response encoding")?,
+                )
+            } else if (200..300).contains(&status) {
+                return Err("inference response malformed JSON".into());
+            } else {
+                Zeroizing::new(Vec::new())
+            };
+            // Apply the request's non-reversible echo filter before any lock wait or late disposal.
+            let filtered = match filter.protect_bytes(&bytes) {
+                Ok(filtered) => filtered,
+                Err(_) if !(200..300).contains(&status) => Zeroizing::new(Vec::new()),
+                Err(why) => return Err(why.into()),
+            };
+            if (200..300).contains(&status) && *filtered != *bytes {
                 return Err("inference proposal contains protected material".into());
             }
-            if !(200..300).contains(&status)
-                && let Some(object) = value.as_object_mut()
-            {
-                object.retain(|name, _| name == "error");
+            let bytes = filtered;
+            continuation.check().map_err(|_| INCOMPLETE)?;
+            if revision != REVISION.get() || pending.stopped.get() {
+                return Err(INCOMPLETE.into());
             }
-            Zeroizing::new(serde_json::to_vec(&value).map_err(|_| "inference response encoding")?)
-        } else if (200..300).contains(&status) {
-            return Err("inference response malformed JSON".into());
-        } else {
-            Zeroizing::new(Vec::new())
-        };
-        // Apply the request's non-reversible echo filter before any lock wait or late disposal.
-        let filtered = match filter.protect_bytes(&bytes) {
-            Ok(filtered) => filtered,
-            Err(_) if !(200..300).contains(&status) => Zeroizing::new(Vec::new()),
-            Err(why) => return Err(why.into()),
-        };
-        if (200..300).contains(&status) && *filtered != *bytes {
-            return Err("inference proposal contains protected material".into());
-        }
-        let bytes = filtered;
-        continuation.check().map_err(|_| INCOMPLETE)?;
-        if revision != REVISION.get() || pending.stopped.get() {
-            return Err(INCOMPLETE.into());
-        }
-        let mut local = pending.until(local.lock()).await?;
-        continuation.check().map_err(|_| INCOMPLETE)?;
-        if revision != REVISION.get() || pending.stopped.get() {
-            return Err(INCOMPLETE.into());
-        }
-        if local.dispatch_refusal().is_some() {
-            return Err(INCOMPLETE.into());
-        }
-        let store = local.store().ok_or(INCOMPLETE)?;
-        store.check_inference_request(task, session)?;
-        with_request_key(session, is_credit, |key| {
-            Ok(complete_response(
-                store,
-                status,
-                &bytes,
-                machine,
-                steps,
-                &[key],
-                &filter,
-            ))
-        })?
-    };
-    let result = match futures_util::future::select(Box::pin(exchange), Box::pin(ready)).await {
-        futures_util::future::Either::Left((result, _)) => result,
-        futures_util::future::Either::Right(_) => Err(INCOMPLETE.into()),
-    };
-    drop(registration);
-    match result {
-        Err(why)
-            if why == INCOMPLETE
-                && received_status
-                    .get()
-                    .is_some_and(|status| status != 0 && !(200..300).contains(&status)) =>
-        {
-            Err(if is_credit
-                && received_status
-                    .get()
-                    .is_some_and(|s| matches!(s, 401 | 402 | 403 | 429))
-            {
-                crate::poc::credit::REFUSED.into()
-            } else {
-                http_failure(received_status.get().expect("known status"))
+            let mut local = pending.until(local.lock()).await?;
+            continuation.check().map_err(|_| INCOMPLETE)?;
+            if revision != REVISION.get() || pending.stopped.get() {
+                return Err(INCOMPLETE.into());
             }
-            .into())
+            if local.dispatch_refusal().is_some() {
+                return Err(INCOMPLETE.into());
+            }
+            let store = local.store().ok_or(INCOMPLETE)?;
+            store
+                .check_inference_request(task, session)
+                .map_err(|why| if retries == 0 { why } else { INCOMPLETE.into() })?;
+            with_request_key(session, is_credit, |key| {
+                if retries < 5
+                    && (200..300).contains(&status)
+                    && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+                    && value.is_object()
+                    && value.get("choices").and_then(Value::as_array).is_none()
+                    && value.get("error").is_some_and(Value::is_object)
+                    && value.pointer("/error/code").and_then(Value::as_f64) == Some(502.0)
+                    && value
+                        .pointer("/error/metadata/error_type")
+                        .and_then(Value::as_str)
+                        == Some("provider_unavailable")
+                {
+                    if !safe(store, &value, &[key]) {
+                        return Ok(Err("inference proposal contains protected material".into()));
+                    }
+                    return Ok(Ok(None));
+                }
+                Ok(
+                    complete_response(store, status, &bytes, machine, steps, &[key], &filter)
+                        .map(Some),
+                )
+            })?
+        };
+        let result = match futures_util::future::select(Box::pin(exchange), Box::pin(ready)).await {
+            futures_util::future::Either::Left((result, _)) => result,
+            futures_util::future::Either::Right(_) => Err(INCOMPLETE.into()),
+        };
+        if matches!(result, Ok(None)) {
+            registration.retry_wait(retries + 1).await?;
+            continuation.check().map_err(|_| INCOMPLETE)?;
+            if revision != REVISION.get() || pending.stopped.get() {
+                return Err(INCOMPLETE.into());
+            }
+            continue;
         }
-        result => result,
+        drop(registration);
+        return match result {
+            Err(why)
+                if why == INCOMPLETE
+                    && received_status
+                        .get()
+                        .is_some_and(|status| status != 0 && !(200..300).contains(&status)) =>
+            {
+                Err(if is_credit
+                    && received_status
+                        .get()
+                        .is_some_and(|s| matches!(s, 401 | 402 | 403 | 429))
+                {
+                    crate::poc::credit::REFUSED.into()
+                } else {
+                    http_failure(received_status.get().expect("known status"))
+                }
+                .into())
+            }
+            Ok(Some(reply)) => Ok(reply),
+            Ok(None) => unreachable!("busy reply handled before completion"),
+            Err(why) => Err(why),
+        };
     }
+    unreachable!("last busy reply completes normally")
 }

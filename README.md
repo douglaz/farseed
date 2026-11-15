@@ -182,8 +182,12 @@ dispatch refusal or unresolved command, is the call's untrusted tool output in t
 the model then decides again. Delivering a result arms no dispatch or retry. **Implementation
 reading: invalid calls.** An unknown tool, invalid arguments or an out-of-set machine ends
 the loop before dispatch or any tool record. A 2xx turn also ends the loop when its body
-does not parse, has zero tool calls or has more than one tool call. No turn is retried and
-the older paid fixture loop does not resume a turn. The served BYO task runner restores
+does not parse, has zero tool calls or has more than one tool call. The older paid fixture
+loop never retries or resumes a turn. The served PoC permits only up to five re-sends after
+waits of 1, 2, 4, 8 and 16 seconds when a complete successful HTTP reply has no choices array
+and reports error code 502 with error type `provider_unavailable`. Each re-send is validated
+like a first send and stays within the same counted Request. Lost, aborted or timed-out
+replies are never retried. The served BYO task runner restores
 eligible work in the original session after unlock and credential resupply, with a new counted
 Request for an interrupted inference turn and collection of pending jobs first.
 

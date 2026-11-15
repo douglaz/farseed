@@ -725,6 +725,7 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                     let id = request.id.as_deref().ok_or("task ID required")?;
                     let task = store.poc_task(id)?;
                     store.poc_change(id, task.revision, Change::Abandon).await?;
+                    crate::poc::inference::stop_task(id);
                 }
                 "raise" => {
                     let id = request.id.as_deref().ok_or("task ID required")?;

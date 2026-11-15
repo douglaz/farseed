@@ -170,7 +170,7 @@ const renderSteps = store => {
       : store.readiness?.inactive ? `Readiness reads are not running: ${store.readiness.inactive}.`
       : payReadiness(store.procurement ?? {}) ? `${readinessWait(store)} ${store.readiness?.checked_at ? `Last check: ${new Date(store.readiness.checked_at).toISOString()}.` : 'No readiness check has completed yet.'}`
       : store.procurement?.phase ? `Saved purchase: ${store.procurement.phase}.` : store.poc_targets?.length ? 'Machine saved. Review it before Start session.' : 'Choose a new or existing machine.',
-    task: store.tasks?.map(task => `${task.machine}: ${task.status}${task.pause_reason ? ' — ' + task.pause_reason : ''}`).join(' ') || (store.lifecycle_state === 'reconciling' ? 'Waiting to revalidate the saved session.' : sessions.length ? 'Session open. Set or continue its goal.' : 'No session started.'),
+    task: store.tasks?.map(task => `${task.machine}: ${task.status}${task.inference_retry ? ' — ' + task.inference_retry : ''}${task.pause_reason ? ' — ' + task.pause_reason : ''}`).join(' ') || (store.lifecycle_state === 'reconciling' ? 'Waiting to revalidate the saved session.' : sessions.length ? 'Session open. Set or continue its goal.' : 'No session started.'),
   };
   if (!active) for (const name of ['credit', 'machine', 'task'].filter(name => name !== 'credit' || !unlocked)) messages[name] = unlocked ? 'Record the seed backup to continue.' : name === 'machine' && store.state === 'locked' ? 'Readiness reads are not running: the store is locked.' : 'Open the local store to view this step.';
   for (const name of stepNames) {
@@ -657,7 +657,7 @@ const renderTasks = (store) => {
   for (const task of store.tasks ?? []) {
     const card = document.createElement('section');
     card.dataset.task = task.id;
-    paragraph(card, `Task ${task.id}: ${task.status}; machine ${task.machine}.`);
+    paragraph(card, `Task ${task.id}: ${task.status}; machine ${task.machine}.${task.inference_retry ? ' ' + task.inference_retry : ''}`);
     paragraph(card, task.goal);
     paragraph(card, `Requests ${task.requests}/${task.limits.requests}; steps ${task.steps}/${task.limits.steps}. Harness reads and optional reports count as steps.`);
     for (const [id, tool, outcome] of task.completed.filter(([id]) => !id.startsWith('$report:'))) { paragraph(card, `Completed call ${id}.`); rawDetails(card, {tool: tool.name === 'done' ? {name: tool.name, arguments: {machine: tool.arguments.machine}} : tool, outcome}, ['task', task.id, 'completed', id]); }

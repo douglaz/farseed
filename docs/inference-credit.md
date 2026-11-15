@@ -141,6 +141,17 @@ This lite path deliberately departs from **ARC-31a, ADR-0028, CNF-69, CNF-70 and
    its credit, as the page explicitly says.
 9. Every PoC inference request asks for zero-data-retention routing (`provider: {"zdr": true}`).
    The PoC does not verify which endpoint served a call; zero-data retention is requested only.
+10. A complete 2xx reply whose JSON object has no `choices` array and has an `error` object
+    with numeric code 502 and `metadata.error_type` equal to `provider_unavailable` permits
+    up to five re-sends after waits of 1, 2, 4, 8 and 16 seconds. Each re-send repeats the
+    first-send validation and uses the same journaled Request; these unserved re-sends carry
+    no cost and are not counted as requests. The page shows a transient provider-busy message
+    during each wait. A sixth busy answer pauses with the existing provider-unavailable reason.
+    Lost, aborted or timed-out replies and all other failures are never retried. This is a
+    bounded PoC exception to the previous no-retry behavior, not a departure from ARC-31a's
+    lost/aborted-reply rule or STA-24's unresolved-intent rule: a complete busy refusal leaves
+    no uncertain accepted work. It adds no cap, clock or accounting guarantees beyond the
+    existing PoC path and its departures above.
 
 The ADR-0042 provider-account departure remains unchanged. Fixture results establish no live
 service or phone readiness, and this branch claims no specification conformance.

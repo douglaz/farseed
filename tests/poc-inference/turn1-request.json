@@ -1,6 +1,6 @@
 {
   "model": "model-a",
-  "max_completion_tokens": 1200,
+  "max_completion_tokens": 4000,
   "tool_choice": "auto",
   "parallel_tool_calls": false,
   "provider": {"zdr": true},

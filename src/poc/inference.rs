@@ -1,4 +1,7 @@
-//! One configured chat-completions endpoint. No provisioning or request retries.
+//! One configured chat-completions endpoint. No provisioning retries.
+//! Only a fast provider-unavailable answer permits up to five re-sends after waits of
+//! 1–16 seconds, each validated like a first send. Lost, aborted or timed-out replies
+//! are never retried.
 //!
 //! Bounds: 8 KiB per outcome excerpt, 128 KiB serialized request, 256 KiB response,
 //! 512 bytes per provider error excerpt and 60 seconds including response reading.
@@ -1124,7 +1127,7 @@ fn request_context<S: Storage>(
         };
         let value = protected(
             store,
-            &json!({"model":config.model,"max_completion_tokens":1200,"tool_choice":"auto","parallel_tool_calls":false,"provider":{"zdr":true},"messages":messages,"tools":tools}),
+            &json!({"model":config.model,"max_completion_tokens":4000,"tool_choice":"auto","parallel_tool_calls":false,"provider":{"zdr":true},"messages":messages,"tools":tools}),
             credentials,
         )?;
         let body =
@@ -1223,7 +1226,8 @@ pub(crate) fn normalize<S: Storage>(
         })?;
         let choice = &value["choices"][0];
         let message = &choice["message"];
-        let cut_off = choice["finish_reason"] == "length";
+        let cut_off = choice["finish_reason"] == "length"
+            || choice["native_finish_reason"] == "max_output_tokens";
         let result: Result<(String, Tool), String> = (|| {
             if cut_off {
                 return Err("reply was cut off".into());
@@ -1357,7 +1361,7 @@ pub(crate) use browser::next;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use browser::{
     CommandResponse, approval, configuration, configure, end, freeze, key_is_set, response_pending,
-    restore, restore_credit, stop_session,
+    restore, restore_credit, retry_progress, stop_session, stop_task,
 };
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

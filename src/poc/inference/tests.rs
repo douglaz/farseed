@@ -101,7 +101,7 @@ fn poc_recorded_normalization_and_transcript_order() {
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(built["max_completion_tokens"], 1200);
+    assert_eq!(built["max_completion_tokens"], 4000);
     assert_eq!(built["provider"], json!({"zdr":true}));
     assert!(built.get("max_tokens").is_none());
     assert!(built.get("reasoning_effort").is_none());

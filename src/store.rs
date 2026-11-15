@@ -2602,6 +2602,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         }
         #[cfg(target_arch = "wasm32")]
         {
+            crate::poc::inference::retry_progress(&mut report);
             report["lifecycle_generation"] =
                 crate::lifecycle::owner().generation().to_string().into();
             if matches!(self.state, State::Unlocked(_)) {
