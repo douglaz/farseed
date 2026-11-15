@@ -1113,6 +1113,7 @@ fn request_context<S: Storage>(
             if !undeclared.is_empty() {
                 handover.push_str(&format!("Seen before setup and not declared: {}. Remove each before done, or it is a finding.\n", undeclared.join(", ")));
             }
+            handover.push_str("These harness reads already run after done, so checks must not repeat them; a check equal to a harness read is dropped and not run.\n");
             handover.push_str("Before calling done, run these same commands yourself with exec and fix every difference. Differences found after done pause the task as findings.");
             messages.push(json!({"role":"user", "content":handover}));
             definitions.as_array().expect("tool definitions").iter()
@@ -1120,7 +1121,7 @@ fn request_context<S: Storage>(
                 .map(|d| {
                     let mut d = d.clone();
                     if d["name"] == "done" {
-                        d["parameters"]["properties"]["checks"] = json!({"type":"array","maxItems":4,"description":"Optional: at most four runnable POSIX sh commands, not descriptions or prose. Each runs as root on the machine after done and before the harness reads. Their exit statuses are shown to the user as checks the AI wrote and never decide delivery.","items":{"type":"string","minLength":1,"maxLength":8192,"description":"A runnable POSIX sh command, not a description or prose, run as root on the machine after done and before the harness reads. Its exit status is shown to the user as a check the AI wrote and never decides delivery."}});
+                        d["parameters"]["properties"]["checks"] = json!({"type":"array","maxItems":4,"description":"Optional: at most four runnable POSIX sh commands, not descriptions or prose. Each runs as root on the machine after done and before the harness reads. Their exit statuses are shown to the user as checks the AI wrote and never decide delivery. The harness reads listed in the handover already run; checks is only for other checks. A check equal to a harness read is dropped and not run.","items":{"type":"string","minLength":1,"maxLength":8192,"description":"A runnable POSIX sh command, not a description or prose, run as root on the machine after done and before the harness reads. Its exit status is shown to the user as a check the AI wrote and never decides delivery. The harness reads listed in the handover already run; checks is only for other checks. A check equal to a harness read is dropped and not run."}});
                     }
                     json!({"type":"function","function":d})
                 }).collect()

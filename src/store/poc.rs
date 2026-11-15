@@ -1206,6 +1206,12 @@ impl<S: Storage> Store<S> {
                                                 .collect();
                                             task.reports = checks
                                                 .iter()
+                                                .filter(|command| {
+                                                    !task
+                                                        .checks
+                                                        .iter()
+                                                        .any(|check| command.trim() == check.trim())
+                                                })
                                                 .map(|command| OptionalReport {
                                                     command: command.clone(),
                                                     status: "queued".into(),

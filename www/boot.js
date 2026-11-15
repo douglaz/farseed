@@ -660,8 +660,15 @@ const renderTasks = (store) => {
     paragraph(card, `Task ${task.id}: ${task.status}; machine ${task.machine}.${task.inference_retry ? ' ' + task.inference_retry : ''}`);
     paragraph(card, task.goal);
     paragraph(card, `Requests ${task.requests}/${task.limits.requests}; steps ${task.steps}/${task.limits.steps}. Harness reads and optional reports count as steps.`);
-    for (const [id, tool, outcome] of task.completed.filter(([id]) => !id.startsWith('$report:'))) { paragraph(card, `Completed call ${id}.`); rawDetails(card, {tool: tool.name === 'done' ? {name: tool.name, arguments: {machine: tool.arguments.machine}} : tool, outcome}, ['task', task.id, 'completed', id]); }
-    if (task.proposal && task.proposal.report == null) { paragraph(card, `Next call ${task.proposal.call_id}.`); rawDetails(card, task.proposal.tool, ['task', task.id, 'proposal', task.proposal.call_id]); }
+    for (const [id, tool, outcome] of task.completed.filter(([id]) => !id.startsWith('$report:'))) {
+      if (id.startsWith('$verify:')) continue;
+      paragraph(card, id.startsWith('$before:') ? 'Read the listening ports before setup.' : tool.name === 'exec' ? 'The AI ran a command on the machine.' : tool.name === 'propose_declaration' ? 'The AI proposed requirements.' : tool.name === 'done' ? 'The AI handed the work over for checks.' : 'Completed a step.');
+      rawDetails(card, {tool: tool.name === 'done' ? {name: tool.name, arguments: {machine: tool.arguments.machine}} : tool, outcome}, ['task', task.id, 'completed', id]);
+    }
+    if (task.proposal && task.proposal.report == null) {
+      paragraph(card, task.proposal.call_id.startsWith('$before:') ? 'Next: read the listening ports before setup.' : task.proposal.call_id.startsWith('$verify:') ? 'Next: a harness read.' : task.proposal.tool.name === 'exec' ? 'Next: a command from the AI.' : task.proposal.tool.name === 'propose_declaration' ? 'Next: a requirements proposal from the AI.' : task.proposal.tool.name === 'done' ? 'Next: the handover from the AI.' : 'Next: a step.');
+      rawDetails(card, task.proposal.tool, ['task', task.id, 'proposal', task.proposal.call_id]);
+    }
     if (task.pending && task.proposal?.report == null) paragraph(card, `Pending job ${task.pending.job}; journal call ${task.pending.call}. Resume inspects this job without launching it again.`);
     if (task.pause_reason) paragraph(card, task.pause_reason);
     for (const check of task.verification) paragraph(card, `Harness read: ${check.command}; job ${check.job}; exit ${check.exit_status ?? 'unknown'}; ${check.excerpt}`);
