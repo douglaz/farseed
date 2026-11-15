@@ -1124,7 +1124,7 @@ fn request_context<S: Storage>(
         };
         let value = protected(
             store,
-            &json!({"model":config.model,"max_tokens":1200,"tool_choice":"auto","parallel_tool_calls":false,"messages":messages,"tools":tools}),
+            &json!({"model":config.model,"max_completion_tokens":1200,"tool_choice":"auto","parallel_tool_calls":false,"provider":{"zdr":true},"messages":messages,"tools":tools}),
             credentials,
         )?;
         let body =
@@ -1186,6 +1186,19 @@ pub(crate) fn normalize<S: Storage>(
                 ));
             }
             let value = decoded.map_err(|_| "inference response malformed JSON")?;
+            if value.get("choices").and_then(Value::as_array).is_none()
+                && value.get("error").is_some_and(Value::is_object)
+            {
+                let detail = protected(store, &value, credentials).ok().and_then(|v| {
+                    v.pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .map(|s| excerpt(s, ERROR_BYTES))
+                });
+                return Err(detail.filter(|s| !s.is_empty()).map_or_else(
+                    || "inference provider unavailable".into(),
+                    |s| format!("inference provider unavailable: {s}"),
+                ));
+            }
             if !safe(store, &value, credentials) {
                 return Err("inference proposal contains protected material".into());
             }

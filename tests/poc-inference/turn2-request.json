@@ -1,7 +1,9 @@
 {
   "model": "model-a",
-  "max_tokens": 1200,
+  "max_completion_tokens": 1200,
   "tool_choice": "auto",
+  "parallel_tool_calls": false,
+  "provider": {"zdr": true},
   "messages": [
     {
       "role": "system",

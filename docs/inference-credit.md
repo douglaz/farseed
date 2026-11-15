@@ -139,8 +139,8 @@ This lite path deliberately departs from **ARC-31a, ADR-0028, CNF-69, CNF-70 and
    NWC; use of a session key for that was not tested and is not tested here.
 8. The account credential is not exported in the recovery sheet (STA-16). Losing the store loses
    its credit, as the page explicitly says.
-9. The retention tier is not requested, as before, because the configured inference has no
-   zero-retention endpoint.
+9. Every PoC inference request asks for zero-data-retention routing (`provider: {"zdr": true}`).
+   The PoC does not verify which endpoint served a call; zero-data retention is requested only.
 
 The ADR-0042 provider-account departure remains unchanged. Fixture results establish no live
 service or phone readiness, and this branch claims no specification conformance.
