@@ -764,9 +764,7 @@ impl<S: Storage> Store<S> {
                 .pending
                 .as_ref()
                 .and_then(|pending| self.poc_committed(pending));
-            if let Some(report) =
-                report.filter(|report| report.state == crate::jobs::State::Finished)
-            {
+            if let Some(report) = report.filter(|report| report.settles_call()) {
                 if !matches!(report.comparison, crate::jobs::Comparison::AdvisoryMatch) {
                     return Err("inference configuration refused: recorded task result differs from its intent and cannot checkpoint; inspect the finding, then Stop task before configuring; remote effects and command holds remain".into());
                 }
@@ -1396,15 +1394,23 @@ impl<S: Storage> Store<S> {
                         let report = self
                             .poc_committed(pending)
                             .ok_or(crate::poc::wait::NO_EVIDENCE)?;
-                        if report.state != crate::jobs::State::Finished
+                        if !report.settles_call()
                             || !matches!(report.comparison, crate::jobs::Comparison::AdvisoryMatch)
                         {
                             return Err(crate::poc::wait::UNTRUSTWORTHY.into());
                         }
                         let before_setup = task.preparing_read();
                         let proposal = task.proposal.take().ok_or(crate::poc::wait::NO_PROPOSAL)?;
-                        let exit = report.exit_status.ok_or(crate::poc::wait::NO_EXIT)?;
-                        let outcome = json!({"call":pending.call,"job":pending.job,"exit_status":exit,"stdout":report.stdout,"stderr":report.stderr});
+                        let exit = report.exit_status;
+                        let background = report.state == crate::jobs::State::Background;
+                        if !background && exit.is_none() {
+                            return Err(crate::poc::wait::NO_EXIT.into());
+                        }
+                        let outcome = if background {
+                            report.background_outcome()
+                        } else {
+                            json!({"call":pending.call,"job":pending.job,"exit_status":exit,"stdout":report.stdout,"stderr":report.stderr})
+                        };
                         // The checkpoint derives from already committed, protected evidence. Do not
                         // make its bytes depend on credentials that disappear at worker restart.
                         if self.protect_output(&outcome)? != outcome {
@@ -1413,10 +1419,10 @@ impl<S: Storage> Store<S> {
                         if before_setup {
                             let attempt = task.before_setup.as_mut().expect("attempt");
                             attempt.settled = true;
-                            attempt.observation = Some(
+                            attempt.observation = exit.map(|exit| {
                                 crate::poc::completion::Read::Listeners
-                                    .observe(exit, &report.stdout),
-                            );
+                                    .observe(exit, &report.stdout)
+                            });
                         }
                         if let Some(index) = proposal.check {
                             let check = task
@@ -1426,9 +1432,9 @@ impl<S: Storage> Store<S> {
                             if check.job != pending.job || check.exit_status.is_some() {
                                 return Err(crate::poc::wait::VERIFICATION_MISMATCH.into());
                             }
-                            check.exit_status = Some(exit);
-                            check.observation =
-                                Some(task.read_plan[index].observe(exit, &report.stdout));
+                            check.exit_status = exit;
+                            check.observation = exit
+                                .map(|exit| task.read_plan[index].observe(exit, &report.stdout));
                             // Protect complete output before taking the excerpt, then protect it again.
                             check.excerpt = outcome["stdout"]
                                 .as_str()
@@ -1442,8 +1448,13 @@ impl<S: Storage> Store<S> {
                         }
                         if let Some(index) = proposal.report {
                             let optional = &mut task.reports[index];
-                            optional.status = "recorded".into();
-                            optional.exit_status = Some(exit);
+                            optional.status = if background {
+                                "still running in the background"
+                            } else {
+                                "recorded"
+                            }
+                            .into();
+                            optional.exit_status = exit;
                             optional.excerpt = report.stdout.chars().take(1024).collect();
                         }
                         task.completed.push((

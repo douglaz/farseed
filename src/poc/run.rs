@@ -87,7 +87,7 @@ pub enum Observation {
 /// Classify durable terminal evidence before the worker publishes its protected result.
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn committed_observation(report: &crate::jobs::Report) -> Option<Observation> {
-    if report.state != crate::jobs::State::Finished {
+    if !report.settles_call() {
         return None;
     }
     Some(
@@ -435,7 +435,9 @@ fn collection_cause(report: &Value) -> String {
             crate::jobs::State::Ended => crate::poc::wait::ENDED,
             crate::jobs::State::Incomplete => crate::poc::wait::INCOMPLETE,
             crate::jobs::State::Running => crate::poc::wait::STILL_RUNNING,
-            crate::jobs::State::Finished => crate::poc::wait::FINISHED,
+            crate::jobs::State::Finished | crate::jobs::State::Background => {
+                crate::poc::wait::FINISHED
+            }
             crate::jobs::State::OtherMachine => unreachable!(),
         }
         .into();

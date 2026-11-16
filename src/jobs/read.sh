@@ -88,9 +88,12 @@ process_id "$d/pid"
 pid=$ident_pid; command_start=$ident_start
 process_id "$d/runner"
 runner=$ident_pid; runner_start=$ident_start
+process_id "$d/group"
+supervisor=$ident_pid; supervisor_start=$ident_start
 passes=0
 while :; do
     living=false
+    kind=present
     status=null
     # An exit record is final, even if a recorded PID now belongs to another process.
     if [ -e "$d/exit" ] || [ -L "$d/exit" ]; then
@@ -98,8 +101,15 @@ while :; do
     else
         if [ "$boot" = "$recorded_boot" ]; then
             if alive "$pid" "$command_start"; then living=true; fi
-            if [ "$wait_job" = true ] && { [ "$living" = true ] || alive "$runner" "$runner_start"; }; then
-                # The runner may still be publishing a normal exit after the command ended.
+            if [ -e "$d/background" ] || [ -L "$d/background" ]; then
+                line "$d/background"
+                [ "$value" = still_running ] || fail "$d/background"
+                if [ "$living" = true ] && alive "$supervisor" "$supervisor_start"; then
+                    kind=background
+                fi
+            fi
+            if [ "$kind" = present ] && [ "$wait_job" = true ] && alive "$supervisor" "$supervisor_start" && alive "$runner" "$runner_start"; then
+                # The supervisor may still be publishing a normal exit after the command ended.
                 pause
                 continue
             fi
@@ -111,6 +121,11 @@ while :; do
     command=$(bytes "$d/command") || exit 1
     stdout=$(bytes "$d/stdout") || exit 1
     stderr=$(bytes "$d/stderr") || exit 1
+    if [ "$kind" = background ] && [ "$status" = null ]; then
+        printf '{"kind":"background","machine":"%s","command":"%s","boot":"%s","current_boot":"%s","pid":%s,"alive":true,"stdout":"%s","stderr":"%s"}\n' \
+            "$machine" "$command" "$recorded_boot" "$boot" "$pid" "$stdout" "$stderr"
+        break
+    fi
     printf '{"kind":"present","machine":"%s","command":"%s","boot":"%s","current_boot":"%s","pid":%s,"alive":%s,"exit_status":%s,"stdout":"%s","stderr":"%s"}\n' \
         "$machine" "$command" "$recorded_boot" "$boot" \
         "$pid" "$living" "$status" "$stdout" "$stderr"

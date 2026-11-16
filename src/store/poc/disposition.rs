@@ -83,6 +83,9 @@ impl<S: Storage> Store<S> {
             JobRecord::Incomplete { machine, command } => (machine.as_ref(), command.as_ref()),
             JobRecord::Present {
                 machine, command, ..
+            }
+            | JobRecord::Background {
+                machine, command, ..
             } => (Some(machine), Some(command)),
         };
         if machine.is_some_and(|m| *m != hex::encode(&task.machine))

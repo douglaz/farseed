@@ -66,8 +66,21 @@ pub(crate) fn held_report(
 /// Supported single-call releases, including a held request waiting for its own dispatch.
 /// Several reports after dispositions require a separate aggregate capacity check.
 pub(crate) fn release_forms(done: &Done) -> Vec<Value> {
-    let command = done.report();
-    let record = serde_json::to_value(&done.evidence).expect("report serialization");
+    result_release_forms(done.report(), &done.evidence, &done.recorded.machine)
+}
+
+pub(crate) fn background_report(report: &jobs::Report) -> Value {
+    let mut outcome = report.background_outcome();
+    outcome["job_record"] = serde_json::to_value(report).expect("report serialization");
+    outcome
+}
+
+pub(crate) fn background_release_forms(report: &jobs::Report, machine: &str) -> Vec<Value> {
+    result_release_forms(background_report(report), report, machine)
+}
+
+fn result_release_forms(command: Value, report: &jobs::Report, machine: &str) -> Vec<Value> {
+    let record = serde_json::to_value(report).expect("report serialization");
     let mut historical_record = record.clone();
     historical_record["historical"] = true.into();
     historical_record["actionable"] = false.into();
@@ -77,10 +90,10 @@ pub(crate) fn release_forms(done: &Done) -> Vec<Value> {
         response(command.clone()),
         response(collected(vec![record.clone()])),
         response(collected(vec![historical_record])),
-        response(held_report(&done.recorded.machine, vec![record], None)),
+        response(held_report(machine, vec![record], None)),
         response(held_report(
-            &done.recorded.machine,
-            vec![dispatch_result(done.seq, command)],
+            machine,
+            vec![dispatch_result(report.evidence.call, command)],
             None,
         )),
     ]

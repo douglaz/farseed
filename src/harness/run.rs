@@ -130,9 +130,23 @@ impl Refusal {
     }
 }
 
+pub enum CommandOutcome {
+    Finished(Box<Done>),
+    Background(Box<jobs::Report>),
+}
+
+impl CommandOutcome {
+    pub fn report(&self) -> Value {
+        match self {
+            Self::Finished(done) => done.report(),
+            Self::Background(report) => super::background_report(report),
+        }
+    }
+}
+
 /// An attempt's outcome as the worker reports it to the page: output and the reconciled record,
 /// or the refusal. Never key material.
-pub fn report(outcome: &Result<Done, Refusal>) -> Value {
+pub fn report(outcome: &Result<CommandOutcome, Refusal>) -> Value {
     match outcome {
         Ok(done) => done.report(),
         Err(refusal) => refusal.to_json(),
@@ -240,7 +254,7 @@ pub async fn run_command(
     command: &[u8],
     origin: Option<&std::rc::Rc<Session>>,
     #[cfg(feature = "tracer")] tamper_auth: bool,
-) -> Result<Done, Refusal> {
+) -> Result<CommandOutcome, Refusal> {
     let (target, elevation, _) = access(target).await.map_err(Refusal::Failed)?;
     let target = &target;
     let session = resolve(journal, &target.machine, origin).await?;
@@ -446,7 +460,7 @@ pub async fn run_command(
                 });
             }
         };
-        if evidence.state != jobs::State::Finished {
+        if !evidence.settles_call() {
             return Err(Refusal::Unresolved {
                 call: seq,
                 why: format!("job record: {:?}", evidence.state),
@@ -462,7 +476,10 @@ pub async fn run_command(
                 evidence: Box::new(evidence),
             });
         }
-        Ok(Done {
+        if evidence.state == jobs::State::Background {
+            return Ok(CommandOutcome::Background(Box::new(evidence)));
+        }
+        Ok(CommandOutcome::Finished(Box::new(Done {
             seq,
             sent,
             recorded,
@@ -472,7 +489,7 @@ pub async fn run_command(
             terminal: evidence.number.expect("committed evidence"),
             host_key,
             evidence,
-        })
+        })))
     }
     .await;
     own.finish(report(&outcome));

@@ -562,7 +562,10 @@ async fn dispatch(live: &std::rc::Rc<crate::binding::Session>, tool: &Tool) -> V
             )
             .await;
             let result = match result {
-                Ok(done) => {
+                Ok(crate::harness::CommandOutcome::Background(report)) => {
+                    super::background_report(&report)
+                }
+                Ok(crate::harness::CommandOutcome::Finished(done)) => {
                     json!({"stdout":String::from_utf8_lossy(&done.stdout),"stderr":String::from_utf8_lossy(&done.stderr),"exit_status":done.exit_status})
                 }
                 Err(why) => why.to_json(),

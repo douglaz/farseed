@@ -84,6 +84,9 @@ pub struct Disposition {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum CallState {
     Unresolved,
+    Background {
+        observation: u64,
+    },
     Finished {
         terminal: u64,
         exit_status: u32,
@@ -291,7 +294,10 @@ impl Dispatch {
         let state = self
             .call_state_mut(terminal.call)
             .expect("recorded command");
-        if matches!(state, CallState::Cancelled | CallState::Finished { .. }) {
+        if matches!(
+            state,
+            CallState::Cancelled | CallState::Finished { .. } | CallState::Background { .. }
+        ) {
             return Err("terminal names a cancelled or already finished call".into());
         }
         if matches!(state, CallState::Unresolved) {
@@ -337,7 +343,7 @@ impl Dispatch {
             .ok_or("job evidence names no call")?;
         if matches!(
             call.state,
-            CallState::Cancelled | CallState::Finished { .. }
+            CallState::Cancelled | CallState::Finished { .. } | CallState::Background { .. }
         ) || self
             .terminals
             .iter()
@@ -349,6 +355,7 @@ impl Dispatch {
             return Err("job evidence identity differs from the intent".into());
         }
         let report = evidence.report(number, &call.intent.machine, &call.intent.command);
+        let unresolved = matches!(call.state, CallState::Unresolved);
         if terminal != (report.state == State::Finished) || report.state == State::Running {
             return Err("job evidence kind differs from what the record establishes".into());
         }
@@ -360,6 +367,11 @@ impl Dispatch {
                     exit_status: report.exit_status.expect("finished record"),
                 },
             )?;
+        }
+        if report.state == State::Background && unresolved {
+            *self.call_state_mut(evidence.call).expect("recorded call") = CallState::Background {
+                observation: number,
+            };
         }
         self.jobs.push(report.clone());
         Ok(report)
@@ -401,7 +413,8 @@ impl Dispatch {
             if !eligible {
                 let settled_by = call.and_then(|state| match state {
                     CallState::Finished { terminal, .. } => Some(*terminal),
-                    CallState::Confirmed { observation } => Some(*observation),
+                    CallState::Confirmed { observation }
+                    | CallState::Background { observation } => Some(*observation),
                     CallState::ReceiptConfirmed {
                         receipt,
                         association,

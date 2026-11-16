@@ -408,10 +408,12 @@ const sessionWait = reason => {
 const commandResultWord = result => {
   const content = result?.content ?? result;
   if (content?.outcome === 'unknown') return 'result unknown';
+  if (content?.outcome === 'still_running' || content?.record?.kind === 'background' || content?.job_record?.record?.kind === 'background') return 'still running in the background';
   if (Number.isInteger(content?.exit_status)) return content.exit_status === 0 ? 'finished' : `failed with code ${content.exit_status}`;
   return content?.running === true ? 'still running' : 'result unknown';
 };
-const checkSummary = check => {
+const checkSummary = (check, outcome) => {
+  if (outcome?.content?.outcome === 'still_running') return `Check: ${commandSummary(check.command)} — still running in the background`;
   const service = check.command.match(/^systemctl is-(active|enabled) -- '([^']+)'\.service$/);
   if (service) {
     const [, kind, name] = service;
@@ -438,7 +440,7 @@ const checkSummary = check => {
   return `Check: machine setup — ${check.exit_status === 0 ? 'finished' : check.exit_status == null ? 'result unknown' : `failed with code ${check.exit_status}`}`;
 };
 const showCheckReport = (parent, report) => {
-  const result = report.status === 'not run' ? 'not run' : report.exit_status == null
+  const result = report.status === 'still running in the background' ? report.status : report.status === 'not run' ? 'not run' : report.exit_status == null
     ? (['queued', 'attempted', 'pending'].includes(report.status) ? 'waiting' : 'result unknown')
     : report.exit_status === 0 ? 'passed' : `failed (exit ${report.exit_status})`;
   paragraph(parent, `${commandSummary(report.command)} — ${result}`);
@@ -846,7 +848,7 @@ const renderTasks = (store) => {
       rawDetails(card, {reason: task.pause_reason}, ['task', task.id, 'pause']);
     }
     for (const check of task.verification) {
-      const line = paragraph(card, checkSummary(check));
+      const line = paragraph(card, checkSummary(check, task.completed.find(([, , outcome]) => outcome?.content?.job === check.job)?.[2]));
       line.dataset.harnessRead = check.command;
       rawDetails(card, check, ['task', task.id, 'check', check.command, check.job]);
     }

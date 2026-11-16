@@ -362,33 +362,38 @@ impl<S: Storage> Store<S> {
             Some(crate::dispatch::Approval::HarnessPin { fingerprint, .. }) => fingerprint.clone(),
             _ => String::new(),
         };
-        let done = crate::harness::Done {
-            seq: intent.call,
-            sent: crate::jobs::launch_with_elevation(
-                intent
-                    .job
-                    .as_deref()
-                    .ok_or("job release identity missing")?,
-                &intent.machine,
-                &command,
-                elevation,
-            )
-            .into_bytes(),
-            recorded: crate::harness::Entry {
-                machine: intent.machine.clone(),
-                command,
-                provenance: intent.provenance.clone(),
-            },
-            stdout: report.stdout.as_bytes().to_vec(),
-            stderr: report.stderr.as_bytes().to_vec(),
-            exit_status: report.exit_status.ok_or("job release exit missing")?,
-            terminal: report.number.ok_or("job release number missing")?,
-            host_key,
-            evidence: report.clone(),
+        let forms = if report.state == crate::jobs::State::Background {
+            crate::harness::background_release_forms(report, &intent.machine)
+        } else {
+            let done = crate::harness::Done {
+                seq: intent.call,
+                sent: crate::jobs::launch_with_elevation(
+                    intent
+                        .job
+                        .as_deref()
+                        .ok_or("job release identity missing")?,
+                    &intent.machine,
+                    &command,
+                    elevation,
+                )
+                .into_bytes(),
+                recorded: crate::harness::Entry {
+                    machine: intent.machine.clone(),
+                    command,
+                    provenance: intent.provenance.clone(),
+                },
+                stdout: report.stdout.as_bytes().to_vec(),
+                stderr: report.stderr.as_bytes().to_vec(),
+                exit_status: report.exit_status.ok_or("job release exit missing")?,
+                terminal: report.number.ok_or("job release number missing")?,
+                host_key,
+                evidence: report.clone(),
+            };
+            crate::harness::release_forms(&done)
         };
         // Each is an alternative synchronous release, not an aggregate array on the wire.
         // protect_output inherits an enclosing work scope; no remaining budget is reset here.
-        for value in crate::harness::release_forms(&done) {
+        for value in forms {
             self.protect_output(&value)?;
         }
         if self.poc.values().any(|task| {
@@ -466,6 +471,15 @@ impl<S: Storage> Store<S> {
                 stdout,
                 stderr,
                 ..
+            }
+            | crate::jobs::Record::Background {
+                machine,
+                command,
+                boot,
+                current_boot,
+                stdout,
+                stderr,
+                ..
             } = &evidence.record
             {
                 for field in [machine, command, boot, current_boot, stdout, stderr] {
@@ -492,7 +506,8 @@ impl<S: Storage> Store<S> {
         crate::poc::inference::work::scope(|| {
             // Reports duplicate the same output as raw hex and lossy text. Protect the full
             // bytes once, then derive both copies; scan every other field independently.
-            let output = if let crate::jobs::Record::Present { stdout, stderr, .. } =
+            let output = if let crate::jobs::Record::Present { stdout, stderr, .. }
+            | crate::jobs::Record::Background { stdout, stderr, .. } =
                 &mut report.evidence.record
             {
                 Some([std::mem::take(stdout), std::mem::take(stderr)])
@@ -507,7 +522,8 @@ impl<S: Storage> Store<S> {
             let mut report: crate::jobs::Report =
                 serde_json::from_value(value).map_err(|_| "job report protection")?;
             if let Some(output) = output
-                && let crate::jobs::Record::Present { stdout, stderr, .. } =
+                && let crate::jobs::Record::Present { stdout, stderr, .. }
+                | crate::jobs::Record::Background { stdout, stderr, .. } =
                     &mut report.evidence.record
             {
                 let mut cache = Vec::new();

@@ -2242,7 +2242,7 @@ impl<S: Storage> Journal for Store<S> {
         if self.protect_output(&value)? != value {
             return Err(crate::poc::wait::PROTECTED_UNAVAILABLE.into());
         }
-        if terminal {
+        if report.settles_call() {
             self.preflight_job_release(&report)?;
             #[cfg(all(feature = "tracer", target_arch = "wasm32"))]
             crate::testonly::session_point("poc_terminal_append").await;

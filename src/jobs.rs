@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 pub const DIRECTORY: &str = "/var/lib/tau-web/jobs";
 pub const BOOT_ID: &str = "/proc/sys/kernel/random/boot_id";
 
+pub const BACKGROUND_STATUS: &str = "still running after 5 minutes; it continues in the background";
+
 // sshd runs the launch as one $SHELL -c argument. Linux MAX_ARG_STRLEN is
 // 32 × PAGE_SIZE: 131072 bytes at 4 KiB pages, including the terminating NUL.
 // The composed text may therefore be at most 131071 bytes.
@@ -44,9 +46,12 @@ fn octal(bytes: &[u8]) -> String {
 /// the parent jobs directory is restricted to mode 0700.
 pub fn launch(id: &str, machine: &str, command: &[u8]) -> String {
     assert!(valid_id(id));
-    let runner = quote(include_str!("jobs/runner.sh"));
+    let runner = quote(
+        &include_str!("jobs/runner.sh")
+            .replace("@COMMAND_RUNNER@", &quote(include_str!("jobs/command.sh"))),
+    );
     format!(
-        "# tau-web job launch {id}\numask 077\nmkdir -p {DIRECTORY} || exit 1\nchmod 700 {DIRECTORY} || exit 1\nd={DIRECTORY}/{id}\nmkdir \"$d\" || {{ printf '%s\\n' \"refusing existing or unavailable job directory: $d\" >&2; exit 1; }}\nprintf '%b' '{}' > \"$d/command\" || exit 1\nprintf '%b' '{}' > \"$d/machine\" || exit 1\ncat {BOOT_ID} > \"$d/boot\" || exit 1\n: > \"$d/stdout\"\n: > \"$d/stderr\"\nsetsid sh -c {runner} sh \"$d\" </dev/null >/dev/null 2> \"$d/runner-stderr\" &\nlauncher=$!\nwhile [ ! -f \"$d/ready\" ]; do\n    kill -0 \"$launcher\" 2>/dev/null || {{ [ -f \"$d/ready\" ] && break; cat \"$d/runner-stderr\" >&2; exit 1; }}\n    # GNU coreutils (Arch) and busybox (Alpine) accept fractional sleep.\n    sleep 0.05\ndone\nwait_job=true\n{}",
+        "# tau-web job launch {id}\numask 077\nmkdir -p {DIRECTORY} || exit 1\nchmod 700 {DIRECTORY} || exit 1\nd={DIRECTORY}/{id}\nmkdir \"$d\" || {{ printf '%s\\n' \"refusing existing or unavailable job directory: $d\" >&2; exit 1; }}\nprintf '%b' '{}' > \"$d/command\" || exit 1\nprintf '%b' '{}' > \"$d/machine\" || exit 1\ncat {BOOT_ID} > \"$d/boot\" || exit 1\n: > \"$d/stdout\"\n: > \"$d/stderr\"\nsetsid sh -c {runner} sh \"$d\" </dev/null >/dev/null 2> \"$d/runner-stderr\" &\nlauncher=$!\nstartup_passes=0\nwhile [ ! -f \"$d/ready\" ]; do\n    kill -0 \"$launcher\" 2>/dev/null || {{ [ -f \"$d/ready\" ] && break; cat \"$d/runner-stderr\" >&2; exit 1; }}\n    startup_passes=$((startup_passes + 1))\n    [ \"$startup_passes\" -lt 3000 ] || exit 1\n    # GNU coreutils (Arch) and busybox (Alpine) accept fractional sleep.\n    sleep 0.05\ndone\nwait_job=true\n{}",
         octal(command),
         octal(machine.as_bytes()),
         include_str!("jobs/read.sh")
@@ -126,6 +131,17 @@ pub enum Record {
         machine: Option<String>,
         command: Option<String>,
     },
+    Background {
+        machine: String,
+        command: String,
+        boot: String,
+        current_boot: String,
+        /// The command shell leads its process group; this PID is also its group ID.
+        pid: u32,
+        alive: bool,
+        stdout: String,
+        stderr: String,
+    },
     Present {
         /// Machine and command are exact bytes, encoded as lowercase hex.
         machine: String,
@@ -144,6 +160,7 @@ pub enum Record {
 #[serde(rename_all = "snake_case")]
 pub enum State {
     Finished,
+    Background,
     Running,
     Ended,
     Missing,
@@ -167,7 +184,15 @@ impl Record {
             stderr,
             boot,
             current_boot,
-            exit_status,
+            ..
+        }
+        | Self::Background {
+            machine,
+            command,
+            stdout,
+            stderr,
+            boot,
+            current_boot,
             ..
         } = self
         {
@@ -176,9 +201,23 @@ impl Record {
                     return Err("job record bytes are not lowercase hex".into());
                 }
             }
-            if boot.is_empty() || current_boot.is_empty() || exit_status.is_some_and(|s| s > 128) {
+            if boot.is_empty()
+                || current_boot.is_empty()
+                || self.exit_status().is_some_and(|s| s > 128)
+            {
                 return Err("job record has invalid boot identity or exit code".into());
             }
+        }
+        if let Self::Background {
+            boot,
+            current_boot,
+            pid,
+            alive,
+            ..
+        } = self
+            && (boot != current_boot || *pid == 0 || !alive)
+        {
+            return Err("background observation has no live command identity".into());
         }
         Ok(())
     }
@@ -187,9 +226,12 @@ impl Record {
         match self {
             Self::Missing => State::Missing,
             Self::Incomplete { .. } => State::Incomplete,
-            Self::Present { machine, .. } if *machine != hex::encode(expected_machine) => {
+            Self::Present { machine, .. } | Self::Background { machine, .. }
+                if *machine != hex::encode(expected_machine) =>
+            {
                 State::OtherMachine
             }
+            Self::Background { .. } => State::Background,
             Self::Present {
                 exit_status: Some(_),
                 ..
@@ -203,6 +245,13 @@ impl Record {
                 ..
             } if boot == current_boot && *pid != 0 => State::Running,
             Self::Present { .. } => State::Ended,
+        }
+    }
+
+    pub fn exit_status(&self) -> Option<u32> {
+        match self {
+            Self::Present { exit_status, .. } => *exit_status,
+            _ => None,
         }
     }
 }
@@ -329,7 +378,12 @@ impl Evidence {
                 command: received,
                 stdout,
                 stderr,
-                exit_status,
+                ..
+            }
+            | Record::Background {
+                command: received,
+                stdout,
+                stderr,
                 ..
             } => (
                 if command == received {
@@ -344,7 +398,7 @@ impl Evidence {
                     .into_owned(),
                 String::from_utf8_lossy(&hex::decode(stderr).expect("validated output"))
                     .into_owned(),
-                *exit_status,
+                self.record.exit_status(),
             ),
         };
         Report {
@@ -356,6 +410,33 @@ impl Evidence {
             stderr,
             exit_status,
         }
+    }
+}
+
+impl Report {
+    pub fn settles_call(&self) -> bool {
+        matches!(self.state, State::Finished | State::Background)
+    }
+
+    pub fn background_outcome(&self) -> serde_json::Value {
+        let directory = format!("{DIRECTORY}/{}", self.evidence.job);
+        let pid = match self.evidence.record {
+            Record::Background { pid, .. } => pid,
+            _ => unreachable!("background outcome requires background evidence"),
+        };
+        serde_json::json!({
+            "call":self.evidence.call, "job":self.evidence.job,
+            "outcome":"still_running", "status":BACKGROUND_STATUS,
+            "background":{
+                "pid":pid, "process_group":pid, "directory":directory,
+                "stdout":format!("{directory}/stdout"),
+                "stderr":format!("{directory}/stderr"),
+                "exit":format!("{directory}/exit"),
+                "result":format!("{directory}/result"),
+                "result_format":"exit <status> or signal_or_high_exit <raw wait status>; above 128 is not an ordinary exit code",
+            },
+            "stdout":self.stdout, "stderr":self.stderr,
+        })
     }
 }
 

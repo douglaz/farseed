@@ -33,9 +33,11 @@ pub use wait::stop_waits;
 
 mod result;
 pub use result::Done;
-pub(crate) use result::release_forms;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use result::background_report;
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) use result::response;
+pub(crate) use result::{background_release_forms, release_forms};
 #[cfg(target_arch = "wasm32")]
 pub(crate) use result::{collected, dispatch_result, held_report};
 
