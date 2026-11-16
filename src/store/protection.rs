@@ -24,6 +24,7 @@ const NONE: u32 = u32::MAX;
 struct Record {
     digest: MemoDigest,
     owner: u32,
+    // Retained for the fixed pool layout; never used to authorize a hit.
     depth: u8,
     bucket_next: u32,
     newer: u32,
@@ -189,7 +190,7 @@ impl RecordPool {
     fn remember(&mut self, owner: u32, digest: MemoDigest, depth: u8) {
         let (index, probes) = self.find(owner, &digest);
         if index != NONE {
-            // Only remember, after a complete clean check, can increase the depth.
+            // Preserve bookkeeping only; depth never qualifies a clean-record hit.
             let record = self.record_mut(index);
             record.depth = record.depth.max(depth);
             self.touch(index);
@@ -269,17 +270,18 @@ impl CleanRecords {
         }
     }
 
-    pub(crate) fn contains(&self, digest: &MemoDigest, depth: usize) -> bool {
+    pub(crate) fn contains(&self, digest: &MemoDigest, _depth: usize) -> bool {
         let Some(owner) = self.owner else {
             return false;
         };
         let mut pool = self.budget.pool.borrow_mut();
         let pool = pool.as_mut().expect("record owner has a pool");
         let (index, _) = pool.find(owner, digest);
-        if index == NONE || depth > usize::from(pool.record(index).depth) {
+        if index == NONE {
             return false;
         }
-        // A hit refreshes usefulness, without changing its digest or checked depth.
+        // A record proves the complete check was unchanged and error-free under
+        // the identical key and record kind. Reuse is independent of visit depth.
         pool.touch(index);
         true
     }
@@ -319,7 +321,7 @@ impl CleanRecords {
             return;
         }
         // Removing before reinsertion releases the source slot and count. Transfers
-        // retain the exact digest/depth; duplicate depths both have clean proofs.
+        // retain the exact digest and bookkeeping; depth never qualifies reuse.
         if let Some(owner) = other.owner {
             loop {
                 let record = {

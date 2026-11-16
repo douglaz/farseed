@@ -688,8 +688,8 @@ impl EchoFilter {
         Ok(match value {
             Value::String(text) => {
                 work::charge(text.len().saturating_mul(4))?;
-                // A complete clean check at d proves subtree height <= 16 - d.
-                // It remains clean at every shallower depth, under the identical key.
+                // Reuse a complete unchanged, error-free check under the identical
+                // key at any depth; the visit-depth refusal above still runs first.
                 let digest = Sha256::digest(text.as_bytes());
                 if seen.text.contains(&digest, depth) {
                     return Ok(value.clone());
