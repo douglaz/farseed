@@ -120,6 +120,15 @@ pub fn launch_with_input(
     elevated(launch_input(id, machine, command, input), elevation)
 }
 
+/// A private, synchronous harness read job. Only path bytes are inserted as octal data.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn file_read(path: &str, elevation: Elevation) -> String {
+    elevated(
+        include_str!("jobs/file-read.sh").replace("@PATH@", &octal(path.as_bytes())),
+        elevation,
+    )
+}
+
 pub fn collect_with_elevation(id: &str, elevation: Elevation) -> String {
     elevated(collect(id), elevation)
 }

@@ -138,6 +138,7 @@ impl Task {
     /// and the command evidence view. Repeating them here can exhaust a whole report.
     pub(super) fn view(&self) -> Value {
         let mut value = serde_json::to_value(self).expect("task serializes");
+        value["file_offers"] = serde_json::to_value(self.file_offers()).expect("offers serialize");
         for step in value["completed"].as_array_mut().expect("completed array") {
             Self::truncate_step_view(step);
         }
@@ -1305,6 +1306,18 @@ impl<S: Storage> Store<S> {
                                                 report: None,
                                             });
                                             task.active();
+                                        }
+                                        Tool::OfferFile { path, label, .. } => {
+                                            let result = if crate::poc::files::allowed_path(path) {
+                                                json!({"status":"offered","label":label})
+                                            } else {
+                                                json!({"refused":"Only absolute file paths outside /var/lib/tau-web/ can be offered."})
+                                            };
+                                            task.completed.push((
+                                                call_id.clone(),
+                                                tool.clone(),
+                                                crate::goals::untrusted("tool_output", result),
+                                            ));
                                         }
                                         Tool::Done { checks, .. } => {
                                             let declaration = self.dispatch.approved_entries

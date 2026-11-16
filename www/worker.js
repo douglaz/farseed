@@ -1,7 +1,7 @@
 // The harness worker alone holds the seed and keys. Only the dedicated seed-backup display
 // carries words to the page; re-entry and passphrase buffers are zero-filled by the module.
 import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, accept_page_goal, TaskPublication, requirements_answer, delivery_request, retire_runtime, sweep_inference, lifecycle_transition, publication_generation, publish_report, verify_inference_clock, withdraw_reinstall } from './pkg/tau_web.js';
-import { identify_execution, wake_tasks, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept } from './pkg/tau_web.js';
+import { identify_execution, wake_tasks, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_download } from './pkg/tau_web.js';
 import { credit_request, retry_ended_credit } from './pkg/tau_web.js';
 import { deployment_configure, provider_configure, provider_key_is_set, provider_visibility, provider_action_delay, provider_request } from './pkg/tau_web.js';
 
@@ -247,6 +247,25 @@ onmessage = async ({ data: envelope }) => {
     Object.assign(wake, {generation:publication_generation(), identity:JSON.stringify(JSON.parse(report).procurement?.identity)});
     await reportStore(report);
     if (data.lifecycle === 'visible' || data.lifecycle === 'resume') await refreshPayments(wake);
+    return;
+  }
+  if (data.file_download) {
+    const request = data.file_download;
+    if (!exactMembers(request, ['id', 'offer', 'request']) ||
+        !Object.values(request).every(value => typeof value === 'string')) return;
+    const generation = publication_generation();
+    let download;
+    try {
+      download = await poc_download(request.id, request.offer);
+      if (retirementRequested || !pageVisible || generation !== publication_generation()) return;
+      postMessage({file_download: {...request, generation: generation.toString(), ...download}}, [download.bytes.buffer]);
+    } catch (error) {
+      if (!retirementRequested && generation === publication_generation())
+        postMessage({file_download: {...request, generation: generation.toString(), error: String(error)}});
+    } finally {
+      if (download?.bytes.byteLength) download.bytes.fill(0);
+      download = undefined;
+    }
     return;
   }
   const generation = publication_generation();

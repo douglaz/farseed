@@ -965,3 +965,69 @@ impl Default for TaskPublication {
         Self::new()
     }
 }
+
+/// The caller supplies an offer identity, never a path. This result is private binary data,
+/// outside the report publisher; the worker transfers it only to the download handler.
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub async fn poc_download(
+    id: String,
+    offer: String,
+) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue> {
+    let result = async {
+        let continuation = crate::lifecycle::owner().continuation()?;
+        let (file, target, pins) = {
+            let local = local();
+            let mut writer = local.lock().await;
+            continuation.check()?;
+            let store = writer
+                .store()
+                .ok_or("Unlock before downloading the file.")?;
+            let task = store.poc_task(&id)?;
+            let file = task
+                .file_offers()
+                .into_iter()
+                .find(|file| file.id == offer)
+                .ok_or("This file offer is no longer available.")?;
+            if !crate::poc::files::allowed_path(&file.path) {
+                return Err("This file path cannot be downloaded.".into());
+            }
+            let (target, pins) = crate::poc::targets::resolve(store, &file.machine)
+                .map_err(|_| "The machine connection is unavailable. Try again.")?;
+            (file, target, pins)
+        };
+        let mut journal = StoreJournal {
+            local: local(),
+            unavailable: false,
+        };
+        let bytes = crate::harness::download_file(&pins, &mut journal, &target, &file.path).await?;
+        {
+            let local = local();
+            let mut writer = local.lock().await;
+            continuation.check()?;
+            let store = writer
+                .store()
+                .ok_or("Unlock before downloading the file.")?;
+            if !store
+                .poc_task(&id)?
+                .file_offers()
+                .iter()
+                .any(|current| current.id == offer)
+            {
+                return Err("This file offer is no longer available.".into());
+            }
+        }
+        let result = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &result,
+            &"filename".into(),
+            &crate::poc::files::filename(&file.path).into(),
+        )
+        .map_err(|_| "The download could not be prepared. Try again.")?;
+        let data = js_sys::Uint8Array::from(bytes.as_slice());
+        js_sys::Reflect::set(&result, &"bytes".into(), &data)
+            .map_err(|_| "The download could not be prepared. Try again.")?;
+        Ok::<_, String>(result.into())
+    }
+    .await;
+    result.map_err(Into::into)
+}

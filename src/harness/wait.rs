@@ -127,7 +127,7 @@ impl Stop {
         }
     }
 
-    fn fire(&self) -> bool {
+    pub(super) fn fire(&self) -> bool {
         let changed = !self.stopped.replace(true);
         self.ready.notify_waiters();
         for socket in self.sockets.borrow().values() {

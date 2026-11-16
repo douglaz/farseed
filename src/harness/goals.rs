@@ -575,6 +575,7 @@ async fn dispatch(live: &std::rc::Rc<crate::binding::Session>, tool: &Tool) -> V
                 .await
                 .unwrap_or_else(|why| json!({"refused":why}))
         }
+        Tool::OfferFile { .. } => json!({"refused":"File offers require a recorded task."}),
         Tool::Job { job, .. } => {
             let live = match journal.connection_session(tool.machine(), Some(live)).await {
                 Ok(s) => s,

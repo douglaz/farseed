@@ -79,6 +79,13 @@ pub enum Tool {
         application: String,
         purpose: String,
     },
+    #[serde(rename = "offer_file")]
+    OfferFile {
+        machine: String,
+        path: String,
+        label: String,
+        why: String,
+    },
     #[serde(rename = "request_harness_job")]
     Job {
         machine: String,
@@ -125,6 +132,15 @@ impl Tool {
             return Err("tool schema".into());
         }
         let tool: Self = serde_json::from_value(value.clone()).map_err(|_| "tool schema")?;
+        if let Self::OfferFile {
+            path, label, why, ..
+        } = &tool
+            && (!crate::poc::files::valid_path(path)
+                || !crate::poc::files::plain_line(label, 64)
+                || !crate::poc::files::plain_line(why, 160))
+        {
+            return Err("offer_file requires an absolute path of 1 to 4096 bytes and plain label and why lines of 1 to 64 and 1 to 160 printable bytes".into());
+        }
         if let Self::Done { checks, .. } = &tool
             && (checks.len() > 4 || checks.iter().any(|c| c.trim().is_empty() || c.len() > 8192))
         {
@@ -189,6 +205,7 @@ impl Tool {
     pub fn machine(&self) -> &str {
         match self {
             Self::Exec { machine, .. }
+            | Self::OfferFile { machine, .. }
             | Self::Job { machine, .. }
             | Self::Typed { machine, .. }
             | Self::Done { machine, .. }
@@ -227,6 +244,11 @@ pub fn definitions() -> Value {
             "exec",
             json!({"machine":machine,"command":{"type":"string","description":"A POSIX sh script run as root on the named machine; exit status, stdout and stderr come back."}}),
             &["machine", "command"]
+        ),
+        spec(
+            "offer_file",
+            json!({"machine":machine,"path":{"type":"string","minLength":1,"maxLength":4096,"description":"An absolute file path of 1 to 4096 bytes without NUL or newline. Paths under /var/lib/tau-web/ are refused."},"label":{"type":"string","minLength":1,"maxLength":64,"description":"A short plain line of 1 to 64 printable bytes."},"why":{"type":"string","minLength":1,"maxLength":160,"description":"One plain line of 1 to 160 printable bytes explaining why the operator needs the file."}}),
+            &["machine", "path", "label", "why"]
         ),
         job,
         spec(

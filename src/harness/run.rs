@@ -834,6 +834,145 @@ pub async fn collect_jobs(
     Ok(reports)
 }
 
+/// Click-only synchronous harness job. This deliberately bypasses command evidence:
+/// no intent, terminal, stdout file, report, task mutation, or automatic retry is created.
+/// Connection admission, configuring account, elevation and pinned SSH are shared.
+pub(crate) async fn download_file(
+    pins: &impl PinSource,
+    journal: &mut impl BoundJournal,
+    target: &Target,
+    path: &str,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    use base64::Engine;
+    use zeroize::Zeroizing;
+    const UNAVAILABLE: &str =
+        "The file could not be downloaded. Check the machine connection and try again.";
+    let (target, elevation, _) = access(target).await.map_err(|_| UNAVAILABLE)?;
+    let session = resolve(journal, &target.machine, None)
+        .await
+        .map_err(|_| UNAVAILABLE)?;
+    let stop = wait::Stop::collection();
+    // A read with no established outcome returns to its row; it never holds the task.
+    use wasm_bindgen::{JsCast, closure::Closure};
+    struct Deadline {
+        worker: web_sys::WorkerGlobalScope,
+        timer: i32,
+        _callback: Closure<dyn FnMut()>,
+    }
+    impl Drop for Deadline {
+        fn drop(&mut self) {
+            self.worker.clear_timeout_with_handle(self.timer);
+        }
+    }
+    let worker: web_sys::WorkerGlobalScope = js_sys::global().unchecked_into();
+    let weak = std::rc::Rc::downgrade(&stop);
+    let callback = Closure::<dyn FnMut()>::new(move || {
+        if let Some(stop) = weak.upgrade() {
+            stop.fire();
+        }
+    });
+    let timer = worker
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            callback.as_ref().unchecked_ref(),
+            60_000,
+        )
+        .map_err(|_| UNAVAILABLE)?;
+    let _deadline = Deadline {
+        worker,
+        timer,
+        _callback: callback,
+    };
+    let work = async {
+        let (ssh, _, _, _socket) = connect(
+            pins,
+            journal,
+            &session,
+            &target,
+            &stop,
+            #[cfg(feature = "tracer")]
+            false,
+        )
+        .await
+        .map_err(|_| UNAVAILABLE)?;
+        journal.current(&session).await.map_err(|_| UNAVAILABLE)?;
+        let mut channel = ssh.channel_open_session().await.map_err(|_| UNAVAILABLE)?;
+        journal.current(&session).await.map_err(|_| UNAVAILABLE)?;
+        channel
+            .exec(true, jobs::file_read(path, elevation).as_bytes())
+            .await
+            .map_err(|_| UNAVAILABLE)?;
+        let mut output = Zeroizing::new(Vec::new());
+        let mut status = None;
+        let mut closed = false;
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } => {
+                    if output.len().saturating_add(data.len()) > 1_420_000 {
+                        return Err(
+                            "The file changed or its transfer could not be verified. Try again.",
+                        );
+                    }
+                    output.extend_from_slice(&data);
+                }
+                // Remote diagnostics are private too; never retain or display them.
+                ChannelMsg::ExtendedData { .. } => {}
+                ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                ChannelMsg::Close => {
+                    closed = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let _ = ssh
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await;
+        journal.current(&session).await.map_err(|_| UNAVAILABLE)?;
+        if !closed {
+            return Err("The download outcome is unknown. Try again.");
+        }
+        match status {
+            Some(44) => return Err("too-large"),
+            Some(45) => {
+                return Err(
+                    "The file is missing, unreadable, or is not a regular file. Try again.",
+                );
+            }
+            Some(46) => return Err("Files under /var/lib/tau-web/ cannot be downloaded."),
+            Some(0) => {}
+            _ => return Err(UNAVAILABLE),
+        }
+        let invalid = "The file changed or its transfer could not be verified. Try again.";
+        let split = output.iter().position(|b| *b == b'\n').ok_or(invalid)?;
+        let size = std::str::from_utf8(&output[..split])
+            .ok()
+            .and_then(|s| s.strip_prefix("TAUFILE "))
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|size| *size <= crate::poc::files::LIMIT)
+            .ok_or(invalid)?;
+        let encoded = Zeroizing::new(
+            output[split + 1..]
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect::<Vec<_>>(),
+        );
+        let bytes = Zeroizing::new(
+            base64::engine::general_purpose::STANDARD
+                .decode(&encoded)
+                .map_err(|_| invalid)?,
+        );
+        if bytes.len() != size {
+            return Err(invalid);
+        }
+        Ok(bytes)
+    };
+    stop.until(work)
+        .await
+        .ok_or("The download was interrupted. Try again.")?
+        .map_err(str::to_owned)
+}
+
 async fn evidence_result(
     journal: &impl BoundJournal,
     session: &Session,

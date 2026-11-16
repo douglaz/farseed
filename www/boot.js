@@ -794,7 +794,61 @@ const renderCommandResult = (result) => {
 };
 
 const taskDispositionDrafts = new Map();
+// Download state contains status only, never bytes, paths entered by the operator, or URLs.
+const fileDownloads = new Map();
+const fileKey = (task, offer) => JSON.stringify([task, offer]);
+const updateFileRow = (row, task, file) => {
+  const state = fileDownloads.get(fileKey(task, file.id));
+  const button = row.querySelector('[data-file-download]');
+  button.disabled = !!state?.pending;
+  button.textContent = state?.pending ? `Downloading ${file.label}…` : state?.error ? `Retry download ${file.label}` : `Download ${file.label}`;
+  row.querySelector('[data-file-error]')?.remove();
+  if (state?.error) {
+    const error = paragraph(row, state.error === 'too-large' ? `${file.label} is larger than 1 MiB; it wasn't downloaded.` : state.error);
+    error.dataset.fileError = '';
+  }
+};
+const interruptFileDownloads = () => {
+  for (const [key, state] of fileDownloads) {
+    if (!state.pending) continue;
+    state.pending = false; state.error = 'The download was interrupted. Try again.';
+    const [task, offer] = JSON.parse(key);
+    const row = document.querySelector(`[data-task="${CSS.escape(task)}"] [data-file-offer="${CSS.escape(offer)}"]`);
+    if (row) updateFileRow(row, task, state.file);
+  }
+};
+const receiveFileDownload = (data, current) => {
+  const key = fileKey(data.id, data.offer);
+  const state = fileDownloads.get(key);
+  try {
+    if (worker !== current || data.generation !== current.generation || document.visibilityState === 'hidden' ||
+        !state?.pending || state.request !== data.request) return;
+    if (data.error) state.error = data.error;
+    else if (data.bytes instanceof Uint8Array && typeof data.filename === 'string') {
+      const blob = new Blob([data.bytes], {type: 'application/octet-stream'});
+      const url = URL.createObjectURL(blob);
+      try {
+        const anchor = document.createElement('a');
+        anchor.href = url; anchor.download = data.filename;
+        document.body.append(anchor); anchor.click(); anchor.remove();
+      } finally { setTimeout(() => URL.revokeObjectURL(url), 0); }
+    } else state.error = 'The download outcome is unknown. Try again.';
+    state.pending = false;
+    const row = document.querySelector(`[data-task="${CSS.escape(data.id)}"] [data-file-offer="${CSS.escape(data.offer)}"]`);
+    if (row) updateFileRow(row, data.id, state.file);
+  } catch {
+    state.error = 'The download could not be saved. Try again.';
+    state.pending = false;
+    const row = document.querySelector(`[data-task="${CSS.escape(data.id)}"] [data-file-offer="${CSS.escape(data.offer)}"]`);
+    if (row) updateFileRow(row, data.id, state.file);
+  } finally {
+    if (data.bytes instanceof Uint8Array) data.bytes.fill(0);
+    delete data.bytes;
+  }
+};
+
 const renderTasks = (store) => {
+  if (store.state !== 'unlocked' || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state)) fileDownloads.clear();
   const worker = snapshotWorker();
   let slot = $('tasks');
   if (!slot) {
@@ -833,7 +887,7 @@ const renderTasks = (store) => {
     }
     paragraph(card, `${task.requests} of ${task.limits.requests} AI replies used; ${task.steps} of ${task.limits.steps} steps used.`);
     for (const [id, tool, outcome] of task.completed.filter(([id]) => !id.startsWith('$report:'))) {
-      if (id.startsWith('$verify:')) continue;
+      if (id.startsWith('$verify:') || tool.name === 'offer_file' && outcome.content?.status === 'offered') continue;
       if (tool.name === 'request_ai_key') {
         const created = outcome?.content?.status === 'created';
         const declined = outcome?.content?.status === 'declined';
@@ -843,6 +897,23 @@ const renderTasks = (store) => {
       } else paragraph(card, id.startsWith('$before:') ? 'Read the listening ports before setup.' : tool.name === 'exec' ? `Ran: ${commandSummary(tool.arguments.command)} (${commandResultWord(outcome)})` : tool.name === 'propose_declaration' ? 'The AI proposed requirements.' : tool.name === 'done' ? 'The AI handed the work over for checks.' : 'Completed a step.');
       const machineKey = tool.name === 'request_ai_key' ? (store.poc_targets ?? []).find(target => target.machine === task.machine)?.application_inference_keys?.find(key => key.path === outcome?.content?.path) : undefined;
       rawDetails(card, {tool: tool.name === 'done' ? {name: tool.name, arguments: {machine: tool.arguments.machine}} : tool, outcome, ...(machineKey ? {application_inference_key: machineKey} : {})}, ['task', task.id, 'completed', id]);
+    }
+    for (const file of task.file_offers ?? []) {
+      const row = document.createElement('div'); row.dataset.fileOffer = file.id;
+      const button = document.createElement('button'); button.type = 'button'; button.dataset.fileDownload = file.id;
+      button.addEventListener('click', () => {
+        const key = fileKey(task.id, file.id);
+        if (fileDownloads.get(key)?.pending) return;
+        const request = crypto.randomUUID();
+        fileDownloads.set(key, {pending: true, request, file});
+        updateFileRow(row, task.id, file);
+        worker.postMessage({file_download: {id: task.id, offer: file.id, request}});
+      });
+      row.append(button); paragraph(row, file.why);
+      rawDetails(row, {path: file.path, machine: file.machine}, ['task', task.id, 'file', file.id]);
+      updateFileRow(row, task.id, file);
+      if (['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state)) button.disabled = true;
+      card.append(row);
     }
     if (task.proposal && task.proposal.report == null) {
       if (awaitingAiKey(task)) {
@@ -1452,6 +1523,7 @@ const start = () => {
     finally { if (key.byteLength) key.fill(0); }
   });
   worker.onmessage = ({ data }) => {
+    if (data.file_download) { receiveFileDownload(data.file_download, current); return; }
     if (worker !== current) return;
     if (typeof data.deployment_ready === 'boolean') {
       publishDefaults(deploymentMaterial, data.deployment_ready);
@@ -1522,10 +1594,12 @@ const lock = () => {
 };
 document.addEventListener('visibilitychange', () => {
   const hidden = document.visibilityState === 'hidden';
+  if (hidden) interruptFileDownloads();
   if (hidden && ceremony) { lock(); return; }
   worker?.postMessage({ lifecycle: hidden ? 'hidden' : 'visible' });
 });
 document.addEventListener('freeze', () => {
+  interruptFileDownloads();
   if (ceremony) { lock(); return; }
   suspended = true;
   worker?.postMessage({ lifecycle: 'freeze' });

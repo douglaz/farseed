@@ -1,4 +1,5 @@
 pub mod completion;
+pub mod files;
 #[cfg_attr(
     not(target_arch = "wasm32"),
     allow(
