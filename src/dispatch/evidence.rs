@@ -821,14 +821,15 @@ impl Dispatch {
         match a {
             StoredAssociation::Legacy(a) => Ok(&a.entry),
             StoredAssociation::Protected(p) => {
-                if self.setup_approval != Some(p.relations.approved_entry.setup) {
-                    return Err("invalid setup approval reference".into());
-                }
-                self.approved_entries
+                let (machine, _) = self
+                    .approved_entries
                     .iter()
                     .find(|(_, e)| e.approved.identity.index == p.relations.approved_entry.index)
-                    .map(|(e, _)| e.as_str())
-                    .ok_or_else(|| "invalid approved entry index".into())
+                    .ok_or("invalid approved entry index")?;
+                if self.entry_setup_approval(machine) != Some(p.relations.approved_entry.setup) {
+                    return Err("invalid setup approval reference".into());
+                }
+                Ok(machine.as_str())
             }
         }
     }
@@ -905,7 +906,9 @@ impl Dispatch {
             },
             relations: AssociationRelations {
                 approved_entry: ApprovedEntryReference {
-                    setup: self.setup_approval.ok_or("missing setup approval")?,
+                    setup: self
+                        .entry_setup_approval(entry)
+                        .ok_or("missing setup approval")?,
                     index: self.approved_entries[entry].approved.identity.index,
                 },
                 target_kind: TargetKind::VendorMachine,
@@ -1070,7 +1073,9 @@ impl Dispatch {
                 },
                 relations: AssociationRelations {
                     approved_entry: ApprovedEntryReference {
-                        setup: self.setup_approval.ok_or("missing setup approval")?,
+                        setup: self
+                            .entry_setup_approval(&a.entry)
+                            .ok_or("missing setup approval")?,
                         index: self
                             .approved_entries
                             .get(&a.entry)

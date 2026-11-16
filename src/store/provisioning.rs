@@ -281,16 +281,48 @@ impl<S: Storage> Store<S> {
         })
         .await
     }
+    // Only completed procurements may precede another purchase in this store.
+    fn procurement_can_start(&self) -> bool {
+        self.procurement.as_ref().is_none_or(|p| p.target.is_some())
+            && self
+                .dispatch
+                .approved_entries
+                .iter()
+                .all(|(machine, entry)| {
+                    self.completed_purchases
+                        .iter()
+                        .chain(self.procurement.iter())
+                        .any(|p| {
+                            p.machine == *machine
+                                && p.identity == entry.approved.identity
+                                && p.target.as_ref() == self.poc_target(machine)
+                                && p.target.is_some()
+                        })
+                })
+            && self
+                .poc_targets
+                .keys()
+                .all(|machine| self.dispatch.approved_entries.contains_key(machine))
+    }
     pub(crate) fn procurement_review_selection(&self) -> Option<&Selection> {
         match &self.procurement {
-            Some(purchase) => purchase.pending_selection.as_ref(),
-            None => self.procurement_selection.as_ref(),
+            Some(purchase) if purchase.target.is_none() => purchase.pending_selection.as_ref(),
+            _ => self.procurement_selection.as_ref(),
         }
     }
     pub(crate) fn procurement_billing(&self) -> Option<&Billing> {
         self.procurement.as_ref().and_then(|p| p.billing.as_ref())
     }
     pub(crate) fn procurement_view(&self) -> Value {
+        let mut view = self.procurement_current_view();
+        if !self.completed_purchases.is_empty() {
+            view["completed"] = self.completed_purchases.iter().map(|p| {
+                json!({"machine":p.machine,"origin":p.origin,"vm_id":p.vm.as_ref().map(|vm|&vm["id"]),"payment_id":p.payment.as_ref().map(|pay|&pay["id"]),"is_paid":p.payment.as_ref().is_some_and(|pay|pay["is_paid"] == true),"target_saved":p.target.is_some()})
+            }).collect();
+        }
+        view
+    }
+    fn procurement_current_view(&self) -> Value {
         let Some(p) = &self.procurement else {
             return json!({"origin":self.procurement_origin(),"selection":self.procurement_selection,"closed":self.closed_purchases.last().map(closed_message)});
         };
@@ -313,7 +345,12 @@ impl<S: Storage> Store<S> {
         } else {
             "approved"
         };
-        json!({"origin":p.origin,"phase":phase,"machine":p.machine,"account":p.account,"selection":p.pending_selection.as_ref().unwrap_or(&p.selected),"approved_selection":p.selected,"relay":p.relay,"class_answer":p.class_answer,"identity":p.identity,"ssh_key_id":p.ssh_key.as_ref().map(|k|&k["id"]),"vm_id":p.vm.as_ref().map(|vm|&vm["id"]),"billing":p.billing,"payment":p.payment,"paid_at":p.paid_at,"readiness_poll_seconds":protocol::readiness_poll_seconds(),"readiness_wait_seconds":protocol::readiness_wait_seconds(),"readiness_state":p.vm.as_ref().map(|vm|&vm["status"]["state"]),"auto_renewal_enabled":p.vm.as_ref().and_then(|vm|vm.get("auto_renewal_enabled")),"target":p.target,"publication":p.publication,"public_keys":self.poc_identity_public_keys(&p.machine,&p.identity).ok()})
+        let selection = if p.target.is_some() {
+            self.procurement_selection.as_ref()
+        } else {
+            Some(p.pending_selection.as_ref().unwrap_or(&p.selected))
+        };
+        json!({"origin":p.origin,"phase":phase,"machine":p.machine,"account":p.account,"selection":selection,"approved_selection":p.selected,"relay":p.relay,"class_answer":p.class_answer,"identity":p.identity,"ssh_key_id":p.ssh_key.as_ref().map(|k|&k["id"]),"vm_id":p.vm.as_ref().map(|vm|&vm["id"]),"billing":p.billing,"payment":p.payment,"paid_at":p.paid_at,"readiness_poll_seconds":protocol::readiness_poll_seconds(),"readiness_wait_seconds":protocol::readiness_wait_seconds(),"readiness_state":p.vm.as_ref().map(|vm|&vm["status"]["state"]),"auto_renewal_enabled":p.vm.as_ref().and_then(|vm|vm.get("auto_renewal_enabled")),"target":p.target,"publication":p.publication,"public_keys":self.poc_identity_public_keys(&p.machine,&p.identity).ok()})
     }
     pub(crate) async fn procurement_catalogue(
         &mut self,
@@ -341,17 +378,17 @@ impl<S: Storage> Store<S> {
         // Invalidate the prior candidate even when the replacement fails validation.
         self.procurement_selection = None;
         self.check_api(api)?;
+        if !self.procurement_can_start()
+            && self.procurement.as_ref().is_none_or(|p| p.create.is_some())
+        {
+            return Err("Complete the saved purchase before reviewing another machine.".into());
+        }
+        let selected = self.procurement_fetch_selection(api, choice).await?;
         if self
             .procurement
             .as_ref()
-            .is_some_and(|p| p.create.is_some())
-            || (self.procurement.is_none() && !self.dispatch.approved_entries.is_empty())
-            || !self.poc_targets.is_empty()
+            .is_some_and(|p| p.target.is_none())
         {
-            return Err("This store already owns a machine or outstanding purchase.".into());
-        }
-        let selected = self.procurement_fetch_selection(api, choice).await?;
-        if self.procurement.is_some() {
             self.procurement_commit(Record::TermsChanged(selected))
                 .await
         } else {
@@ -438,7 +475,7 @@ impl<S: Storage> Store<S> {
                 "Explicit exact charge and maintained-access approvals are required.".into(),
             );
         }
-        let existing = self.procurement.clone();
+        let existing = self.procurement.clone().filter(|p| p.target.is_none());
         if let Some(p) = &existing {
             if p.create.is_some() || p.pending_selection.is_none() {
                 return Err(
@@ -454,8 +491,16 @@ impl<S: Storage> Store<S> {
                     "Renewed approval must retain the saved machine, relay and class.".into(),
                 );
             }
-        } else if !self.dispatch.approved_entries.is_empty() || !self.poc_targets.is_empty() {
-            return Err("This store already owns a machine or outstanding purchase.".into());
+        } else if !self.procurement_can_start() {
+            return Err("Complete the saved purchase before approving another machine.".into());
+        }
+        if existing.is_none()
+            && self
+                .dispatch
+                .approved_entries
+                .contains_key(&approval.machine)
+        {
+            return Err("Choose a new machine name; earlier machine records are kept.".into());
         }
         let selected = existing
             .as_ref()
@@ -527,9 +572,32 @@ impl<S: Storage> Store<S> {
     }
     fn procurement_projection(&self, record: &Record) -> Result<Purchase, String> {
         if let Record::Approved(p) = record {
-            if self.procurement.is_some()
-                || !self.dispatch.approved_entries.is_empty()
-                || !self.poc_targets.is_empty()
+            if !self.procurement_can_start()
+                || self.dispatch.approved_entries.contains_key(&p.machine)
+                || self.poc_targets.contains_key(&p.machine)
+                || self
+                    .commands
+                    .iter()
+                    .any(|(_, entry)| entry.machine == p.machine)
+                || self
+                    .dispatch
+                    .calls
+                    .values()
+                    .any(|call| call.intent.machine == p.machine)
+                || self.exposure_ledger.iter().any(|exposure| {
+                    exposure
+                        .bound_set
+                        .iter()
+                        .any(|bound| bound.machine == p.machine)
+                })
+                || self
+                    .procurement
+                    .as_ref()
+                    .is_some_and(|old| old.origin != p.origin || old.account != p.account)
+                || self
+                    .completed_purchases
+                    .iter()
+                    .any(|old| old.origin != p.origin || old.account != p.account)
             {
                 return Err(REFUSED.into());
             }
@@ -583,8 +651,12 @@ impl<S: Storage> Store<S> {
             return Ok(*p.clone());
         }
         let mut p = self.procurement.clone().ok_or(REFUSED)?;
-        // Closed identities remain consumed even when a new purchase uses the same entry name.
-        for closed in &self.closed_purchases {
+        // Archived VM and payment identities remain consumed.
+        for closed in self
+            .closed_purchases
+            .iter()
+            .chain(&self.completed_purchases)
+        {
             let reused = match record {
                 Record::Associated(vm) => {
                     closed.vm.as_ref().is_some_and(|old| old["id"] == vm["id"])
@@ -809,6 +881,7 @@ impl<S: Storage> Store<S> {
             self.dispatch.associations.retain(|a| a.entry != p.machine);
             self.dispatch.current_installations.remove(&p.machine);
             self.dispatch.setup_approval = None;
+            self.dispatch.purchase_approvals.remove(&p.machine);
             self.provider_origin = p.origin.clone();
             self.procurement = None;
             self.procurement_selection = None;
@@ -870,8 +943,16 @@ impl<S: Storage> Store<S> {
                     .map_err(|e| e.to_string())?;
             }
             dispatch.setup_approval = Some(number);
+            dispatch
+                .purchase_approvals
+                .insert(p.machine.clone(), number);
             self.dispatch = dispatch;
             self.allocation = Some(allocation);
+        }
+        if matches!(record, Record::Approved(_))
+            && let Some(previous) = self.procurement.take()
+        {
+            self.completed_purchases.push(previous);
         }
         self.procurement = Some(p.clone());
         if let Record::Handoff { target, .. } = record {

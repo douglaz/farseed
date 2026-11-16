@@ -22,7 +22,13 @@ access, and supply the existing v1 relay URL. Approval re-fetches the offer and 
 requires another review and approval. Approval carries the displayed configuration snapshot;
 missing or stale consent cannot approve a newer selection still waiting for its page report.
 Approval reserves the machine and relay identities durably.
-An existing enrolled machine or outstanding purchase prevents a new purchase. A closed purchase no longer blocks a new approval; its allocated machine identity stays consumed.
+An existing enrolled machine or outstanding purchase prevents a new purchase. Once a purchase
+has handed off its saved target, Fetch offers and images starts another review in the same
+store, reusing the provider account. Approval requires a new machine name and allocation identity;
+it moves the earlier purchase unchanged to the completed list. Earlier targets, class answers,
+application inference keys, sessions and offers remain bound to their own machines. The purchase
+approval and handoff records reconstruct this list on replay without a new journal format.
+A closed purchase no longer blocks a new approval; its allocated machine identity stays consumed.
 
 Create / Refresh registers only the derived SSH public half, refreshes the selected catalogue,
 image and custom quote as applicable, then saves a pre-order inventory and create intent before

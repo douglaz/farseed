@@ -196,6 +196,12 @@ pub enum BindingRefusal {
 }
 
 impl Dispatch {
+    pub(crate) fn entry_setup_approval(&self, machine: &str) -> Option<u64> {
+        self.purchase_approvals
+            .get(machine)
+            .copied()
+            .or(self.setup_approval)
+    }
     /// Procurement has its own exact charge approval and no satoshi conversion or totals.
     pub(crate) fn apply_poc_purchase(
         &mut self,
@@ -203,8 +209,10 @@ impl Dispatch {
         approved: ApprovedEntry,
         answer: ClassAnswer,
     ) -> Result<(), String> {
-        if !self.approved_entries.is_empty() || approved.identity.family != Family::Machines {
-            return Err("purchase requires a fresh setup".into());
+        if self.approved_entries.contains_key(&approved.entry.machine)
+            || approved.identity.family != Family::Machines
+        {
+            return Err("purchase requires a new machine name and identity".into());
         }
         approved
             .access

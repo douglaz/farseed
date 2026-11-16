@@ -287,6 +287,11 @@ impl<S: Storage> Store<S> {
         let (mut dispatch, allocation) = self.poc_projections(record)?;
         if !self.poc_targets.contains_key(&record.target.machine) {
             dispatch.setup_approval = Some(number);
+            if self.procurement.is_some() {
+                dispatch
+                    .purchase_approvals
+                    .insert(record.target.machine.clone(), number);
+            }
         }
         self.dispatch = dispatch;
         self.allocation = Some(allocation);

@@ -201,6 +201,7 @@ pub enum DispatchRefusal {
 pub struct Dispatch {
     pub approved_entries: BTreeMap<String, ApprovedMachine>,
     pub setup_approval: Option<u64>,
+    pub(crate) purchase_approvals: BTreeMap<String, u64>,
     pub intent_order: Vec<u64>,
     pub calls: BTreeMap<u64, Call>,
     pub terminals: Vec<TerminalRecord>,

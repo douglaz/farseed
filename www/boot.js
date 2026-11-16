@@ -206,7 +206,7 @@ const renderSteps = store => {
   const purchase = store.procurement;
   const machineAction = !store.provider_configuration?.key_set ? $('provider-catalogue')
     : purchase?.phase === 'initial_invoice' ? $('provider-invoice')
-    : purchase?.phase && purchase.phase !== 'terms_changed' ? $('provider-resume')
+    : purchase?.phase && !['terms_changed', 'handed_off'].includes(purchase.phase) ? $('provider-resume')
     : purchase?.selection ? $('provider-approval-form').querySelector('button')
     : providerCatalogue ? $('provider-selection-form').querySelector('button') : $('provider-catalogue');
   emphasize('machine', [machineAction, $('setup-approve')]);
@@ -566,7 +566,7 @@ const renderSetup = (store) => {
   const entries = approved.length ? approved.map(m => m.entry) : store.setup_offer ?? [];
   if (!entries.length) return;
   paragraph(facts, approved.length ? 'Approved setup' : 'Approve the setup');
-  const purchase = Boolean(store.procurement?.phase);
+  const purchase = Boolean(store.procurement?.phase || store.procurement?.completed?.length);
   if (!purchase) paragraph(facts, "Prices are fixture data, not a vendor's price.");
   for (const entry of entries) {
     const billing = entry.cost.period.billing;
@@ -1181,6 +1181,7 @@ $('credit-check').addEventListener('click', () => worker.postMessage({credit_req
 $('credit-configure').addEventListener('click', () => worker.postMessage({credit_request:{action:'configure',endpoint:$('poc-endpoint').value,model:$('poc-model').value}}));
 
 let providerCatalogue = null;
+let providerCompletedMachine = null;
 let providerSelectionDirty = true;
 let providerReviewToken = null;
 let providerDisplayedBilling = null;
@@ -1206,6 +1207,17 @@ const renderProvider = (store, enabled) => {
     : 'After enrollment, configure inference, then press Start session for the displayed model and machine. Copy its public keys. Install the SSH line and enroll the separate relay public key with the relay operator.';
   $('relay-deployment-status').textContent = deployed ? 'The deployment relay key is in use.' : 'No valid deployment relay key is loaded. The seed-derived relay key requires manual enrollment.';
   const purchase = store.procurement ?? {};
+  const completedMachine = purchase.phase === 'handed_off' ? purchase.machine : purchase.completed?.at(-1)?.machine ?? null;
+  if (providerCompletedMachine !== completedMachine) {
+    providerCompletedMachine = completedMachine;
+    providerCatalogue = null;
+    providerSelectionDirty = true;
+    $('provider-catalogue-view').replaceChildren();
+    $('provider-offer').replaceChildren(new Option('Choose a fetched offer', ''));
+    $('provider-image').replaceChildren(new Option('Choose a fetched image', ''));
+    $('provider-machine').value = '';
+    $('provider-class').value = '';
+  }
   if (!$('purchase-review-home')) {
     const home = document.createElement('span'); home.id = 'tau-purchase-review-home';
     $('purchase-review').before(home);
@@ -1306,9 +1318,12 @@ const renderProvider = (store, enabled) => {
     }
     if (purchase.target) paragraph(progress, `The machine’s published host key is saved. Press Start session ${purchase.machine} below to continue setup.`);
   }
-  const canReview = !purchase.phase || ['approved', 'registered', 'terms_changed'].includes(purchase.phase);
+  for (const completed of purchase.completed ?? []) {
+    paragraph(progress, `${completed.machine}: Purchase completed. Provider: ${completed.origin}. VM: ${completed.vm_id ?? 'unknown'}. Payment: ${completed.payment_id ?? 'none'} (${completed.is_paid ? 'paid' : 'not recorded as paid'}). Target saved: ${completed.target_saved ? 'yes' : 'no'}.`);
+  }
+  const canReview = !purchase.phase || ['approved', 'registered', 'terms_changed', 'handed_off'].includes(purchase.phase);
   for (const control of $('provider-selection-form').elements) control.disabled = !enabled || !canReview;
-  for (const control of $('provider-approval-form').elements) control.disabled = !enabled || (Boolean(purchase.phase) && !renewal) || providerSelectionDirty || !purchase.selection;
+  for (const control of $('provider-approval-form').elements) control.disabled = !enabled || (Boolean(purchase.phase) && !renewal && purchase.phase !== 'handed_off') || providerSelectionDirty || !purchase.selection;
   if (renewal) {
     for (const name of ['provider-machine', 'provider-relay', 'provider-class']) $(name).disabled = true;
   }
@@ -1346,6 +1361,7 @@ $('provider-invoice').addEventListener('click', () => providerRequest({action: '
 const clearPocInputs = () => {
   rawFoldChoices.clear();
   providerCatalogue = null;
+  providerCompletedMachine = null;
   providerSelectionDirty = true;
   providerReviewToken = null;
   providerDisplayedBilling = null;
