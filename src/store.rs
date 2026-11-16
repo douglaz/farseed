@@ -77,6 +77,7 @@ use journal::journal;
 pub(crate) mod inference;
 pub mod poc;
 pub mod poc_targets;
+pub(crate) mod protection;
 #[cfg_attr(
     not(target_arch = "wasm32"),
     allow(
@@ -397,6 +398,8 @@ pub struct Store<S> {
     inference: inference::State,
     credit: credit::State,
     scans: crate::scan::References,
+    /// Memory-only clean-check digests; discarded with the unlocked store.
+    protection_memo: std::cell::RefCell<protection::Memo>,
     reinstall: reinstall::State,
     poc_targets: std::collections::BTreeMap<String, poc_targets::Record>,
     procurement: Option<provisioning::Purchase>,
@@ -566,6 +569,7 @@ impl<S: Storage> Store<S> {
             inference: inference::State::default(),
             credit: credit::State::default(),
             scans: Default::default(),
+            protection_memo: Default::default(),
             reinstall: Default::default(),
             poc_targets: Default::default(),
             procurement: None,

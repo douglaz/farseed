@@ -59,7 +59,11 @@ impl<S: Storage> Store<S> {
             return Err("Provider origin contains protected or unscannable material.".into());
         }
         for value in [origin, normalized.as_str()] {
-            if filter.protect_bytes(value.as_bytes())?.as_slice() != value.as_bytes() {
+            if filter
+                .protect_bytes_memo(self, value.as_bytes(), &mut Default::default())?
+                .as_slice()
+                != value.as_bytes()
+            {
                 return Err("Provider origin contains protected or unscannable material.".into());
             }
         }
@@ -77,7 +81,11 @@ impl<S: Storage> Store<S> {
         self.provider_entry_ready()?;
         let account = record.account()?;
         let filter = account.filter(record.key.0.as_bytes());
-        if filter.protect_bytes(record.origin.as_bytes())?.as_slice() != record.origin.as_bytes() {
+        if filter
+            .protect_bytes_memo(self, record.origin.as_bytes(), &mut Default::default())?
+            .as_slice()
+            != record.origin.as_bytes()
+        {
             return Err("Provider origin contains protected or unscannable material.".into());
         }
         self.remember_provider_filter(filter);
@@ -88,7 +96,11 @@ impl<S: Storage> Store<S> {
 
     pub(super) fn check_provider_material(&self, plaintext: &[u8]) -> Result<(), String> {
         for filter in &self.provider_filters {
-            if filter.protect_bytes(plaintext)?.as_slice() != plaintext {
+            if filter
+                .protect_bytes_memo(self, plaintext, &mut Default::default())?
+                .as_slice()
+                != plaintext
+            {
                 return Err(
                     "protected provider material refused before encryption or replay".into(),
                 );
@@ -100,7 +112,11 @@ impl<S: Storage> Store<S> {
     pub(super) fn check_deployment_material(&self, plaintext: &[u8]) -> Result<(), String> {
         if let Some(key) = &self.deployment_relay {
             let filter = deployment_filter(key);
-            if filter.protect_bytes(plaintext)?.as_slice() != plaintext {
+            if filter
+                .protect_bytes_memo(self, plaintext, &mut Default::default())?
+                .as_slice()
+                != plaintext
+            {
                 return Err("Protected relay material refused before encryption.".into());
             }
         }

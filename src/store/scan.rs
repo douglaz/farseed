@@ -17,6 +17,7 @@ mod tests;
 struct OutputCache {
     bytes: BTreeMap<sha2::digest::Output<Sha256>, Zeroizing<Vec<u8>>>,
     echoes: Vec<crate::poc::inference::EchoCache>,
+    clean: super::protection::CleanRecords,
 }
 
 impl<S: Storage> Store<S> {
@@ -207,10 +208,14 @@ impl<S: Storage> Store<S> {
                 .chain(&self.provider_filters)
                 .zip(cache)
             {
-                safe = filter.protect_bytes_cached(&safe, cache)?;
+                safe = filter.protect_bytes_memo(self, &safe, cache)?;
             }
             if let Some(key) = &self.deployment_relay {
-                safe = super::provider::deployment_filter(key).protect_bytes(&safe)?;
+                safe = super::provider::deployment_filter(key).protect_bytes_memo(
+                    self,
+                    &safe,
+                    &mut Default::default(),
+                )?;
             }
             Ok(safe)
         })
@@ -223,7 +228,11 @@ impl<S: Storage> Store<S> {
             .iter()
             .chain(&self.provider_filters)
         {
-            if filter.protect_bytes(bytes)?.as_slice() != bytes {
+            if filter
+                .protect_bytes_memo(self, bytes, &mut Default::default())?
+                .as_slice()
+                != bytes
+            {
                 return Ok(false);
             }
         }
@@ -240,6 +249,9 @@ impl<S: Storage> Store<S> {
         ) -> Result<Zeroizing<Vec<u8>>, String> {
             crate::poc::inference::work::charge(raw.len().saturating_mul(2))?;
             let digest = Sha256::digest(raw);
+            if cache.clean.contains(&digest, 0) {
+                return Ok(Zeroizing::new(raw.to_vec()));
+            }
             if let Some(safe) = cache.bytes.get(&digest) {
                 return Ok(safe.clone());
             }
@@ -248,7 +260,12 @@ impl<S: Storage> Store<S> {
                     .as_bytes()
                     .to_vec(),
             );
-            cache.bytes.insert(digest, safe.clone());
+            if safe.as_slice() == raw {
+                cache.clean.remember(digest, 0);
+            } else {
+                // Replaced outputs remain local to this call; only clean digests survive.
+                cache.bytes.insert(digest, safe.clone());
+            }
             Ok(safe)
         }
         fn protect<S: Storage>(
@@ -316,7 +333,15 @@ impl<S: Storage> Store<S> {
         crate::poc::inference::work::scope(|| {
             self.scan_readiness()?;
             crate::poc::inference::work::value(value, 0)?;
-            protect(self, value, &mut OutputCache::default())
+            self.with_output_memo(|clean| {
+                let mut cache = OutputCache {
+                    clean: std::mem::take(clean),
+                    ..Default::default()
+                };
+                let result = protect(self, value, &mut cache);
+                *clean = cache.clean;
+                result
+            })
         })
     }
 

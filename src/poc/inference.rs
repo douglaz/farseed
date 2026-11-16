@@ -260,12 +260,58 @@ pub(crate) mod work {
     }
 }
 
-/// Fully checked representations, confined to one synchronous protection call.
+/// Fully checked representations, reusable only under an identical computed context key.
+/// Memory only, for the store lifetime; no text, output or credential bytes are retained.
 /// Text and binary checks have different boundary inputs and must not alias.
-#[derive(Default)]
 pub(crate) struct EchoCache {
-    text: std::collections::BTreeSet<sha2::digest::Output<Sha256>>,
-    binary: std::collections::BTreeSet<sha2::digest::Output<Sha256>>,
+    key: Option<sha2::digest::Output<Sha256>>,
+    text: crate::store::protection::CleanRecords,
+    binary: crate::store::protection::CleanRecords,
+    token: crate::store::protection::CleanRecords,
+}
+
+impl Default for EchoCache {
+    fn default() -> Self {
+        Self::new(Default::default())
+    }
+}
+
+impl EchoCache {
+    pub(crate) fn new(budget: std::rc::Rc<crate::store::protection::MemoBudget>) -> Self {
+        Self {
+            key: None,
+            text: crate::store::protection::CleanRecords::new(budget.clone()),
+            binary: crate::store::protection::CleanRecords::new(budget.clone()),
+            token: crate::store::protection::CleanRecords::new(budget),
+        }
+    }
+
+    pub(crate) fn share_budget(
+        &mut self,
+        budget: std::rc::Rc<crate::store::protection::MemoBudget>,
+    ) {
+        let mut shared = Self::new(budget);
+        shared.merge(std::mem::take(self));
+        *self = shared;
+    }
+
+    pub(crate) fn bind(&mut self, key: sha2::digest::Output<Sha256>) {
+        if self.key.as_ref() != Some(&key) {
+            self.key = Some(key);
+            self.text.clear();
+            self.binary.clear();
+            self.token.clear();
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Self) {
+        if let Some(key) = other.key {
+            self.bind(key);
+            self.text.merge(other.text);
+            self.binary.merge(other.binary);
+            self.token.merge(other.token);
+        }
+    }
 }
 
 pub(crate) struct EchoFilter {
@@ -424,6 +470,51 @@ impl EchoFilter {
         }
     }
 
+    /// Hash every pattern field, including prefilters, with framed vector boundaries.
+    pub(crate) fn pattern_digest(&self) -> sha2::digest::Output<Sha256> {
+        let mut hash = Sha256::new();
+        hash.update(b"protection/echo-patterns/v1");
+        for patterns in [
+            &self.representations,
+            &self.literal,
+            &self.decimal_free,
+            &self.hex_free,
+        ] {
+            hash.update((patterns.len() as u64).to_be_bytes());
+            for (length, coarse, fingerprint, digest, sum) in patterns {
+                hash.update((*length as u64).to_be_bytes());
+                for value in [coarse, sum] {
+                    hash.update([u8::from(value.is_some())]);
+                    hash.update(value.unwrap_or_default().to_be_bytes());
+                }
+                hash.update(fingerprint);
+                hash.update(digest);
+            }
+        }
+        hash.update([u8::from(self.decimal_only), u8::from(self.hex_only)]);
+        hash.finalize()
+    }
+
+    pub(crate) fn identity_key(&self) -> sha2::digest::Output<Sha256> {
+        let mut hash = Sha256::new();
+        hash.update(b"protection/echo/identity/v1");
+        hash.update(self.pattern_digest());
+        hash.finalize()
+    }
+
+    pub(crate) fn protect_bytes_memo<S: Storage>(
+        &self,
+        store: &Store<S>,
+        bytes: &[u8],
+        cache: &mut EchoCache,
+    ) -> Result<Zeroizing<Vec<u8>>, String> {
+        store.with_identity_memo(self.identity_key(), |memo| {
+            cache.bind(self.identity_key());
+            memo.merge(std::mem::take(cache));
+            self.protect_bytes_cached(bytes, memo)
+        })
+    }
+
     pub(crate) fn fingerprints(&self) -> EchoFingerprints {
         EchoFingerprints {
             patterns: self.representations.clone(),
@@ -551,6 +642,7 @@ impl EchoFilter {
         cache: &mut EchoCache,
     ) -> Result<Zeroizing<Vec<u8>>, String> {
         work::scope(|| {
+            cache.bind(self.identity_key());
             work::charge(bytes.len())?;
             if self.representations.is_empty() {
                 return Ok(Zeroizing::new(bytes.to_vec()));
@@ -566,6 +658,12 @@ impl EchoFilter {
 
     fn value(&self, value: &Value) -> Result<Value, String> {
         self.value_with(value, &|v| Ok(v.clone()))
+    }
+
+    fn value_memo<S: Storage>(&self, store: &Store<S>, value: &Value) -> Result<Value, String> {
+        store.with_identity_memo(self.identity_key(), |cache| {
+            work::scope(|| self.visit(value, 0, &|v| Ok(v.clone()), cache))
+        })
     }
 
     fn value_with(
@@ -590,9 +688,10 @@ impl EchoFilter {
         Ok(match value {
             Value::String(text) => {
                 work::charge(text.len().saturating_mul(4))?;
-                // Memoize only fully checked representations within this traversal.
+                // A complete clean check at d proves subtree height <= 16 - d.
+                // It remains clean at every shallower depth, under the identical key.
                 let digest = Sha256::digest(text.as_bytes());
-                if seen.text.contains(&digest) {
+                if seen.text.contains(&digest, depth) {
                     return Ok(value.clone());
                 }
                 if self.contains(text.as_bytes())? {
@@ -625,33 +724,34 @@ impl EchoFilter {
                         return Ok(self.marker()?.into());
                     }
                 }
-                for decoded in encoded_containers(text)? {
-                    // Binary forms can recur through several alphabets/alignments too.
-                    // Reuse only a representation that passed every applicable boundary
-                    // in this traversal; failed or replaced forms are never remembered.
-                    work::charge(decoded.len())?;
-                    let digest = Sha256::digest(decoded.as_slice());
-                    if seen.binary.contains(&digest) {
-                        continue;
-                    }
-                    if self.contains(&decoded)? {
-                        return Ok(self.marker()?.into());
-                    }
-                    // The existing placed-secret boundary also sees decoded binary material.
-                    work::charge(decoded.len().saturating_mul(2))?;
-                    let hexadecimal = Value::String(hex::encode(decoded.as_slice()));
-                    if boundary(&hexadecimal)? != hexadecimal {
-                        return Ok(self.marker()?.into());
-                    }
-                    if let Ok(text) = std::str::from_utf8(&decoded) {
-                        let form = Value::String(text.into());
-                        if self.visit(&form, depth + 1, boundary, seen)? != form {
+                for (token, parts) in encoded_containers(text, depth, seen)? {
+                    for decoded in parts {
+                        work::charge(decoded.len())?;
+                        let digest = Sha256::digest(decoded.as_slice());
+                        if seen.binary.contains(&digest, depth) {
+                            continue;
+                        }
+                        if self.contains(&decoded)? {
                             return Ok(self.marker()?.into());
                         }
+                        // The existing boundary also sees decoded binary material.
+                        work::charge(decoded.len().saturating_mul(2))?;
+                        let hexadecimal = Value::String(hex::encode(decoded.as_slice()));
+                        if boundary(&hexadecimal)? != hexadecimal {
+                            return Ok(self.marker()?.into());
+                        }
+                        if let Ok(text) = std::str::from_utf8(&decoded) {
+                            let form = Value::String(text.into());
+                            if self.visit(&form, depth + 1, boundary, seen)? != form {
+                                return Ok(self.marker()?.into());
+                            }
+                        }
+                        seen.binary.remember(digest, depth);
                     }
-                    seen.binary.insert(digest);
+                    // All parts, including the UTF-8 visits, completed unchanged.
+                    seen.token.remember(token, depth);
                 }
-                seen.text.insert(digest);
+                seen.text.remember(digest, depth);
                 value.clone()
             }
             Value::Array(values) => {
@@ -786,7 +886,13 @@ fn rolling_hash(bytes: &[u8]) -> u64 {
     })
 }
 
-fn encoded_containers(text: &str) -> Result<Vec<Zeroizing<Vec<u8>>>, String> {
+type EncodedToken = (sha2::digest::Output<Sha256>, Vec<Zeroizing<Vec<u8>>>);
+
+fn encoded_containers(
+    text: &str,
+    depth: usize,
+    seen: &EchoCache,
+) -> Result<Vec<EncodedToken>, String> {
     work::charge(text.len().saturating_mul(4))?;
     // Common base64 wrapping whitespace is insignificant. Scan both forms, since
     // whitespace can also separate two unrelated tokens.
@@ -831,7 +937,17 @@ fn encoded_containers(text: &str) -> Result<Vec<Zeroizing<Vec<u8>>>, String> {
                     continue;
                 }
                 let token = &text[start..cursor];
-                let token_start = decoded.len();
+                // The tokenizer includes up to two padding bytes. Alphabet and these
+                // exact bytes determine every offset/trim, engine and decoded part below.
+                work::charge(token.len().saturating_add(32))?;
+                let mut hash = Sha256::new();
+                hash.update([alphabet as u8]);
+                hash.update(token.as_bytes());
+                let digest = hash.finalize();
+                if seen.token.contains(&digest, depth) {
+                    continue;
+                }
+                let mut parts = Vec::new();
                 let alignments = if alphabet == 0 { 2 } else { 4 };
                 for offset in 0..alignments.min(token.len()) {
                     for trim in 0..alignments.min(token.len() - offset) {
@@ -841,7 +957,7 @@ fn encoded_containers(text: &str) -> Result<Vec<Zeroizing<Vec<u8>>>, String> {
                             if part.len().is_multiple_of(2)
                                 && let Ok(bytes) = hex::decode(part)
                             {
-                                decoded.push(Zeroizing::new(bytes));
+                                parts.push(Zeroizing::new(bytes));
                             }
                         } else {
                             let engines = if alphabet == 1 {
@@ -859,14 +975,15 @@ fn encoded_containers(text: &str) -> Result<Vec<Zeroizing<Vec<u8>>>, String> {
                                 if let Ok(bytes) = engine.decode(part)
                                     && !bytes.is_empty()
                                     && engine.encode(&bytes) == part
-                                    && !decoded[token_start..].iter().any(|known| **known == bytes)
+                                    && !parts.iter().any(|known| **known == bytes)
                                 {
-                                    decoded.push(Zeroizing::new(bytes));
+                                    parts.push(Zeroizing::new(bytes));
                                 }
                             }
                         }
                     }
                 }
+                decoded.push((digest, parts));
             }
         }
     }
@@ -880,10 +997,11 @@ fn protected<S: Storage>(
 ) -> Result<Value, String> {
     work::scope(|| {
         // Scan decoded strings before JSON escaping, then the complete final encoding as well.
-        let value = EchoFilter::new(credentials)
-            .value_with(&store.protect_output(value)?, &|value| {
-                store.protect_decoded(value)
-            })?;
+        let filter = EchoFilter::new(credentials);
+        let value = store.protect_output(value)?;
+        let value = store.with_decoded_memo(&filter, |cache| {
+            filter.visit(&value, 0, &|value| store.protect_decoded(value), cache)
+        })?;
         let bytes =
             Zeroizing::new(serde_json::to_vec(&value).map_err(|_| "inference JSON encoding")?);
         let redacted = Redacted::for_inference(store, &bytes, credentials)?;
@@ -941,6 +1059,14 @@ fn outcome_excerpt(outcome: &Value) -> Result<String, String> {
     Ok(excerpt(&text, EXCERPT_BYTES))
 }
 
+fn step_messages(id: &str, value: &Value, outcome: &Value) -> Result<[Value; 2], String> {
+    let outcome = Zeroizing::new(outcome_excerpt(outcome)?);
+    Ok([
+        json!({"role":"assistant","content":null,"tool_calls":[{"type":"function","id":id,"function":{"name":value["name"],"arguments":value["arguments"].to_string()}}]}),
+        json!({"role":"tool","tool_call_id":id,"content":&*outcome}),
+    ])
+}
+
 fn usable_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
@@ -987,6 +1113,20 @@ fn request_context<S: Storage>(
     credentials: &[&[u8]],
     task: Option<&crate::store::poc::Task>,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
+    // Each completed step gets a separate synchronous budget before the request's
+    // outer scope. Discard all warm-up output and errors; only clean records survive.
+    for (id, tool, outcome) in steps {
+        let _ = work::scope(|| {
+            let value = serde_json::to_value(tool).map_err(|_| "inference tool encoding")?;
+            if !safe(store, &json!({"id":id,"tool":value}), credentials) {
+                return Ok(());
+            }
+            // This wrapper places both message objects at exactly their request depths.
+            let messages = step_messages(id, &value, outcome)?;
+            protected(store, &json!({"messages":messages}), credentials)?;
+            Ok(())
+        });
+    }
     work::scope(|| {
         if goal.len().saturating_add(machine.len()) >= REQUEST_BYTES {
             return Err("inference request exceeds the local size bound".into());
@@ -1028,9 +1168,7 @@ fn request_context<S: Storage>(
             }
             // Durable evidence is independently protected by the store before append. Limit
             // this model-context projection before repeated serialization/protection.
-            let outcome = Zeroizing::new(outcome_excerpt(outcome)?);
-            messages.push(json!({"role":"assistant","content":null,"tool_calls":[{"type":"function","id":id,"function":{"name":value["name"],"arguments":value["arguments"].to_string()}}]}));
-            messages.push(json!({"role":"tool","tool_call_id":id,"content":&*outcome}));
+            messages.extend(step_messages(id, &value, outcome)?);
         }
         let sockets = task
             .and_then(|t| t.before_setup.as_ref())
@@ -1344,7 +1482,7 @@ fn complete_response<S: Storage>(
         std::str::from_utf8(body).map_err(|_| "inference response malformed JSON")?;
         let decoded: Value =
             serde_json::from_slice(body).map_err(|_| "inference response malformed JSON")?;
-        if filter.value(&decoded)? != decoded {
+        if filter.value_memo(store, &decoded)? != decoded {
             return Err("inference proposal contains protected material".into());
         }
     }

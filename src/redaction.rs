@@ -108,8 +108,9 @@ impl Redacted {
         Self::for_store_cached(store, body, fields, &mut Vec::new())
     }
 
-    /// Cache belongs to this store and these immutable filters, within one synchronous call.
-    /// Exact placed-secret and held-credential boundaries still run on every representation.
+    /// Echo checks reuse only an identical computed filter key, in memory for the store lifetime.
+    /// Exact placed-secret and held-credential boundaries still run on every representation
+    /// unless the enclosing output memo has a complete clean check under its full context key.
     pub(crate) fn for_store_cached<S: Storage>(
         store: &Store<S>,
         body: &[u8],
@@ -154,6 +155,19 @@ pub(crate) enum Derived {
 }
 
 impl Held<'_> {
+    pub(crate) fn digest(&self) -> sha2::digest::Output<sha2::Sha256> {
+        use sha2::{Digest, Sha256};
+        let mut values = self.values().map(Sha256::digest).collect::<Vec<_>>();
+        values.sort();
+        let mut hash = Sha256::new();
+        hash.update(b"protection/held-values/v1");
+        hash.update((values.len() as u64).to_be_bytes());
+        for value in values {
+            hash.update(value);
+        }
+        hash.finalize()
+    }
+
     fn values(&self) -> impl Iterator<Item = &[u8]> {
         self.borrowed
             .iter()
