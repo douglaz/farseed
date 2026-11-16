@@ -201,6 +201,9 @@ impl<S: Storage> Store<S> {
 
     /// Model admission is write-free, including an out-of-set target.
     pub fn check_tool(&self, session: &str, tool: &Tool) -> Result<(), String> {
+        if matches!(tool, Tool::RequestAiKey { .. }) {
+            return Err("AI key requests are available only in a setup task".into());
+        }
         self.check_tool_context(session, tool)?;
         if self.pending_requirements.contains_key(session) {
             return Err("proposal approval pending".into());

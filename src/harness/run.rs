@@ -255,6 +255,28 @@ pub async fn run_command(
     origin: Option<&std::rc::Rc<Session>>,
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<CommandOutcome, Refusal> {
+    run_command_input(
+        pins,
+        journal,
+        target,
+        command,
+        None,
+        origin,
+        #[cfg(feature = "tracer")]
+        tamper_auth,
+    )
+    .await
+}
+
+pub(crate) async fn run_command_input(
+    pins: &impl PinSource,
+    journal: &mut impl BoundJournal,
+    target: &Target,
+    command: &[u8],
+    input: Option<&[u8]>,
+    origin: Option<&std::rc::Rc<Session>>,
+    #[cfg(feature = "tracer")] tamper_auth: bool,
+) -> Result<CommandOutcome, Refusal> {
     let (target, elevation, _) = access(target).await.map_err(Refusal::Failed)?;
     let target = &target;
     let session = resolve(journal, &target.machine, origin).await?;
@@ -274,7 +296,11 @@ pub async fn run_command(
         )
         .await);
     }
-    let bytes = jobs::launch_size_with_elevation(&target.machine, command, elevation);
+    let bytes = if input.is_some() {
+        jobs::launch_with_input(&"0".repeat(48), &target.machine, command, elevation, true).len()
+    } else {
+        jobs::launch_size_with_elevation(&target.machine, command, elevation)
+    };
     if !jobs::launch_fits(bytes) {
         return Err(Refusal::LaunchTooLong { bytes });
     }
@@ -372,11 +398,17 @@ pub async fn run_command(
                 evidence: None,
             });
         }
-        let sent = jobs::launch_with_elevation(job, &entry.machine, &entry.command, elevation)
-            .into_bytes();
+        let sent = jobs::launch_with_input(
+            job,
+            &entry.machine,
+            &entry.command,
+            elevation,
+            input.is_some(),
+        )
+        .into_bytes();
         let progress = super::job_read::Read::default();
         let result = stop
-            .until(exec_record(&mut channel, &sent, Some(&progress)))
+            .until(exec_record(&mut channel, &sent, Some(&progress), input))
             .await
             .unwrap_or_else(|| {
                 Err(if progress.sent() {
@@ -401,7 +433,20 @@ pub async fn run_command(
             (Some(recorded), Some(replayed))
                 if replayed.job.as_deref().is_some_and(|id| {
                     authority.as_ref().is_ok_and(|(_, elevation, _)| {
-                        jobs::launch_reconciles(id, &recorded, *elevation, &sent)
+                        if input.is_some() {
+                            jobs::valid_id(id)
+                                && jobs::launch_with_input(
+                                    id,
+                                    &recorded.machine,
+                                    &recorded.command,
+                                    *elevation,
+                                    true,
+                                )
+                                .as_bytes()
+                                    == sent
+                        } else {
+                            jobs::launch_reconciles(id, &recorded, *elevation, &sent)
+                        }
                     })
                 }) && recorded.machine == target.machine =>
             {
@@ -827,6 +872,7 @@ async fn read_job_record(
         channel,
         jobs::collect_with_elevation(job, elevation).as_bytes(),
         Some(progress),
+        None,
     )
     .await
 }
@@ -837,6 +883,7 @@ async fn exec_record(
     channel: &mut russh::Channel<client::Msg>,
     bytes: &[u8],
     progress: Option<&super::job_read::Read>,
+    input: Option<&[u8]>,
 ) -> Result<Record, String> {
     // Beginning the channel send can enqueue bytes before its future resolves. From here
     // cancellation must conservatively retain possible transmission.
@@ -847,6 +894,16 @@ async fn exec_record(
         .exec(true, bytes)
         .await
         .map_err(|e| format!("exec: {e}"))?;
+    if let Some(input) = input {
+        channel
+            .data(input)
+            .await
+            .map_err(|_| "AI key stdin transmission interrupted")?;
+        channel
+            .eof()
+            .await
+            .map_err(|_| "AI key stdin transmission interrupted")?;
+    }
     let mut delivered = jobs::ReadDelivery::default();
     while let Some(message) = channel.wait().await {
         match message {

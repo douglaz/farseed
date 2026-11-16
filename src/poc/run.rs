@@ -186,9 +186,12 @@ pub async fn resume(
                         }
                     }
                     Err(super::inference::ReplyError::Malformed { reason, cut_off }) => {
-                        return runtime
-                            .change(&task, Change::Malformed { reason, cut_off })
-                            .await;
+                        let change = if cut_off {
+                            Change::CutOff { reason }
+                        } else {
+                            Change::Malformed { reason, cut_off }
+                        };
+                        return runtime.change(&task, change).await;
                     }
                     Err(super::inference::ReplyError::Pause(why)) => {
                         return runtime
@@ -198,6 +201,9 @@ pub async fn resume(
                 };
             }
         }
+    }
+    if task.awaiting_ai_key() {
+        return Ok(task);
     }
     if task.proposal.is_some() {
         runtime.progress(&task).await;
@@ -220,6 +226,16 @@ pub async fn resume(
             return inspect(runtime, &current, session).await;
         }
         if current.revision != task.revision {
+            if task.proposal.as_ref().is_some_and(|proposal| {
+                matches!(proposal.tool, Tool::RequestAiKey { .. })
+                    && current.proposal.is_none()
+                    && current
+                        .completed
+                        .iter()
+                        .any(|(id, _, _)| id == &proposal.call_id)
+            }) {
+                return Ok(current);
+            }
             return Err("stale task execution".into());
         }
         return runtime

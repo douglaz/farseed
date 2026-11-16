@@ -73,6 +73,12 @@ pub fn document_url(s: &str) -> bool {
 pub enum Tool {
     #[serde(rename = "exec")]
     Exec { machine: String, command: String },
+    #[serde(rename = "request_ai_key")]
+    RequestAiKey {
+        machine: String,
+        application: String,
+        purpose: String,
+    },
     #[serde(rename = "request_harness_job")]
     Job {
         machine: String,
@@ -124,6 +130,27 @@ impl Tool {
         {
             return Err("done accepts at most four commands of 1 to 8192 bytes".into());
         }
+        if let Self::RequestAiKey {
+            application,
+            purpose,
+            ..
+        } = &tool
+        {
+            if application.trim().is_empty()
+                || application.len() > 64
+                || !application
+                    .bytes()
+                    .all(|b| b == b' ' || b.is_ascii_graphic())
+            {
+                return Err("AI key application must be one plain line of 1 to 64 bytes".into());
+            }
+            if purpose.trim().is_empty()
+                || purpose.len() > 160
+                || !purpose.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
+            {
+                return Err("AI key purpose must be one plain line of 1 to 160 bytes".into());
+            }
+        }
         if let Self::Job { job, arguments, .. } = &tool {
             let Some(args) = arguments.as_object() else {
                 return Err("job arguments".into());
@@ -165,7 +192,8 @@ impl Tool {
             | Self::Job { machine, .. }
             | Self::Typed { machine, .. }
             | Self::Done { machine, .. }
-            | Self::ProposeDeclaration { machine, .. } => machine,
+            | Self::ProposeDeclaration { machine, .. }
+            | Self::RequestAiKey { machine, .. } => machine,
         }
     }
 }

@@ -4,6 +4,8 @@ use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
 pub const CAP: f64 = 1.0;
+pub const AI_KEY_CAP: f64 = 0.25;
+pub const AI_KEY_LIFETIME: u64 = 30 * 86_400;
 pub const LIFETIME: u64 = 86_400;
 pub const POLL_SECONDS: u64 = 5;
 pub const ACCOUNT_FAILED: &str = "Couldn't create the credit account. Try again.";
@@ -343,7 +345,7 @@ pub fn returned_mint(value: &Value, mint: &Mint) -> Result<(String, String), Str
         .ok_or(MINT_FAILED)?;
     if value["status"] != "success"
         || data["name"] != mint.name
-        || data["usage_limit_usd"].as_f64() != Some(CAP)
+        || data["usage_limit_usd"].as_f64() != Some(mint.requested_cap)
         || data.get("reset_period") != Some(&Value::Null)
         || !expiry_matches(mint.requested_expiry, expiry)
     {

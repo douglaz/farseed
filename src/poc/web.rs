@@ -184,6 +184,7 @@ impl<P: PinSource> Runtime for Web<'_, P> {
         store.check_task_session(task, self.session)?;
         let changed = store.poc_change(&task.id, task.revision, change).await?;
         self.continuation.check()?;
+        drop(writer);
         Ok(changed)
     }
     async fn prepare(&mut self, task: &Task, session: &str) -> Result<Task, String> {
@@ -205,7 +206,9 @@ impl<P: PinSource> Runtime for Web<'_, P> {
         let mut writer = local.lock().await;
         self.continuation.check()?;
         let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
-        store.poc_propose(task, session, call_id, tool).await
+        let changed = store.poc_propose(task, session, call_id, tool).await?;
+        drop(writer);
+        Ok(changed)
     }
 
     async fn execute(&mut self, binding: Binding, task: &Task) -> Result<(), String> {
@@ -240,8 +243,27 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             .ok_or(crate::poc::wait::LOCKED)?
             .poc_authority(&task.id, &binding.session)?;
         let proposal = task.proposal.as_ref().ok_or("missing command proposal")?;
-        let crate::goals::Tool::Exec { command, .. } = &proposal.tool else {
-            return Err("command required".into());
+        let (command, input) = match &proposal.tool {
+            crate::goals::Tool::Exec { command, .. } => (command.clone(), None),
+            crate::goals::Tool::RequestAiKey { .. } => {
+                if !crate::poc::credit::browser::prepare_ai_key(task).await? {
+                    return Ok(());
+                }
+                let local = local();
+                let mut writer = local.lock().await;
+                self.continuation.check()?;
+                let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
+                store.check_task_session(task, &binding.session)?;
+                let entry = store
+                    .ai_key(&task.id, &proposal.call_id)
+                    .ok_or("AI key custody missing")?;
+                let key = entry.key.as_ref().ok_or("AI key custody missing")?;
+                (
+                    crate::store::ai_keys::command(&entry.path, key.0.len()),
+                    Some(zeroize::Zeroizing::new(key.0.as_bytes().to_vec())),
+                )
+            }
+            _ => return Err("command required".into()),
         };
         let mut journal = ScopedJournal {
             base: StoreJournal {
@@ -253,11 +275,12 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             collecting: false,
             continuation: self.continuation.clone(),
         };
-        let result = crate::harness::run_command(
+        let result = crate::harness::run_command_input(
             self.pins,
             &mut journal,
             self.target,
             command.as_bytes(),
+            input.as_deref().map(Vec::as_slice),
             Some(&origin),
             #[cfg(feature = "tracer")]
             false,
@@ -575,6 +598,9 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
         limits: Option<crate::store::poc::Limits>,
         confirmation: Option<crate::store::poc::disposition::Confirmation>,
         continuation: Option<crate::dispatch::Continuation>,
+        call_id: Option<String>,
+        revision: Option<u64>,
+        machine_class_answer: Option<crate::store::poc_targets::KeyCardAnswer>,
     }
     let result = async {
         let value: Value = serde_json::from_str(&request).map_err(|_| "task request")?;
@@ -587,7 +613,10 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
         } else {
             continuation.as_ref().map_err(Clone::clone)?.check()?;
         }
-        if request.action == "resume" || request.action == "dispose-pending" {
+        if matches!(
+            request.action.as_str(),
+            "resume" | "dispose-pending" | "ai-key-create" | "ai-key-decline" | "ai-key-class"
+        ) {
             let continuation = continuation.as_ref().map_err(Clone::clone)?;
             let id = request.id.as_deref().ok_or("task ID required")?;
             #[cfg(feature = "tracer")]
@@ -635,6 +664,43 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                                 .ok_or("continuing assumption required")?,
                         )
                         .await?
+                } else if matches!(
+                    request.action.as_str(),
+                    "ai-key-create" | "ai-key-decline" | "ai-key-class"
+                ) {
+                    crate::poc::run::check_raise(id)?;
+                    store.poc_authority(id, session)?;
+                    if automatic
+                        || request.revision != Some(task.revision)
+                        || request.call_id.as_deref()
+                            != task
+                                .proposal
+                                .as_ref()
+                                .map(|proposal| proposal.call_id.as_str())
+                    {
+                        return Err("AI key decision is no longer available".into());
+                    }
+                    let decision = match (request.action.as_str(), request.machine_class_answer) {
+                        (
+                            "ai-key-create",
+                            Some(crate::store::poc_targets::KeyCardAnswer::OnlyMe),
+                        )
+                        | (
+                            "ai-key-class",
+                            Some(
+                                crate::store::poc_targets::KeyCardAnswer::OthersToo
+                                | crate::store::poc_targets::KeyCardAnswer::NotSure,
+                            ),
+                        ) => Change::AiKeyClassDecision {
+                            answer: request.machine_class_answer.expect("matched answer"),
+                            at: (js_sys::Date::now() / 1000.0) as u64,
+                        },
+                        ("ai-key-create" | "ai-key-decline", None) => Change::AiKeyDecision {
+                            create: request.action == "ai-key-create",
+                        },
+                        _ => return Err("AI key decision is no longer available".into()),
+                    };
+                    store.poc_change(id, task.revision, decision).await?
                 } else {
                     task
                 }

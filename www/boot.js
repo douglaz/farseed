@@ -170,7 +170,7 @@ const renderSteps = store => {
       : store.readiness?.inactive ? 'Machine checks are paused. Open the machine step for details.'
       : payReadiness(store.procurement ?? {}) ? `${readinessWait(store)} ${store.readiness?.checked_at ? `Last check: ${new Date(store.readiness.checked_at).toISOString()}.` : 'The machine has not been checked yet.'}`
       : store.procurement?.phase ? purchaseStatus(store.procurement) : store.poc_targets?.length ? 'Machine saved. Review it before Start session.' : 'Choose a new or existing machine.',
-    task: store.tasks?.map(task => `${task.machine}: ${taskStatus(task.status)}${task.inference_retry ? ' — waiting to retry the AI connection' : ''}${task.pause_reason ? ' — ' + plainPause(task.pause_reason) : ''}`).join(' ') || (store.lifecycle_state === 'reconciling' ? 'Waiting to revalidate the saved session.' : sessions.length ? 'Session open. Set or continue its goal.' : 'No session started.'),
+    task: store.tasks?.map(task => `${task.machine}: ${taskStatus(task.status, task)}${task.inference_retry ? ' — waiting to retry the AI connection' : ''}${task.pause_reason ? ' — ' + plainPause(task.pause_reason) : ''}`).join(' ') || (store.lifecycle_state === 'reconciling' ? 'Waiting to revalidate the saved session.' : sessions.length ? 'Session open. Set or continue its goal.' : 'No session started.'),
   };
   if (!active) for (const name of ['credit', 'machine', 'task'].filter(name => name !== 'credit' || !unlocked)) messages[name] = unlocked ? 'Record the seed backup to continue.' : name === 'machine' && store.state === 'locked' ? 'Unlock to continue checking the machine.' : 'Open the local store to view this step.';
   for (const name of stepNames) {
@@ -342,7 +342,8 @@ const commandSummary = command => {
   const word = !/[|;&<>()`$\\\r\n]/.test(text) && Object.hasOwn(words, program) && words[program].includes(first) ? ` ${first}` : '';
   return shortLine(`${program}${word} …`);
 };
-const taskStatus = status => ({running:'working', waiting:'waiting for the machine', verifying:'checking the result', paused:'paused', complete:'done', abandoned:'stopped'})[status] ?? status;
+const awaitingAiKey = task => task?.proposal?.tool?.name === 'request_ai_key' && !task.ai_key_approved && !task.pending && !['complete', 'abandoned'].includes(task.status);
+const taskStatus = (status, task) => awaitingAiKey(task) ? 'waiting for you' : ({running:'working', waiting:'waiting for the machine', verifying:'checking the result', paused:'paused', complete:'done', abandoned:'stopped'})[status] ?? status;
 const purchaseStatus = purchase => ({
   approved: 'Purchase approved; preparing access to the machine.',
   registration_uncertain: 'Waiting to confirm that the provider saved the access key. The page will check before continuing.',
@@ -818,7 +819,8 @@ const renderTasks = (store) => {
   for (const task of store.tasks ?? []) {
     const card = document.createElement('section');
     card.dataset.task = task.id;
-    paragraph(card, `Setting up ${task.machine}: ${taskStatus(task.status)}.`);
+    const session = (store.sessions ?? []).find(s => s.identity === task.start_session && s.session_state !== 'ended' && s.bound_set.length === 1 && s.bound_set[0] === task.machine);
+    paragraph(card, `Setting up ${task.machine}: ${taskStatus(task.status, task)}.`);
     if (task.goal.length <= 120) paragraph(card, task.goal);
     else {
       const firstSentence = task.goal.match(/^.*?[.!?](?=\s|$)/s)?.[0] ?? task.goal;
@@ -832,11 +834,56 @@ const renderTasks = (store) => {
     paragraph(card, `${task.requests} of ${task.limits.requests} AI replies used; ${task.steps} of ${task.limits.steps} steps used.`);
     for (const [id, tool, outcome] of task.completed.filter(([id]) => !id.startsWith('$report:'))) {
       if (id.startsWith('$verify:')) continue;
-      paragraph(card, id.startsWith('$before:') ? 'Read the listening ports before setup.' : tool.name === 'exec' ? `Ran: ${commandSummary(tool.arguments.command)} (${commandResultWord(outcome)})` : tool.name === 'propose_declaration' ? 'The AI proposed requirements.' : tool.name === 'done' ? 'The AI handed the work over for checks.' : 'Completed a step.');
-      rawDetails(card, {tool: tool.name === 'done' ? {name: tool.name, arguments: {machine: tool.arguments.machine}} : tool, outcome}, ['task', task.id, 'completed', id]);
+      if (tool.name === 'request_ai_key') {
+        const created = outcome?.content?.status === 'created';
+        const declined = outcome?.content?.status === 'declined';
+        const application = shortLine(tool.arguments.application, 64);
+        const line = paragraph(card, created ? `Created an AI key for ${application} on this machine (limit 0.25 USD, expires in 30 days)` : declined ? `Didn't create an AI key for ${application}.` : `Couldn't create an AI key: ${shortLine(outcome?.content?.reason ?? 'the outcome is unavailable', 160)}.`);
+        line.dataset[created ? 'aiKeyCreated' : declined ? 'aiKeyDeclined' : 'aiKeyFailed'] = '';
+      } else paragraph(card, id.startsWith('$before:') ? 'Read the listening ports before setup.' : tool.name === 'exec' ? `Ran: ${commandSummary(tool.arguments.command)} (${commandResultWord(outcome)})` : tool.name === 'propose_declaration' ? 'The AI proposed requirements.' : tool.name === 'done' ? 'The AI handed the work over for checks.' : 'Completed a step.');
+      const machineKey = tool.name === 'request_ai_key' ? (store.poc_targets ?? []).find(target => target.machine === task.machine)?.application_inference_keys?.find(key => key.path === outcome?.content?.path) : undefined;
+      rawDetails(card, {tool: tool.name === 'done' ? {name: tool.name, arguments: {machine: tool.arguments.machine}} : tool, outcome, ...(machineKey ? {application_inference_key: machineKey} : {})}, ['task', task.id, 'completed', id]);
     }
     if (task.proposal && task.proposal.report == null) {
-      paragraph(card, task.proposal.call_id.startsWith('$before:') ? 'Next: read the listening ports before setup.' : task.proposal.call_id.startsWith('$verify:') ? 'Next: check the machine setup.' : task.proposal.tool.name === 'exec' ? `Next: ${commandSummary(task.proposal.tool.arguments.command)}` : task.proposal.tool.name === 'propose_declaration' ? 'Next: a requirements proposal from the AI.' : task.proposal.tool.name === 'done' ? 'Next: the handover from the AI.' : 'Next: a step.');
+      if (awaitingAiKey(task)) {
+        const requestCard = document.createElement('section');
+        requestCard.dataset.aiKeyRequest = '';
+        paragraph(requestCard, `Create an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} on this machine (limit 0.25 USD, expires in 30 days)?`);
+        paragraph(requestCard, "Paid from your inference balance. It can read the account's usage history. It ends when the machine is destroyed, it expires, or it is revoked.");
+        paragraph(requestCard, "This key is for the operator's application and outlives this session. Lock, Stop task and End session do not revoke it.");
+        const needsClass = (store.poc_targets ?? []).find(target => target.machine === task.machine)?.ai_key_needs_class_answer !== false;
+        const unavailable = !session || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
+        let classAnswer;
+        const sendDecision = (decision, answer) => {
+          for (const control of requestCard.querySelectorAll('button')) control.disabled = true;
+          worker.postMessage({task: {action: `ai-key-${decision}`, id: task.id, session: session.identity, call_id: task.proposal.call_id, revision: task.revision, ...(answer ? {machine_class_answer: answer} : {})}});
+        };
+        if (needsClass) {
+          const question = paragraph(requestCard, 'Does this machine serve only you?');
+          question.dataset.machineClass = '';
+          for (const [answer, text] of [['only-me', 'Only me'], ['others-too', 'Others too'], ['not-sure', 'Not sure']]) {
+            const button = document.createElement('button');
+            button.type = 'button'; button.textContent = text; button.dataset.machineClassAnswer = answer;
+            button.setAttribute('aria-pressed', 'false');
+            button.disabled = unavailable;
+            button.addEventListener('click', () => {
+              if (answer !== 'only-me') { sendDecision('class', answer); return; }
+              classAnswer = answer;
+              button.setAttribute('aria-pressed', 'true');
+              requestCard.querySelector('[data-ai-key-decision="create"]').disabled = unavailable;
+            });
+            requestCard.append(button);
+          }
+        }
+        for (const [decision, text] of [['create', 'Create key'], ['decline', "Don't"]]) {
+          const button = document.createElement('button');
+          button.type = 'button'; button.textContent = text; button.dataset.aiKeyDecision = decision;
+          button.disabled = unavailable || (decision === 'create' && needsClass);
+          button.addEventListener('click', () => sendDecision(decision, decision === 'create' ? classAnswer : undefined));
+          requestCard.append(button);
+        }
+        card.append(requestCard);
+      } else paragraph(card, task.proposal.call_id.startsWith('$before:') ? 'Next: read the listening ports before setup.' : task.proposal.call_id.startsWith('$verify:') ? 'Next: check the machine setup.' : task.proposal.tool.name === 'exec' ? `Next: ${commandSummary(task.proposal.tool.arguments.command)}` : task.proposal.tool.name === 'propose_declaration' ? 'Next: a requirements proposal from the AI.' : task.proposal.tool.name === 'done' ? 'Next: the handover from the AI.' : task.proposal.tool.name === 'request_ai_key' ? `Creating an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} and saving it on the machine.` : 'Next: a step.');
       rawDetails(card, task.proposal.tool, ['task', task.id, 'proposal', task.proposal.call_id]);
     }
     if (task.pending && task.proposal?.report == null) {
@@ -883,7 +930,6 @@ const renderTasks = (store) => {
       }
     }
     if (['complete', 'abandoned'].includes(task.status)) { slot.append(card); continue; }
-    const session = (store.sessions ?? []).find(s => s.identity === task.start_session && s.session_state !== 'ended' && s.bound_set.length === 1 && s.bound_set[0] === task.machine);
     paragraph(card, 'If you close this page, work that can continue picks up after you unlock and resupply any requested key. The task keeps the same session, machine, approvals and limits. Use Resume if it stays paused.');
     const action = (text, request) => {
       const button = document.createElement('button');
@@ -891,10 +937,10 @@ const renderTasks = (store) => {
       button.addEventListener('click', () => { button.disabled = true; worker.postMessage({ task: { id: task.id, ...request } }); });
       card.append(button);
     };
-    if (session && store.lifecycle_state !== 'ended') {
+    if (session && store.lifecycle_state !== 'ended' && !awaitingAiKey(task)) {
       action('Resume', { action: 'resume', session: session.identity });
     } else if ((store.sessions ?? []).some(s => s.identity === task.start_session && s.session_state === 'ended')) paragraph(card, 'This task’s session has ended. Its history stays here, but it cannot continue.');
-    else paragraph(card, 'Unlock to restore this task’s session.');
+    else if (!session) paragraph(card, 'Unlock to restore this task’s session.');
     if (session && task.verifying && task.status === 'paused' && !task.pending) {
       action('Prepare complete re-check', { action: 'retry-checks', session: session.identity });
     }

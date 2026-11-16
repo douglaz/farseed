@@ -10,7 +10,7 @@ pub(super) struct Journal<E> {
 
 pub(super) fn journal<E>(event: E) -> Journal<E> {
     Journal {
-        journal_version: 2,
+        journal_version: 4,
         event,
     }
 }
@@ -137,8 +137,10 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Event, String> {
     let version: Version = serde_json::from_slice(bytes)
         .map_err(|_| format!("journal decoding failed. {UNCHANGED}"))?;
     match version.0 {
-        None | Some(1) => return Err(format!("unsupported earlier journal format. {UNCHANGED}")),
-        Some(2) => (),
+        None | Some(1 | 3) => {
+            return Err(format!("unsupported earlier journal format. {UNCHANGED}"));
+        }
+        Some(2 | 4) => (),
         Some(_) => return Err(format!("unknown journal version. {UNCHANGED}")),
     }
     let _: Unique = serde_json::from_slice(bytes)

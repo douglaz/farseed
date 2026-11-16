@@ -45,17 +45,32 @@ fn octal(bytes: &[u8]) -> String {
 /// The same text is sent by both browser builds. Existing job records are never changed;
 /// the parent jobs directory is restricted to mode 0700.
 pub fn launch(id: &str, machine: &str, command: &[u8]) -> String {
+    launch_input(id, machine, command, false)
+}
+
+fn launch_input(id: &str, machine: &str, command: &[u8], input: bool) -> String {
     assert!(valid_id(id));
-    let runner = quote(
-        &include_str!("jobs/runner.sh")
-            .replace("@COMMAND_RUNNER@", &quote(include_str!("jobs/command.sh"))),
-    );
-    format!(
+    let command_runner = if input {
+        include_str!("jobs/command.sh").replace("exec sh \"$d/command\"", "exec 0< \"$d/input\" || exit 1\n    rm -- \"$d/input\" || exit 1\n    exec sh \"$d/command\"")
+    } else {
+        include_str!("jobs/command.sh").into()
+    };
+    let runner =
+        quote(&include_str!("jobs/runner.sh").replace("@COMMAND_RUNNER@", &quote(&command_runner)));
+    let launch = format!(
         "# tau-web job launch {id}\numask 077\nmkdir -p {DIRECTORY} || exit 1\nchmod 700 {DIRECTORY} || exit 1\nd={DIRECTORY}/{id}\nmkdir \"$d\" || {{ printf '%s\\n' \"refusing existing or unavailable job directory: $d\" >&2; exit 1; }}\nprintf '%b' '{}' > \"$d/command\" || exit 1\nprintf '%b' '{}' > \"$d/machine\" || exit 1\ncat {BOOT_ID} > \"$d/boot\" || exit 1\n: > \"$d/stdout\"\n: > \"$d/stderr\"\nsetsid sh -c {runner} sh \"$d\" </dev/null >/dev/null 2> \"$d/runner-stderr\" &\nlauncher=$!\nstartup_passes=0\nwhile [ ! -f \"$d/ready\" ]; do\n    kill -0 \"$launcher\" 2>/dev/null || {{ [ -f \"$d/ready\" ] && break; cat \"$d/runner-stderr\" >&2; exit 1; }}\n    startup_passes=$((startup_passes + 1))\n    [ \"$startup_passes\" -lt 3000 ] || exit 1\n    # GNU coreutils (Arch) and busybox (Alpine) accept fractional sleep.\n    sleep 0.05\ndone\nwait_job=true\n{}",
         octal(command),
         octal(machine.as_bytes()),
         include_str!("jobs/read.sh")
-    )
+    );
+    if input {
+        launch.replace(
+            ": > \"$d/stdout\"",
+            "cat > \"$d/input\" || exit 1\n: > \"$d/stdout\"",
+        )
+    } else {
+        launch
+    }
 }
 
 /// A read only: neither launch text nor the command bytes are in a collection exec.
@@ -93,6 +108,16 @@ pub fn launch_with_elevation(
     elevation: Elevation,
 ) -> String {
     elevated(launch(id, machine, command), elevation)
+}
+
+pub fn launch_with_input(
+    id: &str,
+    machine: &str,
+    command: &[u8],
+    elevation: Elevation,
+    input: bool,
+) -> String {
+    elevated(launch_input(id, machine, command, input), elevation)
 }
 
 pub fn collect_with_elevation(id: &str, elevation: Elevation) -> String {

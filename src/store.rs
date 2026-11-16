@@ -55,6 +55,11 @@ use zeroize::{Zeroize, Zeroizing};
 #[cfg(target_arch = "wasm32")]
 pub mod opfs;
 
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    allow(dead_code, reason = "task keys are driven by the browser worker")
+)]
+pub(crate) mod ai_keys;
 pub(crate) mod authority;
 #[cfg_attr(
     not(target_arch = "wasm32"),
@@ -248,6 +253,7 @@ pub(crate) enum Event {
     PocProviderAccount(crate::poc::provisioning::AccountRecord),
     PocCreditAccount(crate::poc::credit::AccountRecord),
     PocCredit(credit::Record),
+    PocAiKey(ai_keys::Record),
     PocCreditExposure(Exposure),
 }
 
@@ -397,6 +403,7 @@ pub struct Store<S> {
     sessions: Vec<Rc<Session>>,
     inference: inference::State,
     credit: credit::State,
+    ai_keys: Vec<ai_keys::Entry>,
     scans: crate::scan::References,
     /// Memory-only clean-check digests; discarded with the unlocked store.
     protection_memo: std::cell::RefCell<protection::Memo>,
@@ -568,6 +575,7 @@ impl<S: Storage> Store<S> {
             sessions: Vec::new(),
             inference: inference::State::default(),
             credit: credit::State::default(),
+            ai_keys: Vec::new(),
             scans: Default::default(),
             protection_memo: Default::default(),
             reinstall: Default::default(),
@@ -1461,6 +1469,11 @@ impl<S: Storage> Store<S> {
             held.borrowed.push(&account.credit_id.0);
             held.borrowed.push(&account.default_key.0);
         }
+        for entry in &self.ai_keys {
+            if let Some(key) = &entry.key {
+                held.borrowed.push(key.0.as_bytes());
+            }
+        }
         if let Some(key) = &self.deployment_relay {
             held.borrowed.push(&key.0);
             let text = Zeroizing::new(hex::encode(key.0));
@@ -1665,6 +1678,7 @@ impl<S: Storage> Store<S> {
                 (_, Event::PocProviderAccount(account)) => self.replay_provider_account(account)?,
                 (_, Event::PocCreditAccount(account)) => self.replay_credit_account(account)?,
                 (_, Event::PocCredit(record)) => self.replay_credit(record)?,
+                (_, Event::PocAiKey(record)) => self.replay_ai_key(record)?,
                 (_, Event::PocTarget(record)) => {
                     self.replay_poc_target(number, record)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
@@ -1916,9 +1930,17 @@ impl<S: Storage> Store<S> {
             }
         }
         if matches!(&event, Event::DedicatedReinstall(_) | Event::PocTarget(_)) {
-            let value: Value = serde_json::from_slice::<Value>(&plaintext)
+            let mut value: Value = serde_json::from_slice::<Value>(&plaintext)
                 .map(|mut wrapper| wrapper["event"].take())
                 .map_err(|_| "dedicated record shape")?;
+            // Earlier enrollments omitted this additive, empty-by-default list.
+            if matches!(&event, Event::PocTarget(_)) {
+                value["poc_target"]
+                    .as_object_mut()
+                    .ok_or("dedicated record shape")?
+                    .entry("application_inference_keys")
+                    .or_insert_with(|| json!([]));
+            }
             if serde_json::to_value(&event).map_err(|_| "dedicated record shape")? != value {
                 return Err("dedicated record shape".into());
             }
@@ -2013,6 +2035,7 @@ impl<S: Storage> Store<S> {
             Event::PocProviderAccount(_)
                 | Event::PocCreditAccount(_)
                 | Event::PocCredit(_)
+                | Event::PocAiKey(_)
                 | Event::PocCreditExposure(_)
                 | Event::InferenceAccount { .. }
                 | Event::InferenceIntent(_)
@@ -2076,9 +2099,17 @@ impl<S: Storage> Store<S> {
             Zeroizing::new(serde_json::to_vec(&journal(event)).expect("an event serializes"));
         self.check_provider_material(&plaintext)?;
         self.check_deployment_material(&plaintext)?;
+        // Only the intentional encrypted custody field is exempt from echo refusal.
+        // All its metadata is checked; ordinary records still check their exact bytes.
+        let custody = Self::ai_key_custody_metadata(event).map(|value| {
+            Zeroizing::new(serde_json::to_vec(&value).expect("custody metadata serializes"))
+        });
+        let guarded = custody
+            .as_deref()
+            .map_or(plaintext.as_slice(), Vec::as_slice);
         for filter in self.poc_credential_filters.borrow().iter() {
             if filter
-                .literal_match(&plaintext)
+                .literal_match(guarded)
                 .map_err(|_| crate::poc::wait::JOURNAL_REFUSED.to_string())?
             {
                 return Err(crate::poc::wait::JOURNAL_REFUSED.into());

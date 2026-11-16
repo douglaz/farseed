@@ -219,6 +219,9 @@ impl<S: Storage> Store<S> {
                 reason: String::new(),
                 cut_off: true,
             },
+            Change::CutOff {
+                reason: String::new(),
+            },
             Change::PrepareCheck,
             Change::RetryChecks,
             Change::RejectDeclaration,

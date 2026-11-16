@@ -68,6 +68,9 @@ pub struct Malformed {
     pub reason: String,
     pub cut_off: bool,
 }
+fn initial_completion_tokens() -> u32 {
+    4000
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BeforeSetup {
@@ -84,6 +87,7 @@ pub struct Task {
     pub approved_plan: Option<String>,
     pub completed: Vec<Step>,
     pub proposal: Option<Proposal>,
+    pub ai_key_approved: bool,
     pub pending: Option<Pending>,
     pub status: Status,
     pub pause_reason: Option<String>,
@@ -101,12 +105,22 @@ pub struct Task {
     pub verifying: bool,
     pub requesting: bool,
     pub malformed: Option<Malformed>,
+    #[serde(default = "initial_completion_tokens")]
+    pub completion_tokens: u32,
     pub before_setup: Option<BeforeSetup>,
     /// Compare-and-append token: stale requests cannot publish or arm a command.
     pub revision: u64,
     pub inspection_record: Option<u64>,
 }
 impl Task {
+    pub fn awaiting_ai_key(&self) -> bool {
+        !self.ai_key_approved
+            && self.pending.is_none()
+            && self
+                .proposal
+                .as_ref()
+                .is_some_and(|proposal| matches!(proposal.tool, Tool::RequestAiKey { .. }))
+    }
     pub fn preparing_read(&self) -> bool {
         self.before_setup.as_ref().is_some_and(|r| !r.settled)
             && self.proposal.as_ref().is_some_and(|p| {
@@ -151,7 +165,7 @@ impl Task {
     }
     fn active(&mut self) {
         self.pause_reason = None;
-        self.status = if self.pending.is_some() {
+        self.status = if self.pending.is_some() || self.awaiting_ai_key() {
             Status::Waiting
         } else if self.verifying {
             Status::Verifying
@@ -174,15 +188,35 @@ pub enum Change {
     Request,
     PrepareRead,
     SkipRead(String),
-    Malformed { reason: String, cut_off: bool },
-    Propose { call_id: String, tool: Tool },
+    Malformed {
+        reason: String,
+        cut_off: bool,
+    },
+    CutOff {
+        reason: String,
+    },
+    Propose {
+        call_id: String,
+        tool: Tool,
+    },
     PrepareCheck,
     RetryChecks,
     SkipReport(String),
     RejectDeclaration,
+    AiKeyFailed(String),
+    AiKeyDecision {
+        create: bool,
+    },
+    AiKeyClassDecision {
+        answer: super::poc_targets::KeyCardAnswer,
+        at: u64,
+    },
     Settle,
     Inspect,
-    Wait { why: String, running: bool },
+    Wait {
+        why: String,
+        running: bool,
+    },
     Pause(String),
     Raise(Limits),
     Abandon,
@@ -539,7 +573,7 @@ impl<S: Storage> Store<S> {
             return Err("bound set".into());
         }
         // Reuse the legacy installation check without granting stored goals session authority.
-        if matches!(tool, Tool::Exec { .. }) {
+        if matches!(tool, Tool::Exec { .. } | Tool::RequestAiKey { .. }) {
             self.dispatch.check_installation(tool.machine())?;
         }
         Ok(())
@@ -568,6 +602,9 @@ impl<S: Storage> Store<S> {
         self.poc_authority(&task.id, session)?;
         if self.poc_task(&task.id)?.revision != task.revision || task.pending.is_some() {
             return Err("stale task execution".into());
+        }
+        if task.awaiting_ai_key() {
+            return Err("AI key request needs the operator's decision".into());
         }
         if let Tool::ProposeDeclaration {
             machine,
@@ -727,12 +764,18 @@ impl<S: Storage> Store<S> {
         mut change: Change,
     ) -> Result<Task, String> {
         match &mut change {
-            Change::Malformed { reason, .. } => {
+            Change::Malformed { reason, .. } | Change::CutOff { reason } => {
                 if reason.is_empty() || reason.len() > 512 {
                     return Err("malformed-reply reason exceeds its bound".into());
                 }
                 if self.protect_output(&json!(reason))? != json!(reason) {
                     return Err("malformed-reply reason contains protected material".into());
+                }
+            }
+            Change::AiKeyDecision { create: true } => {
+                // New approvals require the class answer; recorded approvals retain their meaning.
+                if self.ai_key_needs_class_answer(&self.poc_task(id)?.machine) {
+                    return Err("answer the machine question on the key card first".into());
                 }
             }
             Change::Pause(why) | Change::Wait { why, .. } | Change::SkipRead(why) => {
@@ -752,7 +795,8 @@ impl<S: Storage> Store<S> {
         };
         self.poc_record_safe(&record)?;
         let task = self.project_poc(self.next, &record)?;
-        self.commit(&Event::Poc(record)).await?;
+        self.commit(&Event::Poc(record.clone())).await?;
+        self.apply_poc_key_class(&record, &task);
         self.poc.insert(id.into(), task.clone());
         Ok(task)
     }
@@ -854,6 +898,7 @@ impl<S: Storage> Store<S> {
         // protects its derived outcome separately before checkpointing it.
         self.poc_record_safe(record)?;
         let task = self.project_poc(number, record)?;
+        self.apply_poc_key_class(record, &task);
         if let Record::Command { intent, .. } = record {
             self.apply_intent(number, intent.clone())?;
         }
@@ -864,6 +909,19 @@ impl<S: Storage> Store<S> {
         }
         self.poc.insert(task.id.clone(), task);
         Ok(())
+    }
+    fn apply_poc_key_class(&mut self, record: &Record, task: &Task) {
+        if let Record::Change {
+            change:
+                Change::AiKeyClassDecision {
+                    answer: super::poc_targets::KeyCardAnswer::OnlyMe,
+                    at,
+                },
+            ..
+        } = record
+        {
+            self.apply_key_card_class(&task.machine, *at);
+        }
     }
     fn project_poc(&self, number: u64, record: &Record) -> Result<Task, String> {
         if let Record::Create {
@@ -910,6 +968,7 @@ impl<S: Storage> Store<S> {
                 approved_plan: None,
                 completed: vec![],
                 proposal: None,
+                ai_key_approved: false,
                 pending: None,
                 status: Status::Running,
                 pause_reason: None,
@@ -927,6 +986,7 @@ impl<S: Storage> Store<S> {
                 verifying: false,
                 requesting: false,
                 malformed: None,
+                completion_tokens: initial_completion_tokens(),
                 before_setup: None,
                 revision: 0,
                 inspection_record: None,
@@ -959,8 +1019,24 @@ impl<S: Storage> Store<S> {
         match record {
             Record::Command { binding, intent } => {
                 let proposal = task.proposal.as_ref().ok_or("missing task proposal")?;
-                let Tool::Exec { machine, command } = &proposal.tool else {
-                    return Err("task command tool".into());
+                let (machine, command) = match &proposal.tool {
+                    Tool::Exec { machine, command } => (machine, command.clone()),
+                    Tool::RequestAiKey { machine, .. } => {
+                        let entry = self
+                            .ai_key(&task.id, &proposal.call_id)
+                            .ok_or("AI key custody missing")?;
+                        if entry.key.is_none() {
+                            return Err("AI key custody missing".into());
+                        }
+                        (
+                            machine,
+                            super::ai_keys::command(
+                                &entry.path,
+                                entry.key.as_ref().ok_or("AI key custody missing")?.0.len(),
+                            ),
+                        )
+                    }
+                    _ => return Err("task command tool".into()),
                 };
                 if binding.session != task.start_session
                     || self.ended_sessions.contains(&binding.session)
@@ -969,7 +1045,7 @@ impl<S: Storage> Store<S> {
                     || intent.call != number
                     || intent.machine != task.machine
                     || machine != &task.machine
-                    || intent.command != hex::encode(command)
+                    || intent.command != hex::encode(&command)
                     || intent.provenance.as_ref().is_none_or(|p| {
                         p.session.as_ref() != Some(&binding.session)
                             || p.target != crate::dispatch::Target::Entry(task.machine.clone())
@@ -1112,7 +1188,7 @@ impl<S: Storage> Store<S> {
                             task.active();
                         }
                     }
-                    Change::Malformed { reason, cut_off } => {
+                    Change::Malformed { reason, .. } | Change::CutOff { reason } => {
                         if !task.requesting
                             || task.pending.is_some()
                             || task.proposal.is_some()
@@ -1123,7 +1199,20 @@ impl<S: Storage> Store<S> {
                                 "no current request or invalid malformed-reply reason".into()
                             );
                         }
-                        let count = task.malformed.as_ref().map_or(1, |m| m.count + 1);
+                        let cut_off = matches!(
+                            change,
+                            Change::CutOff { .. } | Change::Malformed { cut_off: true, .. }
+                        );
+                        // Historical malformed records count a strike and never raise the cap.
+                        let raising_cap = matches!(change, Change::CutOff { .. })
+                            && task.completion_tokens < 16000;
+                        if raising_cap {
+                            task.completion_tokens = (task.completion_tokens * 2).min(16000);
+                        } else if !cut_off {
+                            task.completion_tokens = initial_completion_tokens();
+                        }
+                        let previous = task.malformed.as_ref().map_or(0, |m| m.count);
+                        let count = previous + u32::from(!raising_cap);
                         if count > 3 {
                             return Err("malformed-reply bound exhausted".into());
                         }
@@ -1131,12 +1220,16 @@ impl<S: Storage> Store<S> {
                         task.malformed = Some(Malformed {
                             count,
                             reason: reason.clone(),
-                            cut_off: *cut_off,
+                            cut_off,
                         });
                         if count == 3 {
-                            const PREFIX: &str = "3 malformed replies in a row; last reason: ";
+                            let prefix = if matches!(change, Change::CutOff { .. }) {
+                                "the AI's reply was cut off; 3 unusable replies in a row; last reason: "
+                            } else {
+                                "3 malformed replies in a row; last reason: "
+                            };
                             const SUFFIX: &str = ". Resume asks the model again.";
-                            let available = 512 - PREFIX.len() - SUFFIX.len();
+                            let available = 512 - prefix.len() - SUFFIX.len();
                             let last = if reason.len() > available {
                                 let mut end = available - "…".len();
                                 while !reason.is_char_boundary(end) {
@@ -1146,7 +1239,7 @@ impl<S: Storage> Store<S> {
                             } else {
                                 reason.clone()
                             };
-                            task.pause(format!("{PREFIX}{last}{SUFFIX}"));
+                            task.pause(format!("{prefix}{last}{SUFFIX}"));
                         } else {
                             task.active();
                         }
@@ -1157,6 +1250,8 @@ impl<S: Storage> Store<S> {
                         }
                         task.requesting = false;
                         task.malformed = None;
+                        task.completion_tokens = initial_completion_tokens();
+                        task.ai_key_approved = false;
                         let wire = serde_json::to_value(tool).map_err(|_| "tool encoding")?;
                         Tool::parse(&wire)?;
                         if call_id.is_empty()
@@ -1200,13 +1295,16 @@ impl<S: Storage> Store<S> {
                                     ));
                                 } else {
                                     match tool {
-                                        Tool::Exec { .. } | Tool::ProposeDeclaration { .. } => {
+                                        Tool::Exec { .. }
+                                        | Tool::ProposeDeclaration { .. }
+                                        | Tool::RequestAiKey { .. } => {
                                             task.proposal = Some(Proposal {
                                                 call_id: call_id.clone(),
                                                 tool: tool.clone(),
                                                 check: None,
                                                 report: None,
                                             });
+                                            task.active();
                                         }
                                         Tool::Done { checks, .. } => {
                                             let declaration = self.dispatch.approved_entries
@@ -1255,6 +1353,74 @@ impl<S: Storage> Store<S> {
                                 }
                             }
                         }
+                    }
+                    Change::AiKeyDecision { create } => {
+                        if !task.awaiting_ai_key()
+                            || self
+                                .ai_key(&task.id, &task.proposal.as_ref().expect("request").call_id)
+                                .is_some()
+                        {
+                            return Err("AI key decision is no longer available".into());
+                        }
+                        if *create {
+                            task.ai_key_approved = true;
+                        } else {
+                            let proposal = task.proposal.take().expect("request");
+                            task.completed.push((
+                                proposal.call_id,
+                                proposal.tool,
+                                crate::goals::untrusted(
+                                    "tool_output",
+                                    json!({"status":"declined"}),
+                                ),
+                            ));
+                        }
+                        task.active();
+                    }
+                    Change::AiKeyClassDecision { answer, at } => {
+                        if !task.awaiting_ai_key()
+                            || !self.ai_key_needs_class_answer(&task.machine)
+                            || !self.poc_targets.contains_key(&task.machine)
+                            || !self.dispatch.approved_entries.contains_key(&task.machine)
+                            || *at == 0
+                            || self
+                                .ai_key(&task.id, &task.proposal.as_ref().expect("request").call_id)
+                                .is_some()
+                        {
+                            return Err("AI key decision is no longer available".into());
+                        }
+                        if *answer == super::poc_targets::KeyCardAnswer::OnlyMe {
+                            task.ai_key_approved = true;
+                        } else {
+                            let proposal = task.proposal.take().expect("request");
+                            let reason = if *answer == super::poc_targets::KeyCardAnswer::OthersToo
+                            {
+                                "the operator said this machine may serve others; no key was created"
+                            } else {
+                                "the operator is not sure this machine serves only them; no key was created"
+                            };
+                            task.completed.push((
+                                proposal.call_id,
+                                proposal.tool,
+                                crate::goals::untrusted(
+                                    "tool_output",
+                                    json!({"status":"refused","reason":reason}),
+                                ),
+                            ));
+                        }
+                        task.active();
+                    }
+                    Change::AiKeyFailed(reason) => {
+                        let proposal = task.proposal.take().ok_or("AI key request missing")?;
+                        if !matches!(proposal.tool, Tool::RequestAiKey { .. })
+                            || task.pending.is_some()
+                            || reason.trim().is_empty()
+                        {
+                            return Err("AI key failure record refused".into());
+                        }
+                        let entry = self.ai_key(&task.id, &proposal.call_id);
+                        task.completed.push((proposal.call_id, proposal.tool, crate::goals::untrusted("tool_output", json!({"status":"failed","reason":reason,"path":entry.map(|e| &e.path),"limit_usd":crate::poc::credit::AI_KEY_CAP}))));
+                        task.active();
                     }
                     Change::RejectDeclaration => {
                         let proposal = task.proposal.take().ok_or("no declaration proposal")?;
@@ -1406,7 +1572,15 @@ impl<S: Storage> Store<S> {
                         if !background && exit.is_none() {
                             return Err(crate::poc::wait::NO_EXIT.into());
                         }
-                        let outcome = if background {
+                        let outcome = if matches!(proposal.tool, Tool::RequestAiKey { .. }) {
+                            if background {
+                                return Err("AI key write is still running; inspect the recorded job before Resume".into());
+                            }
+                            self.ai_key_outcome(
+                                self.poc.get(&task.id).ok_or("AI key task missing")?,
+                                exit,
+                            )?
+                        } else if background {
                             report.background_outcome()
                         } else {
                             json!({"call":pending.call,"job":pending.job,"exit_status":exit,"stdout":report.stdout,"stderr":report.stderr})

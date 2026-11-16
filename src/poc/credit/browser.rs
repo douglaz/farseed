@@ -959,3 +959,156 @@ pub(crate) async fn refusal(status: u16, bytes: &[u8], session: &str) -> String 
         InferenceFailure::Refused => REFUSED.into(),
     }
 }
+
+/// A recorded request is never minted twice. Missing custody after it means unknown outcome.
+pub(crate) async fn prepare_ai_key(task: &crate::store::poc::Task) -> Result<bool, String> {
+    use crate::store::ai_keys::Record as KeyRecord;
+    const UNKNOWN: &str =
+        "AI key creation outcome is unknown; the recorded request will not be sent again";
+    let proposal = task.proposal.as_ref().ok_or("AI key request missing")?;
+    if !task.ai_key_approved {
+        return Err("AI key request needs the operator's decision".into());
+    }
+    let fence = Fence::new(Some(&task.start_session))?;
+    let _active = Active::wait().await;
+    let local = crate::worker::local();
+    let (mint, registration) = {
+        let mut local = local.lock().await;
+        let store = fence.store(&mut local)?;
+        store.check_task_session(task, &task.start_session)?;
+        if let Some(entry) = store.ai_key(&task.id, &proposal.call_id) {
+            if entry.key.is_some() {
+                return Ok(true);
+            }
+            store
+                .poc_change(
+                    &task.id,
+                    task.revision,
+                    crate::store::poc::Change::AiKeyFailed(
+                        "the AI key outcome is unknown; no key was saved".into(),
+                    ),
+                )
+                .await?;
+            return Ok(false);
+        }
+        if store.credit_account().is_none() {
+            store
+                .poc_change(
+                    &task.id,
+                    task.revision,
+                    crate::store::poc::Change::AiKeyFailed(
+                        "no inference credit account is available".into(),
+                    ),
+                )
+                .await?;
+            return Ok(false);
+        }
+        let mint = Mint {
+            session: task.start_session.clone(),
+            name: mint_name()?,
+            requested_cap: AI_KEY_CAP,
+            requested_expiry: now().checked_add(AI_KEY_LIFETIME).ok_or(MINT_FAILED)?,
+            issuer_id: None,
+            returned_cap: None,
+            returned_expiry: None,
+        };
+        store
+            .ai_key_commit(KeyRecord::Request {
+                task: task.id.clone(),
+                call: proposal.call_id.clone(),
+                path: crate::store::ai_keys::path(task),
+                mint: mint.clone(),
+                configuration: Some(
+                    crate::poc::inference::configuration().ok_or("inference endpoint missing")?,
+                ),
+            })
+            .await?;
+        (mint, store.credit_filter_handle())
+    };
+    let expiry = js_sys::Date::new(&JsValue::from_f64(mint.requested_expiry as f64 * 1000.0))
+        .to_iso_string()
+        .as_string()
+        .ok_or(MINT_FAILED)?;
+    let (status, mut value) = exchange(
+        &fence,
+        "POST",
+        "/keys",
+        Auth::Account,
+        Some(serde_json::json!({"name":mint.name,"usage_limit_usd":AI_KEY_CAP,"expire_at":expiry})),
+    )
+    .await
+    .map_err(|_| UNKNOWN)?;
+    let raw_key = ClearedValue(value.0["data"]["api_key"].take());
+    let key = raw_key
+        .0
+        .as_str()
+        .map(|s| Zeroizing::new(s.as_bytes().to_vec()));
+    if let Some(key) = &key {
+        let next = crate::poc::inference::EchoFilter::new(&[key]);
+        let mut filters = registration.borrow_mut();
+        if let Some(combined) = filters.first_mut() {
+            combined.merge(next);
+        } else {
+            filters.push(next);
+        }
+    }
+    if status >= 500 {
+        return Err(UNKNOWN.into());
+    }
+    let accepted: Result<(), String> = async {
+        let mut local = local.lock().await;
+        let store = fence.store(&mut local)?;
+        store.check_task_session(task, &task.start_session)?;
+        if status != 201 {
+            return Err("the credit service refused the key request".into());
+        }
+        let key = key
+            .as_ref()
+            .ok_or("the credit service returned an unusable key")?;
+        crate::poc::inference::valid_key(key)
+            .map_err(|_| "the credit service returned an unusable key")?;
+        let account = store
+            .credit_account()
+            .ok_or("no inference credit account is available")?;
+        if key.as_slice() == account.credit_id.0 || key.as_slice() == account.default_key.0 {
+            return Err("the credit service returned an unusable key".into());
+        }
+        store
+            .poc_configuration_key(key)
+            .map_err(|_| "the credit service returned an unusable key")?;
+        let (issuer_id, expires) = returned_mint(&value.0, &mint)
+            .map_err(|_| "the credit service did not confirm the key limits")?;
+        store
+            .ai_key_commit(KeyRecord::Held {
+                machine: task.machine.clone(),
+                name: mint.name.clone(),
+                issuer_id,
+                expires,
+                key: SecretText(Zeroizing::new(
+                    std::str::from_utf8(key).map_err(|_| MINT_FAILED)?.into(),
+                )),
+            })
+            .await?;
+        Ok(())
+    }
+    .await;
+    drop(key);
+    drop(raw_key);
+    drop(value);
+    if let Err(reason) = accepted {
+        let mut local = local.lock().await;
+        // A lock can discard a validated response before custody was committed. Leave
+        // the request unresolved now; the next continuation records its failure once.
+        let store = fence.store(&mut local).map_err(|_| UNKNOWN)?;
+        store.check_task_session(task, &task.start_session)?;
+        store
+            .poc_change(
+                &task.id,
+                task.revision,
+                crate::store::poc::Change::AiKeyFailed(reason),
+            )
+            .await?;
+        return Ok(false);
+    }
+    Ok(true)
+}

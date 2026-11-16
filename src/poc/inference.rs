@@ -78,6 +78,7 @@ fn argument_reason(name: &str, args: &Value) -> String {
     let fields: &[&str] = match name {
         "exec" => &["machine", "command"],
         "done" => &["machine", "checks"],
+        "request_ai_key" => &["machine", "application", "purpose"],
         _ => &["machine", "declaration"],
     };
     let Some(object) = args.as_object() else {
@@ -89,6 +90,11 @@ fn argument_reason(name: &str, args: &Value) -> String {
         }
         let valid = match *field {
             "declaration" => object.contains_key(*field),
+            "application" | "purpose" => args[*field].as_str().is_some_and(|text| {
+                !text.trim().is_empty()
+                    && text.len() <= if *field == "application" { 64 } else { 160 }
+                    && text.bytes().all(|b| b == b' ' || b.is_ascii_graphic())
+            }),
             "checks" => args[*field].as_array().is_some_and(|a| {
                 a.len() <= 4
                     && a.iter().all(|v| {
@@ -1274,13 +1280,14 @@ fn request_context<S: Storage>(
         if let Some(task) = task
             && let Some(malformed) = &task.malformed
         {
-            let mut instruction = format!(
-                "Your last reply could not be used: {}. Reply with exactly one call to an offered tool.",
-                malformed.reason
-            );
-            if malformed.cut_off {
-                instruction.push_str("\nIf your reply was cut off, make it shorter.");
-            }
+            let instruction = if malformed.cut_off {
+                "Your last reply was cut off. The reply limit has been raised where possible; your reply may be complete now. Reply with exactly one call to an offered tool.".into()
+            } else {
+                format!(
+                    "Your last reply could not be used: {}. Reply with exactly one call to an offered tool.",
+                    malformed.reason
+                )
+            };
             messages.push(json!({"role":"user", "content":instruction}));
         }
         let mut ids = std::collections::BTreeSet::new();
@@ -1290,7 +1297,10 @@ fn request_context<S: Storage>(
                 || tool.machine() != machine
                 || !matches!(
                     tool,
-                    Tool::Exec { .. } | Tool::Done { .. } | Tool::ProposeDeclaration { .. }
+                    Tool::Exec { .. }
+                        | Tool::Done { .. }
+                        | Tool::ProposeDeclaration { .. }
+                        | Tool::RequestAiKey { .. }
                 )
             {
                 return Err("inference completed-step schema invalid".into());
@@ -1387,7 +1397,8 @@ fn request_context<S: Storage>(
             handover.push_str("These harness reads already run after done, so checks must not repeat them; a check equal to a harness read is dropped and not run.\n");
             handover.push_str("Before calling done, run these same commands yourself with exec and fix every difference. Differences found after done pause the task as findings.");
             messages.push(json!({"role":"user", "content":handover}));
-            definitions.as_array().expect("tool definitions").iter()
+            messages.push(json!({"role":"user", "content":"For an application the operator asked for that needs its own AI access, call request_ai_key with a short plain application name and purpose, never for your own use and never with a secret; after the operator presses Create key on its card, tau-web creates an application inference key capped at 0.25 USD, expiring in 30 days, and saves it on the machine at the path in the reply, which also gives the chat-completions API base URL to configure the application with. The key outlives this session; use the file, never print the key, and never ask the operator for keys."}));
+            let mut offered: Vec<_> = definitions.as_array().expect("tool definitions").iter()
                 .filter(|d| matches!(d["name"].as_str(), Some("exec" | "done")))
                 .map(|d| {
                     let mut d = d.clone();
@@ -1395,11 +1406,13 @@ fn request_context<S: Storage>(
                         d["parameters"]["properties"]["checks"] = json!({"type":"array","maxItems":4,"description":"Optional: at most four runnable POSIX sh commands, not descriptions or prose. Each runs as root on the machine after done and before the harness reads. Their exit statuses are shown to the user as checks the AI wrote and never decide delivery. The harness reads listed in the handover already run; checks is only for other checks. A check equal to a harness read is dropped and not run.","items":{"type":"string","minLength":1,"maxLength":8192,"description":"A runnable POSIX sh command, not a description or prose, run as root on the machine after done and before the harness reads. Its exit status is shown to the user as a check the AI wrote and never decides delivery. The harness reads listed in the handover already run; checks is only for other checks. A check equal to a harness read is dropped and not run."}});
                     }
                     json!({"type":"function","function":d})
-                }).collect()
+                }).collect();
+            offered.push(json!({"type":"function","function":{"name":"request_ai_key","description":"Request an application inference key for an application the operator asked for that needs its own AI access, never for your own use. The operator must approve on a card before creation; the key outlives the session, with a 0.25 USD cap and 30-day expiry.","parameters":{"type":"object","properties":{"machine":{"type":"string"},"application":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[ -~]+$","description":"Short plain name of the operator's application; no secret."},"purpose":{"type":"string","minLength":1,"maxLength":160,"pattern":"^[ -~]+$","description":"One plain line describing why the operator's application needs its own AI access; no secret."}},"required":["machine","application","purpose"],"additionalProperties":false}}}));
+            offered
         };
         let value = protected(
             store,
-            &json!({"model":config.model,"max_completion_tokens":4000,"tool_choice":"auto","parallel_tool_calls":false,"provider":{"zdr":true},"messages":messages,"tools":tools}),
+            &json!({"model":config.model,"max_completion_tokens":task.map_or(4000, |task| task.completion_tokens),"tool_choice":"auto","parallel_tool_calls":false,"provider":{"zdr":true},"messages":messages,"tools":tools}),
             credentials,
         )?;
         let body =
@@ -1502,7 +1515,7 @@ pub(crate) fn normalize<S: Storage>(
             || choice["native_finish_reason"] == "max_output_tokens";
         let result: Result<(String, Tool), String> = (|| {
             if cut_off {
-                return Err("reply was cut off".into());
+                return Err("the AI's reply was cut off".into());
             }
             let calls = message
                 .get("tool_calls")
@@ -1528,7 +1541,7 @@ pub(crate) fn normalize<S: Storage>(
             if !if store.poc_needs_declaration(machine) {
                 name == "propose_declaration"
             } else {
-                matches!(name, "exec" | "done")
+                matches!(name, "exec" | "done" | "request_ai_key")
             } {
                 return Err("inference tool is not offered".into());
             }

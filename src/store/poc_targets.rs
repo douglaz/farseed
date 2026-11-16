@@ -14,6 +14,28 @@ pub(crate) struct Record {
     relay_identity: Identity,
     class_answer: ClassAnswer,
     access: Access,
+    #[serde(default)]
+    pub(super) application_inference_keys: Vec<super::ai_keys::MachineKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_card_class: Option<KeyCardClass>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyCardAnswer {
+    #[serde(rename = "only-me")]
+    OnlyMe,
+    #[serde(rename = "others-too")]
+    OthersToo,
+    #[serde(rename = "not-sure")]
+    NotSure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyCardClass {
+    class: crate::dispatch::MachineClass,
+    provenance: String,
+    at: u64,
 }
 
 #[derive(Deserialize)]
@@ -41,6 +63,36 @@ pub(super) fn eligible_pass(allocation: &Metadata) -> Option<&Identity> {
 }
 
 impl<S: Storage> Store<S> {
+    pub(crate) fn ai_key_needs_class_answer(&self, machine: &str) -> bool {
+        self.dispatch
+            .approved_entries
+            .get(machine)
+            .is_none_or(|record| {
+                record.class != Some(crate::dispatch::MachineClass::SinglePurpose)
+                    || record.answer != Some(ClassAnswer::No)
+            })
+    }
+
+    pub(super) fn apply_key_card_class(&mut self, machine: &str, at: u64) {
+        let record = self
+            .poc_targets
+            .get_mut(machine)
+            .expect("validated machine");
+        record.class_answer = ClassAnswer::No;
+        record.key_card_class = Some(KeyCardClass {
+            class: crate::dispatch::MachineClass::SinglePurpose,
+            provenance: "operator answer on the key card".into(),
+            at,
+        });
+        let approved = self
+            .dispatch
+            .approved_entries
+            .get_mut(machine)
+            .expect("validated machine");
+        approved.answer = Some(ClassAnswer::No);
+        approved.class = Some(crate::dispatch::MachineClass::SinglePurpose);
+    }
+
     #[cfg(all(feature = "tracer", target_arch = "wasm32"))]
     pub(crate) fn test_poc_replace_target(
         &mut self,
@@ -61,13 +113,23 @@ impl<S: Storage> Store<S> {
     pub fn poc_targets_view(&self) -> Value {
         self.poc_targets
             .values()
-            .map(|record| serde_json::to_value(&record.target).expect("target serializes"))
+            .map(|record| {
+                let mut value = serde_json::to_value(&record.target).expect("target serializes");
+                value["application_inference_keys"] = json!(record.application_inference_keys);
+                value["ai_key_needs_class_answer"] =
+                    json!(self.ai_key_needs_class_answer(&record.target.machine));
+                value["key_card_class"] = json!(record.key_card_class);
+                value
+            })
             .collect::<Vec<_>>()
             .into()
     }
 
     fn poc_projections(&self, record: &Record) -> Result<(Dispatch, Metadata), String> {
         record.target.validate()?;
+        if !record.application_inference_keys.is_empty() || record.key_card_class.is_some() {
+            return Err("machine enrollment cannot supply application inference keys".into());
+        }
         if let Some(old) = self.poc_targets.get(&record.target.machine) {
             return if old == record {
                 Ok((self.dispatch.clone(), self.allocation().clone()))
@@ -208,6 +270,8 @@ impl<S: Storage> Store<S> {
             relay_identity,
             class_answer: enrollment.class_answer,
             access: Access::ad_hoc(),
+            application_inference_keys: Vec::new(),
+            key_card_class: None,
         };
         let (mut dispatch, allocation) = self.poc_projections(&record)?;
         dispatch.setup_approval = Some(self.next);
@@ -332,6 +396,8 @@ impl<S: Storage> Store<S> {
             relay_identity,
             class_answer,
             access: Access::ad_hoc(),
+            application_inference_keys: Vec::new(),
+            key_card_class: None,
         }
     }
 }
