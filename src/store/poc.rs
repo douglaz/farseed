@@ -13,8 +13,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            requests: 100,
-            steps: 200,
+            requests: 250,
+            steps: 500,
         }
     }
 }
@@ -125,18 +125,21 @@ impl Task {
     pub(super) fn view(&self) -> Value {
         let mut value = serde_json::to_value(self).expect("task serializes");
         for step in value["completed"].as_array_mut().expect("completed array") {
-            let content = &mut step[2]["content"];
-            for field in ["stdout", "stderr"] {
-                if let Some(text) = content[field].as_str() {
-                    let excerpt: String = text.chars().take(1024).collect();
-                    if excerpt.len() < text.len() {
-                        content[field] = excerpt.into();
-                        content[format!("{field}_truncated")] = true.into();
-                    }
+            Self::truncate_step_view(step);
+        }
+        value
+    }
+    fn truncate_step_view(step: &mut Value) {
+        let content = &mut step[2]["content"];
+        for field in ["stdout", "stderr"] {
+            if let Some(text) = content[field].as_str() {
+                let excerpt: String = text.chars().take(1024).collect();
+                if excerpt.len() < text.len() {
+                    content[field] = excerpt.into();
+                    content[format!("{field}_truncated")] = true.into();
                 }
             }
         }
-        value
     }
     pub fn ended(&self) -> bool {
         matches!(self.status, Status::Complete | Status::Abandoned)
@@ -279,6 +282,22 @@ impl<S: Storage> Store<S> {
                     task.active();
                     task.revision = number;
                 }
+            }
+        }
+    }
+    /// Warm exactly the report's completed-step projection before any report scope.
+    /// Each check has its own synchronous budget. Outputs/errors are discarded;
+    /// only completed clean checks under the current output key can be reused.
+    pub(super) fn warm_poc_report(&self) {
+        for task in self.poc.values() {
+            for step in &task.completed {
+                let _ = crate::poc::inference::work::scope(|| {
+                    let mut step =
+                        serde_json::to_value(step).map_err(|_| crate::poc::wait::TASK_ENCODING)?;
+                    Task::truncate_step_view(&mut step);
+                    self.protect_output(&json!({"tasks":[{"completed":[step]}]}))?;
+                    Ok(())
+                });
             }
         }
     }

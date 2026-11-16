@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
-pub const CAP: f64 = 0.25;
+pub const CAP: f64 = 1.0;
 pub const LIFETIME: u64 = 86_400;
 pub const POLL_SECONDS: u64 = 5;
 pub const ACCOUNT_FAILED: &str = "Couldn't create the credit account. Try again.";
@@ -12,7 +12,7 @@ pub const INVOICE_INVALID: &str = "The credit service sent an invoice this page 
 pub const UNKNOWN: &str = "Payment status unknown.";
 pub const MINT_FAILED: &str = "Couldn't create this session's inference key.";
 pub const REFUSED: &str = "The credit service refused this request.";
-pub const DISCLOSURE: &str = "Inference uses a key capped at 0.25 USD of your credit and valid 24 hours (requested limits, per key). A new key with the same limits is made after each Unlock or New key press, so a session can use more than 0.25 USD in total; your credit balance is the overall limit.";
+pub const DISCLOSURE: &str = "Inference uses a key capped at 1 USD of your credit and valid 24 hours (requested limits, per key). A new key with the same limits is made after each Unlock or New key press, so a session can use more than 1 USD in total; your credit balance is the overall limit.";
 
 /// A decoded secret clears even when a later field fails to decode.
 pub(crate) struct SecretText(pub Zeroizing<String>);

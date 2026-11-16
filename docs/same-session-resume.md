@@ -106,7 +106,7 @@ Its ordinary control waits and overall watchdog retain their existing limits; th
 checks every credential form and requires an authenticated result with no matches.
 
 
-New PoC tasks record a 100-request / 200-step brake. This is a PoC task limit rather
+New PoC tasks record a 250-request / 500-step brake. This is a PoC task limit rather
 than ARC-31a's session spend/lifetime limit. At key exhaustion the task pauses rather
-than ending the session. Unlock / New key mints another $0.25 key. These are named
+than ending the session. Unlock / New key mints another $1 key. These are named
 PoC departures; no specification-conformance claim is made.

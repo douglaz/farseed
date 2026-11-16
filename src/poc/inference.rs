@@ -29,6 +29,10 @@ pub(crate) fn model_steps(task: &crate::store::poc::Task) -> Vec<Step> {
 }
 const EXCERPT_BYTES: usize = 8 * 1024;
 const REQUEST_BYTES: usize = 128 * 1024;
+// Serialized completed messages, including their separators. Reserve 32 KiB for
+// system/goal/facts/guidance/definitions; the final body cap remains authoritative.
+const HISTORY_BYTES: usize = 96 * 1024;
+const SHORT_EXCERPT_BYTES: usize = 768;
 const RESPONSE_BYTES: usize = 256 * 1024;
 const RESPONSE_TOO_LARGE: &str = "inference response exceeds the local size bound";
 const ERROR_BYTES: usize = 512;
@@ -1026,10 +1030,60 @@ fn excerpt(text: &str, limit: usize) -> String {
     format!("{}{}", &text[..end], &SUFFIX[..SUFFIX.len().min(limit)])
 }
 
-fn outcome_excerpt(outcome: &Value) -> Result<String, String> {
+#[derive(Clone, Copy)]
+enum HistoryExcerpt {
+    Full,
+    Short,
+    Omitted,
+}
+
+fn omitted_output(bytes: usize) -> String {
+    format!("[{bytes} bytes of output omitted]")
+}
+
+fn head_tail_excerpt(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.into();
+    }
+    // The longest possible decimal count reserves enough room before slicing.
+    let room = limit.saturating_sub(omitted_output(text.len()).len() + 2);
+    let mut head = room / 2;
+    let mut tail = text.len() - (room - head);
+    while !text.is_char_boundary(head) {
+        head -= 1;
+    }
+    while !text.is_char_boundary(tail) {
+        tail += 1;
+    }
+    format!(
+        "{}\n{}\n{}",
+        &text[..head],
+        omitted_output(tail - head),
+        &text[tail..]
+    )
+}
+
+impl HistoryExcerpt {
+    fn limit(self) -> usize {
+        match self {
+            Self::Full => EXCERPT_BYTES,
+            Self::Short => SHORT_EXCERPT_BYTES,
+            Self::Omitted => 0,
+        }
+    }
+    fn excerpt(self, text: &str, limit: usize) -> String {
+        match self {
+            Self::Full => excerpt(text, limit),
+            Self::Short => head_tail_excerpt(text, limit),
+            Self::Omitted => omitted_output(text.len()),
+        }
+    }
+}
+
+fn outcome_excerpt(outcome: &Value, detail: HistoryExcerpt) -> Result<String, String> {
     work::value(outcome, 0)?;
     let Some(fields) = outcome.as_object() else {
-        return Ok(excerpt(&outcome.to_string(), EXCERPT_BYTES));
+        return Ok(detail.excerpt(&outcome.to_string(), detail.limit()));
     };
     let streams: Vec<_> = ["stdout", "stderr"]
         .into_iter()
@@ -1042,12 +1096,20 @@ fn outcome_excerpt(outcome: &Value) -> Result<String, String> {
         })
         .collect();
     if streams.is_empty() {
-        return Ok(excerpt(&outcome.to_string(), EXCERPT_BYTES));
+        return Ok(detail.excerpt(&outcome.to_string(), detail.limit()));
+    }
+    if matches!(detail, HistoryExcerpt::Omitted) {
+        return Ok(omitted_output(
+            streams.iter().map(|(_, text)| text.len()).sum(),
+        ));
     }
     let mut text = String::new();
-    let per_stream = EXCERPT_BYTES.saturating_sub(64) / streams.len();
+    let per_stream = detail.limit().saturating_sub(64) / streams.len();
     for (name, content) in streams {
-        text.push_str(&format!("{name}:\n{}\n", excerpt(content, per_stream)));
+        text.push_str(&format!(
+            "{name}:\n{}\n",
+            detail.excerpt(content, per_stream)
+        ));
     }
     let mut rest = fields.clone();
     for name in ["stdout", "stderr", "record"] {
@@ -1056,15 +1118,85 @@ fn outcome_excerpt(outcome: &Value) -> Result<String, String> {
     if !rest.is_empty() {
         text.push_str(&Value::Object(rest).to_string());
     }
-    Ok(excerpt(&text, EXCERPT_BYTES))
+    Ok(detail.excerpt(&text, detail.limit()))
 }
 
-fn step_messages(id: &str, value: &Value, outcome: &Value) -> Result<[Value; 2], String> {
-    let outcome = Zeroizing::new(outcome_excerpt(outcome)?);
+fn step_messages(
+    id: &str,
+    value: &Value,
+    outcome: &Value,
+    detail: HistoryExcerpt,
+) -> Result<[Value; 2], String> {
+    let outcome = Zeroizing::new(outcome_excerpt(outcome, detail)?);
     Ok([
         json!({"role":"assistant","content":null,"tool_calls":[{"type":"function","id":id,"function":{"name":value["name"],"arguments":value["arguments"].to_string()}}]}),
         json!({"role":"tool","tool_call_id":id,"content":&*outcome}),
     ])
+}
+
+// Pure sizing from recorded steps, independent of credentials, memo contents or
+// request facts. No sizing result authorizes release; both protection paths below
+// reconstruct and check the selected representation in full.
+fn history_excerpts(steps: &[Step]) -> Result<Vec<HistoryExcerpt>, String> {
+    fn size(step: &Step, detail: HistoryExcerpt) -> Result<usize, String> {
+        work::scope(|| {
+            let (id, tool, outcome) = step;
+            let value = serde_json::to_value(tool).map_err(|_| "inference tool encoding")?;
+            let messages = step_messages(id, &value, outcome, detail)?;
+            let bytes = Zeroizing::new(
+                serde_json::to_vec(&messages).map_err(|_| "inference request encoding")?,
+            );
+            // Replace the enclosing pair brackets by two message separators.
+            Ok(bytes.len() - 1)
+        })
+    }
+    let mut sizes = steps
+        .iter()
+        .map(|step| Ok([size(step, HistoryExcerpt::Full)?, 0, 0]))
+        .collect::<Result<Vec<_>, String>>()?;
+    if sizes.iter().map(|s| s[0]).sum::<usize>() <= HISTORY_BYTES {
+        return Ok(vec![HistoryExcerpt::Full; steps.len()]);
+    }
+    let mut details = Vec::with_capacity(steps.len());
+    let mut total = 0;
+    for (step, sizes) in steps.iter().zip(&mut sizes) {
+        sizes[1] = size(step, HistoryExcerpt::Short)?;
+        sizes[2] = size(step, HistoryExcerpt::Omitted)?;
+        // A tiny original output can be smaller than its omission notice.
+        let detail = if sizes[1] <= sizes[2] {
+            HistoryExcerpt::Short
+        } else {
+            HistoryExcerpt::Omitted
+        };
+        total += sizes[1].min(sizes[2]);
+        details.push(detail);
+    }
+    if total > HISTORY_BYTES {
+        return Err("inference request exceeds the local size bound".into());
+    }
+    // Reserve the minimal older history, then keep as many newest full excerpts
+    // as fit. After the first full excerpt that cannot fit, use short excerpts;
+    // only the oldest remaining outputs fall back to their omission notice.
+    let mut older = steps.len();
+    for (index, (detail, size)) in details.iter_mut().zip(&sizes).enumerate().rev() {
+        let next = total - size[1].min(size[2]) + size[0];
+        if next > HISTORY_BYTES {
+            older = index + 1;
+            break;
+        }
+        total = next;
+        *detail = HistoryExcerpt::Full;
+        older = index;
+    }
+    for (detail, size) in details[..older].iter_mut().zip(&sizes).rev() {
+        let next = total - size[1].min(size[2]) + size[1];
+        if next > HISTORY_BYTES {
+            break;
+        }
+        total = next;
+        *detail = HistoryExcerpt::Short;
+    }
+    Ok(details)
 }
 
 fn usable_id(id: &str) -> bool {
@@ -1113,16 +1245,17 @@ fn request_context<S: Storage>(
     credentials: &[&[u8]],
     task: Option<&crate::store::poc::Task>,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
+    let details = history_excerpts(steps)?;
     // Each completed step gets a separate synchronous budget before the request's
     // outer scope. Discard all warm-up output and errors; only clean records survive.
-    for (id, tool, outcome) in steps {
+    for ((id, tool, outcome), detail) in steps.iter().zip(&details) {
         let _ = work::scope(|| {
             let value = serde_json::to_value(tool).map_err(|_| "inference tool encoding")?;
             if !safe(store, &json!({"id":id,"tool":value}), credentials) {
                 return Ok(());
             }
             // This wrapper places both message objects at exactly their request depths.
-            let messages = step_messages(id, &value, outcome)?;
+            let messages = step_messages(id, &value, outcome, *detail)?;
             protected(store, &json!({"messages":messages}), credentials)?;
             Ok(())
         });
@@ -1151,7 +1284,7 @@ fn request_context<S: Storage>(
             messages.push(json!({"role":"user", "content":instruction}));
         }
         let mut ids = std::collections::BTreeSet::new();
-        for (id, tool, outcome) in steps {
+        for ((id, tool, outcome), detail) in steps.iter().zip(&details) {
             if !usable_id(id)
                 || !ids.insert(id)
                 || tool.machine() != machine
@@ -1168,7 +1301,7 @@ fn request_context<S: Storage>(
             }
             // Durable evidence is independently protected by the store before append. Limit
             // this model-context projection before repeated serialization/protection.
-            messages.extend(step_messages(id, &value, outcome)?);
+            messages.extend(step_messages(id, &value, outcome, *detail)?);
         }
         let sockets = task
             .and_then(|t| t.before_setup.as_ref())

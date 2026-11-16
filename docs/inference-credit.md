@@ -50,10 +50,10 @@ duplicate mutation presses report the existing operation rather than starting an
 
 Enter the goal before **Start session <machine>**. Start confirms this disclosure:
 
-> Inference uses a key capped at 0.25 USD of your credit and valid 24 hours (requested limits, per key). A new key with the same limits is made after each Unlock or New key press, so a session can use more than 0.25 USD in total; your credit balance is the overall limit.
+> Inference uses a key capped at 1 USD of your credit and valid 24 hours (requested limits, per key). A new key with the same limits is made after each Unlock or New key press, so a session can use more than 1 USD in total; your credit balance is the overall limit.
 
 The credit-backed Exposure records the original session and public endpoint/model atomically.
-The worker commits a mint name before requesting a key, checks the returned 0.25 cap, null reset
+The worker commits a mint name before requesting a key, checks the returned 1 USD cap, null reset
 period and expiry within 60 seconds, then commits the issuer id and limits. Names are `k` followed
 by 24 lowercase hexadecimal characters drawn from 96 random bits: exactly 25 characters. Each
 new mint uses fresh randomness and the store refuses a repeated name. Before a new mint it lists
@@ -120,14 +120,14 @@ This lite path deliberately departs from **ARC-31a, ADR-0028, CNF-69, CNF-70 and
 
 1. There is no reviewed pinned protocol profile. Service-reported USD uses binary floats and
    rounding down for display, rather than exact-decimal account units.
-2. The fixed 0.25 USD cap and 24-hour lifetime are disclosed before and confirmed by Start.
+2. The fixed 1 USD cap and 24-hour lifetime are disclosed before and confirmed by Start.
    Limits are not editable and there is no choice-generation record. Returned limits are checked,
    but there is no issuer-clock contract, local expiry enforcement beyond the issuer's,
    aggregate accounting or in-flight accounting.
 3. Account creation and top-up have no journaled SEC-12 intent. Mint records retain only
    non-secret names, issuer ids and limit metadata.
 4. Fresh minting after Unlock or New key in the same session departs from the one-mint and
-   no-replay-remint rules. Every key has a new 0.25 allowance and 24-hour expiry, so the account
+   no-replay-remint rules. Every key has a new 1 USD allowance and 24-hour expiry, so the account
    balance alone bounds session total. Earlier keys are revoked best effort; returned expiry
    is accepted within 60 seconds of the requested value.
 5. End/re-mint revocation is best effort. CNF-69 refusal-after-close is not established when

@@ -2545,6 +2545,9 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
     /// The state the page shows: `none`, `locked`, `unlocked` or `refused` with its reason, and
     /// an `error` for a request that changed nothing.
     pub fn report(&self, error: Option<&str>) -> Value {
+        if let State::Unlocked(store) = &self.state {
+            store.warm_poc_report();
+        }
         let mut report = match &self.state {
             State::Unopened => json!({ "state": "unopened" }),
             State::NoStore => json!({ "state": "none" }),
