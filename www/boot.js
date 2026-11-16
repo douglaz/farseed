@@ -123,7 +123,7 @@ const snapshotWorker = () => {
   const generation = current?.generation;
   return { postMessage: (data, transfer) => current?.sendAt ? current.sendAt(data, transfer, generation) : current?.postMessage(data, transfer) };
 };
-const readinessWait = store => ({starting:'The provider is starting the machine.',published_key:'The machine’s published host key has not appeared yet.',address:'Waiting for one allocated IPv4 address.',refused:'Readiness read refused. Review the machine diagnostic.',ready:'Saving the machine handoff.',checking:'Reading machine readiness.'}[store.readiness?.kind ?? 'checking'] ?? 'Readiness diagnostic is unavailable.');
+const readinessWait = store => ({starting:'The provider is starting the machine.',published_key:'The machine’s published host key has not appeared yet.',address:'Waiting for one allocated IPv4 address.',refused:'The machine check could not finish. Open Details to review what happened.',ready:'Saving the machine for setup.',checking:'Checking whether the machine is ready.'}[store.readiness?.kind ?? 'checking'] ?? 'The machine’s status is unavailable.');
 const stepNames = ['store', 'credit', 'machine', 'task'];
 const foldChoices = new Map();
 const rawFoldChoices = new Map();
@@ -167,12 +167,12 @@ const renderSteps = store => {
     store: texts[store.state] ?? store.state,
     credit: store.credit_error || store.credit?.balance_text || (!store.credit?.account ? 'No inference credit yet.' : 'Inference credit balance not read yet.'),
     machine: store.readiness?.expired ? 'Published host-key wait expired after three hours. First contact is stopped.'
-      : store.readiness?.inactive ? `Readiness reads are not running: ${store.readiness.inactive}.`
-      : payReadiness(store.procurement ?? {}) ? `${readinessWait(store)} ${store.readiness?.checked_at ? `Last check: ${new Date(store.readiness.checked_at).toISOString()}.` : 'No readiness check has completed yet.'}`
-      : store.procurement?.phase ? `Saved purchase: ${store.procurement.phase}.` : store.poc_targets?.length ? 'Machine saved. Review it before Start session.' : 'Choose a new or existing machine.',
-    task: store.tasks?.map(task => `${task.machine}: ${task.status}${task.inference_retry ? ' — ' + task.inference_retry : ''}${task.pause_reason ? ' — ' + task.pause_reason : ''}`).join(' ') || (store.lifecycle_state === 'reconciling' ? 'Waiting to revalidate the saved session.' : sessions.length ? 'Session open. Set or continue its goal.' : 'No session started.'),
+      : store.readiness?.inactive ? 'Machine checks are paused. Open the machine step for details.'
+      : payReadiness(store.procurement ?? {}) ? `${readinessWait(store)} ${store.readiness?.checked_at ? `Last check: ${new Date(store.readiness.checked_at).toISOString()}.` : 'The machine has not been checked yet.'}`
+      : store.procurement?.phase ? purchaseStatus(store.procurement) : store.poc_targets?.length ? 'Machine saved. Review it before Start session.' : 'Choose a new or existing machine.',
+    task: store.tasks?.map(task => `${task.machine}: ${taskStatus(task.status)}${task.inference_retry ? ' — waiting to retry the AI connection' : ''}${task.pause_reason ? ' — ' + plainPause(task.pause_reason) : ''}`).join(' ') || (store.lifecycle_state === 'reconciling' ? 'Waiting to revalidate the saved session.' : sessions.length ? 'Session open. Set or continue its goal.' : 'No session started.'),
   };
-  if (!active) for (const name of ['credit', 'machine', 'task'].filter(name => name !== 'credit' || !unlocked)) messages[name] = unlocked ? 'Record the seed backup to continue.' : name === 'machine' && store.state === 'locked' ? 'Readiness reads are not running: the store is locked.' : 'Open the local store to view this step.';
+  if (!active) for (const name of ['credit', 'machine', 'task'].filter(name => name !== 'credit' || !unlocked)) messages[name] = unlocked ? 'Record the seed backup to continue.' : name === 'machine' && store.state === 'locked' ? 'Unlock to continue checking the machine.' : 'Open the local store to view this step.';
   for (const name of stepNames) {
     const step = document.querySelector(`[data-step="${name}"]`);
     step.dataset.current = String(current === name);
@@ -300,6 +300,7 @@ const paragraph = (parent, text) => {
   const p = document.createElement('p');
   p.textContent = text;
   parent.append(p);
+  return p;
 };
 const rawDetails = (parent, value, identity) => {
   const details = document.createElement('details');
@@ -311,6 +312,137 @@ const rawDetails = (parent, value, identity) => {
   const text = document.createElement('pre'); text.dataset.rawJson = ''; text.textContent = JSON.stringify(value, null, 2);
   details.append(summary, text); parent.append(details);
   return details;
+};
+// These summaries affect the page only; saved records retain their original text.
+const shortLine = (value, limit = 80) => {
+  const line = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (line.length <= limit) return line;
+  const cut = line.slice(0, limit - 1);
+  const space = cut.lastIndexOf(' ');
+  return `${space > 0 ? cut.slice(0, space) : cut}…`;
+};
+// Only known command words belong on the filmed card; arguments stay in Details.
+const commandSummary = command => {
+  const text = String(command ?? '').trim();
+  const match = text.match(/^([A-Za-z0-9_./+-]+)(?=\s|$|[|;&<>])/);
+  if (!match) return 'command …';
+  const program = match[1].split('/').pop();
+  if (!program) return 'command …';
+  const rest = text.slice(match[1].length).trim();
+  if (!rest) return shortLine(program);
+  const first = rest.split(/\s/)[0];
+  const words = {
+    systemctl: ['enable', 'disable', 'start', 'stop', 'restart', 'reload', 'status', 'is-active', 'is-enabled', 'daemon-reload'],
+    pacman: ['-S', '-Sy', '-Syu', '-Syyu', '-R', '-Rs', '-Rns', '-Q', '-Qi', '-Qs'],
+    apt: ['update', 'upgrade', 'install', 'remove', 'purge', 'show', 'list'],
+    'apt-get': ['update', 'upgrade', 'install', 'remove', 'purge'],
+    dnf: ['update', 'upgrade', 'install', 'remove', 'info', 'list'],
+    yum: ['update', 'upgrade', 'install', 'remove', 'info', 'list'],
+  };
+  const word = !/[|;&<>()`$\\\r\n]/.test(text) && Object.hasOwn(words, program) && words[program].includes(first) ? ` ${first}` : '';
+  return shortLine(`${program}${word} …`);
+};
+const taskStatus = status => ({running:'working', waiting:'waiting for the machine', verifying:'checking the result', paused:'paused', complete:'done', abandoned:'stopped'})[status] ?? status;
+const purchaseStatus = purchase => ({
+  approved: 'Purchase approved; preparing access to the machine.',
+  registration_uncertain: 'Waiting to confirm that the provider saved the access key. The page will check before continuing.',
+  registered: 'Access key saved; preparing the machine order.',
+  create_uncertain: 'Waiting to confirm the machine order. The page will check before continuing.',
+  initial_invoice: 'Machine ordered; review the invoice before paying.',
+  invoice_uncertain: 'Waiting to confirm the invoice. The page will check before continuing.',
+  payment_readiness: purchase.payment?.is_paid ? 'Payment received; the provider is starting the machine.' : 'Waiting for payment of the machine invoice.',
+  handed_off: 'Machine ready.',
+  terms_changed: 'The price or setup changed. Review the updated plan before approving it.'
+})[purchase.phase] ?? 'Purchase status is unavailable. Open Details for the saved information.';
+const workBoundReason = 'protected output withheld: protection work bound exceeded';
+const pauseMessages = new Map();
+const pauseGroup = (reasons, message) => reasons.forEach(reason => pauseMessages.set(reason, message));
+pauseGroup([workBoundReason], 'The page stopped because checking the task’s history for secrets got too large. Resume may need several tries. If it keeps stopping here, Stop task ends it.');
+pauseGroup(['unknown task', 'stale or ended task', 'task ended'], 'This task is no longer available to continue. Review its saved details.');
+pauseGroup(['task encoding', 'task credential boundary', 'task result encoding', 'task result publication'], 'The page could not safely read or show this task. Unlock again; if it stays paused, keep the saved details for help.');
+pauseGroup(['protected output withheld: value depth exceeded', 'protected output withheld: encoding depth exceeded', 'protected output unavailable', 'inference protected field name invalid', 'inference output withheld after protected field collision', 'inference output escaped fragment count exceeds the local bound', 'scan length', 'scan marker contains protected material; output withheld', 'output hex', 'job output hex', 'output key collision after protection', 'redaction marker cannot exclude held credentials'], 'The page could not safely check the result for secrets, so it was withheld. Unlock again; if it stays paused, keep the saved details for help.');
+pauseGroup(['required scan material unavailable; output withheld', 'session credential has no response scan representation', 'held credential derivation refused', 'required scan material unavailable', 'invalid scan envelope', 'scan envelope encoding', 'noncanonical scan envelope', 'invalid scan ciphertext', 'noncanonical scan ciphertext', 'scan authentication failed', 'invalid scan material', 'scan material encoding', 'noncanonical or unsupported scan material', 'scan identity is not awaiting material'], 'Information needed to check results for secrets is unavailable or unreadable. Unlock again and resupply any requested keys before Resume.');
+pauseGroup(['locked', 'response requires an unlocked seed'], 'The page is locked. Unlock it to continue.');
+pauseGroup(['missing pending job', 'missing pending identity', 'task has no pending job', 'no committed job evidence', 'job outcome is not trustworthy', 'pending task has no proposal', 'missing job exit', 'missing verification record', 'verification job mismatch'], 'The page cannot establish what happened to the earlier command. Review the saved details before deciding how to continue.');
+pauseGroup(['resolved target differs from task machine', 'fresh authority must bind only the task machine'], 'The connection points to a different machine. Restore the original machine connection before Resume.');
+pauseGroup(['resolved relay, host and user are required before Resume'], 'The machine connection is incomplete. Supply its relay, address and login name before Resume.');
+pauseGroup(['trusted host pin missing; configure it before Resume'], 'The machine’s trusted host key is missing. Configure it before Resume.');
+pauseGroup(['committed job record differs from its intent and cannot checkpoint; pending identity retained for inspection; to configure, Stop task; remote effects and command holds remain'], 'The saved result does not match the command that was sent. Review Details and use Stop task before changing the setup. Earlier commands may still run.');
+pauseGroup(['session authority belongs to another task; use the task’s original session'], 'This connection belongs to a different task. Restore this task’s original session before Resume.');
+pauseGroup(['proposal approval pending; review the open requirements card and approve explicitly or reject before Resume'], 'The proposed requirements need your decision. Review the requirements card and approve or reject it before Resume.');
+pauseGroup(['original session requires acceptance of Acting on a goal with no brief'], 'This session still needs your approval to act on a goal without a brief. Review and accept that choice before Resume.');
+pauseGroup(['sessions ended', 'no live session', 'session ended', 'goal requires a live session'], 'The session has ended or is unavailable. This task needs its original active session to continue.');
+pauseGroup(['reconciliation or verification required after suspension'], 'The page must check the saved session after the interruption. Unlock again before Resume.');
+pauseGroup(['session cap exhausted'], 'The session’s spending limit has been reached. Review its budget before continuing.');
+pauseGroup(['session expired'], 'The session has expired. Review the session controls before continuing.');
+pauseGroup(['incompatible issuer usage', 'incompatible or missing issuer acceptance'], 'The saved spending approval cannot be used. Review the session’s spending approval before continuing.');
+pauseGroup(['clock uncertain; verification required', 'clock evidence out of range'], 'The page cannot rely on its clock. Use the clock check before Resume.');
+pauseGroup(['invalid spend', 'invalid spend exponent', 'invalid nonnegative spend', 'spend scale', 'unsupported spend precision'], 'The page could not read the spending amount safely. Review the saved details before continuing.');
+pauseGroup(['recorded job is running; Resume inspects it again'], 'The earlier command is still running. Resume checks it again without running it twice.');
+pauseGroup(['task paused: diagnostic protection failed; inspect authority and configuration before Resume'], 'The page could not safely show why it stopped. Check the session and connection settings before Resume.');
+pauseGroup(['recorded job output requires protection before checkpoint', 'verification excerpt requires protection before checkpoint'], 'The page could not safely save the command result. Unlock again before Resume; the earlier command will be checked without running it twice.');
+pauseGroup(['task revision exhausted'], 'This task has reached its saved-update limit and cannot continue. Keep its details for help.');
+pauseGroup(['journal refused', 'AES-GCM refused the record', 'move: FileSystemHandle.move() is not available'], 'The browser could not safely save the result. Reopen and unlock this page before Resume; the earlier command will be checked without running it twice.');
+const plainPause = reason => {
+  if (!reason) return '';
+  const verdict = 'Findings unknown until a complete re-check. ';
+  if (reason.startsWith(verdict)) return verdict + plainPause(reason.slice(verdict.length));
+  const checkpoint = 'recorded result could not be checkpointed: ';
+  if (reason.startsWith(checkpoint)) {
+    const cause = reason.slice(checkpoint.length);
+    return pauseMessages.get(cause) ?? 'The browser could not safely save the result. Reopen and unlock this page before Resume; the earlier command will be checked without running it twice.';
+  }
+  if (pauseMessages.has(reason)) return pauseMessages.get(reason);
+  if (/^collection returned no outcome for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return 'The earlier command’s result is not available yet. Resume checks it again without running it twice.';
+  if (/^collection record identity mismatch for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return 'The returned result does not match the earlier command. Review Details before Resume; the command will not be run twice.';
+  if (/^collection (?:failed for pending call|failed for pending call \d+ job|.* for pending call) /.test(reason)) return 'The page could not establish the earlier command’s result. Review Details and check the connection before Resume; the command will not be run twice.';
+  if (reason.startsWith('scan nonce: ')) return 'The saved information needed to check for secrets is unreadable. Unlock again and resupply any requested keys before Resume.';
+  return reason;
+};
+const sessionWait = reason => {
+  if (reason === 'Inference key required for another request; existing job collection remains available.') return 'Resupply the AI connection key to continue. The page can still collect the earlier command’s result.';
+  if (reason === 'Automatic inference waits for the admitted endpoint and model. Restore them, or explicitly Resume with the displayed configuration. Existing job collection remains available.') return 'Restore the earlier AI connection settings, or use Resume to approve the settings shown here. The page can still collect the earlier command’s result.';
+  const plain = plainPause(reason);
+  return plain !== reason ? plain : 'This session needs a check before more work can run. Review Details and unlock again.';
+};
+const commandResultWord = result => {
+  const content = result?.content ?? result;
+  if (content?.outcome === 'unknown') return 'result unknown';
+  if (Number.isInteger(content?.exit_status)) return content.exit_status === 0 ? 'finished' : `failed with code ${content.exit_status}`;
+  return content?.running === true ? 'still running' : 'result unknown';
+};
+const checkSummary = check => {
+  const service = check.command.match(/^systemctl is-(active|enabled) -- '([^']+)'\.service$/);
+  if (service) {
+    const [, kind, name] = service;
+    const observation = check.observation;
+    const value = observation?.kind === (kind === 'active' ? 'running' : 'enabled') && typeof observation.value === 'boolean' ? observation.value : null;
+    return `Check: ${name} ${kind === 'active' ? 'is running' : 'starts at boot'} — ${value === null ? 'result unknown' : value ? 'yes' : 'no'}`;
+  }
+  if (check.command === 'ss -H -n -l -t -u') {
+    const observation = check.observation;
+    if (observation?.kind !== 'sockets' || !Array.isArray(observation.value)) return 'Check: listening ports — result unknown';
+    const groups = [];
+    for (const proto of ['tcp', 'udp']) {
+      const ports = new Map();
+      for (const socket of observation.value.filter(socket => socket.proto === proto)) {
+        const local = /^127\./.test(socket.address) || socket.address === '::1';
+        ports.set(socket.port, (ports.get(socket.port) ?? true) && local);
+      }
+      const external = [...ports].filter(([, local]) => !local).map(([port]) => port).sort((a, b) => a - b);
+      const local = [...ports].filter(([, local]) => local).map(([port]) => port).sort((a, b) => a - b);
+      if (external.length || local.length) groups.push(`${proto.toUpperCase()} ${external.join(', ')}${local.length ? `${external.length ? ' (plus ' : ''}local-only ${local.join(', ')}${external.length ? ')' : ''}` : ''}`);
+    }
+    return `Check: listening ports — ${groups.join('; ') || 'none'}`;
+  }
+  return `Check: machine setup — ${check.exit_status === 0 ? 'finished' : check.exit_status == null ? 'result unknown' : `failed with code ${check.exit_status}`}`;
+};
+const showCheckReport = (parent, report) => {
+  const result = report.status === 'not run' ? 'not run' : report.exit_status == null
+    ? (['queued', 'attempted', 'pending'].includes(report.status) ? 'waiting' : 'result unknown')
+    : report.exit_status === 0 ? 'passed' : `failed (exit ${report.exit_status})`;
+  paragraph(parent, `${commandSummary(report.command)} — ${result}`);
+  rawDetails(parent, report);
 };
 const readableFacts = (parent, value) => {
   const list = document.createElement('dl');
@@ -331,31 +463,41 @@ const updateInferenceFacts = () => {
 };
 for (const name of ['poc-endpoint', 'poc-model']) $(name).addEventListener('input', updateInferenceFacts);
 const installationPreview = (parent, d) => {
-  paragraph(parent, 'Installation preview. When handed over, the harness checks declared system services and TCP listeners only.');
+  paragraph(parent, 'Installation preview. At handover, the page checks the promised services and TCP ports only.');
   const departures = document.createElement('strong');
   const extraPorts = Array.isArray(d.listeners.inbound) ? d.listeners.inbound.filter(e => !(e.proto === 'tcp' && e.port === 22 && e.from === 'any')) : [];
   const services = Array.isArray(d.services) ? d.services : [];
-  departures.textContent = `Departures from the ad-hoc minimum: ${[...services.map(e => `service ${e.name}`), ...extraPorts.map(e => `${e.proto.toUpperCase()} port ${e.port} (${e.from})`), ...(Array.isArray(d.listeners.outbound) ? d.listeners.outbound.map(e => `outgoing ${e.host} ${e.proto.toUpperCase()} port ${e.port}`) : []), ...(d.key_material.spendable === true ? ['spendable key material permitted'] : []), ...(Array.isArray(d.key_material.permitted) ? d.key_material.permitted.map(e => `${e.kind} at ${e.where}`) : []), ...(Array.isArray(d.default_credentials) ? d.default_credentials.map(e => `default credential ${e}`) : [])].join('; ') || 'none'}.`;
+  const keyKind = kind => kind === 'public' ? 'a public key' : `${kind} key material`;
+  const additions = [
+    ...services.map(e => `runs the ${e.name} service${e.scope.kind === 'user' ? ` for user ${e.scope.account}` : ''}`),
+    ...extraPorts.map(e => e.from === 'none' ? `${e.proto.toUpperCase()} port ${e.port} only from inside the machine` : `answers on ${e.proto.toUpperCase()} port ${e.port} ${e.from === 'any' ? 'for anyone' : 'for its peers (who can reach it is not checked)'}`),
+    ...(Array.isArray(d.listeners.outbound) ? d.listeners.outbound.map(e => `may connect out ${e.host === 'any' ? '' : `to ${e.host} `}on ${e.proto.toUpperCase()} port ${e.port}`) : []),
+    ...(d.key_material.spendable === true ? ['may hold keys that can spend money'] : []),
+    ...(Array.isArray(d.key_material.permitted) ? d.key_material.permitted.map(e => `${keyKind(e.kind)} at ${e.where}`) : []),
+    ...(Array.isArray(d.default_credentials) ? d.default_credentials.map(e => `changes the default password for ${e}`) : [])
+  ];
+  departures.textContent = `What this setup adds beyond the basic machine: ${additions.join('; ') || 'nothing extra'}.`;
   parent.append(departures);
-  const list = (value, empty, entry) => {
-    if (value === 'unspecified') paragraph(parent, 'Not stated yet; delivery is blocked.');
-    else if (!value.length) paragraph(parent, empty);
-    else for (const e of value) paragraph(parent, entry(e));
-  };
-  list(d.listeners.inbound, 'No port is permitted to answer.', e => `It may answer on ${e.proto.toUpperCase()} port ${e.port}, ${e.from === 'any' ? 'for anyone on the internet' : e.from === 'none' ? 'only from inside the server itself' : 'meant for its peers only; who can reach it is not checked'}.`);
-  paragraph(parent, 'Every TCP listener counts, including loopback and stock-image listeners. Anything answering outside these permissions is a finding. An allowed port need not have a listener. UDP listeners are recorded, not judged.');
-  list(d.services, 'No service is promised.', e => `${e.name} (${e.scope.kind === 'system' ? 'a system service' : `a service of user ${e.scope.account}`}) ${e.lifecycle === 'running-at-delivery' ? 'is running when handed over. A restart may stop it.' : 'must be running and enabled for boot; enabled, restart not demonstrated.'}`);
-  paragraph(parent, 'Outgoing connections — not checked in this PoC.');
-  list(d.listeners.outbound, 'No restriction on outgoing connections is declared; none is checked.', e => `It may connect out to ${e.host === 'any' ? 'any address' : e.host} on ${e.proto.toUpperCase()} port ${e.port}; this restriction is not measured.`);
-  paragraph(parent, `Money keys — not checked in this PoC. ${d.key_material.spendable === false ? 'Spendable key material is forbidden; no post-setup search runs here.' : 'Spendable key material is permitted by this declaration.'}`);
-  paragraph(parent, 'Other keys — not checked in this PoC.');
-  list(d.key_material.permitted, 'No keys of its own are expected. Its SSH keys and application keys are counted separately; no search runs here.', e => `Expected: ${e.kind} at ${e.where}.`);
-  paragraph(parent, `Later checks — not checked in this PoC. ${Array.isArray(d.drift_checks) && !d.drift_checks.length ? 'No extra checks on later visits.' : 'Not stated.'}`);
-  paragraph(parent, `Extra checks: ${Array.isArray(d.required) && !d.required.length ? 'No extra checks at handover.' : 'Not stated.'}`);
-  paragraph(parent, 'Default passwords — not checked in this PoC.');
-  if (d.default_credentials === 'none') paragraph(parent, 'No default credential is listed to be changed.');
-  else list(d.default_credentials, 'No default credential is listed to be changed.', e => `Declared changed from its default: ${e}; not measured.`);
-  paragraph(parent, 'Fixed lockdown checks, SSH password posture, local password entries, key-material searches, drift checks, outbound restrictions and default credentials are not checked in this PoC. No reboot is demonstrated.');
+  if (d.listeners.inbound === 'unspecified') paragraph(parent, 'Incoming ports are not stated yet; handover is blocked.');
+  else if (!d.listeners.inbound.length) paragraph(parent, 'No port is permitted to answer.');
+  else if (d.listeners.inbound.some(e => e.proto === 'tcp' && e.port === 22 && e.from === 'any')) paragraph(parent, 'The basic machine also allows SSH connections on TCP port 22 from anyone.');
+  paragraph(parent, 'All open TCP ports count, including ports used only inside the machine and ports that came with it. An unexpected port is a finding. An allowed port need not be in use. UDP ports are listed but not judged.');
+  if (d.services === 'unspecified') paragraph(parent, 'Services are not stated yet; handover is blocked.');
+  else if (!services.length) paragraph(parent, 'No service is promised.');
+  else for (const e of services) paragraph(parent, e.lifecycle === 'running-at-delivery'
+    ? `${e.name} must be running at handover. A restart may stop it.`
+    : `${e.name} must be running and set to start at boot.`);
+  if (d.listeners.outbound === 'unspecified') paragraph(parent, 'Outgoing connections are not stated yet; handover is blocked.');
+  else if (!d.listeners.outbound.length) paragraph(parent, 'No restriction on outgoing connections is promised.');
+  if (d.key_material.spendable === 'unspecified') paragraph(parent, 'Whether money keys are allowed is not stated yet; handover is blocked.');
+  else if (d.key_material.spendable === false) paragraph(parent, 'Keys that can spend money are not allowed.');
+  if (d.key_material.permitted === 'unspecified') paragraph(parent, 'Other expected keys are not stated yet; handover is blocked.');
+  else if (!d.key_material.permitted.length) paragraph(parent, 'No other keys are expected. SSH access keys and application keys are counted separately.');
+  paragraph(parent, Array.isArray(d.drift_checks) && !d.drift_checks.length ? 'No extra checks on later visits.' : 'Checks on later visits are not stated.');
+  paragraph(parent, Array.isArray(d.required) && !d.required.length ? 'No extra checks at handover.' : 'Extra handover checks are not stated.');
+  if (d.default_credentials === 'none' || Array.isArray(d.default_credentials) && !d.default_credentials.length) paragraph(parent, 'No default passwords are listed to be changed.');
+  else if (d.default_credentials === 'unspecified') paragraph(parent, 'Default passwords to change are not stated yet; handover is blocked.');
+  paragraph(parent, 'This proof of concept does not check security hardening, SSH or local passwords, stored keys, later changes, outgoing restrictions or default password changes. It does not test a reboot.');
   paragraph(parent, 'Completion means Delivered (service and TCP checks only). Differences leave the task paused as Handed over with findings. Incomplete reads leave Findings unknown until a complete re-check.');
   rawDetails(parent, d, ['installation-candidate', parent.dataset.requirementsCard]);
 };
@@ -406,12 +548,13 @@ const renderSetup = (store) => {
     end.type = 'button'; end.textContent = 'End session'; end.dataset.endSession = identity;
     end.addEventListener('click', () => { end.disabled = true; worker.postMessage({task: {action: 'end-session', session: identity}}); });
     const binding = [...(store.sessions ?? []), ...(store.endable_sessions ?? [])].find(session => session.identity === identity);
-    paragraph($('session-controls'), `Session ${identity}: bound machines ${(binding?.bound_set ?? []).join(', ')}.`);
+    paragraph($('session-controls'), `Session for ${(binding?.bound_set ?? []).join(', ')}.`);
+    rawDetails($('session-controls'), {session: identity}, ['session-control', identity]);
     $('session-controls').append(end);
   };
   if (store.lifecycle_state === 'reconciling') {
     for (const session of store.endable_sessions ?? []) {
-      paragraph($('session-controls'), `Session ${session.identity}: waiting for revalidation; bound machine ${session.bound_set.join(', ')}.`);
+      paragraph($('session-controls'), `Checking the saved session for ${session.bound_set.join(', ')}.`);
       addEnd(session.identity);
     }
     return;
@@ -449,7 +592,8 @@ const renderSetup = (store) => {
   for (const machine of approved) {
     const section = document.createElement('section');
     section.dataset.machine = machine.entry.machine;
-    paragraph(section, `${machine.entry.machine}: ${machine.family} index ${machine.index}.`);
+    paragraph(section, `Machine: ${machine.entry.machine}.`);
+    rawDetails(section, {family: machine.family, index: machine.index}, ['machine', machine.entry.machine, 'identity']);
     if (machine.class === null) {
       paragraph(section, `Machine class for ${machine.entry.machine}.`);
       paragraph(section, classQuestion);
@@ -469,11 +613,17 @@ const renderSetup = (store) => {
       }
       section.append(controls);
     } else {
-      paragraph(section, `Answer: ${machine.answer}; class: ${machine.class}.`);
+      paragraph(section, machine.answer === 'no' ? 'This machine is for you and people you know.' : 'This machine may serve people you do not know.');
     }
     const access = machine.access;
-    if (access) paragraph(section, `Access model: ${access.model}; profile ${access.profile}, revision ${access.revision}.`);
-    if (machine.declaration) renderDeclaration(section, machine.declaration);
+    if (access) {
+      paragraph(section, 'Machine access is approved.');
+      rawDetails(section, access, ['machine', machine.entry.machine, 'access']);
+    }
+    if (machine.declaration) {
+      paragraph(section, 'Approved setup requirements are saved.');
+      rawDetails(section, machine.declaration, ['machine', machine.entry.machine, 'requirements']);
+    }
     renderDelivery($('task-setup'), machine.entry.machine, store);
     for (const approval of (store.reinstall_approvals ?? []).filter(a => a.entry === machine.entry.machine)) {
       paragraph(section, `Dedicated reinstall reset ${approval.reset}: ${approval.state}; rendering session ${approval.session}.`);
@@ -492,12 +642,19 @@ const renderSetup = (store) => {
     }
     const installation = (store.installations ?? []).find(i => i.machine === machine.entry.machine);
     if (installation) paragraph(section, `Installation: ${installation.installation}.`);
-    for (const ended of (store.sessions ?? []).filter(s => s.session_state === 'ended' && s.bound_set.includes(machine.entry.machine))) paragraph(section, `Session ${ended.identity}: ${ended.inference_limits?.state ?? 'ended'}. Approvals from this session are no longer usable.`);
+    for (const ended of (store.sessions ?? []).filter(s => s.session_state === 'ended' && s.bound_set.includes(machine.entry.machine))) {
+      paragraph(section, 'An earlier session ended. Its approvals can no longer be used.');
+      rawDetails(section, ended, ['ended-session', ended.identity]);
+    }
     const session = (store.sessions ?? []).find(s => s.session_state !== 'ended' && s.bound_set.includes(machine.entry.machine));
     if (session) {
-      paragraph(section, `Session ${session.identity}: bound set ${session.bound_set.join(', ')}; ${session.inference_limits?.state ?? session.session_state ?? 'running'}.`);
-      if (session.readiness_reason) paragraph(section, session.readiness_reason);
-      paragraph(section, `Inference model: ${session.inference_configuration?.model ?? 'unavailable'}; machine: ${machine.entry.machine}.`);
+      paragraph(section, `Session open for ${session.bound_set.join(', ')}.`);
+      rawDetails(section, {session: session.identity, state: session.inference_limits?.state ?? session.session_state}, ['session', session.identity]);
+      if (session.readiness_reason) {
+        paragraph(section, sessionWait(session.readiness_reason));
+        rawDetails(section, {reason: session.readiness_reason}, ['session-wait', session.identity]);
+      }
+      paragraph(section, `AI connection selected for ${machine.entry.machine}.`);
       addEnd(session.identity);
       const limits = session.inference_limits;
       if (limits && !session.credit_backed) {
@@ -515,15 +672,16 @@ const renderSetup = (store) => {
       }
       const card = document.createElement('section');
       card.dataset.goalCard = session.identity;
-      paragraph(card, 'Goal for this session');
+      const started = (store.tasks ?? []).find(task => task.start_session === session.identity);
+      if (!started) paragraph(card, 'Goal for this session');
       if (session.goal) {
-        paragraph(card, session.goal.text);
-        paragraph(card, `Source: ${session.goal.source}.`);
-        if (session.goal.document_source) paragraph(card, `Document source: ${session.goal.document_source}.`);
+        if (!started) {
+          paragraph(card, session.goal.text);
+          rawDetails(card, {source: session.goal.source, document_source: session.goal.document_source}, ['goal-source', session.identity]);
+        }
         const accepted = (session.standing_modes ?? []).includes('Acting on a goal with no brief');
-        const started = (store.tasks ?? []).find(task => task.start_session === session.identity);
         if (started) {
-          paragraph(card, `Session task ${started.id}. Use Resume on that task.`);
+          paragraph(card, 'See the task card for the goal and progress.');
         } else if (!accepted || !started) {
           paragraph(card, accepted ? 'Start was accepted. Continue with this same goal and machine.' : 'No brief is available.');
           paragraph(card, 'Acting on a goal with no brief');
@@ -622,10 +780,11 @@ const renderCommandResult = (result) => {
   const card = document.createElement('section');
   card.dataset.commandResult = String(result.call);
   if (result.optional_report) paragraph(card, 'Checks the AI wrote — not part of Delivered');
-  paragraph(card, `Recorded call ${result.call}; job ${result.job}; exit ${result.exit_status ?? 'unknown'}.${result.historical ? ' Historical result; no current action authority.' : ''}`);
+  paragraph(card, `Command ${commandResultWord(result)}.${result.historical ? ' This is a saved result; it does not allow any new action.' : ''}`);
+  const details = rawDetails(card, {call: result.call, job: result.job, exit_status: result.exit_status}, ['command-result', result.call]);
   for (const field of ['stdout', 'stderr']) {
-    paragraph(card, field);
-    const output = document.createElement('pre'); output.dataset.commandOutput = ''; output.textContent = result[field] ?? ''; card.append(output);
+    paragraph(details, field === 'stdout' ? 'Output' : 'Error output');
+    const output = document.createElement('pre'); output.dataset.commandOutput = ''; output.textContent = result[field] ?? ''; details.append(output);
   }
   const previous = slot.querySelector(`[data-command-result="${Number(result.call)}"]`);
   if (previous) previous.replaceWith(card); else slot.append(card);
@@ -657,44 +816,73 @@ const renderTasks = (store) => {
   for (const task of store.tasks ?? []) {
     const card = document.createElement('section');
     card.dataset.task = task.id;
-    paragraph(card, `Task ${task.id}: ${task.status}; machine ${task.machine}.${task.inference_retry ? ' ' + task.inference_retry : ''}`);
-    paragraph(card, task.goal);
-    paragraph(card, `Requests ${task.requests}/${task.limits.requests}; steps ${task.steps}/${task.limits.steps}. Harness reads and optional reports count as steps.`);
+    paragraph(card, `Setting up ${task.machine}: ${taskStatus(task.status)}.`);
+    if (task.goal.length <= 120) paragraph(card, task.goal);
+    else {
+      const firstSentence = task.goal.match(/^.*?[.!?](?=\s|$)/s)?.[0] ?? task.goal;
+      paragraph(card, shortLine(firstSentence, 120));
+      rawDetails(card, {goal: task.goal}, ['task', task.id, 'goal']);
+    }
+    if (task.inference_retry) {
+      paragraph(card, 'Waiting before trying the AI connection again.');
+      rawDetails(card, {retry: task.inference_retry}, ['task', task.id, 'retry']);
+    }
+    paragraph(card, `${task.requests} of ${task.limits.requests} AI replies used; ${task.steps} of ${task.limits.steps} steps used.`);
     for (const [id, tool, outcome] of task.completed.filter(([id]) => !id.startsWith('$report:'))) {
       if (id.startsWith('$verify:')) continue;
-      paragraph(card, id.startsWith('$before:') ? 'Read the listening ports before setup.' : tool.name === 'exec' ? 'The AI ran a command on the machine.' : tool.name === 'propose_declaration' ? 'The AI proposed requirements.' : tool.name === 'done' ? 'The AI handed the work over for checks.' : 'Completed a step.');
+      paragraph(card, id.startsWith('$before:') ? 'Read the listening ports before setup.' : tool.name === 'exec' ? `Ran: ${commandSummary(tool.arguments.command)} (${commandResultWord(outcome)})` : tool.name === 'propose_declaration' ? 'The AI proposed requirements.' : tool.name === 'done' ? 'The AI handed the work over for checks.' : 'Completed a step.');
       rawDetails(card, {tool: tool.name === 'done' ? {name: tool.name, arguments: {machine: tool.arguments.machine}} : tool, outcome}, ['task', task.id, 'completed', id]);
     }
     if (task.proposal && task.proposal.report == null) {
-      paragraph(card, task.proposal.call_id.startsWith('$before:') ? 'Next: read the listening ports before setup.' : task.proposal.call_id.startsWith('$verify:') ? 'Next: a harness read.' : task.proposal.tool.name === 'exec' ? 'Next: a command from the AI.' : task.proposal.tool.name === 'propose_declaration' ? 'Next: a requirements proposal from the AI.' : task.proposal.tool.name === 'done' ? 'Next: the handover from the AI.' : 'Next: a step.');
+      paragraph(card, task.proposal.call_id.startsWith('$before:') ? 'Next: read the listening ports before setup.' : task.proposal.call_id.startsWith('$verify:') ? 'Next: check the machine setup.' : task.proposal.tool.name === 'exec' ? `Next: ${commandSummary(task.proposal.tool.arguments.command)}` : task.proposal.tool.name === 'propose_declaration' ? 'Next: a requirements proposal from the AI.' : task.proposal.tool.name === 'done' ? 'Next: the handover from the AI.' : 'Next: a step.');
       rawDetails(card, task.proposal.tool, ['task', task.id, 'proposal', task.proposal.call_id]);
     }
-    if (task.pending && task.proposal?.report == null) paragraph(card, `Pending job ${task.pending.job}; journal call ${task.pending.call}. Resume inspects this job without launching it again.`);
-    if (task.pause_reason) paragraph(card, task.pause_reason);
-    for (const check of task.verification) paragraph(card, `Harness read: ${check.command}; job ${check.job}; exit ${check.exit_status ?? 'unknown'}; ${check.excerpt}`);
+    if (task.pending && task.proposal?.report == null) {
+      paragraph(card, 'Waiting for the earlier command. Resume checks its result without running it twice.');
+      rawDetails(card, task.pending, ['task', task.id, 'pending']);
+    }
+    if (task.pause_reason) {
+      paragraph(card, plainPause(task.pause_reason));
+      rawDetails(card, {reason: task.pause_reason}, ['task', task.id, 'pause']);
+    }
+    for (const check of task.verification) {
+      const line = paragraph(card, checkSummary(check));
+      line.dataset.harnessRead = check.command;
+      rawDetails(card, check, ['task', task.id, 'check', check.command, check.job]);
+    }
     if (task.verdict) paragraph(card, task.verdict);
-    for (const finding of task.findings ?? []) paragraph(card, finding.detail);
-    for (const note of task.notes ?? []) paragraph(card, `${note.service.name}: ${note.text}`);
+    for (const finding of task.findings ?? []) {
+      const service = finding.service?.name;
+      paragraph(card, service ? `${service} does not match the approved setup.` : finding.field === 'inbound' ? 'The listening ports do not match the approved setup.' : 'A setup check found a difference or could not finish. Open Details to review it.');
+      rawDetails(card, finding);
+    }
+    for (const note of task.notes ?? []) paragraph(card, note.text === 'enabled, restart not demonstrated'
+      ? `${note.service.name} is set to start at boot (a reboot was not tested).`
+      : note.text === 'stopped since a restart, as approved' ? `${note.service.name} stopped after a restart, as approved.` : `${note.service.name}: ${note.text}`);
     let reports;
     if (task.reports?.length) {
       reports = document.createElement('section');
       paragraph(reports, 'Checks the AI wrote — not part of Delivered');
-      if (task.pending && task.proposal?.report != null) paragraph(reports, `Pending job ${task.pending.job}; journal call ${task.pending.call}. Resume inspects this job without launching it again.`);
-      for (const report of task.reports) paragraph(reports, `${report.command}; ${report.status}; exit ${report.exit_status ?? 'unknown'}; ${report.excerpt}`);
+      if (task.pending && task.proposal?.report != null) {
+        paragraph(reports, 'Waiting for the earlier check. Resume checks its result without running it twice.');
+        rawDetails(reports, task.pending, ['task', task.id, 'pending-report']);
+      }
+      for (const report of task.reports) showCheckReport(reports, report);
       card.append(reports);
     }
     for (const [id, , result] of task.completed) {
       if (result.content?.outcome === 'unknown' && result.content?.disposition) {
         const outcome = result.content;
-        const parent = id.startsWith('$report:') ? reports : card;
-        paragraph(parent, `Call ${outcome.call}; job ${outcome.job}; outcome unknown. Disposition record ${outcome.disposition}; assumption ${outcome.continuation}.`);
-        if (outcome.machine_held) paragraph(parent, `The machine remains held by other unresolved calls: ${outcome.remaining_unresolved.join(', ')}.`);
-        paragraph(parent, outcome.uncertainty);
+        const parent = id.startsWith('$report:') && reports ? reports : card;
+        paragraph(parent, `The earlier command’s result is unknown. You chose to carry on as if it ${outcome.continuation === 'as_if_done' ? 'ran' : 'did not run'}.`);
+        if (outcome.machine_held) paragraph(parent, 'Other commands still have unknown results. The machine stays paused for them.');
+        paragraph(parent, 'The earlier command may arrive or run late and overlap later commands. The page will never show that late result.');
+        rawDetails(parent, outcome, ['task', task.id, 'unknown', id]);
       }
     }
     if (['complete', 'abandoned'].includes(task.status)) { slot.append(card); continue; }
     const session = (store.sessions ?? []).find(s => s.identity === task.start_session && s.session_state !== 'ended' && s.bound_set.length === 1 && s.bound_set[0] === task.machine);
-    paragraph(card, 'This task retains its original session, machine, approvals and budgets. Eligible interrupted work continues after unlock and any required key resupply. Resume continues a genuine pause.');
+    paragraph(card, 'If you close this page, work that can continue picks up after you unlock and resupply any requested key. The task keeps the same session, machine, approvals and limits. Use Resume if it stays paused.');
     const action = (text, request) => {
       const button = document.createElement('button');
       button.type = 'button'; button.textContent = text;
@@ -703,8 +891,8 @@ const renderTasks = (store) => {
     };
     if (session && store.lifecycle_state !== 'ended') {
       action('Resume', { action: 'resume', session: session.identity });
-    } else if ((store.sessions ?? []).some(s => s.identity === task.start_session && s.session_state === 'ended')) paragraph(card, `Session ${task.start_session} is ended. This task remains history and cannot continue.`);
-    else paragraph(card, `Unlock to restore session ${task.start_session}.`);
+    } else if ((store.sessions ?? []).some(s => s.identity === task.start_session && s.session_state === 'ended')) paragraph(card, 'This task’s session has ended. Its history stays here, but it cannot continue.');
+    else paragraph(card, 'Unlock to restore this task’s session.');
     if (session && task.verifying && task.status === 'paused' && !task.pending) {
       action('Prepare complete re-check', { action: 'retry-checks', session: session.identity });
     }
@@ -718,15 +906,15 @@ const renderTasks = (store) => {
         const draft = taskDispositionDrafts.get(task.id);
         if (!draft) return;
         const snapshot = draft.confirmation;
-        paragraph(confirmation, `Journal call ${snapshot.pending.call}; job ${snapshot.pending.job}; machine ${snapshot.machine}. Latest committed read: ${snapshot.read}, record ${snapshot.observation}.`);
-        paragraph(confirmation, `The outcome stays unknown. This records your assumption: ${labels[draft.continuation]} (${draft.continuation}).`);
-        paragraph(confirmation, 'The agent may then run the same command again, as a new command.');
+        paragraph(confirmation, `The earlier command on ${snapshot.machine} still has no confirmed result.`);
+        rawDetails(confirmation, snapshot, ['task', task.id, 'confirmation']);
+        paragraph(confirmation, `The result stays unknown. Your choice: ${labels[draft.continuation]}.`);
+        paragraph(confirmation, 'The AI may then run the same command again.');
         paragraph(confirmation, 'If the earlier command arrives or runs late, it can overlap later commands and the page will never show it.');
         if (snapshot.read === 'incomplete') paragraph(confirmation, 'The incomplete command may still be running.');
-        if (snapshot.remaining.length) paragraph(confirmation, `Other unresolved calls on this machine: ${snapshot.remaining.join(', ')}. This choice does not release them; the machine remains held by them.`);
+        if (snapshot.remaining.length) paragraph(confirmation, 'Other commands still have unknown results. This choice does not clear them; the machine stays paused for them.');
         if (snapshot.standing) {
-          const dropped = snapshot.standing.calls.filter(call => call !== snapshot.pending.call);
-          paragraph(confirmation, `This replaces disposition record ${snapshot.standing.number}, continuation ${snapshot.standing.continuation}. Dropped calls: ${dropped.length ? dropped.join(', ') : 'none'}. Dropped calls retain their unknown outcome under the old record.`);
+          paragraph(confirmation, 'This replaces your earlier choice for this command. Other commands covered by that choice keep their unknown results.');
         }
         const confirm = document.createElement('button'); confirm.type = 'button'; confirm.textContent = 'Confirm unknown outcome';
         confirm.addEventListener('click', () => {
@@ -748,14 +936,17 @@ const renderTasks = (store) => {
         card.append(choose);
       }
       card.append(confirmation); showConfirmation();
-    } else if (task.disposition_refusal) paragraph(card, task.disposition_refusal);
-    paragraph(card, 'Stop task stops local orchestration; remote effects and billing continue.');
+    } else if (task.disposition_refusal) {
+      paragraph(card, 'The page cannot accept a choice about the unknown result yet. Review Details before continuing.');
+      rawDetails(card, {reason: task.disposition_refusal}, ['task', task.id, 'choice-refused']);
+    }
+    paragraph(card, 'Stop task ends this task here. What was already done on the machine stays, and the machine keeps running and billing until you delete it.');
     action('Stop task', { action: 'abandon' });
     const requests = document.createElement('input'); requests.type = 'number'; requests.min = task.limits.requests; requests.max = 1000; requests.value = taskLimitDrafts.get(task.id)?.[0] ?? task.limits.requests; requests.setAttribute('aria-label', 'Task request limit');
     const steps = document.createElement('input'); steps.type = 'number'; steps.min = task.limits.steps; steps.max = 2000; steps.value = taskLimitDrafts.get(task.id)?.[1] ?? task.limits.steps; steps.setAttribute('aria-label', 'Task step limit');
     const raise = document.createElement('button'); raise.type = 'button'; raise.textContent = 'Raise limits';
     raise.addEventListener('click', () => { raise.disabled = true; worker.postMessage({ task: { action: 'raise', id: task.id, limits: { requests: Number(requests.value), steps: Number(steps.value) } } }); });
-    const requestLabel = document.createElement('label'); requestLabel.textContent = 'Request limit'; requestLabel.append(requests);
+    const requestLabel = document.createElement('label'); requestLabel.textContent = 'AI reply limit'; requestLabel.append(requests);
     const stepLabel = document.createElement('label'); stepLabel.textContent = 'Step limit'; stepLabel.append(steps);
     const details = document.createElement('details'); details.dataset.taskDetails = task.id; details.dataset.foldKey = JSON.stringify(['task',task.id,'limits']);
     const summary = document.createElement('summary'); summary.textContent = 'Task details'; details.append(summary, requestLabel, stepLabel, raise); card.append(details);
@@ -948,23 +1139,29 @@ const renderProvider = (store, enabled) => {
     paragraph(selection, `Provider origin: ${purchase.origin}`);
     const c = purchase.selection.charge;
     paragraph(selection, `Recurring charge: ${c.amount} ${c.currency === 'BTC' ? 'millisats' : c.currency + ' cents'} per ${c.interval_amount} ${c.interval_type}. Tax and processing fee are shown on the initial invoice.`);
-    readableFacts(selection, purchase.selection);
+    const selected = purchase.selection;
+    const resources = selected.resources ?? selected.offer;
+    paragraph(selection, `${selected.offer.name}; ${selected.offer.region?.name ?? 'region not stated'}; ${selected.image.distribution} ${selected.image.flavour} ${selected.image.version}.`);
+    paragraph(selection, `${resources.cpu} CPUs; ${resources.memory} bytes of memory; ${resources.disk_size ?? resources.disk} bytes of disk space.`);
     rawDetails(selection, purchase.selection, ['purchase', purchase.origin, purchase.account ?? null]);
   }
   const progress = $('provider-progress'); progress.replaceChildren();
-  if (purchase.closed) paragraph(progress, purchase.closed);
+  if (purchase.closed) {
+    paragraph(progress, 'The provider no longer has the earlier machine or its payment records, and this purchase recorded no payment. You can approve a new purchase. If you paid, keep your proof of payment; these checks cannot establish whether you paid.');
+    rawDetails(progress, {closed: purchase.closed}, ['purchase-closed']);
+  }
   if (purchase.phase) {
-    paragraph(progress, `Saved purchase ${purchase.machine}: ${purchase.phase}. VM ${purchase.vm_id ?? 'not associated'}; SSH registration ${purchase.ssh_key_id ?? 'not established'}.`);
-    paragraph(progress, `Bound provider origin: ${purchase.origin}`);
-    paragraph(progress, `Provider account public identity: ${purchase.account}`);
-    paragraph(progress, `Provider auto-renewal policy: ${purchase.auto_renewal_enabled === true ? 'enabled' : purchase.auto_renewal_enabled === false ? 'disabled' : 'unknown'}. This page does not change that policy.`);
+    paragraph(progress, `${purchase.machine}: ${purchaseStatus(purchase)}`);
+    rawDetails(progress, purchase, ['purchase-progress', purchase.machine]);
+    paragraph(progress, `Machine provider: ${purchase.origin}`);
+    paragraph(progress, `Automatic renewal: ${purchase.auto_renewal_enabled === true ? 'on' : purchase.auto_renewal_enabled === false ? 'off' : 'unknown'}. This page does not change it.`);
     if (purchase.billing) {
       const quote = purchase.billing.terms;
-      paragraph(progress, `Initial Lightning quote for VM ${purchase.billing.vm_id}: amount ${quote.amount}, tax ${quote.tax}, processing fee ${quote.processing_fee} (${quote.currency === 'BTC' ? 'millisats' : quote.currency + ' cents'}); ${quote.time} seconds for one approved billing period. Review these exact terms before issuing. Refresh may update this quote before issuance.`);
+      paragraph(progress, `Initial Lightning quote: ${quote.amount}, plus tax ${quote.tax} and processing fee ${quote.processing_fee} (${quote.currency === 'BTC' ? 'millisats' : quote.currency + ' cents'}), covering ${quote.time} seconds. Review these terms before requesting the invoice. Refresh may update the quote.`);
     }
     if (purchase.payment) {
       const pay = purchase.payment;
-      paragraph(progress, `Payment ${pay.id} for VM ${pay.vm_id}: ${pay.is_paid ? 'paid' : 'payment pending'}; expires ${pay.expires}. Amount ${pay.amount}, tax ${pay.tax}, processing fee ${pay.processing_fee} (${pay.currency === 'BTC' ? 'millisats' : pay.currency + ' cents'}).`);
+      paragraph(progress, `Invoice ${pay.is_paid ? 'paid' : 'awaiting payment'}; expires ${pay.expires}. Amount ${pay.amount}, tax ${pay.tax}, processing fee ${pay.processing_fee} (${pay.currency === 'BTC' ? 'millisats' : pay.currency + ' cents'}).`);
       if (!pay.is_paid) {
         invoiceControls(progress, pay.data.lightning, Math.floor(Date.parse(pay.expires) / 1000));
         const check = document.createElement('button'); check.type = 'button'; check.textContent = 'Check now'; check.disabled = !enabled;
@@ -974,10 +1171,13 @@ const renderProvider = (store, enabled) => {
     if (payReadiness(purchase)) {
       const readiness = store.readiness;
       if (readiness?.expired) paragraph(progress, 'Published host-key wait expired after three hours from recorded payment. First contact is stopped; this page cannot reinstall or abandon a paid purchase.');
-      else if (readiness?.inactive) paragraph(progress, `Readiness reads are not running: ${readiness.inactive}.`);
+      else if (readiness?.inactive) {
+        paragraph(progress, readiness.inactive === 'the page is hidden' ? 'Return to this page to continue checking the machine.' : readiness.inactive === 'the provider key is missing' ? 'Resupply the provider key to continue checking the machine.' : readiness.inactive === 'a command response is pending' ? 'Waiting for the earlier command before checking the machine.' : 'Machine checks are paused. Unlock again before continuing.');
+        rawDetails(progress, readiness, ['readiness', purchase.machine]);
+      }
       else {
         paragraph(progress, readinessWait(store));
-        paragraph(progress, readiness?.checked_at ? `Last readiness check: ${new Date(readiness.checked_at).toISOString()}.` : 'No readiness check has completed yet.');
+        paragraph(progress, readiness?.checked_at ? `Last machine check: ${new Date(readiness.checked_at).toISOString()}.` : 'The machine has not been checked yet.');
       }
     }
     if (purchase.public_keys) {
@@ -985,7 +1185,7 @@ const renderProvider = (store, enabled) => {
       paragraph(progress, deployed ? 'Deployment relay public key:' : 'Relay public key — enroll this separately with the relay operator:');
       const publicKey = document.createElement('pre'); publicKey.textContent = purchase.public_keys.relay_pubkey; progress.append(publicKey);
     }
-    if (purchase.target) paragraph(progress, `Published pin saved for VM ${purchase.vm_id}: ${purchase.target.pin}. Press Start session ${purchase.machine} below to continue configuration.`);
+    if (purchase.target) paragraph(progress, `The machine’s published host key is saved. Press Start session ${purchase.machine} below to continue setup.`);
   }
   const canReview = !purchase.phase || ['approved', 'registered', 'terms_changed'].includes(purchase.phase);
   for (const control of $('provider-selection-form').elements) control.disabled = !enabled || !canReview;
@@ -1082,22 +1282,23 @@ const renderPoc = (store) => {
   targets.replaceChildren();
   for (const target of store.poc_targets ?? []) {
     const row = document.createElement('section');
-    paragraph(row, `${target.machine}: relay profile ${target.profile}; elevation ${target.elevation}.`);
-    paragraph(row, `Host ${target.host}, port ${target.port}, user ${target.user}; relay ${target.relay}.`);
-    paragraph(row, `Independent host pin: ${target.pin}`);
+    paragraph(row, `${target.machine} is ready for setup.`);
+    paragraph(row, `Connect to ${target.host} on port ${target.port} as ${target.user}. ${target.elevation === 'sudo -n' ? 'Commands can use administrator access without a password.' : target.elevation === 'none' ? 'Commands use this login’s normal access.' : 'Open Details for command access settings.'}`);
+    paragraph(row, `Trusted machine host key: ${target.pin}`);
+    rawDetails(row, target, ['target', target.machine]);
     const creditSession = (store.sessions ?? []).some(session => session.credit_backed && session.session_state !== 'ended' && (session.bound_set ?? []).includes(target.machine));
     const creditChoice = store.credit?.selected || !store.poc_configuration?.key_set;
     const readingCredit = store.credit?.account && store.credit.balance === null && !store.credit_error;
-    const useCredit = creditSession || (creditChoice && (store.credit?.can_start || readingCredit));
+    const useCredit = creditSession || (creditChoice && Boolean(store.credit?.account));
     const configuration = document.createElement('p');
     if (useCredit) configuration.dataset.inferenceApproval = '';
     else configuration.textContent = `Inference endpoint: ${store.poc_configuration?.configuration?.endpoint ?? 'unavailable'}; model: ${store.poc_configuration?.configuration?.model ?? 'unavailable'}.`;
     row.append(configuration);
-    paragraph(row, useCredit ? `Start session approves this inference endpoint and model for ${target.machine}.` : `Start session approves inference using ${store.poc_configuration?.configuration?.model || 'the configured model'} on ${target.machine}.`);
+    paragraph(row, `Start session approves the selected AI connection for ${target.machine}.`);
     const inputs = startInputs(row, target.machine, '', !useCredit, useCredit);
     if (useCredit) {
       paragraph(row, store.credit.disclosure);
-      if (readingCredit) paragraph(row, 'Reading inference credit balance…');
+      if (readingCredit) paragraph(row, 'Reading AI credit balance…');
       else if (store.credit_error) paragraph(row, store.credit_error);
       else if (!store.credit.can_start) paragraph(row, store.credit.balance_text);
     }
