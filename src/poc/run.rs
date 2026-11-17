@@ -187,7 +187,7 @@ pub async fn resume(
                     }
                     Err(super::inference::ReplyError::Malformed { reason, cut_off }) => {
                         let change = if cut_off {
-                            Change::CutOff { reason }
+                            Change::CutOffAtLimit { reason }
                         } else {
                             Change::Malformed { reason, cut_off }
                         };

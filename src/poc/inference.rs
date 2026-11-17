@@ -3,9 +3,9 @@
 //! 1–16 seconds, each validated like a first send. Lost, aborted or timed-out replies
 //! are never retried.
 //!
-//! Bounds: 8 KiB per outcome excerpt, 128 KiB serialized request, 256 KiB response,
+//! Bounds: 8 KiB per outcome excerpt, 128 KiB serialized request, 2 MiB response,
 //! 512 bytes per provider error excerpt; each exchange, including response reading,
-//! gets 15 ms per requested completion token, clamped to 60–300 seconds.
+//! gets 15 ms per requested completion token, clamped to 60–960 seconds.
 //! Protection checks exact credential bytes before output serialization.
 //! Excerpts signal truncation; the finite request cap can pause long transcripts.
 //! Request counts, completed steps and the decision to resume belong to the caller.
@@ -26,12 +26,13 @@ pub(crate) fn model_steps(task: &crate::store::poc::Task) -> Vec<Step> {
         .collect()
 }
 const EXCERPT_BYTES: usize = 8 * 1024;
+const COMPLETION_TOKENS: u32 = 64_000;
 const REQUEST_BYTES: usize = 128 * 1024;
 // Serialized completed messages, including their separators. Reserve 32 KiB for
 // system/goal/facts/guidance/definitions; the final body cap remains authoritative.
 const HISTORY_BYTES: usize = 96 * 1024;
 const SHORT_EXCERPT_BYTES: usize = 768;
-const RESPONSE_BYTES: usize = 256 * 1024;
+const RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const RESPONSE_TOO_LARGE: &str = "inference response exceeds the local size bound";
 const ERROR_BYTES: usize = 512;
 pub(crate) const INCOMPLETE: &str =
@@ -597,7 +598,7 @@ fn request_context<S: Storage>(
         };
         let value = protected(
             store,
-            &json!({"model":config.model,"max_completion_tokens":task.map_or(4000, |task| task.completion_tokens),"tool_choice":"auto","parallel_tool_calls":false,"provider":{"zdr":true},"messages":messages,"tools":tools}),
+            &json!({"model":config.model,"max_completion_tokens":COMPLETION_TOKENS,"tool_choice":"auto","parallel_tool_calls":false,"provider":{"zdr":true},"messages":messages,"tools":tools}),
             credentials,
         )?;
         let body =

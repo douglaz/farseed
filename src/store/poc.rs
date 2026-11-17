@@ -69,6 +69,7 @@ pub struct Malformed {
     pub cut_off: bool,
 }
 fn initial_completion_tokens() -> u32 {
+    // Historical journal state only; requests use the fixed inference reply limit.
     4000
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +195,10 @@ pub enum Change {
         cut_off: bool,
     },
     CutOff {
+        reason: String,
+    },
+    // New fixed-limit cutoffs always count a strike. Keep CutOff's replay meaning.
+    CutOffAtLimit {
         reason: String,
     },
     Propose {
@@ -747,7 +752,9 @@ impl<S: Storage> Store<S> {
         mut change: Change,
     ) -> Result<Task, String> {
         match &mut change {
-            Change::Malformed { reason, .. } | Change::CutOff { reason } => {
+            Change::Malformed { reason, .. }
+            | Change::CutOff { reason }
+            | Change::CutOffAtLimit { reason } => {
                 if reason.is_empty() || reason.len() > 512 {
                     return Err("malformed-reply reason exceeds its bound".into());
                 }
@@ -1171,7 +1178,9 @@ impl<S: Storage> Store<S> {
                             task.active();
                         }
                     }
-                    Change::Malformed { reason, .. } | Change::CutOff { reason } => {
+                    Change::Malformed { reason, .. }
+                    | Change::CutOff { reason }
+                    | Change::CutOffAtLimit { reason } => {
                         if !task.requesting
                             || task.pending.is_some()
                             || task.proposal.is_some()
@@ -1184,9 +1193,12 @@ impl<S: Storage> Store<S> {
                         }
                         let cut_off = matches!(
                             change,
-                            Change::CutOff { .. } | Change::Malformed { cut_off: true, .. }
+                            Change::CutOff { .. }
+                                | Change::CutOffAtLimit { .. }
+                                | Change::Malformed { cut_off: true, .. }
                         );
-                        // Historical malformed records count a strike and never raise the cap.
+                        // Only legacy CutOff records raise the historical cap without a strike.
+                        // Malformed and new fixed-limit cutoffs always count a strike.
                         let raising_cap = matches!(change, Change::CutOff { .. })
                             && task.completion_tokens < 16000;
                         if raising_cap {
@@ -1206,7 +1218,10 @@ impl<S: Storage> Store<S> {
                             cut_off,
                         });
                         if count == 3 {
-                            let prefix = if matches!(change, Change::CutOff { .. }) {
+                            let prefix = if matches!(
+                                change,
+                                Change::CutOff { .. } | Change::CutOffAtLimit { .. }
+                            ) {
                                 "the AI's reply was cut off; 3 unusable replies in a row; last reason: "
                             } else {
                                 "3 malformed replies in a row; last reason: "

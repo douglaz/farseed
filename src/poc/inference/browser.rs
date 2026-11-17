@@ -389,11 +389,8 @@ pub(crate) async fn next(
     #[cfg(feature = "tracer")]
     crate::testonly::session_point("poc_inference_writer").await;
     // Allow 15 ms per requested token, with at least a minute for small replies.
-    // The 16,000-token cap gets four minutes; five minutes bounds a stalled exchange.
-    let deadline_ms = task
-        .completion_tokens
-        .saturating_mul(15)
-        .clamp(60_000, 300_000) as i32;
+    // The fixed 64,000-token cap gets sixteen minutes, including a stalled exchange.
+    let deadline_ms = COMPLETION_TOKENS.saturating_mul(15).clamp(60_000, 960_000) as i32;
     // Five fast busy replies, 1+2+4+8+16 seconds of waits, then one full exchange.
     // This timer also bounds admission and progress waits across all re-sends.
     let total_deadline = monotonic_ms()? + f64::from(5 * BUSY_WINDOW_MS + 31_000 + deadline_ms);
