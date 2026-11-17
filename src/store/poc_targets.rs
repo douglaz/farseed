@@ -347,6 +347,7 @@ impl<S: Storage> Store<S> {
         let tool = crate::goals::Tool::Done {
             machine: proposal.machine().into(),
             checks: vec![],
+            urls: vec![],
         };
         self.propose_requirements(session, candidate, proposal, &tool)
     }

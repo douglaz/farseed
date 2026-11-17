@@ -103,9 +103,98 @@ pub enum Tool {
         machine: String,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         checks: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        urls: Vec<DeliveredUrl>,
     },
     #[serde(rename = "propose_declaration")]
     ProposeDeclaration { machine: String, declaration: Value },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveredUrl {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl DeliveredUrl {
+    fn valid(&self) -> bool {
+        if self.url.is_empty()
+            || self.url.len() > 2048
+            || self
+                .url
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control() || c == '\\')
+            || self
+                .label
+                .as_ref()
+                .is_some_and(|label| !crate::poc::files::plain_line(label, 48))
+        {
+            return false;
+        }
+        let Some(rest) = self
+            .url
+            .strip_prefix("http://")
+            .or_else(|| self.url.strip_prefix("https://"))
+        else {
+            return false;
+        };
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        if authority.is_empty() || authority.contains('@') {
+            return false;
+        }
+        // The deployed worker uses the browser's URL parser, including IDNA and IP parsing.
+        #[cfg(target_arch = "wasm32")]
+        {
+            web_sys::Url::new(&self.url).is_ok_and(|url| {
+                !url.hostname().is_empty() && url.username().is_empty() && url.password().is_empty()
+            })
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let (host, port) = if let Some(ip) = authority.strip_prefix('[') {
+                let Some((ip, suffix)) = ip.split_once(']') else {
+                    return false;
+                };
+                if ip.parse::<std::net::Ipv6Addr>().is_err() {
+                    return false;
+                }
+                (
+                    ip,
+                    suffix
+                        .strip_prefix(':')
+                        .or((suffix.is_empty()).then_some("")),
+                )
+            } else {
+                let (host, port) = authority.split_once(':').unwrap_or((authority, ""));
+                if host.is_empty()
+                    || !host
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || "-._%".contains(c))
+                {
+                    return false;
+                }
+                (host, Some(port))
+            };
+            !host.is_empty()
+                && port.is_some_and(|port| port.is_empty() || port.parse::<u16>().is_ok())
+        }
+    }
+}
+
+pub(crate) fn valid_delivered_urls(value: &Value) -> bool {
+    value.as_array().is_some_and(|urls| {
+        urls.len() <= 8
+            && urls.iter().all(|entry| {
+                entry.is_object()
+                    && entry
+                        .get("label")
+                        .is_none_or(|label| label.is_null() || label.is_string())
+                    && serde_json::from_value::<DeliveredUrl>(entry.clone())
+                        .is_ok_and(|entry| entry.valid())
+            })
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,7 +220,21 @@ impl Tool {
         if !value.is_object() || !value["arguments"].is_object() {
             return Err("tool schema".into());
         }
-        let tool: Self = serde_json::from_value(value.clone()).map_err(|_| "tool schema")?;
+        let mut value = value.clone();
+        if value["name"] == "done"
+            && let Some(arguments) = value["arguments"].as_object_mut()
+            && arguments.get("urls").is_some_and(Value::is_null)
+        {
+            arguments.remove("urls");
+        }
+        if value["name"] == "done"
+            && value["arguments"]
+                .get("urls")
+                .is_some_and(|urls| !valid_delivered_urls(urls))
+        {
+            return Err("done urls must contain at most eight absolute HTTP or HTTPS URLs of 1 to 2048 bytes with a host, no user information, whitespace or controls, and optional plain labels of 1 to 48 printable bytes".into());
+        }
+        let tool: Self = serde_json::from_value(value).map_err(|_| "tool schema")?;
         if let Self::OfferFile {
             path, label, why, ..
         } = &tool
@@ -256,7 +359,11 @@ pub fn definitions() -> Value {
             json!({"machine":machine,"operation":{"enum":["create","reset","reinstall","destroy","read"]},"arguments":{"type":"object","additionalProperties":{"type":"string"}}}),
             &["machine", "operation", "arguments"]
         ),
-        spec("done", json!({"machine":machine}), &["machine"])
+        spec(
+            "done",
+            json!({"machine":machine,"urls":{"type":"array","maxItems":8,"description":"Optional addresses the operator uses to reach what was set up, never secrets. When the goal is a service the operator will open, pass every address they can use in urls.","items":{"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":2048,"description":"An absolute http:// or https:// URL of 1 to 2048 bytes with a host, no user information, control characters or whitespace."},"label":{"type":"string","minLength":1,"maxLength":48,"description":"An optional short plain label of 1 to 48 printable ASCII bytes."}},"required":["url"],"additionalProperties":false}}}),
+            &["machine"]
+        )
     ])
 }
 

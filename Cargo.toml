@@ -61,7 +61,7 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 console_error_panic_hook = "0.1"
 # The local store's browser half: the origin-private file system and WebCrypto's PBKDF2.
 web-sys = { version = "0.3", features = [
-  "Blob", "Crypto", "CryptoKey", "FileSystemDirectoryHandle", "FileSystemFileHandle",
+  "Blob", "Crypto", "CryptoKey", "Url", "FileSystemDirectoryHandle", "FileSystemFileHandle",
   "FileSystemGetDirectoryOptions", "FileSystemGetFileOptions", "FileSystemWritableFileStream",
   "Pbkdf2Params", "StorageManager", "SubtleCrypto", "WorkerGlobalScope", "WorkerNavigator", "DedicatedWorkerGlobalScope",
   "AbortController", "AbortSignal", "WritableStream", "Request", "RequestInit", "RequestRedirect", "RequestMode",

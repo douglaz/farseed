@@ -76,7 +76,7 @@ impl PartialEq<&str> for ReplyError {
 fn argument_reason(name: &str, args: &Value) -> String {
     let fields: &[&str] = match name {
         "exec" => &["machine", "command"],
-        "done" => &["machine", "checks"],
+        "done" => &["machine", "checks", "urls"],
         "request_ai_key" => &["machine", "application", "purpose"],
         "offer_file" => &["machine", "path", "label", "why"],
         _ => &["machine", "declaration"],
@@ -85,7 +85,7 @@ fn argument_reason(name: &str, args: &Value) -> String {
         return "arguments: expected JSON object".into();
     };
     for field in fields {
-        if *field == "checks" && !object.contains_key(*field) {
+        if matches!(*field, "checks" | "urls") && !object.contains_key(*field) {
             continue;
         }
         let valid = match *field {
@@ -102,9 +102,13 @@ fn argument_reason(name: &str, args: &Value) -> String {
                             .is_some_and(|s| !s.trim().is_empty() && s.len() <= 8192)
                     })
             }),
+            "urls" => args[*field].is_null() || crate::goals::valid_delivered_urls(&args[*field]),
             _ => args[*field].is_string(),
         };
         if !valid {
+            if *field == "urls" {
+                return "arguments.urls: use at most eight absolute HTTP or HTTPS URLs of 1 to 2048 bytes with a host, no user information, whitespace or controls, and optional plain labels of 1 to 48 printable bytes".into();
+            }
             return format!("arguments.{field}: missing or invalid value for the offered tool");
         }
     }

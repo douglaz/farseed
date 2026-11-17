@@ -844,6 +844,74 @@ const receiveFileDownload = (data, current) => {
   }
 };
 
+const deliveredHostKind = (hostname) => {
+  const host = hostname.toLowerCase().replace(/\.$/, '');
+  if (host.endsWith('.onion')) return 'onion';
+  const ipv4Kind = (parts) => {
+    const [a, b, c] = parts;
+    if (a === 10 || a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a === 100 && b >= 64 && b <= 127) return 'private';
+    if (a === 0 || a === 127 || a >= 224 || a === 169 && b === 254 ||
+        a === 192 && b === 0 && (c === 0 || c === 2) || a === 192 && b === 88 && c === 99 ||
+        a === 198 && (b === 18 || b === 19 || b === 51 && c === 100) || a === 203 && b === 0 && c === 113) return 'other';
+    return 'public';
+  };
+  if (host.startsWith('[') && host.endsWith(']')) {
+    const ip = host.slice(1, -1);
+    // URL.hostname has already normalized IPv6; expand it to classify the address bits.
+    const [left, right] = ip.split('::');
+    const before = left ? left.split(':') : [];
+    const after = right ? right.split(':') : [];
+    const words = [...before, ...Array(right === undefined ? 0 : 8 - before.length - after.length).fill('0'), ...after].map(word => parseInt(word, 16));
+    if (words.length !== 8 || words.some(word => !Number.isInteger(word))) return 'other';
+    if (words.slice(0, 5).every(word => word === 0) && words[5] === 0xffff) return ipv4Kind([words[6] >> 8, words[6] & 255, words[7] >> 8, words[7] & 255]);
+    if ((words[0] & 0xfe00) === 0xfc00) return 'private';
+    if ((words[0] & 0xe000) !== 0x2000 || words[0] === 0x2001 && (words[1] < 0x200 || words[1] === 0xdb8) ||
+        words[0] === 0x2002 || words[0] === 0x3fff && words[1] < 0x1000) return 'other';
+    return 'public';
+  }
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return ipv4Kind(host.split('.').map(Number));
+  if (!host || !host.split('.').every(label => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label))) return 'other';
+  if (!host.includes('.') || ['.ts.net', '.local', '.internal', '.lan', '.home', '.home.arpa', '.localhost'].some(suffix => host.endsWith(suffix))) return 'private';
+  if (['.invalid', '.test', '.example', '.arpa'].some(suffix => host.endsWith(suffix))) return 'other';
+  return 'public';
+};
+const taskDeliveredUrls = (task) => task.completed?.findLast(([, tool, outcome]) =>
+  tool.name === 'done' && outcome.content?.verification_required === true)?.[1].arguments.urls ?? [];
+const renderDeliveredUrls = (parent, entries) => {
+  if (!Array.isArray(entries) || entries.length > 8) return;
+  const parsed = [];
+  for (const entry of entries) {
+    if (!entry || typeof entry.url !== 'string' || new TextEncoder().encode(entry.url).length > 2048 ||
+        !/^https?:\/\//.test(entry.url) || /[\s\p{Cc}\\]/u.test(entry.url) ||
+        entry.url.slice(entry.url.indexOf('://') + 3).split(/[/?#]/, 1)[0].includes('@') ||
+        entry.label !== undefined && (typeof entry.label !== 'string' || !entry.label.trim() || !/^[\x20-\x7e]{1,48}$/.test(entry.label))) return;
+    try {
+      const url = new URL(entry.url);
+      if (!url.hostname || url.username || url.password) return;
+      const hostIndex = entry.url.indexOf(url.hostname);
+      if (hostIndex < 0) return;
+      parsed.push({url, text: entry.url, hostname: entry.url.slice(hostIndex, hostIndex + url.hostname.length), label: entry.label});
+    } catch { return; }
+  }
+  if (!parsed.length) return;
+  const section = document.createElement('section');
+  paragraph(section, 'Addresses to open the service:');
+  for (const {url, text, hostname, label} of parsed) {
+    const row = document.createElement('p');
+    if (label) {
+      const caption = document.createElement('span'); caption.textContent = label;
+      row.append(caption, document.createElement('br'));
+    }
+    const host = document.createElement('strong'); host.textContent = hostname;
+    const anchor = document.createElement('a');
+    anchor.dataset.deliveredUrl = ''; anchor.dataset.kind = deliveredHostKind(url.hostname);
+    anchor.href = url.href; anchor.target = '_blank'; anchor.rel = 'noopener noreferrer';
+    anchor.textContent = text;
+    row.append(host, document.createElement('br'), anchor); section.append(row);
+  }
+  parent.append(section);
+};
+
 const renderTasks = (store) => {
   if (store.state !== 'unlocked' || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state)) fileDownloads.clear();
   const worker = snapshotWorker();
@@ -967,7 +1035,10 @@ const renderTasks = (store) => {
       line.dataset.harnessRead = check.command;
       rawDetails(card, check, ['task', task.id, 'check', check.command, check.job]);
     }
-    if (task.verdict) paragraph(card, task.verdict);
+    if (task.verdict) {
+      paragraph(card, task.verdict);
+      renderDeliveredUrls(card, taskDeliveredUrls(task));
+    }
     for (const finding of task.findings ?? []) {
       const service = finding.service?.name;
       paragraph(card, service ? `${service} does not match the approved setup.` : finding.field === 'inbound' ? 'The listening ports do not match the approved setup.' : 'A setup check found a difference or could not finish. Open Details to review it.');
@@ -1085,6 +1156,10 @@ const renderDelivery = (section, machine, store) => {
   verdict.textContent = delivery.verdict;
   if (delivery.verdict_is_historical && delivery.last_completed_check) paragraph(card, 'The last completed result is historical; a final demonstration is still needed.');
   card.append(verdict);
+  // Tasks arrive keyed by random id, not in time order: show addresses here only when exactly one task on this machine
+  // has a verdict; otherwise each task's own card shows its addresses.
+  const verdictTasks = (store.tasks ?? []).filter(task => task.machine === machine && task.verdict);
+  if (verdictTasks.length === 1) renderDeliveredUrls(card, taskDeliveredUrls(verdictTasks[0]));
   paragraph(card, 'Delivered covers the declared machine state and the fixed lockdown checks.');
   if (delivery.last_completed_check) {
     paragraph(card, 'Last recorded check against its journaled declaration:');
