@@ -9,8 +9,36 @@ pub const NAME: &str = "Control center";
 pub const USER_TEXT: &str = "Your own private AI machine. It runs NixOS, has an AI agent with a web dashboard, and only you can reach it. It can install more for you later.";
 pub const OPTIONS: &[(&str, &str, bool)] =
     &[("TOR", "Also reach it over Tor (an onion address)", false)];
+pub const INPUTS: &[(&str, &str)] = &[(
+    "USER_SSH_KEY",
+    "Your SSH public key (optional): lets you log in to the machine directly",
+)];
+pub const INVALID_SSH_KEY: &str =
+    "Enter one SSH public key line (for example ssh-ed25519 AAAA… you@host), or leave it empty.";
+pub const CLEAR_GOAL: &str = "Clear the goal text to use the Control center template.";
 pub const FIXED_FACTS: &[(&str, &str)] = &[("AGENT_MAY_CHANGE_MACHINE", "yes")];
+pub const THIRD_PARTY_HOSTS: &[(&str, &str)] =
+    &[("app.t3.codes", "T3 app (you sign in with your T3 account)")];
+pub const REQUIRED_FILES: &[&str] = &["wireguard.conf", "control-center-login.txt"];
+
+pub fn third_party_label(url: &str) -> Option<&'static str> {
+    let authority = url
+        .strip_prefix("https://")?
+        .split(['/', '?', '#'])
+        .next()?;
+    if authority.contains([':', '@']) {
+        return None;
+    }
+    #[cfg(target_arch = "wasm32")]
+    let host = web_sys::Url::new(url).ok()?.host();
+    #[cfg(not(target_arch = "wasm32"))]
+    let host = authority.to_owned();
+    THIRD_PARTY_HOSTS
+        .iter()
+        .find_map(|(listed, label)| host.eq_ignore_ascii_case(listed).then_some(*label))
+}
 pub type Options = BTreeMap<String, bool>;
+pub type Inputs = BTreeMap<String, String>;
 pub const NEEDS_NIXOS: &str = "The Control center needs a NixOS machine.";
 pub const FINISHED: &str =
     "Every step passed. Call done with every address the user should open in urls.";
@@ -135,6 +163,76 @@ pub fn valid_options(options: Option<&Options>) -> bool {
         options
             .keys()
             .all(|name| OPTIONS.iter().any(|(fact, _, _)| name == fact))
+    })
+}
+
+fn valid_ssh_key(line: &str) -> bool {
+    use base64::Engine;
+    if line.len() > 8192 || !line.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+        return false;
+    }
+    let mut parts = line.splitn(3, ' ');
+    let kind = parts.next().unwrap_or_default();
+    if !matches!(
+        kind,
+        "ssh-ed25519"
+            | "ecdsa-sha2-nistp256"
+            | "ecdsa-sha2-nistp384"
+            | "ecdsa-sha2-nistp521"
+            | "ssh-rsa"
+            | "sk-ssh-ed25519@openssh.com"
+            | "sk-ecdsa-sha2-nistp256@openssh.com"
+    ) || parts.clone().nth(1).is_some_and(|comment| {
+        comment.len() > 100
+            || comment.split(' ').any(|word| {
+                word.is_empty()
+                    || !word
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"@._+=:/-".contains(&byte))
+            })
+    }) {
+        return false;
+    }
+    let Some(encoded) = parts.next() else {
+        return false;
+    };
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Some(prefix) = bytes.get(..4) else {
+        return false;
+    };
+    let length = u32::from_be_bytes(prefix.try_into().expect("four-byte length")) as usize;
+    length == kind.len() && bytes.get(4..4 + length) == Some(kind.as_bytes())
+}
+
+pub fn normalize_inputs(inputs: &mut Option<Inputs>) -> Result<(), String> {
+    if let Some(values) = inputs {
+        for (name, value) in values.iter_mut() {
+            if !INPUTS.iter().any(|(known, _)| name == known) {
+                return Err("invalid goal template".into());
+            }
+            let line = value.trim();
+            if !line.is_empty() && !valid_ssh_key(line) {
+                return Err(INVALID_SSH_KEY.into());
+            }
+            *value = line.to_owned();
+        }
+        values.retain(|_, value| !value.is_empty());
+        if values.is_empty() {
+            *inputs = None;
+        }
+    }
+    Ok(())
+}
+
+pub fn valid_inputs(inputs: Option<&Inputs>) -> bool {
+    inputs.is_none_or(|values| {
+        values.iter().all(|(name, value)| {
+            INPUTS.iter().any(|(known, _)| name == known)
+                && value == value.trim()
+                && valid_ssh_key(value)
+        })
     })
 }
 

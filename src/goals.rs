@@ -18,6 +18,8 @@ pub struct Goal {
     pub template: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<crate::poc::template::Options>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<crate::poc::template::Inputs>,
 }
 
 impl Goal {

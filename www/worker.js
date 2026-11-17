@@ -197,6 +197,9 @@ const exactMembers = (value, names) => value && typeof value === 'object' &&
   !Array.isArray(value) && Object.keys(value).length === names.length &&
   names.every(name => Object.hasOwn(value, name));
 const startFields = value => typeof value.goal === 'string' && (value.document_source === null || typeof value.document_source === 'string');
+const startMembers = (value, required) => startFields(value) &&
+  required.every(name => Object.hasOwn(value, name)) &&
+  Object.keys(value).every(name => [...required, 'template', 'options', 'inputs'].includes(name));
 
 const startGoal = async (report, inputs, machine) => {
   let current = JSON.parse(report);
@@ -204,7 +207,7 @@ const startGoal = async (report, inputs, machine) => {
   const session = current.sessions?.find(s => s.session_state !== 'ended' && s.bound_set?.length === 1 && s.bound_set[0] === machine);
   if (!session || current.tasks?.some(task => task.start_session === session.identity)) return report;
   if (!session.goal) {
-    report = await goal_request(JSON.stringify({session: session.identity, text: inputs.goal, document_source: inputs.document_source || null}));
+    report = await goal_request(JSON.stringify({session: session.identity, text: inputs.goal, document_source: inputs.document_source || null, template: inputs.template, options: inputs.options, inputs: inputs.inputs}));
     current = JSON.parse(report);
     if (current.error) return report;
   }
@@ -327,8 +330,9 @@ onmessage = async ({ data: envelope }) => {
       report = JSON.stringify(current);
     }
   }
-  else if (typeof data.poc_bind?.machine === 'string' && (exactMembers(data.poc_bind,['machine']) || exactMembers(data.poc_bind,['machine','goal','document_source']) && startFields(data.poc_bind))) {
-    if (typeof data.poc_bind.goal === 'string' && !data.poc_bind.goal.trim()) { const current=JSON.parse(await open());current.error='Enter a goal before Start session.';report=JSON.stringify(current); }
+  else if (typeof data.poc_bind?.machine === 'string' && (exactMembers(data.poc_bind,['machine']) || startMembers(data.poc_bind,['machine','goal','document_source']))) {
+    if (['template', 'options', 'inputs'].some(name => Object.hasOwn(data.poc_bind, name))) report = await poc_bind(data.poc_bind.machine, JSON.stringify(data.poc_bind));
+    else if (typeof data.poc_bind.goal === 'string' && !data.poc_bind.goal.trim()) { const current=JSON.parse(await open());current.error='Enter a goal before Start session.';report=JSON.stringify(current); }
     else report = await poc_bind(data.poc_bind.machine);
     if (typeof data.poc_bind.goal === 'string') report = await startGoal(report, data.poc_bind, data.poc_bind.machine);
   }

@@ -517,6 +517,12 @@ enum Action {
         goal: String,
         #[serde(default)]
         document_source: Option<String>,
+        #[serde(default)]
+        template: Option<String>,
+        #[serde(default)]
+        options: Option<crate::poc::template::Options>,
+        #[serde(default)]
+        inputs: Option<crate::poc::template::Inputs>,
         endpoint: String,
         model: String,
     },
@@ -549,12 +555,18 @@ pub async fn credit_request(request: String) -> String {
         };
         fence.check()?;
         match action {
-            Action::Start { machine, goal, document_source, endpoint, model } => {
+            Action::Start { machine, goal, document_source, template, options, inputs, endpoint, model } => {
                 let config = Configuration::new(endpoint,model)?;
                 let session = {
                     let local = crate::worker::local(); let mut local = local.lock().await;
                     let store = fence.store(&mut local)?;
-                    if goal.trim().is_empty() { return Err("Enter a goal before Start session.".into()); }
+                    if template.is_some() || options.is_some() || inputs.is_some() {
+                        let mut candidate = crate::goals::Goal {
+                            session: String::new(), text: goal.clone(), source: crate::goals::SOURCE.into(),
+                            document_source: document_source.clone(), template: template.clone(), options: options.clone(), inputs: inputs.clone(),
+                        };
+                        store.prepare_template_goal(Some(&machine), &mut candidate)?;
+                    } else if goal.trim().is_empty() { return Err("Enter a goal before Start session.".into()); }
                     if !store.credit_can_start() { return Err("Read a positive inference credit balance before Start.".into()); }
                     if !crate::poc::inference::safe(store,&serde_json::json!({"goal":goal,"endpoint":config.endpoint,"model":config.model}),&[]) { return Err("Start contains protected material.".into()); }
                     if store.sessions().iter().any(|s| s["session_state"] != "ended" && s["bound_set"].as_array().is_some_and(|b| b.iter().any(|m| m == &machine))) {
@@ -564,7 +576,7 @@ pub async fn credit_request(request: String) -> String {
                     let session = store.admit_with_credit(&machine,&[],crate::binding::InferenceApproval {approved:true,configuration:config},true).await?;
                     fence.check()?;
                     if document_source.is_some() { return Err("Document source is unavailable for credit Start.".into()); }
-                    store.enter_goal(&session,goal,None).await?;
+                    store.enter_template_goal(&session,goal,None,template,options,inputs).await?;
                     fence.check()?;
                     store.poc_start(&session).await?;
                     session

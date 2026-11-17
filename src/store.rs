@@ -1985,8 +1985,23 @@ impl<S: Storage> Store<S> {
                 .map(|mut wrapper| wrapper["event"].take())
                 .map_err(|_| "invalid binding record shape".to_string())?;
             if value.get("goal").is_some_and(|g| {
-                g.as_object()
-                    .is_none_or(|o| o.len() != 4 || !o.contains_key("document_source"))
+                g.as_object().is_none_or(|o| {
+                    !["session", "text", "source", "document_source"]
+                        .iter()
+                        .all(|name| o.contains_key(*name))
+                        || o.keys().any(|name| {
+                            ![
+                                "session",
+                                "text",
+                                "source",
+                                "document_source",
+                                "template",
+                                "options",
+                                "inputs",
+                            ]
+                            .contains(&name.as_str())
+                        })
+                })
             }) {
                 return Err("invalid goal record shape".into());
             }
@@ -2603,7 +2618,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 "delivery": store.delivery_view(),
                 "sessions": store.sessions(),
                 "goals": store.goals,
-                "goal_templates": [{"id":crate::poc::template::ID,"name":crate::poc::template::NAME,"text":crate::poc::template::USER_TEXT,"options":crate::poc::template::OPTIONS.iter().map(|(name, label, default)| json!({"name":name,"label":label,"default":default})).collect::<Vec<_>>()}],
+                "goal_templates": [{"id":crate::poc::template::ID,"name":crate::poc::template::NAME,"text":crate::poc::template::USER_TEXT,"options":crate::poc::template::OPTIONS.iter().map(|(name, label, default)| json!({"name":name,"label":label,"default":default})).collect::<Vec<_>>(),"inputs":crate::poc::template::INPUTS.iter().map(|(name, label)| json!({"name":name,"label":label})).collect::<Vec<_>>()}],
                 "mode_acceptances": store.mode_acceptances(),
                 "signature_refusals": store.signature_refusals(),
                 "installations": store.dispatch.approved_entries.keys().filter(|m| store.installation_unpinned(m)).map(|m| json!({"machine":m,"installation":"unpinned"})).collect::<Vec<_>>(),

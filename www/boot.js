@@ -114,6 +114,8 @@ let ceremony = false;
 let suspended = false;
 const goalOutcomes = new Map();
 const creditGoalDrafts = new Map();
+const creditTemplateDrafts = new Map();
+const goalTemplateDrafts = new Map();
 const setupDrafts = new Map();
 const startDrafts = new Map();
 const taskLimitDrafts = new Map();
@@ -727,21 +729,15 @@ const renderSetup = (store) => {
           const choice = document.createElement('section');
           paragraph(choice, 'Start from a template');
           paragraph(choice, template.text);
-          const options = new Map();
-          for (const value of template.options) {
-            const label = document.createElement('label');
-            const option = document.createElement('input');
-            option.type = 'checkbox'; option.checked = value.default;
-            label.append(option, document.createTextNode(value.label));
-            choice.append(label);
-            options.set(value.name, option);
-          }
+          const draft = goalTemplateDrafts.get(session.identity) ?? {options: {}, inputs: {}};
+          goalTemplateDrafts.set(session.identity, draft);
+          const values = templateControls(choice, template, draft);
           const choose = document.createElement('button');
           choose.type = 'button'; choose.textContent = template.name;
           choose.dataset.goalEnter = session.identity;
           choose.addEventListener('click', () => {
             choose.disabled = true; enter.disabled = true;
-            worker.postMessage({goal: {session: session.identity, text: '', document_source: null, template: template.id, options: Object.fromEntries([...options].map(([name, option]) => [name, option.checked]))}});
+            worker.postMessage({goal: {session: session.identity, text: '', document_source: null, template: template.id, ...values()}});
           });
           choice.append(choose);
           card.append(choice);
@@ -910,8 +906,10 @@ const deliveredHostKind = (hostname) => {
   if (['.invalid', '.test', '.example', '.arpa'].some(suffix => host.endsWith(suffix))) return 'other';
   return 'public';
 };
-const taskDeliveredUrls = (task) => task.completed?.findLast(([, tool, outcome]) =>
-  tool.name === 'done' && outcome.content?.verification_required === true)?.[1].arguments.urls ?? [];
+const taskDeliveredUrls = (task) => {
+  const done = task.completed?.findLast(([, tool, outcome]) => tool.name === 'done' && outcome.content?.verification_required === true);
+  return (done?.[1].arguments.urls ?? []).map(entry => ({...entry, notVisited: done[2].content.unvisited_urls?.find(skipped => skipped.url === entry.url)?.label}));
+};
 const renderDeliveredUrls = (parent, entries) => {
   if (!Array.isArray(entries) || entries.length > 8) return;
   const parsed = [];
@@ -923,18 +921,16 @@ const renderDeliveredUrls = (parent, entries) => {
     try {
       const url = new URL(entry.url);
       if (!url.hostname || url.username || url.password) return;
-      const hostIndex = entry.url.indexOf(url.hostname);
-      if (hostIndex < 0) return;
-      parsed.push({url, text: entry.url, hostname: entry.url.slice(hostIndex, hostIndex + url.hostname.length), label: entry.label});
+      parsed.push({url, text: entry.url, hostname: url.hostname, label: entry.label, notVisited: entry.notVisited});
     } catch { return; }
   }
   if (!parsed.length) return;
   const section = document.createElement('section');
   paragraph(section, 'Addresses to open the service:');
-  for (const {url, text, hostname, label} of parsed) {
+  for (const {url, text, hostname, label, notVisited} of parsed) {
     const row = document.createElement('p');
-    if (label) {
-      const caption = document.createElement('span'); caption.textContent = label;
+    if (label || notVisited) {
+      const caption = document.createElement('span'); caption.textContent = notVisited ? `${notVisited}; not visited from the machine` : label;
       row.append(caption, document.createElement('br'));
     }
     const host = document.createElement('strong'); host.textContent = hostname;
@@ -1033,6 +1029,8 @@ const renderTasks = (store) => {
             anchor.href = url.href; anchor.target = '_blank'; anchor.rel = 'noopener noreferrer';
             const domain = document.createElement('strong'); domain.textContent = url.hostname.toLowerCase();
             anchor.append(domain); row.append(anchor);
+            const fullLink = document.createElement('code'); fullLink.textContent = url.href;
+            row.append(document.createElement('br'), fullLink);
           }
           const unavailable = !session || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
           let answered = false;
@@ -1110,7 +1108,7 @@ const renderTasks = (store) => {
     }
     for (const finding of task.findings ?? []) {
       const service = finding.service?.name;
-      paragraph(card, ['sign_in', 'control_center'].includes(finding.field) ? finding.detail : service ? `${service} does not match the approved setup.` : finding.field === 'inbound' ? 'The listening ports do not match the approved setup.' : 'A setup check found a difference or could not finish. Open Details to review it.');
+      paragraph(card, ['sign_in', 'control_center', 'control_center_files'].includes(finding.field) ? finding.detail : service ? `${service} does not match the approved setup.` : finding.field === 'inbound' ? 'The listening ports do not match the approved setup.' : 'A setup check found a difference or could not finish. Open Details to review it.');
       rawDetails(card, finding);
     }
     for (const note of task.notes ?? []) paragraph(card, note.text === 'enabled, restart not demonstrated'
@@ -1513,6 +1511,8 @@ const clearPocInputs = () => {
   $('provider-progress').replaceChildren();
   $('provider-key').value = '';
   creditGoalDrafts.clear();
+  creditTemplateDrafts.clear();
+  goalTemplateDrafts.clear();
   setupDrafts.clear();
   startDrafts.clear();
   taskLimitDrafts.clear();
@@ -1527,7 +1527,34 @@ const clearPocInputs = () => {
 };
 const payReadiness = purchase => purchase.payment?.is_paid && !purchase.target;
 
-const startInputs = (row, machine, initialGoal = '', documentSource = true, creditMode = false) => {
+const templateControls = (parent, template, draft) => {
+  const options = new Map();
+  for (const value of template.options) {
+    const label = document.createElement('label');
+    const option = document.createElement('input');
+    option.type = 'checkbox'; option.dataset.templateOption = value.name;
+    option.checked = draft.options[value.name] ?? value.default;
+    option.addEventListener('change', () => { draft.options[value.name] = option.checked; });
+    label.append(option, document.createTextNode(value.label));
+    parent.append(label); options.set(value.name, option);
+  }
+  const inputs = new Map();
+  for (const value of template.inputs ?? []) {
+    const label = document.createElement('label');
+    const input = document.createElement('input');
+    input.type = 'text'; input.dataset.templateInput = value.name;
+    input.value = draft.inputs[value.name] ?? '';
+    input.addEventListener('input', () => { draft.inputs[value.name] = input.value; });
+    label.append(document.createTextNode(value.label), input);
+    parent.append(label); inputs.set(value.name, input);
+  }
+  return () => ({
+    options: Object.fromEntries([...options].map(([name, option]) => [name, option.checked])),
+    inputs: Object.fromEntries([...inputs].map(([name, input]) => [name, input.value])),
+  });
+};
+
+const startInputs = (row, machine, initialGoal = '', documentSource = true, creditMode = false, templates = []) => {
   const goal = document.createElement('textarea'); if (creditMode) goal.dataset.creditGoal = machine; goal.dataset.startGoal = machine;
   goal.setAttribute('aria-label', 'Goal before Start session'); goal.value = creditGoalDrafts.get(machine) ?? initialGoal;
   goal.addEventListener('input', () => creditGoalDrafts.set(machine, goal.value));
@@ -1536,12 +1563,31 @@ const startInputs = (row, machine, initialGoal = '', documentSource = true, cred
   source.value = startDrafts.get(machine)?.[1] ?? '';
   source.addEventListener('input', () => startDrafts.set(machine, ['', source.value]));
   paragraph(row, 'Acting on a goal with no brief');
-  row.append(goal); if (documentSource) row.append(source);
-  return () => ({goal:goal.value, document_source:source.value || null});
+  row.append(goal);
+  const template = templates.find(value => value.id === 'control-center@1');
+  let selected;
+  let values;
+  if (template) {
+    const draft = creditTemplateDrafts.get(machine) ?? {selected: false, options: {}, inputs: {}};
+    creditTemplateDrafts.set(machine, draft);
+    const label = document.createElement('label');
+    selected = document.createElement('input');
+    selected.type = 'checkbox'; selected.dataset.creditTemplate = template.id; selected.checked = draft.selected;
+    selected.addEventListener('change', () => { draft.selected = selected.checked; });
+    label.append(selected, document.createTextNode('Use the Control center template'));
+    row.append(label); paragraph(row, template.text);
+    values = templateControls(row, template, draft);
+  }
+  if (documentSource) row.append(source);
+  return () => ({goal:goal.value, document_source:selected?.checked ? null : source.value || null,
+    ...(selected?.checked ? {template: template.id, ...values()} : {})});
 };
 
 const renderPoc = (store) => {
-  if (typeof store.credit_started_machine === 'string') creditGoalDrafts.delete(store.credit_started_machine);
+  if (typeof store.credit_started_machine === 'string') {
+    creditGoalDrafts.delete(store.credit_started_machine);
+    creditTemplateDrafts.delete(store.credit_started_machine);
+  }
   const worker = snapshotWorker();
   const enabled = store.state === 'unlocked' && !ceremony &&
     !['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
@@ -1572,7 +1618,7 @@ const renderPoc = (store) => {
     else configuration.textContent = `Inference endpoint: ${store.poc_configuration?.configuration?.endpoint ?? 'unavailable'}; model: ${store.poc_configuration?.configuration?.model ?? 'unavailable'}.`;
     row.append(configuration);
     paragraph(row, `Start session approves the selected AI connection for ${target.machine}.`);
-    const inputs = startInputs(row, target.machine, '', !useCredit, useCredit);
+    const inputs = startInputs(row, target.machine, '', !useCredit, useCredit, store.goal_templates);
     if (useCredit) {
       paragraph(row, store.credit.disclosure);
       if (readingCredit) paragraph(row, 'Reading AI credit balance…');

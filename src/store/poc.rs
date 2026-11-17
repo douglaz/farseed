@@ -88,6 +88,8 @@ pub struct Task {
     pub template: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<crate::poc::template::Options>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs: Option<crate::poc::template::Inputs>,
     pub machine: String,
     pub approved_plan: Option<String>,
     pub completed: Vec<Step>,
@@ -223,6 +225,10 @@ pub enum Change {
         tool: Tool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         control_center_hashes: Option<[String; 2]>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unvisited_urls: Option<Vec<crate::goals::DeliveredUrl>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        missing_files: Option<Vec<String>>,
     },
     // Record admission once; URL parsing must never change a question during replay.
     ProposeOperator {
@@ -628,10 +634,36 @@ impl<S: Storage> Store<S> {
                     .map(str::to_owned),
                 tool,
             }
-        } else if matches!(tool, Tool::Done { .. }) {
+        } else if let Tool::Done { urls, .. } = &tool {
+            let unvisited: Vec<_> = urls
+                .iter()
+                .filter_map(|entry| {
+                    (task.template.as_deref() == Some(crate::poc::template::ID))
+                        .then(|| crate::poc::template::third_party_label(&entry.url))
+                        .flatten()
+                        .map(|label| crate::goals::DeliveredUrl {
+                            url: entry.url.clone(),
+                            label: Some(label.into()),
+                        })
+                })
+                .collect();
+            let mut missing_files = Vec::new();
+            if task.template.as_deref() == Some(crate::poc::template::ID) {
+                let offers = task.file_offers();
+                for name in crate::poc::template::REQUIRED_FILES {
+                    if !offers
+                        .iter()
+                        .any(|offer| offer.path.rsplit('/').next() == Some(*name))
+                    {
+                        missing_files.push((*name).to_owned());
+                    }
+                }
+            }
             Change::ProposeDone {
                 call_id,
                 tool,
+                unvisited_urls: (!unvisited.is_empty()).then_some(unvisited),
+                missing_files: (!missing_files.is_empty()).then_some(missing_files),
                 control_center_hashes: (task.template.as_deref() == Some(crate::poc::template::ID))
                     .then(|| {
                         crate::poc::template::CONTROL_CENTER
@@ -1023,6 +1055,7 @@ impl<S: Storage> Store<S> {
                 goal: goal.text.clone(),
                 template: goal.template.clone(),
                 options: goal.options.clone(),
+                inputs: goal.inputs.clone(),
                 machine: exposure.bound_set[0].machine.clone(),
                 approved_plan: None,
                 completed: vec![],
@@ -1427,6 +1460,12 @@ impl<S: Storage> Store<S> {
                                             ));
                                         }
                                         Tool::Done { checks, urls, .. } => {
+                                            let unvisited = match change {
+                                                Change::ProposeDone { unvisited_urls, .. } => {
+                                                    unvisited_urls.as_deref().unwrap_or_default()
+                                                }
+                                                _ => &[],
+                                            };
                                             let declaration = self.dispatch.approved_entries
                                                 [&task.machine]
                                                 .declaration
@@ -1441,6 +1480,11 @@ impl<S: Storage> Store<S> {
                                                 } else {
                                                     crate::poc::completion::reads(declaration)?
                                                 };
+                                            task.read_plan.retain(|read| {
+                                                !matches!(read,
+                                                crate::poc::completion::Read::SignIn { url }
+                                                if unvisited.iter().any(|entry| &entry.url == url))
+                                            });
                                             if task.template.as_deref()
                                                 == Some(crate::poc::template::ID)
                                             {
@@ -1491,13 +1535,22 @@ impl<S: Storage> Store<S> {
                                                 .collect();
                                             task.verifying = true;
                                             task.status = Status::Verifying;
+                                            let mut outcome = json!({"verification_required":true});
+                                            if !unvisited.is_empty() {
+                                                outcome["unvisited_urls"] = json!(unvisited);
+                                            }
+                                            if let Change::ProposeDone {
+                                                missing_files: Some(names),
+                                                ..
+                                            } = change
+                                                && !names.is_empty()
+                                            {
+                                                outcome["missing_files"] = json!(names);
+                                            }
                                             task.completed.push((
                                                 call_id.clone(),
                                                 tool.clone(),
-                                                crate::goals::untrusted(
-                                                    "tool_output",
-                                                    json!({"verification_required":true}),
-                                                ),
+                                                crate::goals::untrusted("tool_output", outcome),
                                             ));
                                         }
                                         Tool::Job { .. } | Tool::Typed { .. } => {
@@ -1703,11 +1756,24 @@ impl<S: Storage> Store<S> {
                                 .iter()
                                 .map(|v| v.observation.clone())
                                 .collect::<Vec<_>>();
-                            let result = crate::poc::completion::judge(
+                            let missing_files = task
+                                .completed
+                                .iter()
+                                .rev()
+                                .find(|(_, tool, _)| matches!(tool, Tool::Done { .. }))
+                                .and_then(|(_, _, outcome)| {
+                                    outcome["content"]["missing_files"].as_array()
+                                })
+                                .map(|names| {
+                                    names.iter().filter_map(Value::as_str).collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            let result = crate::poc::completion::judge_with_files(
                                 declaration,
                                 &task.read_plan,
                                 &observations,
                                 &task.findings,
+                                &missing_files,
                             );
                             task.findings = result.findings;
                             task.notes = result.notes;

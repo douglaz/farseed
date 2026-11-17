@@ -571,6 +571,49 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         let result = self.store().expect("unlocked").poc_bind(machine).await;
         self.report(result.as_ref().err().map(String::as_str))
     }
+    pub async fn poc_bind_start(&mut self, machine: &str, request: &str) -> Value {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Start {
+            machine: String,
+            goal: String,
+            document_source: Option<String>,
+            #[serde(default)]
+            template: Option<String>,
+            #[serde(default)]
+            options: Option<crate::poc::template::Options>,
+            #[serde(default)]
+            inputs: Option<crate::poc::template::Inputs>,
+        }
+        let result = async {
+            if let Some(why) = self.dispatch_refusal() {
+                return Err(why.into());
+            }
+            let start: Start =
+                serde_json::from_str(request).map_err(|_| "invalid Start request")?;
+            if start.machine != machine {
+                return Err("invalid Start request".into());
+            }
+            let store = self.store().ok_or("locked")?;
+            if start.template.is_some() || start.options.is_some() || start.inputs.is_some() {
+                let mut goal = crate::goals::Goal {
+                    session: String::new(),
+                    text: start.goal,
+                    source: crate::goals::SOURCE.into(),
+                    document_source: start.document_source,
+                    template: start.template,
+                    options: start.options,
+                    inputs: start.inputs,
+                };
+                store.prepare_template_goal(Some(machine), &mut goal)?;
+            } else if start.goal.trim().is_empty() {
+                return Err("Enter a goal before Start session.".into());
+            }
+            store.poc_bind(machine).await.map(|_| ())
+        }
+        .await;
+        self.report(result.as_ref().err().map(String::as_str))
+    }
     pub async fn poc_accept(&mut self, request: &str) -> Value {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]

@@ -341,6 +341,16 @@ pub fn judge(
     observations: &[Option<Observation>],
     standing: &[Finding],
 ) -> delivery::ResultSet {
+    judge_with_files(d, plan, observations, standing, &[])
+}
+
+pub fn judge_with_files(
+    d: &Declaration,
+    plan: &[Read],
+    observations: &[Option<Observation>],
+    standing: &[Finding],
+    missing_files: &[&str],
+) -> delivery::ResultSet {
     let mut measurements = delivery::Measurements::missing();
     let mut facts = Vec::new();
     let mut services_unsettled = false;
@@ -537,6 +547,18 @@ pub fn judge(
             }
         }
         fields.push(control_center);
+    }
+    if !missing_files.is_empty() {
+        required.push(FieldId::ControlCenterFiles);
+        let mut files = result(FieldId::ControlCenterFiles, delivery::Status::Checked);
+        finding(
+            &mut files,
+            format!(
+                "The control center's files were not offered for download: {}. Resume the task to let the AI offer them.",
+                missing_files.join(", ")
+            ),
+        );
+        fields.push(files);
     }
     let mut result = delivery::aggregate_selected(&required, fields, standing, true);
     if unstated(d).is_some()

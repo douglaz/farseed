@@ -24,6 +24,7 @@ pub enum FieldId {
     SshdPosture,
     SignIn,
     ControlCenter,
+    ControlCenterFiles,
 }
 impl FieldId {
     pub const DECLARATION: [Self; 9] = [

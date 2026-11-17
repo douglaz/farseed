@@ -489,7 +489,11 @@ fn request_context<S: Storage>(
         ];
         messages.push(json!({"role":"system","content":"When the operator needs a file from the machine, such as a VPN connection file or sign-in details, offer it with offer_file instead of printing its contents. The operator downloads it from the page."}));
         messages.push(json!({"role":"system","content":"When a step needs the operator, such as approving a login in their own account at a link the software printed or choosing between options, call ask_operator with the purpose, the HTTPS link if any and short choices; wait for the answer, then check the result on the machine. Keep long-running login commands in the background under the existing background-command rules while the operator acts."}));
-        if task.and_then(|t| store.poc_machine_distribution(&t.machine)) == Some("nixos") {
+        if task
+            .filter(|t| t.template.is_none())
+            .and_then(|t| store.poc_machine_distribution(&t.machine))
+            == Some("nixos")
+        {
             messages.push(json!({"role":"system","content":"This machine runs NixOS: make lasting changes in the system configuration (/etc/nixos/configuration.nix or a module it imports) and apply them with `nixos-rebuild switch`; packages or services installed any other way don't survive a rebuild or reboot."}));
         }
         if let Some(mut facts) = task.and_then(|t| store.poc_inference_facts(t)) {
@@ -509,6 +513,14 @@ fn request_context<S: Storage>(
                 facts["AI_MODEL"] = json!(configuration.model);
                 for (name, value) in super::template::facts(task.options.as_ref()) {
                     facts[name] = json!(value);
+                }
+                for (name, _) in super::template::INPUTS {
+                    facts[name] = json!(
+                        task.inputs
+                            .as_ref()
+                            .and_then(|inputs| inputs.get(*name))
+                            .map_or("", String::as_str)
+                    );
                 }
             }
             let facts = store.protect_output_with(&facts, credentials)?;
@@ -678,6 +690,10 @@ fn request_context<S: Storage>(
             }
             handover.push_str("These harness reads already run after done, so checks must not repeat them; a check equal to a harness read is dropped and not run.\n");
             handover.push_str("Each address passed to done is visited anonymously from the machine after done and must ask for sign-in (HTTP 401/403, a redirect to a login page, or a page with a password field); an address that opens without signing in is a finding.\n");
+            if task.is_some_and(|t| t.template.as_deref() == Some(super::template::ID)) {
+                handover.push_str("The T3 app address https://app.t3.codes is listed for the user and not visited.\n");
+                handover.push_str("Before done, offer wireguard.conf and control-center-login.txt with offer_file; a missing offer is a finding.\n");
+            }
             handover.push_str("Before calling done, run these same commands yourself with exec and fix every difference. Differences found after done pause the task as findings.");
             messages.push(json!({"role":"user", "content":handover}));
             messages.push(json!({"role":"user", "content":"For an application the operator asked for that needs its own AI access, call request_ai_key with a short plain application name and purpose, never for your own use and never with a secret; after the operator presses Create key on its card, tau-web creates an application inference key capped at 0.25 USD, expiring in 30 days, and saves it on the machine at the path in the reply, which also gives the chat-completions API base URL to configure the application with. The key outlives this session; use the file, never print the key, and never ask the operator for keys."}));

@@ -425,8 +425,14 @@ mod worker {
     }
 
     #[wasm_bindgen]
-    pub async fn poc_bind(machine: String) -> String {
-        local().lock().await.poc_bind(&machine).await.to_string()
+    pub async fn poc_bind(machine: String, start: Option<String>) -> String {
+        let local = local();
+        let mut local = local.lock().await;
+        match start {
+            Some(request) => local.poc_bind_start(&machine, &request).await,
+            None => local.poc_bind(&machine).await,
+        }
+        .to_string()
     }
 
     #[wasm_bindgen]

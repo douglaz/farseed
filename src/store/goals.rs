@@ -146,6 +146,8 @@ impl<S: Storage> Store<S> {
     pub(super) fn check_goal(&self, goal: &Goal) -> Result<(), String> {
         if self.ended_sessions.contains(&goal.session)
             || !goal.valid()
+            || !crate::poc::template::valid_inputs(goal.inputs.as_ref())
+            || (goal.template.is_none() && goal.inputs.is_some())
             || !self
                 .exposure_ledger
                 .iter()
@@ -179,8 +181,46 @@ impl<S: Storage> Store<S> {
         text: String,
         document_source: Option<String>,
     ) -> Result<(), String> {
-        self.enter_template_goal(session, text, document_source, None, None)
+        self.enter_template_goal(session, text, document_source, None, None, None)
             .await
+    }
+
+    /// Shared, write-free template checks run before Start admits a session.
+    pub(crate) fn prepare_template_goal(
+        &self,
+        machine: Option<&str>,
+        goal: &mut Goal,
+    ) -> Result<(), String> {
+        if !crate::poc::template::valid_options(goal.options.as_ref())
+            || (goal.template.is_none() && (goal.options.is_some() || goal.inputs.is_some()))
+        {
+            return Err("invalid goal template".into());
+        }
+        if let Some(id) = &goal.template {
+            if !goal.text.trim().is_empty() {
+                return Err(crate::poc::template::CLEAR_GOAL.into());
+            }
+            if id != crate::poc::template::ID || goal.document_source.is_some() {
+                return Err("invalid goal template".into());
+            }
+            crate::poc::template::normalize_inputs(&mut goal.inputs)?;
+            if machine.and_then(|machine| self.poc_machine_distribution(machine)) != Some("nixos") {
+                return Err(crate::poc::template::NEEDS_NIXOS.into());
+            }
+            // Validate the vendored text before either admission or recording a goal.
+            std::sync::LazyLock::force(&crate::poc::template::CONTROL_CENTER);
+            goal.text = crate::poc::template::goal(goal.options.as_ref());
+        }
+        if goal.template.is_some()
+            && !crate::redaction::Redacted::inference_value_is_safe(
+                self,
+                &serde_json::to_value(goal).expect("goal serializes"),
+                &[],
+            )
+        {
+            return Err("goal credential boundary".into());
+        }
+        Ok(())
     }
 
     pub async fn enter_template_goal(
@@ -190,41 +230,32 @@ impl<S: Storage> Store<S> {
         document_source: Option<String>,
         template: Option<String>,
         options: Option<crate::poc::template::Options>,
+        inputs: Option<crate::poc::template::Inputs>,
     ) -> Result<(), String> {
         self.live_goal_session(session)?;
-        if !crate::poc::template::valid_options(options.as_ref())
-            || (template.is_none() && options.is_some())
-        {
-            return Err("invalid goal template".into());
-        }
-        let text = if let Some(id) = &template {
-            if id != crate::poc::template::ID {
-                return Err("invalid goal template".into());
-            }
+        let machine = if template.is_some() {
             let exposure = self
                 .exposure_ledger
                 .iter()
                 .find(|e| e.session == session)
                 .ok_or("missing goal binding")?;
-            if exposure.bound_set.len() != 1
-                || self.poc_machine_distribution(&exposure.bound_set[0].machine) != Some("nixos")
-            {
+            if exposure.bound_set.len() != 1 {
                 return Err(crate::poc::template::NEEDS_NIXOS.into());
             }
-            // Validate the vendored text at first selection, before recording a goal.
-            std::sync::LazyLock::force(&crate::poc::template::CONTROL_CENTER);
-            crate::poc::template::goal(options.as_ref())
+            Some(exposure.bound_set[0].machine.clone())
         } else {
-            text
+            None
         };
-        let goal = Goal {
+        let mut goal = Goal {
             session: session.into(),
             text,
             source: crate::goals::SOURCE.into(),
             document_source,
             template,
             options,
+            inputs,
         };
+        self.prepare_template_goal(machine.as_deref(), &mut goal)?;
         self.check_goal(&goal)?;
         if !crate::redaction::Redacted::inference_value_is_safe(
             self,

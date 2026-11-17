@@ -51,6 +51,8 @@ struct Entry {
     template: Option<String>,
     #[serde(default)]
     options: Option<crate::poc::template::Options>,
+    #[serde(default)]
+    inputs: Option<crate::poc::template::Inputs>,
 }
 
 #[wasm_bindgen]
@@ -101,6 +103,7 @@ async fn enter(request: &str) -> Result<(), String> {
                 entry.document_source,
                 entry.template,
                 entry.options,
+                entry.inputs,
             )
             .await?;
         if source.is_some() {
