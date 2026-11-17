@@ -22,6 +22,7 @@ pub enum FieldId {
     DefaultCredentials,
     FixedDefaultCredentials,
     SshdPosture,
+    SignIn,
 }
 impl FieldId {
     pub const DECLARATION: [Self; 9] = [

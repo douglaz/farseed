@@ -1,11 +1,15 @@
-//! The limited service and TCP claim derives only from journaled declaration reads.
+//! The limited delivery claim derives only from journaled harness reads.
 use crate::declaration::{Declaration, Field, From, Lifecycle, Protocol, Scope, Service};
 use crate::delivery::{self, FieldId, FieldResult, Finding, Measured, ServiceFact, ServiceState};
 use serde::{Deserialize, Serialize};
 
 pub const DELIVERED: &str = "Delivered (service and TCP checks only)";
+pub const DELIVERED_SIGN_IN: &str = "Delivered (service, TCP and sign-in checks only)";
 pub const FINDINGS: &str = "Handed over with findings";
 pub const UNKNOWN: &str = "Findings unknown until a complete re-check";
+
+// The spec's read tables don't cover this visit yet.
+const SIGN_IN_COMMAND: &str = r#"(visit=$(curl -q --silent --show-error --location --max-redirs 5 --insecure --max-time {timeout} --max-filesize 1048576 --proto '=http,https' --proto-redir '=http,https' --disallow-username-in-url --proxy '' --noproxy '' {proxy} --write-out '\nTAU_SIGN_IN %{http_code} %{url_effective}\n' -- {url}); curl_status=$?; printf '%s\n' "$visit" | LC_ALL=C awk 'NR > 1 { body = body previous "\n" } { previous = $0 } END { if (previous !~ /^TAU_SIGN_IN [0-9][0-9][0-9] https?:\/\//) exit 1; split(previous, meta, " "); path = meta[3]; sub(/^[^:]+:\/\/[^\/?#]*/, "", path); sub(/[?#].*$/, "", path); if (path == "") path = "/"; password = "no"; body = tolower(body); while (match(body, /<input[[:space:]][^>]*>/)) { tag = substr(body, RSTART, RLENGTH); if (tag ~ /[[:space:]]type[[:space:]]*=[[:space:]]*("password"|\047password\047|password[[:space:]\/>])/) password = "yes"; body = substr(body, RSTART + RLENGTH) } printf "%s %s\npassword_form %s\n", meta[2], path, password }'; parse_status=$?; [ "$curl_status" -eq 0 ] || exit "$curl_status"; exit "$parse_status")"#;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -13,6 +17,7 @@ pub enum Read {
     Running { service: Service },
     Enabled { service: Service },
     Listeners,
+    SignIn { url: String },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +37,12 @@ pub enum Observation {
     Running(bool),
     Enabled(bool),
     Sockets(Vec<Socket>),
+    SignIn {
+        code: u16,
+        path: String,
+        password_input: bool,
+    },
+    SignInUnreachable,
     Failed(String),
 }
 fn template(table: &str, key: &str) -> &'static str {
@@ -58,6 +69,32 @@ impl Read {
             )
             .replace("{name}", &format!("'{}'", service.name)),
             Self::Listeners => template("listeners_inbound", "command").into(),
+            Self::SignIn { url } => {
+                #[cfg(target_arch = "wasm32")]
+                let host = web_sys::Url::new(url)
+                    .expect("validated delivered URL")
+                    .hostname();
+                #[cfg(not(target_arch = "wasm32"))]
+                let host = url
+                    .split_once("://")
+                    .expect("validated delivered URL")
+                    .1
+                    .split(['/', '?', '#', ':'])
+                    .next()
+                    .unwrap_or_default();
+                let onion = host.to_ascii_lowercase().ends_with(".onion");
+                SIGN_IN_COMMAND
+                    .replace(
+                        "{proxy}",
+                        if onion {
+                            "--socks5-hostname 127.0.0.1:9050"
+                        } else {
+                            ""
+                        },
+                    )
+                    .replace("{timeout}", if onion { "45" } else { "15" })
+                    .replace("{url}", &format!("'{}'", url.replace('\'', "'\\''")))
+            }
         }
     }
     pub fn observe(&self, exit: u32, stdout: &str) -> Observation {
@@ -72,6 +109,7 @@ impl Read {
                 Ok(sockets) => Observation::Sockets(sockets),
                 Err(why) => Observation::Failed(why),
             },
+            Self::SignIn { .. } => sign_in(exit, stdout),
             _ => Observation::Failed(format!("Read {} exited with status {exit}", self.command())),
         }
     }
@@ -128,6 +166,12 @@ pub fn proposal(value: &serde_json::Value) -> Result<Declaration, String> {
     Ok(declaration)
 }
 pub fn reads(d: &Declaration) -> Result<Vec<Read>, String> {
+    reads_for_urls(d, &[])
+}
+pub fn reads_for_urls(
+    d: &Declaration,
+    urls: &[crate::goals::DeliveredUrl],
+) -> Result<Vec<Read>, String> {
     let mut reads = Vec::new();
     if let Field::Value(services) = &d.services {
         for service in services {
@@ -145,7 +189,61 @@ pub fn reads(d: &Declaration) -> Result<Vec<Read>, String> {
         }
     }
     reads.push(Read::Listeners);
+    reads.extend(urls.iter().map(|delivered| Read::SignIn {
+        url: delivered.url.clone(),
+    }));
     Ok(reads)
+}
+
+fn sign_in(exit: u32, stdout: &str) -> Observation {
+    if exit != 0 {
+        return Observation::SignInUnreachable;
+    }
+    let mut lines = stdout.lines();
+    let parsed = (|| {
+        let (code, path) = lines.next()?.split_once(' ')?;
+        if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let code = code.parse::<u16>().ok()?;
+        if !(100..=999).contains(&code)
+            || !path.starts_with('/')
+            || path.chars().any(|c| c.is_whitespace() || c.is_control())
+        {
+            return None;
+        }
+        let password_input = match lines.next()? {
+            "password_form yes" => true,
+            "password_form no" => false,
+            _ => return None,
+        };
+        if lines.next().is_some() {
+            return None;
+        }
+        Some(Observation::SignIn {
+            code,
+            path: path.into(),
+            password_input,
+        })
+    })();
+    parsed.unwrap_or(Observation::SignInUnreachable)
+}
+
+fn login_path(path: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    path.match_indices('/').any(|(index, _)| {
+        [
+            "login", "signin", "sign-in", "sign_in", "auth", "oauth", "session",
+        ]
+        .into_iter()
+        .any(|name| {
+            path[index + 1..].strip_prefix(name).is_some_and(|tail| {
+                tail.chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
+            })
+        })
+    })
 }
 fn sockets(stdout: &str) -> Result<Vec<Socket>, String> {
     let mut sockets = Vec::new();
@@ -327,12 +425,47 @@ pub fn judge(
         }
     }
     fields.push(inbound);
-    let mut result = delivery::aggregate_selected(
-        &[FieldId::Services, FieldId::Inbound],
-        fields,
-        standing,
-        true,
-    );
+    let mut required = vec![FieldId::Services, FieldId::Inbound];
+    if plan.iter().any(|read| matches!(read, Read::SignIn { .. })) {
+        required.push(FieldId::SignIn);
+        let mut sign_in = result(FieldId::SignIn, delivery::Status::Checked);
+        for (index, read) in plan.iter().enumerate() {
+            let Read::SignIn { url } = read else { continue };
+            let detail = match observations.get(index).and_then(Option::as_ref) {
+                None => {
+                    sign_in.status = delivery::Status::Unavailable;
+                    continue;
+                }
+                Some(Observation::SignIn {
+                    code,
+                    path,
+                    password_input,
+                }) => {
+                    if matches!(*code, 401 | 403)
+                        || (200..400).contains(code) && login_path(path)
+                        || (200..300).contains(code) && *password_input
+                    {
+                        continue;
+                    }
+                    if (200..400).contains(code) {
+                        format!(
+                            "Anyone who can reach {url} can use it without signing in, so what it holds may be exposed: its data, its settings and any keys it keeps. It needs a sign-in before it is handed over."
+                        )
+                    } else {
+                        format!(
+                            "{url} answered with HTTP {code} instead of the app's page, so tau-web could not check that it asks for sign-in."
+                        )
+                    }
+                }
+                Some(_) => format!(
+                    "{url} could not be visited from the machine, so tau-web could not check that it asks for sign-in."
+                ),
+            };
+            finding(&mut sign_in, detail);
+        }
+        fields.push(sign_in);
+    }
+    let mut result = delivery::aggregate_selected(&required, fields, standing, true);
     if unstated(d).is_some()
         || services_unsettled
         || plan.len() != observations.len()

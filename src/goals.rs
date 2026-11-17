@@ -377,7 +377,7 @@ pub fn definitions() -> Value {
         ),
         spec(
             "done",
-            json!({"machine":machine,"urls":{"type":"array","maxItems":8,"description":"Optional addresses the operator uses to reach what was set up, never secrets. When the goal is a service the operator will open, pass every address they can use in urls.","items":{"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":2048,"description":"An absolute http:// or https:// URL of 1 to 2048 bytes with a host, no user information, control characters or whitespace."},"label":{"type":"string","minLength":1,"maxLength":48,"description":"An optional short plain label of 1 to 48 printable ASCII bytes."}},"required":["url"],"additionalProperties":false}}}),
+            json!({"machine":machine,"urls":{"type":"array","maxItems":8,"description":"Optional addresses the operator uses to reach what was set up, never secrets. When the goal is a service the operator will open, pass every address they can use in urls. Each is visited anonymously after done and must ask for sign-in, or it is a finding.","items":{"type":"object","properties":{"url":{"type":"string","minLength":1,"maxLength":2048,"description":"An absolute http:// or https:// URL of 1 to 2048 bytes with a host, no user information, control characters or whitespace."},"label":{"type":"string","minLength":1,"maxLength":48,"description":"An optional short plain label of 1 to 48 printable ASCII bytes."}},"required":["url"],"additionalProperties":false}}}),
             &["machine"]
         )
     ])

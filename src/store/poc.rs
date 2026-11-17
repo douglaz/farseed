@@ -213,6 +213,11 @@ pub enum Change {
         call_id: String,
         tool: Tool,
     },
+    // New done calls add sign-in reads; keep Propose's historical read plan on replay.
+    ProposeDone {
+        call_id: String,
+        tool: Tool,
+    },
     // Record admission once; URL parsing must never change a question during replay.
     ProposeOperator {
         call_id: String,
@@ -616,6 +621,8 @@ impl<S: Storage> Store<S> {
                     .map(str::to_owned),
                 tool,
             }
+        } else if matches!(tool, Tool::Done { .. }) {
+            Change::ProposeDone { call_id, tool }
         } else {
             Change::Propose { call_id, tool }
         };
@@ -1287,7 +1294,13 @@ impl<S: Storage> Store<S> {
                         }
                     }
                     Change::Propose { call_id, tool }
+                    | Change::ProposeDone { call_id, tool }
                     | Change::ProposeOperator { call_id, tool, .. } => {
+                        if matches!(change, Change::ProposeDone { .. })
+                            && !matches!(tool, Tool::Done { .. })
+                        {
+                            return Err("done proposal requires a done tool".into());
+                        }
                         let operator_refusal =
                             if let Change::ProposeOperator { refusal, .. } = change {
                                 if !matches!(tool, Tool::AskOperator { .. }) {
@@ -1395,14 +1408,21 @@ impl<S: Storage> Store<S> {
                                                 crate::goals::untrusted("tool_output", result),
                                             ));
                                         }
-                                        Tool::Done { checks, .. } => {
+                                        Tool::Done { checks, urls, .. } => {
                                             let declaration = self.dispatch.approved_entries
                                                 [&task.machine]
                                                 .declaration
                                                 .as_ref()
                                                 .ok_or("approved declaration missing")?;
                                             task.read_plan =
-                                                crate::poc::completion::reads(declaration)?;
+                                                if matches!(change, Change::ProposeDone { .. }) {
+                                                    crate::poc::completion::reads_for_urls(
+                                                        declaration,
+                                                        urls,
+                                                    )?
+                                                } else {
+                                                    crate::poc::completion::reads(declaration)?
+                                                };
                                             task.checks = task
                                                 .read_plan
                                                 .iter()
@@ -1632,7 +1652,16 @@ impl<S: Storage> Store<S> {
                                 task.verdict = None;
                                 task.pause(crate::poc::completion::UNKNOWN);
                             } else if result.delivered {
-                                task.verdict = Some(crate::poc::completion::DELIVERED.into());
+                                task.verdict = Some(
+                                    if task.read_plan.iter().any(|read| {
+                                        matches!(read, crate::poc::completion::Read::SignIn { .. })
+                                    }) {
+                                        crate::poc::completion::DELIVERED_SIGN_IN
+                                    } else {
+                                        crate::poc::completion::DELIVERED
+                                    }
+                                    .into(),
+                                );
                                 task.status = Status::Complete;
                                 task.pause_reason = None;
                             } else {

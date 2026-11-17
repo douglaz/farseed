@@ -606,6 +606,9 @@ fn request_context<S: Storage>(
                         serde_json::to_string(&declaration.listeners.inbound)
                             .map_err(|_| "inbound encoding")?
                     ),
+                    super::completion::Read::SignIn { .. } => {
+                        unreachable!("declaration reads have no URLs")
+                    }
                 };
                 handover.push_str(&format!("{}: {passes}\n", read.command()));
             }
@@ -617,6 +620,7 @@ fn request_context<S: Storage>(
                 handover.push_str(&format!("Seen before setup and not declared: {}. Remove each before done, or it is a finding.\n", undeclared.join(", ")));
             }
             handover.push_str("These harness reads already run after done, so checks must not repeat them; a check equal to a harness read is dropped and not run.\n");
+            handover.push_str("Each address passed to done is visited anonymously from the machine after done and must ask for sign-in (HTTP 401/403, a redirect to a login page, or a page with a password field); an address that opens without signing in is a finding.\n");
             handover.push_str("Before calling done, run these same commands yourself with exec and fix every difference. Differences found after done pause the task as findings.");
             messages.push(json!({"role":"user", "content":handover}));
             messages.push(json!({"role":"user", "content":"For an application the operator asked for that needs its own AI access, call request_ai_key with a short plain application name and purpose, never for your own use and never with a secret; after the operator presses Create key on its card, tau-web creates an application inference key capped at 0.25 USD, expiring in 30 days, and saves it on the machine at the path in the reply, which also gives the chat-completions API base URL to configure the application with. The key outlives this session; use the file, never print the key, and never ask the operator for keys."}));

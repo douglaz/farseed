@@ -510,7 +510,7 @@ const installationPreview = (parent, d) => {
   if (d.default_credentials === 'none' || Array.isArray(d.default_credentials) && !d.default_credentials.length) paragraph(parent, 'No default passwords are listed to be changed.');
   else if (d.default_credentials === 'unspecified') paragraph(parent, 'Default passwords to change are not stated yet; handover is blocked.');
   paragraph(parent, 'This proof of concept does not check security hardening, SSH or local passwords, stored keys, later changes, outgoing restrictions or default password changes. It does not test a reboot.');
-  paragraph(parent, 'Completion means Delivered (service and TCP checks only). Differences leave the task paused as Handed over with findings. Incomplete reads leave Findings unknown until a complete re-check.');
+  paragraph(parent, 'Completion checks services and TCP listeners and visits each handed-over address once to see that it asks for sign-in. Differences leave the task paused as Handed over with findings. Incomplete reads leave Findings unknown until a complete re-check.');
   rawDetails(parent, d, ['installation-candidate', parent.dataset.requirementsCard]);
 };
 const renderDeclaration = (parent, d) => {
@@ -1087,7 +1087,7 @@ const renderTasks = (store) => {
     }
     for (const finding of task.findings ?? []) {
       const service = finding.service?.name;
-      paragraph(card, service ? `${service} does not match the approved setup.` : finding.field === 'inbound' ? 'The listening ports do not match the approved setup.' : 'A setup check found a difference or could not finish. Open Details to review it.');
+      paragraph(card, finding.field === 'sign_in' ? finding.detail : service ? `${service} does not match the approved setup.` : finding.field === 'inbound' ? 'The listening ports do not match the approved setup.' : 'A setup check found a difference or could not finish. Open Details to review it.');
       rawDetails(card, finding);
     }
     for (const note of task.notes ?? []) paragraph(card, note.text === 'enabled, restart not demonstrated'
