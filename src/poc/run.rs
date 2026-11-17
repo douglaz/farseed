@@ -169,6 +169,9 @@ pub async fn resume(
                 if !task.requesting {
                     return Ok(task);
                 }
+                // Show the recorded request (running, one more reply used) while the reply is awaited; otherwise a
+                // resumed task keeps showing its old pause until the reply lands.
+                runtime.progress(&task).await;
                 // The durable request count is consumed even if this future is lost.
                 let next = model.next(&task, session).await;
                 if let Err(why) = runtime.authority(id, session).await {
