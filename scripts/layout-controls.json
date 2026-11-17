@@ -200,7 +200,7 @@
   "fixtureLimit": "Fixture measurements and fixed lockdown fixture checks only; no live machine was read. The bundle's lockdown checklist and real observation paths are not implemented.",
   "checkboxTerms": {
     "tau-provider-approve-charge": "Approve the exact displayed machine configuration, region, image, resources and recurring charge terms.",
-    "tau-provider-approve-access": "Approve maintained, ad-hoc access, Arch user and whole-script sudo -n.",
+    "tau-provider-approve-access": "Approve maintained, ad-hoc access, the image's login user and whole-script sudo -n.",
     "tau-poc-approve-existing": "Approve this existing machine. This does not order a machine or assert installation facts.",
     "tau-poc-approve-access": "Approve maintained, ad-hoc access to this machine."
   }
