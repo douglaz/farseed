@@ -27,6 +27,10 @@ You are building the user's control center on this NixOS machine. Follow the ste
    twice. If it still fails, stop and report the FAIL lines and the step number.
 7. Commands already run as root. Keep output short: only the first 8 KiB of output comes back, and the
    scripts print only what matters.
+8. Change the `cc-*.nix` files, the two scripts and the user's files (wireguard.conf,
+   control-center-login.txt, app-url.txt) only by running a step's Do block. A FAIL line that ends with
+   `(needs the user: ask_operator)` can only be fixed by the user: ask with `ask_operator`, wait for the
+   answer, then run that step's Wait and Check again. Don't work around it.
 
 ## Facts (tau-web fills these in)
 
@@ -177,6 +181,8 @@ S=/var/lib/control-center; O=/var/lib/tor/onion/control-center/hostname
 U=$(cat $S/login-user 2>/dev/null); H=$(getent passwd "$U" | cut -d: -f6); N=0; G=0
 T0=$(date +%s); B=150; [ "$1" = done ] && B=90
 t() { n=$1; shift; N=$((N+1)); if "$@" >/dev/null 2>&1; then G=$((G+1)); else echo "CHECK $n FAIL"; fi; }
+# A check only the user can make pass (an approval in their own account): its FAIL line says so.
+tu() { n=$1; shift; N=$((N+1)); if "$@" >/dev/null 2>&1; then G=$((G+1)); else echo "CHECK $n FAIL (needs the user: ask_operator)"; fi; }
 w() { e=$(( $(date +%s) + $1 )); [ $e -gt $((T0 + B)) ] && e=$((T0 + B)); shift
   while ! "$@" >/dev/null 2>&1 && [ "$(date +%s)" -lt $e ]; do sleep 2; done; }
 m() { [ "$(stat -c '%a %U' "$1" 2>/dev/null)" = "$2" ]; }
@@ -242,9 +248,10 @@ t3() {
 }
 connect() {
   w 120 both
-  t t3_connect_linked linked
-  t t3_tunnel_connected tunnel
-  t t3_credential_service_only m /var/lib/t3code/userdata/secrets/cloud-cli-oauth-token.bin "600 hermes"
+  tu t3_connect_linked linked
+  # Without the link the tunnel can't connect (the user's part); with it, a restart of t3code is the fix.
+  if linked >/dev/null 2>&1; then t t3_tunnel_connected tunnel; else tu t3_tunnel_connected tunnel; fi
+  tu t3_credential_service_only m /var/lib/t3code/userdata/secrets/cloud-cli-oauth-token.bin "600 hermes"
 }
 wireguard() {
   t wg0_address sh -c 'ip -4 addr show wg0 | grep -q "inet 10.88.0.1/24"'
@@ -300,7 +307,7 @@ STEP
 ```
 **Check** (the two scripts must match byte for byte):
 ```sh
-printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22aba7edd6ad35a83f9ce5fe1b73ac01ed5b4d3d7e2564d2022839f 80ac27d171603fb1dab4e9b15876d8e89ee0636b1c9f410f0e95d5a0e1740ed0 | sha256sum -c && echo "CHECKS scripts PASS" || echo "CHECKS scripts FAIL"
+printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22aba7edd6ad35a83f9ce5fe1b73ac01ed5b4d3d7e2564d2022839f 9893ad673d5aafe3ea544949898c73b9a2e12702bc21d4e1fcc5251a5b46669a | sha256sum -c && echo "CHECKS scripts PASS" || echo "CHECKS scripts FAIL"
 ```
 Expect `CHECKS scripts PASS`.
 
@@ -735,9 +742,9 @@ sh /etc/nixos/cc-check.sh connect
 ```
 Expect `CHECKS connect PASS`. The check waits up to 2 minutes for the tunnel to connect.
 
-**If it fails:** if the Wait said SIGN-IN ENDED, run the Do block again (a new link) and call `ask_operator` again.
-If only `t3_tunnel_connected` fails after APPROVED, run `systemctl restart t3code`, wait one minute, and check
-again.
+**If it fails:** if the Wait said SIGN-IN ENDED, or a FAIL line says `(needs the user: ask_operator)`, run the Do
+block again (a new link) and call `ask_operator` again. If only `t3_tunnel_connected` fails, without that note,
+run `systemctl restart t3code`, wait one minute, and check again.
 
 ---
 
@@ -895,7 +902,7 @@ STEP
 ```
 **Check** (takes up to 5 minutes: it also checks T3 Connect and visits every address in app-url.txt):
 ```sh
-printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22aba7edd6ad35a83f9ce5fe1b73ac01ed5b4d3d7e2564d2022839f 80ac27d171603fb1dab4e9b15876d8e89ee0636b1c9f410f0e95d5a0e1740ed0 | sha256sum -c --quiet && sh /etc/nixos/cc-check.sh done
+printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22aba7edd6ad35a83f9ce5fe1b73ac01ed5b4d3d7e2564d2022839f 9893ad673d5aafe3ea544949898c73b9a2e12702bc21d4e1fcc5251a5b46669a | sha256sum -c --quiet && sh /etc/nixos/cc-check.sh done
 ```
 Expect `CHECKS done PASS`. If only a `visit_` check fails for an onion address, wait 2 minutes and run it again: a
 new onion service can take a few minutes to become reachable.
@@ -913,6 +920,11 @@ Then call `done` with `urls`: `https://app.t3.codes` (label `T3 Code`), `http://
 ---
 
 ## Recovery
+
+**R0: what not to do.** Never edit `cc-*.nix`, `cc-rebuild.sh` or `cc-check.sh` except by running a step's Do
+block. Never rewrite the user's files except by running Step 11's Do block. A FAIL line that ends with
+`(needs the user: ask_operator)` waits on the user: ask with `ask_operator`, wait for the answer, then run that
+step's Wait and Check again.
 
 **R1: the rebuild failed (`REBUILD FAILED`).** Nothing changed: the old system is still running. Read the error
 lines that the wait command printed.
