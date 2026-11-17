@@ -73,6 +73,14 @@ pub fn document_url(s: &str) -> bool {
 pub enum Tool {
     #[serde(rename = "exec")]
     Exec { machine: String, command: String },
+    #[serde(rename = "ask_operator")]
+    AskOperator {
+        purpose: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
+        #[serde(default = "crate::poc::question::default_choices")]
+        choices: Vec<String>,
+    },
     #[serde(rename = "request_ai_key")]
     RequestAiKey {
         machine: String,
@@ -221,6 +229,12 @@ impl Tool {
             return Err("tool schema".into());
         }
         let mut value = value.clone();
+        if value["name"] == "ask_operator"
+            && let Some(arguments) = value["arguments"].as_object_mut()
+            && arguments.get("choices").is_some_and(Value::is_null)
+        {
+            arguments.remove("choices");
+        }
         if value["name"] == "done"
             && let Some(arguments) = value["arguments"].as_object_mut()
             && arguments.get("urls").is_some_and(Value::is_null)
@@ -307,6 +321,8 @@ impl Tool {
     }
     pub fn machine(&self) -> &str {
         match self {
+            // Questions inherit their durable task's binding, without a machine argument.
+            Self::AskOperator { .. } => "",
             Self::Exec { machine, .. }
             | Self::OfferFile { machine, .. }
             | Self::Job { machine, .. }

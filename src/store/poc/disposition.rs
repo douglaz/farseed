@@ -168,6 +168,20 @@ impl<S: Storage> Store<S> {
 
     pub(in crate::store) fn poc_task_view(&self, task: &Task) -> Value {
         let mut value = task.view();
+        #[cfg(target_arch = "wasm32")]
+        if task.awaiting_operator() {
+            let display = task
+                .proposal
+                .as_ref()
+                .and_then(|proposal| crate::poc::question::display(&proposal.tool));
+            if let Some(display) = display.filter(|display| self.poc_safe(display).is_ok()) {
+                value["operator_question"] = display;
+            } else {
+                value["proposal"] = Value::Null;
+                value["status"] = "paused".into();
+                value["pause_reason"] = "The operator question was withheld because its display could not be protected.".into();
+            }
+        }
         if task.status == Status::Paused && task.pending.is_some() {
             match self.poc_disposition_offer(&task.id, &task.start_session) {
                 Ok(offer) => {

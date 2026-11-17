@@ -114,6 +114,13 @@ pub struct Task {
     pub inspection_record: Option<u64>,
 }
 impl Task {
+    pub fn awaiting_operator(&self) -> bool {
+        self.pending.is_none()
+            && self
+                .proposal
+                .as_ref()
+                .is_some_and(|proposal| matches!(proposal.tool, Tool::AskOperator { .. }))
+    }
     pub fn awaiting_ai_key(&self) -> bool {
         !self.ai_key_approved
             && self.pending.is_none()
@@ -167,13 +174,14 @@ impl Task {
     }
     fn active(&mut self) {
         self.pause_reason = None;
-        self.status = if self.pending.is_some() || self.awaiting_ai_key() {
-            Status::Waiting
-        } else if self.verifying {
-            Status::Verifying
-        } else {
-            Status::Running
-        };
+        self.status =
+            if self.pending.is_some() || self.awaiting_ai_key() || self.awaiting_operator() {
+                Status::Waiting
+            } else if self.verifying {
+                Status::Verifying
+            } else {
+                Status::Running
+            };
     }
 }
 
@@ -205,6 +213,12 @@ pub enum Change {
         call_id: String,
         tool: Tool,
     },
+    // Record admission once; URL parsing must never change a question during replay.
+    ProposeOperator {
+        call_id: String,
+        tool: Tool,
+        refusal: Option<String>,
+    },
     PrepareCheck,
     RetryChecks,
     SkipReport(String),
@@ -212,6 +226,10 @@ pub enum Change {
     AiKeyFailed(String),
     AiKeyDecision {
         create: bool,
+    },
+    OperatorAnswer {
+        call_id: String,
+        answer: String,
     },
     AiKeyClassDecision {
         answer: super::poc_targets::KeyCardAnswer,
@@ -577,8 +595,22 @@ impl<S: Storage> Store<S> {
     ) -> Result<Task, String> {
         self.poc_authority(&task.id, session)?;
         self.poc_safe(&tool)?;
-        self.poc_change(&task.id, task.revision, Change::Propose { call_id, tool })
-            .await
+        #[cfg(target_arch = "wasm32")]
+        if let Some(display) = crate::poc::question::display(&tool) {
+            self.poc_safe(&display)?;
+        }
+        let change = if matches!(tool, Tool::AskOperator { .. }) {
+            Change::ProposeOperator {
+                call_id,
+                refusal: crate::poc::question::validate(&tool)
+                    .err()
+                    .map(str::to_owned),
+                tool,
+            }
+        } else {
+            Change::Propose { call_id, tool }
+        };
+        self.poc_change(&task.id, task.revision, change).await
     }
 
     /// An admitted declaration uses the same approval path as other requirements.
@@ -594,6 +626,9 @@ impl<S: Storage> Store<S> {
         }
         if task.awaiting_ai_key() {
             return Err("AI key request needs the operator's decision".into());
+        }
+        if task.awaiting_operator() {
+            return Err("The question needs the operator's answer.".into());
         }
         if let Tool::ProposeDeclaration {
             machine,
@@ -1242,7 +1277,20 @@ impl<S: Storage> Store<S> {
                             task.active();
                         }
                     }
-                    Change::Propose { call_id, tool } => {
+                    Change::Propose { call_id, tool }
+                    | Change::ProposeOperator { call_id, tool, .. } => {
+                        let operator_refusal =
+                            if let Change::ProposeOperator { refusal, .. } = change {
+                                if !matches!(tool, Tool::AskOperator { .. }) {
+                                    return Err("No operator question is pending.".into());
+                                }
+                                refusal.as_ref()
+                            } else {
+                                if matches!(tool, Tool::AskOperator { .. }) {
+                                    return Err("The question needs a recorded admission.".into());
+                                }
+                                None
+                            };
                         if !task.requesting || task.pending.is_some() || task.proposal.is_some() {
                             return Err("no current task request".into());
                         }
@@ -1264,7 +1312,9 @@ impl<S: Storage> Store<S> {
                         } else {
                             task.steps += 1;
                             task.active();
-                            if tool.machine() != task.machine {
+                            if !matches!(tool, Tool::AskOperator { .. })
+                                && tool.machine() != task.machine
+                            {
                                 task.completed.push((
                                     call_id.clone(),
                                     tool.clone(),
@@ -1303,6 +1353,26 @@ impl<S: Storage> Store<S> {
                                                 report: None,
                                             });
                                             task.active();
+                                        }
+                                        Tool::AskOperator { .. } => {
+                                            if let Some(reason) = operator_refusal {
+                                                task.completed.push((
+                                                    call_id.clone(),
+                                                    tool.clone(),
+                                                    crate::goals::untrusted(
+                                                        "tool_output",
+                                                        json!({"refused":reason}),
+                                                    ),
+                                                ));
+                                            } else {
+                                                task.proposal = Some(Proposal {
+                                                    call_id: call_id.clone(),
+                                                    tool: tool.clone(),
+                                                    check: None,
+                                                    report: None,
+                                                });
+                                                task.active();
+                                            }
                                         }
                                         Tool::OfferFile { path, label, .. } => {
                                             let result = if crate::poc::files::allowed_path(path) {
@@ -1363,6 +1433,28 @@ impl<S: Storage> Store<S> {
                                 }
                             }
                         }
+                    }
+                    Change::OperatorAnswer { call_id, answer } => {
+                        let proposal = task
+                            .proposal
+                            .as_ref()
+                            .ok_or("The question is no longer available.")?;
+                        let Tool::AskOperator { choices, .. } = &proposal.tool else {
+                            return Err("The question is no longer available.".into());
+                        };
+                        if !task.awaiting_operator()
+                            || &proposal.call_id != call_id
+                            || !choices.contains(answer)
+                        {
+                            return Err("The question is no longer available.".into());
+                        }
+                        let proposal = task.proposal.take().expect("pending question");
+                        task.completed.push((
+                            proposal.call_id,
+                            proposal.tool,
+                            json!({"answer":answer}),
+                        ));
+                        task.active();
                     }
                     Change::AiKeyDecision { create } => {
                         if !task.awaiting_ai_key()

@@ -602,6 +602,7 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
         call_id: Option<String>,
         revision: Option<u64>,
         machine_class_answer: Option<crate::store::poc_targets::KeyCardAnswer>,
+        answer: Option<String>,
     }
     let result = async {
         let value: Value = serde_json::from_str(&request).map_err(|_| "task request")?;
@@ -616,7 +617,12 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
         }
         if matches!(
             request.action.as_str(),
-            "resume" | "dispose-pending" | "ai-key-create" | "ai-key-decline" | "ai-key-class"
+            "resume"
+                | "dispose-pending"
+                | "ai-key-create"
+                | "ai-key-decline"
+                | "ai-key-class"
+                | "operator-answer"
         ) {
             let continuation = continuation.as_ref().map_err(Clone::clone)?;
             let id = request.id.as_deref().ok_or("task ID required")?;
@@ -667,6 +673,26 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                             request
                                 .continuation
                                 .ok_or("continuing assumption required")?,
+                        )
+                        .await?
+                } else if request.action == "operator-answer" {
+                    crate::poc::run::check_raise(id)?;
+                    store.poc_authority(id, session)?;
+                    if automatic || request.revision != Some(task.revision) {
+                        return Err("The question is no longer available.".into());
+                    }
+                    store
+                        .poc_change(
+                            id,
+                            task.revision,
+                            Change::OperatorAnswer {
+                                call_id: request
+                                    .call_id
+                                    .ok_or("The question is no longer available.")?,
+                                answer: request
+                                    .answer
+                                    .ok_or("Choose an answer on the question card.")?,
+                            },
                         )
                         .await?
                 } else if matches!(

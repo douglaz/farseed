@@ -77,6 +77,7 @@ fn argument_reason(name: &str, args: &Value) -> String {
     let fields: &[&str] = match name {
         "exec" => &["machine", "command"],
         "done" => &["machine", "checks", "urls"],
+        "ask_operator" => &["purpose", "link", "choices"],
         "request_ai_key" => &["machine", "application", "purpose"],
         "offer_file" => &["machine", "path", "label", "why"],
         _ => &["machine", "declaration"],
@@ -85,7 +86,8 @@ fn argument_reason(name: &str, args: &Value) -> String {
         return "arguments: expected JSON object".into();
     };
     for field in fields {
-        if matches!(*field, "checks" | "urls") && !object.contains_key(*field) {
+        if matches!(*field, "checks" | "urls" | "link" | "choices") && !object.contains_key(*field)
+        {
             continue;
         }
         let valid = match *field {
@@ -103,9 +105,35 @@ fn argument_reason(name: &str, args: &Value) -> String {
                     })
             }),
             "urls" => args[*field].is_null() || crate::goals::valid_delivered_urls(&args[*field]),
+            "link" => {
+                args[*field].is_null()
+                    || args[*field]
+                        .as_str()
+                        .is_some_and(super::question::valid_link)
+            }
+            "choices" => {
+                args[*field].is_null()
+                    || args[*field].as_array().is_some_and(|choices| {
+                        (2..=4).contains(&choices.len())
+                            && choices.iter().enumerate().all(|(index, choice)| {
+                                choice
+                                    .as_str()
+                                    .is_some_and(|text| super::files::plain_line(text, 32))
+                                    && !choices[..index].contains(choice)
+                            })
+                    })
+            }
             _ => args[*field].is_string(),
         };
         if !valid {
+            if name == "ask_operator" {
+                return match *field {
+                    "purpose" => "arguments.purpose: use one plain line of 1 to 160 printable bytes",
+                    "link" => "arguments.link: use an absolute HTTPS URL of 1 to 2048 bytes with a host, no user information, whitespace or controls, or omit it",
+                    "choices" => "arguments.choices: use 2 to 4 distinct plain strings of 1 to 32 printable bytes each, or omit it",
+                    _ => unreachable!("operator question field"),
+                }.into();
+            }
             if *field == "urls" {
                 return "arguments.urls: use at most eight absolute HTTP or HTTPS URLs of 1 to 2048 bytes with a host, no user information, whitespace or controls, and optional plain labels of 1 to 48 printable bytes".into();
             }
@@ -326,7 +354,13 @@ fn step_messages(
     outcome: &Value,
     detail: HistoryExcerpt,
 ) -> Result<[Value; 2], String> {
-    let outcome = Zeroizing::new(outcome_excerpt(outcome, detail)?);
+    let outcome = Zeroizing::new(
+        if value["name"] == "ask_operator" && outcome["answer"].is_string() {
+            outcome.to_string()
+        } else {
+            outcome_excerpt(outcome, detail)?
+        },
+    );
     Ok([
         json!({"role":"assistant","content":null,"tool_calls":[{"type":"function","id":id,"function":{"name":value["name"],"arguments":value["arguments"].to_string()}}]}),
         json!({"role":"tool","tool_call_id":id,"content":&*outcome}),
@@ -454,6 +488,7 @@ fn request_context<S: Storage>(
             json!({"role":"user","content":format!("Machine: {machine}\nGoal: {goal}")}),
         ];
         messages.push(json!({"role":"system","content":"When the operator needs a file from the machine, such as a VPN connection file or sign-in details, offer it with offer_file instead of printing its contents. The operator downloads it from the page."}));
+        messages.push(json!({"role":"system","content":"When a step needs the operator, such as approving a login in their own account at a link the software printed or choosing between options, call ask_operator with the purpose, the HTTPS link if any and short choices; wait for the answer, then check the result on the machine. Keep long-running login commands in the background under the existing background-command rules while the operator acts."}));
         if let Some(facts) = task.and_then(|t| store.poc_inference_facts(t)) {
             let facts = store.protect_output_with(&facts, credentials)?;
             messages.push(json!({"role":"user","content":facts.to_string()}));
@@ -475,7 +510,7 @@ fn request_context<S: Storage>(
         for ((id, tool, outcome), detail) in steps.iter().zip(&details) {
             if !usable_id(id)
                 || !ids.insert(id)
-                || tool.machine() != machine
+                || (!matches!(tool, Tool::AskOperator { .. }) && tool.machine() != machine)
                 || !matches!(
                     tool,
                     Tool::Exec { .. }
@@ -483,6 +518,7 @@ fn request_context<S: Storage>(
                         | Tool::ProposeDeclaration { .. }
                         | Tool::RequestAiKey { .. }
                         | Tool::OfferFile { .. }
+                        | Tool::AskOperator { .. }
                 )
             {
                 return Err("inference completed-step schema invalid".into());
@@ -598,6 +634,7 @@ fn request_context<S: Storage>(
                 .find(|d| d["name"] == "offer_file")
                 .expect("file tool definition");
             offered.push(json!({"type":"function","function":file}));
+            offered.push(json!({"type":"function","function":{"name":"ask_operator","description":"Ask the operator to approve a login or choose an option. Never request or include secrets; answers are fixed choice labels, never free text.","parameters":{"type":"object","properties":{"purpose":{"type":"string","minLength":1,"maxLength":160,"pattern":"^[ -~]+$","description":"One plain line explaining why the operator is asked; no secrets."},"link":{"type":"string","minLength":1,"maxLength":2048,"description":"Optional absolute HTTPS URL with a host, no userinfo, whitespace or control bytes; no secrets. The operator may open it; the page never opens it automatically."},"choices":{"type":"array","minItems":2,"maxItems":4,"uniqueItems":true,"default":["Done","Can't"],"items":{"type":"string","minLength":1,"maxLength":32,"pattern":"^[ -~]+$"}}},"required":["purpose"],"additionalProperties":false}}}));
             offered
         };
         let value = protected(
@@ -763,7 +800,10 @@ pub(crate) fn normalize<S: Storage>(
             if !if store.poc_needs_declaration(machine) {
                 name == "propose_declaration"
             } else {
-                matches!(name, "exec" | "done" | "request_ai_key" | "offer_file")
+                matches!(
+                    name,
+                    "exec" | "done" | "request_ai_key" | "offer_file" | "ask_operator"
+                )
             } {
                 return Err("inference tool is not offered".into());
             }
@@ -778,7 +818,7 @@ pub(crate) fn normalize<S: Storage>(
                 return Err("inference proposal contains protected material".into());
             }
             let tool = Tool::parse(&proposal).map_err(|_| argument_reason(name, &arguments))?;
-            if tool.machine() != machine {
+            if !matches!(tool, Tool::AskOperator { .. }) && tool.machine() != machine {
                 return Err("inference tool names a different machine".into());
             }
             let provided = match call.get("id") {

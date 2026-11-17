@@ -205,7 +205,7 @@ pub async fn resume(
             }
         }
     }
-    if task.awaiting_ai_key() {
+    if task.awaiting_ai_key() || task.awaiting_operator() {
         return Ok(task);
     }
     if task.proposal.is_some() {

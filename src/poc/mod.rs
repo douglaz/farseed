@@ -17,6 +17,7 @@ pub(crate) mod proposal;
     )
 )]
 pub mod provisioning;
+pub(crate) mod question;
 pub mod run;
 pub mod targets;
 #[cfg(target_arch = "wasm32")]

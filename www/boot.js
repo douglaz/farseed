@@ -343,7 +343,17 @@ const commandSummary = command => {
   return shortLine(`${program}${word} …`);
 };
 const awaitingAiKey = task => task?.proposal?.tool?.name === 'request_ai_key' && !task.ai_key_approved && !task.pending && !['complete', 'abandoned'].includes(task.status);
-const taskStatus = (status, task) => awaitingAiKey(task) ? 'waiting for you' : ({running:'working', waiting:'waiting for the machine', verifying:'checking the result', paused:'paused', complete:'done', abandoned:'stopped'})[status] ?? status;
+const awaitingOperator = task => task?.proposal?.tool?.name === 'ask_operator' && !task.pending && !['complete', 'abandoned'].includes(task.status);
+const operatorLink = link => {
+  if (typeof link !== 'string' || !link.length || new TextEncoder().encode(link).length > 2048 || /[\p{White_Space}\p{Cc}\\]/u.test(link) || !/^https:\/\//i.test(link)) return;
+  const authority = link.slice(link.indexOf('://') + 3).split(/[/?#]/)[0];
+  if (!authority || authority.includes('@')) return;
+  try {
+    const url = new URL(link);
+    if (url.protocol === 'https:' && url.hostname && !url.username && !url.password) return url;
+  } catch { /* Refuse malformed links without displaying their text. */ }
+};
+const taskStatus = (status, task) => awaitingAiKey(task) || awaitingOperator(task) ? 'waiting for you' : ({running:'working', waiting:'waiting for the machine', verifying:'checking the result', paused:'paused', complete:'done', abandoned:'stopped'})[status] ?? status;
 const purchaseStatus = purchase => ({
   approved: 'Purchase approved; preparing access to the machine.',
   registration_uncertain: 'Waiting to confirm that the provider saved the access key. The page will check before continuing.',
@@ -953,6 +963,12 @@ const renderTasks = (store) => {
     paragraph(card, `${task.requests} of ${task.limits.requests} AI replies used; ${task.steps} of ${task.limits.steps} steps used.`);
     for (const [id, tool, outcome] of task.completed.filter(([id]) => !id.startsWith('$report:'))) {
       if (id.startsWith('$verify:') || tool.name === 'offer_file' && outcome.content?.status === 'offered') continue;
+      if (tool.name === 'ask_operator') {
+        const answered = typeof outcome.answer === 'string';
+        paragraph(card, answered ? `Answered: ${outcome.answer}.` : outcome.content?.refused ?? 'The question could not be asked.');
+        rawDetails(card, {tool: answered ? tool : {name: tool.name}, outcome}, ['task', task.id, 'completed', id]);
+        continue;
+      }
       if (tool.name === 'request_ai_key') {
         const created = outcome?.content?.status === 'created';
         const declined = outcome?.content?.status === 'declined';
@@ -981,7 +997,35 @@ const renderTasks = (store) => {
       card.append(row);
     }
     if (task.proposal && task.proposal.report == null) {
-      if (awaitingAiKey(task)) {
+      if (awaitingOperator(task)) {
+        const question = task.operator_question;
+        const url = question?.link == null ? undefined : operatorLink(question.link);
+        if (question && (question.link == null || url && url.href === question.href && url.hostname.toLowerCase() === question.domain)) {
+          const row = document.createElement('section'); row.dataset.operatorQuestion = '';
+          paragraph(row, question.purpose);
+          if (url) {
+            const anchor = document.createElement('a'); anchor.dataset.operatorLink = '';
+            anchor.href = url.href; anchor.target = '_blank'; anchor.rel = 'noopener noreferrer';
+            const domain = document.createElement('strong'); domain.textContent = url.hostname.toLowerCase();
+            anchor.append(domain); row.append(anchor);
+          }
+          const unavailable = !session || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
+          let answered = false;
+          for (const choice of question.choices ?? ['Done', "Can't"]) {
+            const button = document.createElement('button');
+            button.type = 'button'; button.textContent = choice;
+            button.dataset.operatorChoice = ''; button.dataset.choice = choice; button.disabled = unavailable;
+            button.addEventListener('click', () => {
+              if (answered || button.disabled) return;
+              answered = true;
+              for (const control of row.querySelectorAll('button')) control.disabled = true;
+              worker.postMessage({task: {action: 'operator-answer', id: task.id, session: session.identity, call_id: task.proposal.call_id, revision: task.revision, answer: choice}});
+            });
+            row.append(button);
+          }
+          card.append(row);
+        }
+      } else if (awaitingAiKey(task)) {
         const requestCard = document.createElement('section');
         requestCard.dataset.aiKeyRequest = '';
         paragraph(requestCard, `Create an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} on this machine (limit 0.25 USD, expires in 30 days)?`);
@@ -1076,7 +1120,7 @@ const renderTasks = (store) => {
       button.addEventListener('click', () => { button.disabled = true; worker.postMessage({ task: { id: task.id, ...request } }); });
       card.append(button);
     };
-    if (session && store.lifecycle_state !== 'ended' && !awaitingAiKey(task)) {
+    if (session && store.lifecycle_state !== 'ended' && !awaitingAiKey(task) && !awaitingOperator(task)) {
       action('Resume', { action: 'resume', session: session.identity });
     } else if ((store.sessions ?? []).some(s => s.identity === task.start_session && s.session_state === 'ended')) paragraph(card, 'This task’s session has ended. Its history stays here, but it cannot continue.');
     else if (!session) paragraph(card, 'Unlock to restore this task’s session.');
