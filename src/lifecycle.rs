@@ -1,5 +1,7 @@
 //! One worker-owned lifecycle fence. Ordinary hide does not change authority.
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+#[cfg(any(target_arch = "wasm32", test))]
+use std::cell::RefCell;
 use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,6 +16,7 @@ struct ExecutionIdentity([u8; 16]);
 
 pub struct Authority {
     incarnation: ExecutionIdentity,
+    #[cfg(any(target_arch = "wasm32", test))]
     page_incarnation: RefCell<Option<String>>,
     identity_sealed: Cell<bool>,
     generation: Cell<u64>,
@@ -25,6 +28,7 @@ impl Default for Authority {
         getrandom::fill(&mut incarnation).expect("execution incarnation randomness");
         Self {
             incarnation: ExecutionIdentity(incarnation),
+            #[cfg(any(target_arch = "wasm32", test))]
             page_incarnation: RefCell::new(None),
             identity_sealed: Cell::new(false),
             generation: Cell::new(0),
@@ -62,11 +66,6 @@ impl Authority {
     }
     pub(crate) fn seal_identity(&self) {
         self.identity_sealed.set(true);
-    }
-    pub(crate) fn references(&self) -> Vec<String> {
-        let mut references = vec![hex::encode(self.incarnation.0)];
-        references.extend(self.page_incarnation.borrow().iter().cloned());
-        references
     }
     pub fn state(&self) -> &'static str {
         match self.phase.get() {

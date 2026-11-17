@@ -42,6 +42,12 @@ pub(crate) fn select_byo() {
 pub(crate) fn has_key(session: &str) -> bool {
     SESSION_KEY.with_borrow(|key| key.as_ref().is_some_and(|(owner, _)| owner == session))
 }
+pub(crate) fn held_key() -> Option<SessionInferenceKey> {
+    SESSION_KEY.with_borrow(|key| {
+        key.as_ref()
+            .map(|(_, key)| SessionInferenceKey(key.0.clone()))
+    })
+}
 pub(crate) fn key_present() -> bool {
     SESSION_KEY.with_borrow(Option::is_some)
 }
@@ -609,14 +615,13 @@ pub async fn credit_request(request: String) -> String {
     if let Some(session) = started_session {
         report["page_start_session"] = session.into();
     }
-    report.to_string()
+    local.encode_report(report)
 }
 
 // This narrow capability permits only best-effort deletion of a returned key after retirement.
 struct Cleanup {
     headers: web_sys::Headers,
     origin: String,
-    filters: Rc<RefCell<Vec<crate::poc::inference::EchoFilter>>>,
 }
 impl Cleanup {
     fn new(store: &crate::store::Store<crate::store::opfs::Opfs>) -> Result<Self, String> {
@@ -629,19 +634,16 @@ impl Cleanup {
                 std::str::from_utf8(&account.credit_id.0).map_err(|_| MINT_FAILED)?,
             )
             .map_err(|_| MINT_FAILED)?;
-        Ok(Self {
-            headers,
-            origin,
-            filters: store.credit_filter_handle(),
-        })
+        Ok(Self { headers, origin })
     }
     fn safe_id(&self, id: &str) -> bool {
         identifier(id)
-            && self.filters.borrow().iter().all(|filter| {
-                filter
-                    .protect_bytes(id.as_bytes())
-                    .is_ok_and(|safe| safe.as_slice() == id.as_bytes())
-            })
+            && self
+                .headers
+                .get("x-credit-id")
+                .ok()
+                .flatten()
+                .is_some_and(|key| !crate::redaction::contains(id.as_bytes(), key.as_bytes()))
     }
     async fn revoke(&self, id: &str) {
         if !self.safe_id(id) {
@@ -864,11 +866,11 @@ async fn mint_inner(session: &str, replace: bool, parent: &Fence) -> Result<(), 
         .to_iso_string()
         .as_string()
         .ok_or(MINT_FAILED)?;
-    let (registration, cleanup) = {
+    let cleanup = {
         let local = crate::worker::local();
         let mut local = local.lock().await;
         let store = fence.store(&mut local)?;
-        (store.credit_filter_handle(), Cleanup::new(store)?)
+        Cleanup::new(store)?
     };
     let (status, mut value) = exchange(
         &fence,
@@ -889,15 +891,7 @@ async fn mint_inner(session: &str, replace: bool, parent: &Fence) -> Result<(), 
         .0
         .as_str()
         .map(|s| Zeroizing::new(s.as_bytes().to_vec()));
-    if let Some(key) = &key {
-        let next = crate::poc::inference::EchoFilter::new(&[key]);
-        let mut filters = registration.borrow_mut();
-        if let Some(combined) = filters.first_mut() {
-            combined.merge(next);
-        } else {
-            filters.push(next);
-        }
-    }
+
     #[cfg(feature = "tracer")]
     crate::testonly::session_point("credit_mint_return").await;
     let accepted: Result<(), String> = async {
@@ -913,9 +907,8 @@ async fn mint_inner(session: &str, replace: bool, parent: &Fence) -> Result<(), 
         if key.as_slice() == account.credit_id.0 || key.as_slice() == account.default_key.0 {
             return Err(MINT_FAILED.into());
         }
-        store.poc_configuration_key(key).map_err(|_| MINT_FAILED)?;
         let metadata = ClearedValue(serde_json::json!({"id":value.0["data"]["_id"],"name":value.0["data"]["name"],"cap":value.0["data"]["usage_limit_usd"],"expiry":value.0["data"]["expire_at"]}));
-        if !crate::poc::inference::safe(store, &metadata.0, &[]) { return Err(MINT_FAILED.into()); }
+        if !crate::poc::inference::safe(store, &metadata.0, &[key]) { return Err(MINT_FAILED.into()); }
         let (id, expiry) = returned_mint(&value.0, &mint)?;
         store
             .credit_commit(Record::MintId {
@@ -972,7 +965,7 @@ pub(crate) async fn prepare_ai_key(task: &crate::store::poc::Task) -> Result<boo
     let fence = Fence::new(Some(&task.start_session))?;
     let _active = Active::wait().await;
     let local = crate::worker::local();
-    let (mint, registration) = {
+    let mint = {
         let mut local = local.lock().await;
         let store = fence.store(&mut local)?;
         store.check_task_session(task, &task.start_session)?;
@@ -1023,7 +1016,7 @@ pub(crate) async fn prepare_ai_key(task: &crate::store::poc::Task) -> Result<boo
                 ),
             })
             .await?;
-        (mint, store.credit_filter_handle())
+        mint
     };
     let expiry = js_sys::Date::new(&JsValue::from_f64(mint.requested_expiry as f64 * 1000.0))
         .to_iso_string()
@@ -1043,15 +1036,7 @@ pub(crate) async fn prepare_ai_key(task: &crate::store::poc::Task) -> Result<boo
         .0
         .as_str()
         .map(|s| Zeroizing::new(s.as_bytes().to_vec()));
-    if let Some(key) = &key {
-        let next = crate::poc::inference::EchoFilter::new(&[key]);
-        let mut filters = registration.borrow_mut();
-        if let Some(combined) = filters.first_mut() {
-            combined.merge(next);
-        } else {
-            filters.push(next);
-        }
-    }
+
     if status >= 500 {
         return Err(UNKNOWN.into());
     }
@@ -1073,9 +1058,6 @@ pub(crate) async fn prepare_ai_key(task: &crate::store::poc::Task) -> Result<boo
         if key.as_slice() == account.credit_id.0 || key.as_slice() == account.default_key.0 {
             return Err("the credit service returned an unusable key".into());
         }
-        store
-            .poc_configuration_key(key)
-            .map_err(|_| "the credit service returned an unusable key")?;
         let (issuer_id, expires) = returned_mint(&value.0, &mint)
             .map_err(|_| "the credit service did not confirm the key limits")?;
         store

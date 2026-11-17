@@ -80,9 +80,9 @@ mod provider;
 mod sessions;
 use journal::journal;
 pub(crate) mod inference;
+mod output;
 pub mod poc;
 pub mod poc_targets;
-pub(crate) mod protection;
 #[cfg_attr(
     not(target_arch = "wasm32"),
     allow(
@@ -92,7 +92,6 @@ pub(crate) mod protection;
 )]
 pub mod provisioning;
 pub mod reinstall;
-mod scan;
 
 /// The directory the store owns in the origin-private file system.
 pub const DIRECTORY: &str = "tau-web-store";
@@ -404,22 +403,16 @@ pub struct Store<S> {
     inference: inference::State,
     credit: credit::State,
     ai_keys: Vec<ai_keys::Entry>,
-    scans: crate::scan::References,
-    /// Memory-only clean-check digests; discarded with the unlocked store.
-    protection_memo: std::cell::RefCell<protection::Memo>,
     reinstall: reinstall::State,
     poc_targets: std::collections::BTreeMap<String, poc_targets::Record>,
     procurement: Option<provisioning::Purchase>,
     closed_purchases: Vec<provisioning::Purchase>,
     completed_purchases: Vec<provisioning::Purchase>,
-    provider_filters: Vec<crate::poc::inference::EchoFilter>,
     procurement_selection: Option<crate::poc::provisioning::Selection>,
     provider_origin: String,
     provider_account: Option<crate::poc::provisioning::Account>,
     deployment_origin: Option<String>,
     deployment_relay: Option<crate::credential::RelayKey>,
-    /// Memory-only credential fingerprints continue protecting late evidence after key disposal.
-    poc_credential_filters: Rc<std::cell::RefCell<Vec<crate::poc::inference::EchoFilter>>>,
     authority: Rc<crate::lifecycle::Authority>,
     response_calls: std::collections::BTreeSet<u64>,
     exposure_ledger: Vec<Exposure>,
@@ -580,20 +573,16 @@ impl<S: Storage> Store<S> {
             inference: inference::State::default(),
             credit: credit::State::default(),
             ai_keys: Vec::new(),
-            scans: Default::default(),
-            protection_memo: Default::default(),
             reinstall: Default::default(),
             poc_targets: Default::default(),
             procurement: None,
             closed_purchases: Vec::new(),
             completed_purchases: Vec::new(),
-            provider_filters: Vec::new(),
             procurement_selection: None,
             provider_origin: crate::poc::provisioning::default_origin(),
             provider_account: None,
             deployment_origin: None,
             deployment_relay: None,
-            poc_credential_filters: Default::default(),
             authority,
             response_calls: std::collections::BTreeSet::new(),
             exposure_ledger: Vec::new(),
@@ -808,7 +797,7 @@ impl<S: Storage> Store<S> {
             return Err("Read a positive inference credit balance before Start.".into());
         }
         inference_approval.validate()?;
-        self.ensure_scan_references().await?;
+
         if !crate::poc::inference::safe(
             self,
             &serde_json::to_value(&inference_approval).map_err(|_| "approval encoding")?,
@@ -849,7 +838,6 @@ impl<S: Storage> Store<S> {
                 identity,
             }],
         };
-        self.poc_adoption_safe(None, Some(&exposure))?;
         let event = if credit {
             Event::PocCreditExposure(exposure.clone())
         } else {
@@ -1476,20 +1464,27 @@ impl<S: Storage> Store<S> {
             held.borrowed.push(&account.credit_id.0);
             held.borrowed.push(&account.default_key.0);
         }
+        #[cfg(target_arch = "wasm32")]
+        {
+            if let Some(key) = crate::poc::inference::held_key() {
+                held.derived.push(Derived::Inference(key));
+            }
+            if let Some(key) = crate::poc::credit::browser::held_key() {
+                held.derived.push(Derived::Session(key));
+            }
+        }
         for entry in &self.ai_keys {
             if let Some(key) = &entry.key {
                 held.borrowed.push(key.0.as_bytes());
             }
         }
         if let Some(key) = &self.deployment_relay {
-            held.borrowed.push(&key.0);
-            let text = Zeroizing::new(hex::encode(key.0));
             held.derived
-                .push(Derived::RelayText(crate::poc::credit::SecretText(
-                    Zeroizing::new(text.to_uppercase()),
-                )));
+                .push(Derived::Text(Zeroizing::new(hex::encode(key.0))));
+        }
+        if let Some(account) = &self.provider_account {
             held.derived
-                .push(Derived::RelayText(crate::poc::credit::SecretText(text)));
+                .push(Derived::Text(Zeroizing::new(hex::encode(account.bytes()))));
         }
         for session in &self.sessions {
             let bindings = session.given.borrow();
@@ -1661,9 +1656,7 @@ impl<S: Storage> Store<S> {
             records.push((number, bytes, event, plaintext));
         }
         self.previous = Address([0; 32]);
-        for (number, bytes, event, plaintext) in records {
-            // Custody filters exist only after applying their record, not during decoding.
-            self.check_provider_material(&plaintext)?;
+        for (number, bytes, event, _plaintext) in records {
             match (number, &event) {
                 (FIRST, Event::Seed { mnemonic }) => {
                     let seed = Seed::import(mnemonic).map_err(|e| {
@@ -1691,9 +1684,7 @@ impl<S: Storage> Store<S> {
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
                 (_, Event::Procurement(record)) => self.replay_procurement(number, record)?,
-                (_, Event::ProviderProtection(fingerprints)) => {
-                    self.remember_provider_filter(fingerprints.filter());
-                }
+                (_, Event::ProviderProtection(_)) => {}
                 (_, Event::DedicatedReinstall(record)) => {
                     self.replay_reinstall(number, record)?;
                 }
@@ -2101,26 +2092,39 @@ impl<S: Storage> Store<S> {
         if number >= u64::from(u32::MAX) {
             return Err(crate::poc::wait::ENCRYPTION_CAP.render(number, "", ""));
         }
-        let previous = hex::encode(self.previous.0);
-        let plaintext =
-            Zeroizing::new(serde_json::to_vec(&journal(event)).expect("an event serializes"));
-        self.check_provider_material(&plaintext)?;
-        self.check_deployment_material(&plaintext)?;
-        // Only the intentional encrypted custody field is exempt from echo refusal.
-        // All its metadata is checked; ordinary records still check their exact bytes.
-        let custody = Self::ai_key_custody_metadata(event).map(|value| {
-            Zeroizing::new(serde_json::to_vec(&value).expect("custody metadata serializes"))
-        });
-        let guarded = custody
-            .as_deref()
-            .map_or(plaintext.as_slice(), Vec::as_slice);
-        for filter in self.poc_credential_filters.borrow().iter() {
-            if filter
-                .literal_match(guarded)
-                .map_err(|_| crate::poc::wait::JOURNAL_REFUSED.to_string())?
+        if self.seed.is_some() {
+            let metadata = match event {
+                Event::Seed { .. }
+                | Event::InferenceAccount { .. }
+                | Event::PocCreditAccount(_) => Value::Null,
+                Event::PocProviderAccount(account) => {
+                    json!({"origin":account.origin,"source":account.source})
+                }
+                Event::PocAiKey(ai_keys::Record::Held {
+                    machine,
+                    name,
+                    issuer_id,
+                    expires,
+                    ..
+                }) => {
+                    json!({"machine":machine,"name":name,"issuer_id":issuer_id,"expires":expires})
+                }
+                _ => serde_json::to_value(event).expect("an event serializes"),
+            };
+            if !self
+                .protect_output(&metadata)
+                .is_ok_and(|safe| safe == metadata)
             {
                 return Err(crate::poc::wait::JOURNAL_REFUSED.into());
             }
+        }
+        let previous = hex::encode(self.previous.0);
+        let plaintext =
+            Zeroizing::new(serde_json::to_vec(&journal(event)).expect("an event serializes"));
+        if self.seed.is_some() {
+            let (public, credentials) = journal::public_bytes(event, &plaintext)?;
+            self.check_output_bytes_with_credentials(&public, &credentials)
+                .map_err(|_| crate::poc::wait::JOURNAL_REFUSED.to_string())?;
         }
         let nonce: [u8; 12] = random()?;
         let ciphertext = cipher(&self.key.0)
@@ -2337,7 +2341,6 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             for session in &store.sessions {
                 session.given.borrow_mut().clear();
             }
-            store.clear_scan_working_copies();
         }
         self.seed_backup = BackupStage::Inactive;
         self.state = State::Locked;
@@ -2587,9 +2590,6 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
     /// The state the page shows: `none`, `locked`, `unlocked` or `refused` with its reason, and
     /// an `error` for a request that changed nothing.
     pub fn report(&self, error: Option<&str>) -> Value {
-        if let State::Unlocked(store) = &self.state {
-            store.warm_poc_report();
-        }
         let mut report = match &self.state {
             State::Unopened => json!({ "state": "unopened" }),
             State::NoStore => json!({ "state": "none" }),
@@ -2679,8 +2679,20 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         self.protect_report(report)
     }
 
+    /// Protect fields and the final bytes after a caller adds report members.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn encode_report(&self, report: Value) -> String {
+        let encoded = self.protect_report(report).to_string();
+        if let State::Unlocked(store) = &self.state
+            && store.check_output_bytes(encoded.as_bytes()).is_err()
+        {
+            return String::new();
+        }
+        encoded
+    }
+
     fn protect_report(&self, report: Value) -> Value {
-        match &self.state {
+        let protected = match &self.state {
             State::Unlocked(store) if store.authority.state() == "ended" => {
                 // Durable history remains readable; no runtime session or action survives end.
                 let mut history = serde_json::Map::new();
@@ -2719,7 +2731,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 store.protect_output(&controls).unwrap_or_else(|_| json!({"state":"unlocked",
                     "lifecycle_state":"reconciling","error":"Protected session controls unavailable."}))
             }
-            State::Unlocked(store) => store.protect_output(&report).map(|mut protected| {
+            State::Unlocked(store) => store.protect_output(&report).and_then(|mut protected| {
                 // Keep durable delivery facts distinct from the current caller's ability to act.
                 if let Some(deliveries) = protected["delivery"].as_array_mut() {
                     for delivery in deliveries {
@@ -2733,12 +2745,23 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                         }
                     }
                 }
-                protected
+                store.check_output_bytes(protected.to_string().as_bytes())?;
+                Ok(protected)
             }).unwrap_or_else(
                 |why| json!({"state":"unlocked","lifecycle_state":if store.sessions.iter().any(|s| s.ended.get()) { "ended" } else { "reconciling" },"error":why}),
             ),
             _ => report,
+        };
+        // A fixed withheld report can itself collide with a credential's exact spelling.
+        // Withhold the envelope too instead of releasing that collision.
+        if let State::Unlocked(store) = &self.state
+            && store
+                .check_output_bytes(protected.to_string().as_bytes())
+                .is_err()
+        {
+            return Value::Null;
         }
+        protected
     }
 
     /// The journal's projections: calls (including cancelled ones), terminal evidence,

@@ -23,7 +23,6 @@ pub mod modes;
 pub mod poc;
 pub mod redaction;
 pub mod relay_auth;
-pub mod scan;
 pub mod seed;
 pub mod store;
 #[cfg(feature = "tracer")]
@@ -190,21 +189,6 @@ mod worker {
         result
             .unwrap_or_else(|why| serde_json::json!({"withheld":why}))
             .to_string()
-    }
-
-    /// Register scan custody without usable configuration so append checks remain independently
-    /// exercised even when conservative configuration admission already refuses the fixture.
-    #[cfg(feature = "tracer")]
-    #[wasm_bindgen]
-    pub async fn test_poc_register_credential(key: Vec<u8>) -> Result<(), wasm_bindgen::JsValue> {
-        let key = zeroize::Zeroizing::new(key);
-        local()
-            .lock()
-            .await
-            .store()
-            .ok_or("locked")?
-            .remember_poc_credential(&key);
-        Ok(())
     }
 
     #[cfg(feature = "tracer")]
@@ -774,12 +758,8 @@ mod worker {
             crate::testonly::session_point("command_release_writer").await;
             let mut local = self.local.lock().await;
             let store = local.store().ok_or("locked")?;
-            store.ensure_scan_references().await?;
-            let safe = store.protect_command_results(&value);
-            if !store.has_live_sessions() {
-                store.clear_scan_working_copies();
-            }
-            safe
+
+            store.protect_command_results(&value)
         }
         async fn current(&self, session: &crate::binding::Session) -> Result<(), String> {
             self.local
@@ -943,10 +923,6 @@ mod worker {
             match crate::poc::targets::resolve(store, &text("machine")) {
                 Ok(resolved) => resolved,
                 Err(reason) => {
-                    store
-                        .ensure_scan_references()
-                        .await
-                        .map_err(wasm_bindgen::JsValue::from)?;
                     let safe = (|| {
                         // Protect the dynamic value separately to retain the refusal category
                         // when the credential filter replaces an entire matching string.
@@ -965,9 +941,9 @@ mod worker {
                     })()
                     .unwrap_or_else(|why: String| serde_json::json!({"outcome":{"refused":why}}));
                     let encoded = safe.to_string();
-                    if !store.has_live_sessions() {
-                        store.clear_scan_working_copies();
-                    }
+                    store
+                        .check_output_bytes(encoded.as_bytes())
+                        .map_err(wasm_bindgen::JsValue::from)?;
                     return Ok(encoded);
                 }
             }
@@ -1008,10 +984,7 @@ mod worker {
         let Some(store) = local.store() else {
             return Ok(serde_json::json!({"outcome":{"refused":"locked"}}).to_string());
         };
-        store
-            .ensure_scan_references()
-            .await
-            .map_err(wasm_bindgen::JsValue::from)?;
+
         let mut report = store
             .protect_output(&report)
             .unwrap_or_else(|why| serde_json::json!({"outcome":{"refused":why}}));
@@ -1030,9 +1003,9 @@ mod worker {
             if changed {
                 continue;
             }
-            if !store.has_live_sessions() {
-                store.clear_scan_working_copies();
-            }
+            store
+                .check_output_bytes(encoded.as_bytes())
+                .map_err(wasm_bindgen::JsValue::from)?;
             return Ok(encoded);
         }
     }

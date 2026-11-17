@@ -401,28 +401,6 @@ fn poc_wait_hex_admission_public_keys_across_fresh_stores_hex_open() {
 }
 
 #[test]
-fn poc_wait_hex_exact_and_all_digit_forms_still_refuse() {
-    // All identities are fixed; only the explicitly retained goal supplies the exact hex form.
-    let _identifiers = FixedIdentifiers::new();
-    let mut store = crate::store::inference::tests::ready();
-    let session = store.sessions[0].identity.clone();
-    let key = b"exact~hex~credential~QZ";
-    block_on(store.enter_goal(&session, hex::encode(key), None)).unwrap();
-    block_on(store.accept_mode(&session, Mode::NoBrief)).unwrap();
-    block_on(store.poc_create(&session)).unwrap();
-    assert!(store.poc_configuration_key(key).is_err());
-    // 'Q' encodes as 51: the hex representation is all digits even though the key is not.
-    let digits = b"QQQQQQQQQQQQQQQQ";
-    assert!(hex::encode(digits).bytes().all(|b| b.is_ascii_digit()));
-    assert!(
-        crate::poc::inference::EchoFilter::new(&[digits])
-            .symbolic_match(b"arbitrary")
-            .unwrap()
-    );
-    assert!(store.poc_configuration_key(digits).is_err());
-}
-
-#[test]
 fn poc_wait_real_collection_producers_reach_resume() {
     // Fix seed, task and job identities for every configuration and continuation assertion.
     let _identifiers = FixedIdentifiers::new();

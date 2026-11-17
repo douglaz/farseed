@@ -54,23 +54,11 @@ impl<S: Storage> Store<S> {
             return Err("Provider account entry refused: command response pending; retry after it completes.".into());
         }
         let normalized = provider_origin(origin)?;
-        let filter = account.filter(input);
         if !crate::poc::inference::safe(self, &json!([origin, normalized]), &[input]) {
             return Err("Provider origin contains protected or unscannable material.".into());
         }
-        for value in [origin, normalized.as_str()] {
-            if filter
-                .protect_bytes_memo(self, value.as_bytes(), &mut Default::default())?
-                .as_slice()
-                != value.as_bytes()
-            {
-                return Err("Provider origin contains protected or unscannable material.".into());
-            }
-        }
         let record = account.record(source, normalized.clone());
         self.commit(&Event::PocProviderAccount(record)).await?;
-        // No await or external effect separates committed custody from filter installation.
-        self.remember_provider_filter(filter);
         self.provider_origin = normalized;
         self.procurement_selection = None;
         self.provider_account = Some(account.copy());
@@ -80,56 +68,10 @@ impl<S: Storage> Store<S> {
     pub(super) fn replay_provider_account(&mut self, record: &AccountRecord) -> Result<(), String> {
         self.provider_entry_ready()?;
         let account = record.account()?;
-        let filter = account.filter(record.key.0.as_bytes());
-        if filter
-            .protect_bytes_memo(self, record.origin.as_bytes(), &mut Default::default())?
-            .as_slice()
-            != record.origin.as_bytes()
-        {
-            return Err("Provider origin contains protected or unscannable material.".into());
-        }
-        self.remember_provider_filter(filter);
         self.provider_origin = record.origin.clone();
         self.provider_account = Some(account);
         Ok(())
     }
-
-    pub(super) fn check_provider_material(&self, plaintext: &[u8]) -> Result<(), String> {
-        for filter in &self.provider_filters {
-            if filter
-                .protect_bytes_memo(self, plaintext, &mut Default::default())?
-                .as_slice()
-                != plaintext
-            {
-                return Err(
-                    "protected provider material refused before encryption or replay".into(),
-                );
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn check_deployment_material(&self, plaintext: &[u8]) -> Result<(), String> {
-        if let Some(key) = &self.deployment_relay {
-            let filter = deployment_filter(key);
-            if filter
-                .protect_bytes_memo(self, plaintext, &mut Default::default())?
-                .as_slice()
-                != plaintext
-            {
-                return Err("Protected relay material refused before encryption.".into());
-            }
-        }
-        Ok(())
-    }
-}
-
-pub(super) fn deployment_filter(
-    key: &crate::credential::RelayKey,
-) -> crate::poc::inference::EchoFilter {
-    let hex = Zeroizing::new(hex::encode(key.0));
-    let upper = Zeroizing::new(hex.to_uppercase());
-    crate::poc::inference::EchoFilter::new(&[&key.0, hex.as_bytes(), upper.as_bytes()])
 }
 
 impl<S: Storage + Clone, K: Kdf> Local<S, K> {
@@ -148,14 +90,11 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         }
         let relay = crate::credential::RelayKey::from_deployment(input);
         if let Some(key) = &relay {
-            let filter = deployment_filter(key);
+            let text_key = Zeroizing::new(hex::encode(key.0));
             // Refuse the whole defaults object before public fields can reach page sinks.
             // Scan the origin independently too: it becomes worker configuration below.
             for text in [public_fields, origin.as_deref().unwrap_or("")] {
-                if !filter
-                    .protect_bytes(text.as_bytes())
-                    .is_ok_and(|safe| safe.as_slice() == text.as_bytes())
-                {
+                if crate::redaction::contains(text.as_bytes(), text_key.as_bytes()) {
                     self.deployment_origin = None;
                     self.deployment_relay = None;
                     return Ok(false);

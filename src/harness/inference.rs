@@ -54,7 +54,6 @@ async fn publication(generation: u64, session: String, report: String, post: boo
     let mut local = local.lock().await;
     if let Some(store) = local.store() {
         let _ = store.sessions();
-        let _ = store.ensure_scan_references().await;
     }
     // A settled stopped loop can still report safe metadata after ordinary authority ends.
     // This separate channel carries no body, proposal, controls or actionable done.
@@ -230,7 +229,7 @@ async fn publication(generation: u64, session: String, report: String, post: boo
                     }
                 }
             }
-            js_sys::JSON::parse(&json!({"store":message}).to_string()).ok()
+            Some(json!({"store":message}).to_string())
         } else {
             None
         };
@@ -259,14 +258,20 @@ async fn publication(generation: u64, session: String, report: String, post: boo
                     .check_session_authority(&session, crate::store::authority::current_pair(0))?;
             }
             if let Some(store) = local.store() {
-                store.check_report_sessions(&value)?;
-                if !store.has_live_sessions() {
-                    store.clear_scan_working_copies();
+                store.check_output_bytes(encoded.as_bytes())?;
+                if let Some(message) = &message {
+                    store.check_output_bytes(message.as_bytes())?;
                 }
+                store.check_report_sessions(&value)?;
             }
             Ok::<_, String>(())
         })();
         if let Err(why) = final_check {
+            if last_refusal.as_ref() == Some(&why)
+                && value["error"] == "Protected report authority unavailable."
+            {
+                return String::new();
+            }
             carries_result = false;
             value = if last_refusal.as_ref() == Some(&why) {
                 json!({"state":"unlocked","lifecycle_state":"reconciling","seed_backup_stage":"inactive","error":"Protected report authority unavailable."})
@@ -276,7 +281,7 @@ async fn publication(generation: u64, session: String, report: String, post: boo
             last_refusal = Some(why);
             continue;
         }
-        if let Some(message) = message {
+        if let Some(message) = message.and_then(|message| js_sys::JSON::parse(&message).ok()) {
             let worker: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
             let _ = worker.post_message(&message);
         }
@@ -309,11 +314,6 @@ pub async fn lifecycle_transition(event: String) -> String {
     if let Some(store) = local.store() {
         if event == "freeze" {
             store.suspend_clocks();
-        }
-        if event == "resume"
-            && let Err(why) = store.reload_scan_references().await
-        {
-            return local.report(Some(&why)).to_string();
         }
         // The old runner cannot append through its fenced continuation. Close its
         // uncertain request before revalidation permits any automatic wake.
@@ -385,9 +385,7 @@ async fn transport_authorized(request: &Request, body: &str) -> bool {
                 .clock_verification_authority(&session.identity)
                 .is_ok_and(|(_, current)| Rc::ptr_eq(&current, session));
         }
-        ((request.method == "OPTIONS" && request.path == "/" && request.body.is_empty())
-            || request.scan_revision == store.scan_revision())
-            && store.check_current_session(session).is_ok()
+        store.check_current_session(session).is_ok()
     } else {
         // Only the existing revocation path can send without ordinary session authority.
         (request.method == "OPTIONS" && request.path == "/" && request.body.is_empty())
@@ -703,7 +701,6 @@ pub async fn inference_request(request: String) -> String {
     let local = crate::worker::local();
     let mut guard = local.lock().await;
     if let Some(store) = guard.store() {
-        let _ = store.ensure_scan_references().await;
         result = store
             .protect_output(&result)
             .unwrap_or_else(|why| json!({"refused":why}));
@@ -721,7 +718,7 @@ pub async fn inference_request(request: String) -> String {
         {
             fields.insert("store_state".into(), state);
         }
-        let message = js_sys::JSON::parse(&json!({"store":status}).to_string()).ok();
+        let message = json!({"store":status}).to_string();
         let encoded = result.to_string();
         let current = continuation.as_ref().is_ok_and(|c| c.check().is_ok())
             && guard.store().is_some_and(|store| {
@@ -743,16 +740,28 @@ pub async fn inference_request(request: String) -> String {
             continue;
         }
         if let Some(store) = guard.store() {
+            if store.check_output_bytes(encoded.as_bytes()).is_err() {
+                let withheld = json!({"refused":crate::poc::wait::PROTECTED_UNAVAILABLE,"historical":true,"actionable":false});
+                if result == withheld {
+                    return String::new();
+                }
+                result = withheld;
+                continue;
+            }
+            if store.check_output_bytes(message.as_bytes()).is_err() {
+                if status_fallback {
+                    return String::new();
+                }
+                status_fallback = true;
+                continue;
+            }
             if let Err(why) = store.check_report_sessions(&status_for_check) {
                 status_fallback = last_status_refusal.as_ref() == Some(&why);
                 last_status_refusal = Some(why);
                 continue;
             }
-            if !store.has_live_sessions() {
-                store.clear_scan_working_copies();
-            }
         }
-        if let Some(message) = message {
+        if let Ok(message) = js_sys::JSON::parse(&message) {
             let worker: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
             let _ = worker.post_message(&message);
         }
@@ -897,36 +906,6 @@ pub async fn test_cold_inference_route() {
     if let Some(store) = crate::worker::local().lock().await.store() {
         store.test_cold_inference_route();
     }
-}
-
-#[cfg(feature = "tracer")]
-#[wasm_bindgen]
-pub async fn test_scan_fixture(name: String, value: js_sys::Uint8Array) -> Result<String, JsValue> {
-    let secret = Zeroizing::new(value.to_vec());
-    value.fill(0, 0, value.length());
-    crate::worker::local()
-        .lock()
-        .await
-        .store()
-        .ok_or("locked")?
-        .synthetic_scan_fixture(name, secret)
-        .await
-        .map_err(JsValue::from)
-}
-
-#[cfg(feature = "tracer")]
-#[wasm_bindgen]
-pub async fn test_scan_reload(clear: bool) -> bool {
-    let local = crate::worker::local();
-    let mut local = local.lock().await;
-    let Some(store) = local.store() else {
-        return false;
-    };
-    if clear {
-        store.clear_scan_working_copies();
-        return true;
-    }
-    store.reload_scan_references().await.is_ok()
 }
 
 #[cfg(feature = "tracer")]

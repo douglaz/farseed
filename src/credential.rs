@@ -177,12 +177,6 @@ impl Credential for DataKey {
     const NAME: &'static str = "Data-encryption key";
 }
 
-impl sealed::Sealed for crate::scan::ScanMaterial {}
-impl Credential for crate::scan::ScanMaterial {
-    const ROW: u8 = 23;
-    const NAME: &'static str = "Placed-secret scan key and reference";
-}
-
 impl LocalPassphrase {
     /// Takes the bytes as received; the caller clears any other copy it holds.
     pub fn new(bytes: Vec<u8>) -> LocalPassphrase {

@@ -404,53 +404,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn poc_session_admission_refuses_credential_and_encoded_approval_before_append() {
-        use base64::engine::general_purpose::{STANDARD, URL_SAFE};
-        let key = b"byo~approval~secret~482700";
-        for form in [
-            String::from_utf8(key.to_vec()).unwrap(),
-            hex::encode(key),
-            hex::encode_upper(key),
-            STANDARD.encode(key),
-            URL_SAFE.encode(key),
-        ] {
-            let mut s = ready();
-            s.remember_poc_credential(key);
-            let approval = crate::binding::InferenceApproval {
-                approved: true,
-                configuration: crate::poc::inference::Configuration::new(
-                    format!("https://fixture.invalid/{form}"),
-                    "fixture".into(),
-                )
-                .unwrap(),
-            };
-            let before = s.storage.files();
-            assert!(
-                block_on(s.admit("fixture-other", &[], approval)).is_err(),
-                "approval must be scanned before append"
-            );
-            assert_eq!(s.storage.files(), before);
-            assert_eq!(s.sessions.len(), 1);
-            assert!(s.failed.is_none());
-        }
-        let s = ready();
-        assert!(
-            s.poc_configuration_key(s.authority.references()[0].as_bytes())
-                .is_err()
-        );
-        for key in [
-            br#""journal_version":2,"event":"#.as_slice(),
-            br#""inference_approval":"#,
-            br#""end":{"session":"#,
-        ] {
-            assert!(
-                s.poc_configuration_key(key).is_err(),
-                "new control envelopes participate in key admission"
-            );
-        }
-    }
-
     #[derive(Clone)]
     struct Held {
         base: MemoryStorage,

@@ -102,34 +102,6 @@ fn provisioning_signs_exact_request_and_unique_read_identity() {
     assert!(crate::relay_auth::verify_signature(&tampered).is_err());
 }
 #[test]
-fn provisioning_provider_credential_has_separate_encoded_protection() {
-    for input in ["0".repeat(64), "z".repeat(64), "7".repeat(63)] {
-        assert!(Account::parse(input.as_bytes()).is_err());
-    }
-    let input = hex::encode([7; 32]);
-    let a = Account::parse(input.as_bytes()).unwrap();
-    let filter = a.filter(input.as_bytes());
-    for text in [
-        input.clone(),
-        hex::encode(input.as_bytes()),
-        STANDARD.encode(input.as_bytes()),
-        STANDARD.encode([7; 32]),
-        input.to_uppercase(),
-    ] {
-        assert_ne!(
-            filter.protect_bytes(text.as_bytes()).unwrap().as_slice(),
-            text.as_bytes()
-        );
-    }
-    assert_eq!(
-        filter
-            .protect_bytes(b"a useful public response")
-            .unwrap()
-            .as_slice(),
-        b"a useful public response"
-    );
-}
-#[test]
 fn provisioning_selection_and_full_association_negative_controls() {
     for custom in [false, true] {
         let selected = selection(custom);

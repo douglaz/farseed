@@ -167,15 +167,8 @@ impl Account {
                 .to_bytes(),
         )
     }
-    pub(crate) fn filter(&self, input: &[u8]) -> crate::poc::inference::EchoFilter {
-        let lower = Zeroizing::new(hex::encode(*self.0));
-        let upper = Zeroizing::new(lower.to_uppercase());
-        crate::poc::inference::EchoFilter::new(&[
-            input,
-            self.0.as_ref(),
-            lower.as_bytes(),
-            upper.as_bytes(),
-        ])
+    pub(crate) fn bytes(&self) -> &[u8] {
+        self.0.as_ref()
     }
     /// A random nonce changes the event id even for repeated reads in the same second.
     pub fn authorization(
@@ -206,28 +199,6 @@ impl Account {
             STANDARD.encode(event.as_bytes())
         )))
     }
-}
-
-/// Protect request material in both its transmitted and decoded representations.
-pub(crate) fn request_filter(auth: &str) -> Result<crate::poc::inference::EchoFilter, String> {
-    let event = Zeroizing::new(
-        STANDARD
-            .decode(auth.strip_prefix("Nostr ").ok_or(REFUSED)?)
-            .map_err(|_| REFUSED)?,
-    );
-    let signed: Value = serde_json::from_slice(&event).map_err(|_| REFUSED)?;
-    let signature = signed["sig"]
-        .as_str()
-        .filter(|s| s.len() == 128)
-        .ok_or(REFUSED)?;
-    let mut raw = Zeroizing::new([0u8; 64]);
-    hex::decode_to_slice(signature, raw.as_mut()).map_err(|_| REFUSED)?;
-    Ok(crate::poc::inference::EchoFilter::new(&[
-        auth.as_bytes(),
-        &event,
-        signature.as_bytes(),
-        raw.as_ref(),
-    ]))
 }
 
 pub(crate) const READ_REFUSED: &str =
@@ -288,15 +259,6 @@ pub(crate) fn decoded_missing(method: &str, url: &str, status: u16, body: &[u8])
 
 #[allow(async_fn_in_trait)]
 pub(crate) trait Api {
-    /// Prepare exact request protection before any bytes can leave the browser.
-    fn prepare(
-        &mut self,
-        _method: &str,
-        _path: &str,
-        _body: Option<&Value>,
-    ) -> Result<Option<crate::poc::inference::EchoFingerprints>, String> {
-        Ok(None)
-    }
     /// One exchange; no retries. All successful data must pass store credential protection.
     async fn request(
         &mut self,
@@ -310,9 +272,6 @@ pub(crate) trait Api {
     fn account(&self) -> String;
     fn now(&self) -> u64;
     fn current(&self) -> Result<(), String>;
-    fn take_filter(&mut self) -> Option<crate::poc::inference::EchoFilter> {
-        None
-    }
 }
 
 pub(crate) fn number(v: &Value, name: &str) -> Result<u64, String> {

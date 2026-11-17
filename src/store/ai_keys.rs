@@ -190,7 +190,6 @@ impl<S: Storage> Store<S> {
                 expires,
                 key,
             } => {
-                self.remember_poc_credential(key.0.as_bytes());
                 let entry = self
                     .ai_keys
                     .iter_mut()
@@ -220,22 +219,6 @@ impl<S: Storage> Store<S> {
         }
         Ok(())
     }
-    pub(super) fn ai_key_custody_metadata(event: &Event) -> Option<Value> {
-        if let Event::PocAiKey(Record::Held {
-            machine,
-            name,
-            issuer_id,
-            expires,
-            ..
-        }) = event
-        {
-            Some(
-                json!({"journal_version":4,"event":{"poc_ai_key":{"held":{"machine":machine,"name":name,"issuer_id":issuer_id,"expires":expires}}}}),
-            )
-        } else {
-            None
-        }
-    }
     pub(crate) async fn ai_key_commit(&mut self, record: Record) -> Result<(), String> {
         self.credit_ready()?;
         self.validate_ai_key(&record)?;
@@ -243,8 +226,18 @@ impl<S: Storage> Store<S> {
             Record::Request { task, .. } => {
                 self.poc_authority(task, &self.poc_task(task)?.start_session)?;
             }
-            Record::Held { key, .. } => {
-                self.remember_poc_credential(key.0.as_bytes());
+            Record::Held {
+                machine,
+                name,
+                issuer_id,
+                expires,
+                key,
+            } => {
+                let metadata =
+                    json!({"machine":machine,"name":name,"issuer_id":issuer_id,"expires":expires});
+                if !crate::poc::inference::safe(self, &metadata, &[key.0.as_bytes()]) {
+                    return Err("AI key metadata contains protected material".into());
+                }
             }
         }
         if let Record::Request { .. } = &record

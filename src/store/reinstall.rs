@@ -149,7 +149,6 @@ pub struct PendingReset {
     live: Rc<Session>,
     ticket: crate::lifecycle::Continuation,
     sent: std::cell::Cell<bool>,
-    scan_revision: u64,
     standing: Option<u64>,
 }
 
@@ -268,7 +267,6 @@ impl<S: Storage> Store<S> {
             live,
             ticket,
             sent: std::cell::Cell::new(false),
-            scan_revision: self.scans.revision(),
             standing: self
                 .dispatch
                 .standing_for(&intent.resource)
@@ -281,12 +279,11 @@ impl<S: Storage> Store<S> {
         if self.failed.is_some() || pending.sent.get() {
             return Err("failed writer or possibly transmitted reset".into());
         }
-        if pending.scan_revision != self.scans.revision()
-            || pending.standing
-                != self
-                    .dispatch
-                    .standing_for(&pending.intent.resource)
-                    .map(|d| d.number)
+        if pending.standing
+            != self
+                .dispatch
+                .standing_for(&pending.intent.resource)
+                .map(|d| d.number)
             || self
                 .dispatch
                 .unresolved(&pending.intent.resource)

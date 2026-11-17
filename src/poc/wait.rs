@@ -1,96 +1,73 @@
-//! Fixed diagnostics and symbolic fields that can reach a durable collection wait.
-//! Producers render these definitions; admission uses the same shapes before accepting a key.
-#[derive(Clone, Copy)]
-enum Destination {
-    Direct,
-    Settle,
-    Both,
-}
-macro_rules! fixed {
-    ($( $name:ident: $destination:ident = $text:literal; )*) => {
-        $(pub(crate) const $name: &str = $text;)*
-        const FIXED: &[(&str, Destination)] = &[$(($name, Destination::$destination)),*];
-    };
-}
-fixed! {
-    UNKNOWN_TASK: Both = "unknown task";
-    TASK_ENCODING: Both = "task encoding";
-    TASK_BOUNDARY: Both = "task credential boundary";
-    WORK_BOUND: Both = "protected output withheld: protection work bound exceeded";
-    VALUE_DEPTH: Both = "protected output withheld: value depth exceeded";
-    ENCODING_DEPTH: Both = "protected output withheld: encoding depth exceeded";
-    PROTECTED_UNAVAILABLE: Both = "protected output unavailable";
-    FIELD_NAME: Both = "inference protected field name invalid";
-    FIELD_COLLISION: Both = "inference output withheld after protected field collision";
-    FRAGMENTS: Both = "inference output escaped fragment count exceeds the local bound";
-    SCAN_UNAVAILABLE: Both = "required scan material unavailable; output withheld";
-    SCAN_LENGTH: Both = "scan length";
-    SCAN_MARKER: Both = "scan marker contains protected material; output withheld";
-    OUTPUT_HEX: Both = "output hex";
-    JOB_OUTPUT_HEX: Both = "job output hex";
-    OUTPUT_COLLISION: Both = "output key collision after protection";
-    UNLOCKED_SEED: Both = "response requires an unlocked seed";
-    CREDENTIAL_SCAN: Both = "session credential has no response scan representation";
-    DERIVATION: Both = "held credential derivation refused";
-    REDACTION_MARKER: Both = "redaction marker cannot exclude held credentials";
-    LOCKED: Direct = "locked";
-    MISSING_PENDING_JOB: Direct = "missing pending job";
-    MISSING_PENDING_IDENTITY: Direct = "missing pending identity";
-    TARGET_DIFFERS: Direct = "resolved target differs from task machine";
-    TARGET_REQUIRED: Direct = "resolved relay, host and user are required before Resume";
-    PIN_REQUIRED: Direct = "trusted host pin missing; configure it before Resume";
-    RESULT_ENCODING: Direct = "task result encoding";
-    RESULT_PUBLICATION: Direct = "task result publication";
-    COMMITTED_MISMATCH: Direct = "committed job record differs from its intent and cannot checkpoint; pending identity retained for inspection; to configure, Stop task; remote effects and command holds remain";
-    TASK_ENDED: Direct = "task ended";
-    SESSION_OWNER: Direct = "session authority belongs to another task; use the task’s original session";
-    BOUND_MACHINE: Direct = "fresh authority must bind only the task machine";
-    APPROVAL_PENDING: Direct = "proposal approval pending; review the open requirements card and approve explicitly or reject before Resume";
-    ACCEPTANCE: Direct = "original session requires acceptance of Acting on a goal with no brief";
-    SESSIONS_ENDED: Direct = "sessions ended";
-    NO_SESSION: Direct = "no live session";
-    SESSION_ENDED: Direct = "session ended";
-    LIVE_GOAL: Direct = "goal requires a live session";
-    SUSPENSION: Direct = "reconciliation or verification required after suspension";
-    CAP_EXHAUSTED: Direct = "session cap exhausted";
-    SESSION_EXPIRED: Direct = "session expired";
-    ISSUER_USAGE: Direct = "incompatible issuer usage";
-    ISSUER_ACCEPTANCE: Direct = "incompatible or missing issuer acceptance";
-    CLOCK_UNCERTAIN: Direct = "clock uncertain; verification required";
-    CLOCK_RANGE: Direct = "clock evidence out of range";
-    INVALID_SPEND: Direct = "invalid spend";
-    SPEND_EXPONENT: Direct = "invalid spend exponent";
-    NONNEGATIVE_SPEND: Direct = "invalid nonnegative spend";
-    SPEND_SCALE: Direct = "spend scale";
-    SPEND_PRECISION: Direct = "unsupported spend precision";
-    SCAN_REQUIRED: Direct = "required scan material unavailable";
-    SCAN_ENVELOPE: Direct = "invalid scan envelope";
-    SCAN_ENCODING: Direct = "scan envelope encoding";
-    SCAN_NONCANONICAL: Direct = "noncanonical scan envelope";
-    SCAN_CIPHERTEXT: Direct = "invalid scan ciphertext";
-    SCAN_NONCANONICAL_CIPHER: Direct = "noncanonical scan ciphertext";
-    SCAN_AUTH: Direct = "scan authentication failed";
-    SCAN_MATERIAL: Direct = "invalid scan material";
-    SCAN_MATERIAL_ENCODING: Direct = "scan material encoding";
-    SCAN_MATERIAL_SHAPE: Direct = "noncanonical or unsupported scan material";
-    SCAN_INSTALL: Direct = "scan identity is not awaiting material";
-    RUNNING: Direct = "recorded job is running; Resume inspects it again";
-    FALLBACK: Direct = "task paused: diagnostic protection failed; inspect authority and configuration before Resume";
-    STALE_TASK: Settle = "stale or ended task";
-    NO_PENDING: Settle = "task has no pending job";
-    NO_EVIDENCE: Settle = "no committed job evidence";
-    UNTRUSTWORTHY: Settle = "job outcome is not trustworthy";
-    NO_PROPOSAL: Settle = "pending task has no proposal";
-    NO_EXIT: Settle = "missing job exit";
-    CHECKPOINT_PROTECTION: Settle = "recorded job output requires protection before checkpoint";
-    NO_VERIFICATION: Settle = "missing verification record";
-    VERIFICATION_MISMATCH: Settle = "verification job mismatch";
-    EXCERPT_PROTECTION: Settle = "verification excerpt requires protection before checkpoint";
-    REVISION_EXHAUSTED: Settle = "task revision exhausted";
-    JOURNAL_REFUSED: Settle = "journal refused";
-    ENCRYPTION_REFUSED: Settle = "AES-GCM refused the record";
-    MOVE_UNAVAILABLE: Settle = "move: FileSystemHandle.move() is not available";
-}
+//! Fixed diagnostics for durable collection waits.
+pub(crate) const UNKNOWN_TASK: &str = "unknown task";
+pub(crate) const TASK_ENCODING: &str = "task encoding";
+pub(crate) const TASK_BOUNDARY: &str = "task credential boundary";
+pub(crate) const PROTECTED_UNAVAILABLE: &str = "protected output unavailable";
+pub(crate) const JOB_OUTPUT_HEX: &str = "job output hex";
+pub(crate) const OUTPUT_COLLISION: &str = "output key collision after protection";
+pub(crate) const UNLOCKED_SEED: &str = "response requires an unlocked seed";
+pub(crate) const CREDENTIAL_SCAN: &str = "session credential has no response scan representation";
+pub(crate) const DERIVATION: &str = "held credential derivation refused";
+pub(crate) const REDACTION_MARKER: &str = "redaction marker cannot exclude held credentials";
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const LOCKED: &str = "locked";
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const MISSING_PENDING_JOB: &str = "missing pending job";
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const MISSING_PENDING_IDENTITY: &str = "missing pending identity";
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const TARGET_DIFFERS: &str = "resolved target differs from task machine";
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const TARGET_REQUIRED: &str = "resolved relay, host and user are required before Resume";
+pub(crate) const PIN_REQUIRED: &str = "trusted host pin missing; configure it before Resume";
+pub(crate) const RESULT_ENCODING: &str = "task result encoding";
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const RESULT_PUBLICATION: &str = "task result publication";
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const COMMITTED_MISMATCH: &str = "committed job record differs from its intent and cannot checkpoint; pending identity retained for inspection; to configure, Stop task; remote effects and command holds remain";
+pub(crate) const TASK_ENDED: &str = "task ended";
+pub(crate) const SESSION_OWNER: &str =
+    "session authority belongs to another task; use the task’s original session";
+pub(crate) const BOUND_MACHINE: &str = "fresh authority must bind only the task machine";
+pub(crate) const APPROVAL_PENDING: &str = "proposal approval pending; review the open requirements card and approve explicitly or reject before Resume";
+pub(crate) const ACCEPTANCE: &str =
+    "original session requires acceptance of Acting on a goal with no brief";
+pub(crate) const SESSIONS_ENDED: &str = "sessions ended";
+pub(crate) const NO_SESSION: &str = "no live session";
+pub(crate) const SESSION_ENDED: &str = "session ended";
+pub(crate) const LIVE_GOAL: &str = "goal requires a live session";
+pub(crate) const SUSPENSION: &str = "reconciliation or verification required after suspension";
+pub(crate) const CAP_EXHAUSTED: &str = "session cap exhausted";
+pub(crate) const SESSION_EXPIRED: &str = "session expired";
+pub(crate) const ISSUER_USAGE: &str = "incompatible issuer usage";
+pub(crate) const ISSUER_ACCEPTANCE: &str = "incompatible or missing issuer acceptance";
+pub(crate) const CLOCK_UNCERTAIN: &str = "clock uncertain; verification required";
+pub(crate) const CLOCK_RANGE: &str = "clock evidence out of range";
+pub(crate) const INVALID_SPEND: &str = "invalid spend";
+pub(crate) const SPEND_EXPONENT: &str = "invalid spend exponent";
+pub(crate) const NONNEGATIVE_SPEND: &str = "invalid nonnegative spend";
+pub(crate) const SPEND_SCALE: &str = "spend scale";
+pub(crate) const SPEND_PRECISION: &str = "unsupported spend precision";
+pub(crate) const RUNNING: &str = "recorded job is running; Resume inspects it again";
+pub(crate) const FALLBACK: &str =
+    "task paused: diagnostic protection failed; inspect authority and configuration before Resume";
+pub(crate) const STALE_TASK: &str = "stale or ended task";
+pub(crate) const NO_PENDING: &str = "task has no pending job";
+pub(crate) const NO_EVIDENCE: &str = "no committed job evidence";
+pub(crate) const UNTRUSTWORTHY: &str = "job outcome is not trustworthy";
+pub(crate) const NO_PROPOSAL: &str = "pending task has no proposal";
+pub(crate) const NO_EXIT: &str = "missing job exit";
+pub(crate) const CHECKPOINT_PROTECTION: &str =
+    "recorded job output requires protection before checkpoint";
+pub(crate) const NO_VERIFICATION: &str = "missing verification record";
+pub(crate) const VERIFICATION_MISMATCH: &str = "verification job mismatch";
+pub(crate) const EXCERPT_PROTECTION: &str =
+    "verification excerpt requires protection before checkpoint";
+pub(crate) const REVISION_EXHAUSTED: &str = "task revision exhausted";
+pub(crate) const JOURNAL_REFUSED: &str = "journal refused";
+pub(crate) const ENCRYPTION_REFUSED: &str = "AES-GCM refused the record";
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const MOVE_UNAVAILABLE: &str = "move: FileSystemHandle.move() is not available";
 pub(crate) const CHECKPOINT: &str = "recorded result could not be checkpointed: ";
 #[derive(Clone, Copy)]
 pub(crate) struct Shape(pub(crate) &'static str);
@@ -99,87 +76,39 @@ impl Shape {
         render(self.0, number, job, payload)
     }
 }
-macro_rules! shapes {
-    ($( $name:ident: $destination:ident = $text:literal; )*) => {
-        $(pub(crate) const $name: Shape = Shape($text);)*
-        const SHAPES: &[(Shape, Destination)] = &[$(($name, Destination::$destination)),*];
-    };
-}
-shapes! {
-    NO_OUTCOME: Direct = "collection returned no outcome for pending call {number} job {job}; pending identity retained";
-    IDENTITY_MISMATCH: Direct = "collection record identity mismatch for pending call {number} job {job}; pending identity retained";
-    COLLECTION_PROTECTION: Direct = "collection failed for pending call {number} job {job}: diagnostic protection failed; pending identity retained";
-    COLLECTION_FAILED: Direct = "collection failed for pending call {number}: {payload}; pending identity retained";
-    EARLIER_APPEND: Settle = "an earlier append failed ({payload}), so none follows until the worker restarts";
-    ENCRYPTION_CAP: Settle = "record {number} would be the 2^32nd encryption under this store's data key";
-    ENTROPY: Settle = "getrandom: {payload}";
-}
+pub(crate) const NO_OUTCOME: Shape = Shape(
+    "collection returned no outcome for pending call {number} job {job}; pending identity retained",
+);
+pub(crate) const IDENTITY_MISMATCH: Shape = Shape(
+    "collection record identity mismatch for pending call {number} job {job}; pending identity retained",
+);
+pub(crate) const COLLECTION_PROTECTION: Shape = Shape(
+    "collection failed for pending call {number} job {job}: diagnostic protection failed; pending identity retained",
+);
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) const COLLECTION_FAILED: Shape =
+    Shape("collection failed for pending call {number}: {payload}; pending identity retained");
+pub(crate) const EARLIER_APPEND: Shape =
+    Shape("an earlier append failed ({payload}), so none follows until the worker restarts");
+pub(crate) const ENCRYPTION_CAP: Shape =
+    Shape("record {number} would be the 2^32nd encryption under this store's data key");
+pub(crate) const ENTROPY: Shape = Shape("getrandom: {payload}");
 pub(crate) const COLLECTION: Shape =
     Shape("collection {payload} for pending call {number} job {job}; pending identity retained");
-macro_rules! causes {
-    ($( $name:ident: $detail:literal = $text:literal; )*) => {
-        $(pub(crate) const $name: &str = $text;)*
-        pub(crate) const CAUSES: &[(&str, bool)] = &[$(($name, $detail)),*];
-    };
-}
-causes! {
-    CHECKPOINT_UNCERTAIN: true = "evidence checkpoint not confirmed; observation remains uncertain";
-    NOT_READ: true = "not read";
-    READ_FAILED: true = "record read failed";
-    MALFORMED: false = "has missing or malformed outcome metadata";
-    NO_METADATA: false = "has no committed observation metadata";
-    FOREIGN: false = "recorded a foreign machine record; record mismatch";
-    COMMAND_MISMATCH: false = "recorded a command/record mismatch";
-    MISSING: false = "recorded no record found";
-    ENDED: false = "recorded process ended without a trustworthy exit status";
-    INCOMPLETE: false = "recorded an incomplete job record";
-    STILL_RUNNING: false = "recorded job still running";
-    FINISHED: false = "returned a finished record without matching committed terminal evidence";
-}
-/// The callback sees complete reason shapes. Payload markers are holes, never known text.
-/// All numbered fields are rendered from u64, and job fields have the tracked hexadecimal domain.
-pub(crate) fn visit(mut accept: impl FnMut(String)) {
-    for (text, destination) in FIXED
-        .iter()
-        .copied()
-        .chain(SHAPES.iter().map(|(s, d)| (s.0, *d)))
-    {
-        if matches!(destination, Destination::Direct | Destination::Both) {
-            accept(text.into());
-        }
-        if matches!(destination, Destination::Settle | Destination::Both) {
-            accept(format!("{CHECKPOINT}{text}"));
-        }
-    }
-    accept(decode_error(SCAN_NONCE_FIELD, "{payload}"));
-    accept(length_parts(SCAN_NONCE_FIELD, "{number}", 12));
-    for context in [
-        OPFS_CONTEXT,
-        crate::store::DIRECTORY,
-        crate::store::STAGING,
-        MOVE_CONTEXT,
-    ] {
-        accept(checkpoint(&storage_error(context, "{payload}")));
-    }
-    accept(checkpoint(&storage_error(
-        &move_context(crate::store::STAGING, "{number}"),
-        "{payload}",
-    )));
-    accept(checkpoint(&directory_missing()));
-    // Arbitrary storage errors still have the fixed checkpoint prefix.
-    accept(format!("{CHECKPOINT}{{payload}}"));
-    for (cause, detail) in CAUSES {
-        accept(COLLECTION.0.replace("{payload}", cause));
-        if *detail {
-            accept(
-                COLLECTION
-                    .0
-                    .replace("{payload}", &with_detail(cause, "{payload}")),
-            );
-        }
-    }
-}
-
+pub(crate) const CHECKPOINT_UNCERTAIN: &str =
+    "evidence checkpoint not confirmed; observation remains uncertain";
+pub(crate) const NOT_READ: &str = "not read";
+pub(crate) const READ_FAILED: &str = "record read failed";
+pub(crate) const MALFORMED: &str = "has missing or malformed outcome metadata";
+pub(crate) const NO_METADATA: &str = "has no committed observation metadata";
+pub(crate) const FOREIGN: &str = "recorded a foreign machine record; record mismatch";
+pub(crate) const COMMAND_MISMATCH: &str = "recorded a command/record mismatch";
+pub(crate) const MISSING: &str = "recorded no record found";
+pub(crate) const ENDED: &str = "recorded process ended without a trustworthy exit status";
+pub(crate) const INCOMPLETE: &str = "recorded an incomplete job record";
+pub(crate) const STILL_RUNNING: &str = "recorded job still running";
+pub(crate) const FINISHED: &str =
+    "returned a finished record without matching committed terminal evidence";
 pub(crate) fn checkpoint(why: &str) -> String {
     format!("{CHECKPOINT}{why}")
 }
@@ -197,19 +126,23 @@ pub(crate) fn with_detail(category: &str, detail: &str) -> String {
     format!("{category}: {detail}")
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) const OPFS_CONTEXT: &str = "OPFS";
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) const MOVE_CONTEXT: &str = "move";
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn storage_error(context: &str, detail: &str) -> String {
     format!("{context}: {detail}")
 }
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn move_context(from: &str, to: &str) -> String {
     format!("move {from} to {to}")
 }
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn directory_missing() -> String {
     storage_error(crate::store::DIRECTORY, "not found")
 }
 
-pub(crate) const SCAN_NONCE_FIELD: &str = "scan nonce";
 pub(crate) fn decimal(number: u64) -> String {
     number.to_string()
 }

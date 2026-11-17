@@ -1467,60 +1467,6 @@ fn poc_drive_continues_unavailable_tools_and_executes_verification_serially() {
 }
 
 #[test]
-fn poc_checkpoint_does_not_depend_on_transient_output_redaction() {
-    let (mut f, task, session) = Fixture::new();
-    let proposed = proposal(&mut f.store.borrow_mut(), &task);
-    append(&mut f.store.borrow_mut(), &proposed, &session);
-    let pending = f.task(&task.id);
-    let output = "later-sensitive-output-value";
-    evidence(
-        &mut f.store.borrow_mut(),
-        &pending,
-        record(&pending, Some(0), output),
-    );
-    block_on(f.store.borrow_mut().synthetic_scan_fixture(
-        "later-value".into(),
-        Zeroizing::new(output.as_bytes().to_vec()),
-    ))
-    .unwrap();
-    let paused = block_on(run::resume(
-        &mut f,
-        &mut Script::default(),
-        &task.id,
-        &session,
-    ))
-    .unwrap();
-    assert_eq!(paused.status, Status::Paused);
-    assert!(
-        paused
-            .pause_reason
-            .as_ref()
-            .unwrap()
-            .contains("requires protection")
-    );
-    assert!(paused.completed.is_empty());
-    assert_eq!(paused.pending, pending.pending);
-    assert!(!serde_json::to_string(&paused).unwrap().contains(output));
-    assert_eq!(
-        reopen(&f.store.borrow()).poc_task(&task.id).unwrap(),
-        paused,
-        "replay reconstructs identical task bytes without transient scan objects"
-    );
-    assert!(f.remote.borrow().sends.is_empty());
-}
-
-async fn wait_release(release: &Cell<bool>) {
-    std::future::poll_fn(|_| {
-        if release.get() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
-    })
-    .await;
-}
-
-#[test]
 fn poc_protected_progress_precedes_command_and_check_results_and_allows_abandon() {
     for verifying in [false, true] {
         for before_send in [false, true] {
@@ -2864,107 +2810,6 @@ fn poc_recovery_configuration_barrier_survives_reopen_until_checkpoint() {
 }
 
 #[test]
-fn poc_metadata_remains_usable_with_later_credential_but_sinks_protect_history() {
-    // Fix every generated identifier so configuration and later adoption cannot vary with the seed.
-    let _identifiers = FixedIdentifiers::new();
-    let late = "later-synthetic-value-529840";
-    let mut store = ready();
-    let session = store.sessions[0].identity.clone();
-    let task = create_task(&mut store);
-    let proposed = proposal(&mut store, &task);
-    append(&mut store, &proposed, &session);
-    let pending = store.poc_task(&task.id).unwrap();
-    evidence(&mut store, &pending, record(&pending, Some(0), late));
-    let settled = change(&mut store, &pending, Change::Settle);
-    store.remember_poc_credential(late.as_bytes());
-    let loaded = store.poc_task(&task.id).unwrap();
-    assert_eq!(loaded, settled);
-    let next = change(&mut store, &loaded, Change::Request);
-    assert!(next.requesting);
-    assert!(!crate::redaction::Redacted::inference_value_is_safe(
-        &store,
-        &serde_json::to_value(&next.completed).unwrap(),
-        &[]
-    ));
-    let paused = change(
-        &mut store,
-        &next,
-        Change::Pause("request withheld; inspect configuration before Resume".into()),
-    );
-    let abandoned = change(&mut store, &paused, Change::Abandon);
-    assert_eq!(abandoned.status, Status::Abandoned);
-    assert_eq!(abandoned.completed, settled.completed);
-    let mut local = Local::new(store.storage.clone(), Fixed);
-    local.state = super::super::State::Unlocked(Box::new(store));
-    assert!(!local.report(None).to_string().contains(late));
-}
-
-#[test]
-fn poc_new_metadata_events_refuse_protected_envelope_before_append() {
-    // Fix every generated identifier so configuration and later adoption cannot vary with the seed.
-    let _identifiers = FixedIdentifiers::new();
-    for ending in [false, true] {
-        for protect_session in [false, true] {
-            let mut store = ready();
-            let task = create_task(&mut store);
-            let mut store = reopen(&store);
-            let session = fresh(&mut store);
-            let secret = if protect_session { &session } else { &task.id };
-            store.remember_poc_credential(secret.as_bytes());
-            let files = store.storage.files();
-            let next = store.next;
-            let result = if ending {
-                block_on(store.end_session(&session))
-            } else {
-                block_on(store.poc_change(&task.id, task.revision, Change::Abandon)).map(|_| ())
-            };
-            if ending && protect_session || !ending && !protect_session {
-                assert!(result.is_err());
-                assert_eq!(store.storage.files(), files, "refuse before any append");
-                assert_eq!(store.next, next);
-                assert_eq!(store.poc_task(&task.id).unwrap(), task);
-            } else {
-                result.unwrap(); // An unrelated session is absent from this complete event.
-            }
-        }
-    }
-}
-
-#[test]
-fn poc_configuration_rejects_reference_collisions_without_changing_inventory() {
-    // Fix every generated identifier so configuration and later adoption cannot vary with the seed.
-    let _identifiers = FixedIdentifiers::new();
-    let mut store = ready();
-    let task = create_task(&mut store);
-    let mut store = reopen(&store);
-    let session = fresh(&mut store);
-    store.poc_authority(&task.id, &session).map(|_| ()).unwrap();
-    let references = [
-        task.id,
-        task.start_session,
-        session,
-        "endable_sessions".into(),
-    ];
-    let files = store.storage.files();
-    for reference in references {
-        for key in [&reference, &reference[..reference.len().min(16)]] {
-            assert!(
-                store
-                    .poc_configuration_key(key.as_bytes())
-                    .unwrap_err()
-                    .contains("task references")
-            );
-            assert!(store.poc_credential_filters.borrow().is_empty());
-            assert_eq!(store.storage.files(), files);
-        }
-    }
-    store
-        .poc_configuration_key(b"ordinary-later-key-482700")
-        .unwrap();
-    assert!(store.poc_credential_filters.borrow().is_empty());
-}
-
-#[test]
 fn poc_mismatched_terminal_configuration_requires_abandon_and_preserves_hold() {
     let mut store = ready();
     let session = store.sessions[0].identity.clone();
@@ -3001,35 +2846,6 @@ fn poc_mismatched_terminal_configuration_requires_abandon_and_preserves_hold() {
     ));
     assert!(recovered.poc_configuration_ready().is_ok());
     assert!(reopen(&recovered).poc_configuration_ready().is_ok());
-}
-
-#[test]
-fn poc_complete_serialized_event_and_its_envelope_are_protected() {
-    // Fix every generated identifier so configuration and later adoption cannot vary with the seed.
-    let _identifiers = FixedIdentifiers::new();
-    for whole in [false, true] {
-        let mut store = ready();
-        let task = create_task(&mut store);
-        let event = serde_json::to_string(&Event::Poc(Record::Change {
-            id: task.id.clone(),
-            expected: task.revision,
-            change: Change::Abandon,
-        }))
-        .unwrap();
-        let key = if whole {
-            event.as_bytes()
-        } else {
-            &event.as_bytes()[..18]
-        };
-        assert!(store.poc_configuration_key(key).is_err());
-        store.remember_poc_credential(key);
-        let files = store.storage.files();
-        assert_eq!(
-            block_on(store.poc_change(&task.id, task.revision, Change::Abandon)),
-            Err("task credential boundary".into())
-        );
-        assert_eq!(store.storage.files(), files);
-    }
 }
 
 #[path = "journal_tests.rs"]

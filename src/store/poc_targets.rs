@@ -703,12 +703,6 @@ pub(crate) async fn test_poc_job_evidence(
         )
         .await
         .map_err(|_| "fixture append")?;
-    if !previous_key.is_empty() {
-        store.remember_poc_credential(previous_key.as_bytes());
-    }
-    if !key.is_empty() {
-        store.remember_poc_credential(key.as_bytes());
-    }
     let intent = &store.dispatch.calls[&call].intent;
     let evidence = crate::jobs::Evidence {
         call,
@@ -788,13 +782,6 @@ pub(crate) async fn test_poc_job_evidence(
     .await?;
     let canonical_replayed = recovered.dispatch.jobs == store.dispatch.jobs
         && recovered.dispatch.calls == store.dispatch.calls;
-    // Display equality below deliberately uses the same transient protection context.
-    for key in [&key, &previous_key]
-        .into_iter()
-        .filter(|key| !key.is_empty())
-    {
-        recovered.remember_poc_credential(key.as_bytes());
-    }
     let replayed = canonical_replayed
         && recovered.dispatch.jobs == store.dispatch.jobs
         && recovered.dispatch.calls == store.dispatch.calls

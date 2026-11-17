@@ -81,11 +81,6 @@ impl<S: Storage> Store<S> {
         }
         Ok(())
     }
-    pub(crate) fn credit_filter_handle(
-        &self,
-    ) -> Rc<std::cell::RefCell<Vec<crate::poc::inference::EchoFilter>>> {
-        self.poc_credential_filters.clone()
-    }
     pub(crate) fn credit_ready(&self) -> Result<(), String> {
         self.authority.ordinary()?;
         if self.failed.is_some() || self.next >= u64::from(u32::MAX) {
@@ -140,8 +135,7 @@ impl<S: Storage> Store<S> {
         }
         account.validate()?;
         self.poc_configuration_ready()?;
-        self.poc_configuration_key(account.credit_id.0.as_bytes())?;
-        self.poc_configuration_key(account.default_key.0.as_bytes())?;
+
         if self.credit.account.is_some() {
             return Err("Credit account already recorded.".into());
         }
@@ -154,7 +148,6 @@ impl<S: Storage> Store<S> {
             )),
         });
         self.commit(&event).await?;
-        // No await or external effect separates committed custody from filter installation.
         self.replay_credit_account(account)
     }
     pub(super) fn replay_credit_account(&mut self, account: &AccountRecord) -> Result<(), String> {
@@ -168,8 +161,7 @@ impl<S: Storage> Store<S> {
             credit_id: InferenceAccountCredential::new(id.to_vec()),
             default_key: InferenceAccountCredential::new(key.to_vec()),
         });
-        self.remember_poc_credential(id);
-        self.remember_poc_credential(key);
+
         Ok(())
     }
     fn credit_validate(&self, record: &Record) -> Result<(), String> {

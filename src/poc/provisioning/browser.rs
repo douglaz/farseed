@@ -1,6 +1,5 @@
 //! Actual browser fetch of the exact absolute URL supplied by Purchase authority.
 use super::*;
-use crate::poc::inference::EchoFilter;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use tokio::sync::Notify;
@@ -227,8 +226,6 @@ pub async fn provider_request(request: String) -> String {
         let mut api = Browser {
             account: store.provider_account().ok_or("Provider account unavailable.")?.copy(),
             continuation,
-            filter: None,
-            prepared: None,
             automatic_visibility: automatic.then(|| VISIBILITY.get()),
             started: now,
             requests: 0,
@@ -276,7 +273,7 @@ pub async fn provider_request(request: String) -> String {
     if let Ok(Some(catalogue)) = result {
         report["provider_catalogue"] = catalogue;
     }
-    report.to_string()
+    local.encode_report(report)
 }
 
 struct Pending {
@@ -304,18 +301,11 @@ impl Drop for Wait {
         PENDING.with_borrow_mut(|p| *p = None);
     }
 }
-struct Prepared {
-    url: String,
-    method: String,
-    body: Option<Zeroizing<String>>,
-    auth: Zeroizing<String>,
-}
+
 struct Browser {
     automatic_visibility: Option<u64>,
     account: Account,
     continuation: crate::lifecycle::Continuation,
-    filter: Option<EchoFilter>,
-    prepared: Option<Prepared>,
     started: f64,
     requests: u8,
     response_status: u16,
@@ -337,38 +327,6 @@ impl Browser {
 impl Api for Browser {
     fn response_status(&self) -> u16 {
         self.response_status
-    }
-    fn prepare(
-        &mut self,
-        method: &str,
-        url: &str,
-        body: Option<&Value>,
-    ) -> Result<Option<crate::poc::inference::EchoFingerprints>, String> {
-        self.current()?;
-        if self.prepared.is_some() || !matches!(method, "GET" | "POST") {
-            return Err(REFUSED.into());
-        }
-        let url = url.to_string();
-        let body = body.map(|b| Zeroizing::new(b.to_string()));
-        let mut nonce = [0; 32];
-        getrandom::fill(&mut nonce).map_err(|_| REFUSED)?;
-        let auth = self.account.authorization(
-            &url,
-            method,
-            body.as_ref().map(|b| b.as_bytes()),
-            self.now(),
-            &nonce,
-        )?;
-        let filter = request_filter(&auth)?;
-        let fingerprints = filter.fingerprints();
-        self.filter = Some(filter);
-        self.prepared = Some(Prepared {
-            url,
-            method: method.into(),
-            body,
-            auth,
-        });
-        Ok(Some(fingerprints))
     }
     fn account(&self) -> String {
         self.account.public()
@@ -392,9 +350,6 @@ impl Api for Browser {
             return Err(INCOMPLETE.into());
         }
         Ok(())
-    }
-    fn take_filter(&mut self) -> Option<EchoFilter> {
-        self.filter.take()
     }
     async fn request(
         &mut self,
@@ -439,20 +394,16 @@ impl Api for Browser {
             _callback: callback,
         };
         let cancelled = pending.notify.notified();
-        let Prepared {
-            url: prepared_url,
-            method: prepared_method,
-            body: prepared_body,
-            auth,
-        } = self.prepared.take().ok_or(REFUSED)?;
-        if prepared_url != url
-            || prepared_method != method
-            || prepared_body.as_deref().map(String::as_str)
-                != body.as_ref().map(Value::to_string).as_deref()
-        {
-            return Err(REFUSED.into());
-        }
-        let body = prepared_body;
+        let body = body.map(|b| Zeroizing::new(b.to_string()));
+        let mut nonce = [0; 32];
+        getrandom::fill(&mut nonce).map_err(|_| REFUSED)?;
+        let auth = self.account.authorization(
+            url,
+            method,
+            body.as_ref().map(|b| b.as_bytes()),
+            self.now(),
+            &nonce,
+        )?;
         let init = web_sys::RequestInit::new();
         init.set_method(method);
         init.set_mode(web_sys::RequestMode::Cors);

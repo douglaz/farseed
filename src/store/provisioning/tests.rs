@@ -1000,31 +1000,6 @@ fn provisioning_failed_intent_write_sends_nothing_and_account_cannot_change() {
     assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
     assert_eq!(api.count("POST /api/v1/ssh-key"), 0);
 }
-#[test]
-fn provisioning_provider_echoes_never_enter_journal_or_public_context() {
-    let mut s = ready();
-    let credential = hex::encode([7; 32]);
-    let a = protocol::Account::parse(credential.as_bytes()).unwrap();
-    s.remember_provider_filter(a.filter(credential.as_bytes()));
-    for text in [
-        credential.clone(),
-        hex::encode(credential.as_bytes()),
-        base64::engine::general_purpose::STANDARD.encode(credential.as_bytes()),
-    ] {
-        let value = json!({"name":text});
-        assert!(!crate::poc::inference::safe(&s, &value, &[]));
-        assert_ne!(s.protect_output(&value).unwrap(), value);
-    }
-    // Hexadecimal account custody must not activate inference structural refusal.
-    assert!(s.poc_credential_filters.borrow().is_empty());
-    let mut api = Fixture::new(false);
-    approve(&mut s, &mut api);
-    let mut echoed = fixtures::vm(&fixtures::selection(false), 11);
-    echoed["template"]["name"] = credential.into();
-    let next = s.next;
-    assert!(block_on(s.commit(&Event::Procurement(Record::Associated(echoed)))).is_err());
-    assert_eq!(s.next, next);
-}
 
 #[test]
 fn provisioning_fresh_store_preserves_report_shape_until_selection() {
@@ -1696,76 +1671,6 @@ fn provisioning_outside_clock_evidence_preserves_uncertain_intent_without_resend
 }
 
 #[test]
-fn provisioning_actual_request_signature_encodings_never_reach_response_journal_or_output() {
-    use zeroize::Zeroizing;
-    let input = Zeroizing::new(hex::encode([7; 32]));
-    let account = protocol::Account::parse(input.as_bytes()).unwrap();
-    let auth = account
-        .authorization(
-            "https://api.lnvps.net/api/v1/vm/templates",
-            "GET",
-            None,
-            42,
-            &[5; 32],
-        )
-        .unwrap();
-    let event = Zeroizing::new(
-        base64::engine::general_purpose::STANDARD
-            .decode(auth.strip_prefix("Nostr ").unwrap())
-            .unwrap(),
-    );
-    let signed: Value = serde_json::from_slice(&event).unwrap();
-    let signature = signed["sig"].as_str().unwrap();
-    let raw = Zeroizing::new(hex::decode(signature).unwrap());
-    let mixed: String = signature
-        .chars()
-        .enumerate()
-        .map(|(i, c)| {
-            if i % 2 == 0 {
-                c.to_ascii_uppercase()
-            } else {
-                c
-            }
-        })
-        .collect();
-    for form in [
-        base64::engine::general_purpose::STANDARD.encode(raw.as_slice()),
-        signature.to_uppercase(),
-        mixed,
-    ] {
-        let mut s = ready();
-        let mut api = Fixture::new(false);
-        api.response_filter = Some(protocol::request_filter(&auth).unwrap());
-        api.response_echo = Some(form.clone());
-        assert!(
-            block_on(s.procurement_catalogue(&mut api)).is_err(),
-            "Request signature echo must be refused before response publication"
-        );
-        let value = json!({"name":form});
-        assert!(
-            !crate::poc::inference::safe(&s, &value, &[]),
-            "Signature encoding must not reach model context"
-        );
-        assert!(
-            s.protect_output(&value).unwrap() != value,
-            "Signature encoding must not reach output"
-        );
-        let mut echoed = fixtures::vm(&fixtures::selection(false), 11);
-        echoed["template"]["name"] = value["name"].clone();
-        let next = s.next;
-        assert!(
-            block_on(s.commit(&Event::Procurement(Record::Associated(echoed)))).is_err(),
-            "Exact serialized journal must reject request signatures"
-        );
-        assert_eq!(s.next, next);
-        assert!(
-            s.poc_credential_filters.borrow().is_empty(),
-            "Provider request custody is separate from inference admission"
-        );
-    }
-}
-
-#[test]
 fn provisioning_fiat_plan_uses_authoritative_lightning_quote_and_provider_period() {
     for currency in ["EUR", "USD"] {
         let mut s = ready();
@@ -2018,101 +1923,6 @@ fn provisioning_delayed_creation_evidence_within_action_and_clock_bounds_replays
 }
 
 #[test]
-fn provisioning_approval_credential_admission_precedes_durable_change() {
-    let old = b"fixture~inference~key~482700";
-    let current = b"current-inference-key-9751";
-    for key in [old.as_slice(), current.as_slice()] {
-        for alias in [
-            hex::encode(key),
-            String::from_utf8(key.to_vec()).unwrap(),
-            hex::encode_upper(key),
-            base64::engine::general_purpose::STANDARD.encode(key),
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key),
-            key.iter().map(|b| format!("%{b:02X}")).collect(),
-        ] {
-            for field in ["machine", "relay"] {
-                let mut s = ready();
-                let mut api = Fixture::new(false);
-                block_on(s.procurement_select(
-                    &mut api,
-                    Choice {
-                        offer_id: 1,
-                        image_id: 3,
-                        resources: None,
-                    },
-                ))
-                .unwrap();
-                s.remember_poc_credential(old);
-                s.remember_poc_credential(current);
-                let mut request = approval();
-                if field == "machine" {
-                    request.machine = alias.clone();
-                } else {
-                    request.relay = format!("wss://relay.invalid/{alias}/");
-                }
-                let files = s.storage.files();
-                let allocation = s.allocation().clone();
-                let end = s.records().end;
-                let calls = api.calls.clone();
-                let error = block_on(s.procurement_approve(&mut api, request)).unwrap_err();
-                assert!(
-                    error.contains("protected or unscannable"),
-                    "{field}: {alias}"
-                );
-                assert_eq!(s.storage.files(), files, "approval must not append");
-                assert_eq!(s.records().end, end);
-                assert_eq!(s.allocation(), &allocation);
-                assert_eq!(api.calls, calls, "refusal precedes provider traffic");
-                assert!(s.procurement.is_none());
-                assert!(s.dispatch.approved_entries.is_empty());
-                let replayed = reopen(&s);
-                assert!(replayed.procurement.is_none());
-                assert_eq!(replayed.allocation(), &allocation);
-                assert_eq!(replayed.storage.files(), files);
-            }
-        }
-    }
-    let mut safe = ready();
-    safe.remember_poc_credential(old);
-    safe.remember_poc_credential(current);
-    approve(&mut safe, &mut Fixture::new(false));
-    assert!(reopen(&safe).procurement.is_some());
-}
-
-#[test]
-fn provisioning_approval_unscannable_authority_preserves_state() {
-    let mut s = ready();
-    let mut api = Fixture::new(false);
-    block_on(s.procurement_select(
-        &mut api,
-        Choice {
-            offer_id: 1,
-            image_id: 3,
-            resources: None,
-        },
-    ))
-    .unwrap();
-    block_on(s.synthetic_scan_fixture(
-        "credential".into(),
-        Zeroizing::new(b"required-secret-1234".to_vec()),
-    ))
-    .unwrap();
-    s.clear_scan_working_copies();
-    let files = s.storage.files();
-    let allocation = s.allocation().clone();
-    let calls = api.calls.clone();
-    assert!(
-        block_on(s.procurement_approve(&mut api, approval()))
-            .unwrap_err()
-            .contains("protected or unscannable")
-    );
-    assert_eq!(s.storage.files(), files);
-    assert_eq!(s.allocation(), &allocation);
-    assert_eq!(api.calls, calls);
-    assert!(s.procurement.is_none());
-}
-
-#[test]
 fn provisioning_custom_caps_gate_direct_reconciliation_status_and_authenticated_replay() {
     for mode in ["direct", "lost", "later"] {
         for missing in [false, true] {
@@ -2359,96 +2169,6 @@ fn provisioning_missing_limits_refuse_before_approval_and_authenticated_replay()
 }
 
 #[test]
-fn provisioning_request_protection_survives_worker_loss_before_response() {
-    let input = Zeroizing::new(hex::encode([7; 32]));
-    let account = protocol::Account::parse(input.as_bytes()).unwrap();
-    let auth = account
-        .authorization(
-            "https://api.lnvps.net/api/v1/vm/templates",
-            "GET",
-            None,
-            42,
-            &[5; 32],
-        )
-        .unwrap();
-    let signed: Value = serde_json::from_slice(
-        &base64::engine::general_purpose::STANDARD
-            .decode(auth.strip_prefix("Nostr ").unwrap())
-            .unwrap(),
-    )
-    .unwrap();
-    let signature = signed["sig"].as_str().unwrap();
-    let forms = [
-        signature.to_string(),
-        signature.to_uppercase(),
-        base64::engine::general_purpose::STANDARD.encode(hex::decode(signature).unwrap()),
-        signed.to_string(),
-        auth.to_string(),
-    ];
-    let mut s = ready();
-    let mut api = Fixture::new(false);
-    api.prepared_protection = Some(protocol::request_filter(&auth).unwrap().fingerprints());
-    api.fail_catalogue = true;
-    assert!(block_on(s.procurement_catalogue(&mut api)).is_err());
-    assert_eq!(api.count("GET /api/v1/vm/templates"), 1);
-    let mut loaded = reopen(&s);
-    loaded.remember_provider_filter(account.filter(input.as_bytes()));
-    for form in forms {
-        let next = loaded.next;
-        api.fail_catalogue = false;
-        api.response_echo = Some(form.clone());
-        assert!(
-            block_on(loaded.procurement_catalogue(&mut api)).is_err(),
-            "prior request material must not be published after reload"
-        );
-        let value = json!({"name":form});
-        assert!(!crate::poc::inference::safe(&loaded, &value, &[]));
-        assert_ne!(loaded.protect_output(&value).unwrap(), value);
-        let mut vm = fixtures::vm(&fixtures::selection(false), 11);
-        vm["template"]["name"] = value["name"].clone();
-        assert!(block_on(loaded.commit(&Event::Procurement(Record::Associated(vm)))).is_err());
-        assert_eq!(
-            loaded.next, next,
-            "refused evidence never enters the journal"
-        );
-        let mut reader = Store::new(
-            loaded.storage.clone(),
-            DataKey(loaded.key.0),
-            loaded.id.clone(),
-        );
-        for number in 0..loaded.next {
-            let bytes = block_on(loaded.storage.read(&number.to_string())).unwrap();
-            let event = reader.open(number, &bytes).unwrap();
-            assert!(
-                !serde_json::to_string(&event)
-                    .unwrap()
-                    .contains(value["name"].as_str().unwrap())
-            );
-            reader.previous = Address(Sha256::digest(&bytes).into());
-        }
-    }
-    assert!(loaded.poc_credential_filters.borrow().is_empty());
-}
-
-#[test]
-fn provisioning_failed_protection_append_dispatches_nothing() {
-    for fault in [Fault::Fail(1), Fault::LandThenFail(3)] {
-        let mut s = ready();
-        let mut api = Fixture::new(false);
-        api.prepared_protection = Some(
-            crate::poc::inference::EchoFilter::new(&[b"synthetic request scan material"])
-                .fingerprints(),
-        );
-        s.storage.fault(fault);
-        assert!(block_on(s.procurement_catalogue(&mut api)).is_err());
-        assert!(
-            api.calls.is_empty(),
-            "no transport before protection commit succeeds"
-        );
-    }
-}
-
-#[test]
 fn provisioning_failed_mutation_protection_keeps_intent_without_dispatch_or_retry() {
     for route in [
         "POST /api/v1/ssh-key",
@@ -2488,36 +2208,6 @@ fn provisioning_failed_mutation_protection_keeps_intent_without_dispatch_or_retr
                 assert_eq!(loaded.procurement, purchase);
             }
         }
-    }
-}
-
-#[test]
-fn provisioning_request_fingerprint_wire_format_roundtrips_fixed_length_digests() {
-    let filter = crate::poc::inference::EchoFilter::new(&[b"synthetic public request material"]);
-    let snapshot = filter.fingerprints();
-    let encoded = serde_json::to_value(&snapshot).unwrap();
-    for pattern in encoded["patterns"].as_array().unwrap() {
-        assert_eq!(pattern[2].as_array().unwrap().len(), 32);
-        assert_eq!(pattern[3].as_array().unwrap().len(), 32);
-    }
-    let restored: crate::poc::inference::EchoFingerprints =
-        serde_json::from_value(encoded.clone()).unwrap();
-    assert_eq!(snapshot, restored);
-    for input in [
-        b"synthetic public request material".as_slice(),
-        b"ordinary harmless output".as_slice(),
-    ] {
-        assert_eq!(
-            filter.protect_bytes(input).unwrap(),
-            restored.filter().protect_bytes(input).unwrap()
-        );
-    }
-    for length in [0, 31, 33] {
-        let mut malformed = encoded.clone();
-        malformed["patterns"][0][2] = json!(vec![0u8; length]);
-        assert!(
-            serde_json::from_value::<crate::poc::inference::EchoFingerprints>(malformed).is_err()
-        );
     }
 }
 

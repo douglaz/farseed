@@ -6,18 +6,15 @@
 //! Bounds: 8 KiB per outcome excerpt, 128 KiB serialized request, 256 KiB response,
 //! 512 bytes per provider error excerpt; each exchange, including response reading,
 //! gets 15 ms per requested completion token, clamped to 60–300 seconds.
-//! Protection shares 512 Mi work units across nodes/representations, with depth 16.
-//! Complexity exhaustion withholds the value; no partially scanned value is released.
+//! Protection checks exact credential bytes before output serialization.
 //! Excerpts signal truncation; the finite request cap can pause long transcripts.
 //! Request counts, completed steps and the decision to resume belong to the caller.
 
 use crate::goals::Tool;
 use crate::redaction::Redacted;
 use crate::store::{Storage, Store};
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 type Step = (String, Tool, Value);
@@ -191,815 +188,13 @@ pub(crate) fn valid_key(key: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-/// Fingerprints permit late echo filtering after the usable credential has been destroyed.
-/// No reversible credential encoding survives in this request-local filter.
-// Coarse prefilters for forms of at least 16 bytes avoid hashing ordinary windows.
-// Very short forms retain only digests; their candidate hashes are charged to the
-// same finite work budget. Cryptographic digests decide every match.
-type EchoPattern = (
-    usize,
-    Option<u16>,
-    sha2::digest::Output<Sha256>,
-    sha2::digest::Output<Sha256>,
-    Option<u16>,
-);
+type LegacyPattern = (usize, Option<u16>, [u8; 32], [u8; 32], Option<u16>);
 
-/// Synchronous scopes nest into one budget, including store/redaction callbacks. No scope
-/// crosses an await. Charge before allocation, decoding, traversal and candidate hashing.
-pub(crate) mod work {
-    use std::cell::Cell;
-    const LIMIT: usize = 512 * 1024 * 1024;
-    thread_local! {
-        static LEFT: Cell<usize> = const { Cell::new(LIMIT) };
-        static DEPTH: Cell<usize> = const { Cell::new(0) };
-    }
-    pub(crate) fn charge(units: usize) -> Result<(), String> {
-        LEFT.with(|left| match left.get().checked_sub(units) {
-            Some(next) => {
-                left.set(next);
-                Ok(())
-            }
-            None => {
-                left.set(0);
-                Err(crate::poc::wait::WORK_BOUND.into())
-            }
-        })
-    }
-    pub(crate) fn value(value: &serde_json::Value, depth: usize) -> Result<(), String> {
-        use serde_json::Value;
-        charge(512)?;
-        if depth > 32 {
-            return Err(crate::poc::wait::VALUE_DEPTH.into());
-        }
-        match value {
-            Value::String(s) => charge(s.len())?,
-            Value::Array(a) => {
-                for v in a {
-                    self::value(v, depth + 1)?;
-                }
-            }
-            Value::Object(o) => {
-                for (k, v) in o {
-                    charge(k.len())?;
-                    self::value(v, depth + 1)?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-    pub(crate) fn scope<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-        scoped(f)
-    }
-    pub(crate) fn reply<T>(
-        f: impl FnOnce() -> Result<T, super::ReplyError>,
-    ) -> Result<T, super::ReplyError> {
-        scoped(f)
-    }
-    fn scoped<T, E>(f: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
-        struct Guard;
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                DEPTH.set(DEPTH.get() - 1);
-            }
-        }
-        if DEPTH.get() == 0 {
-            LEFT.set(LIMIT);
-        }
-        DEPTH.set(DEPTH.get() + 1);
-        let _guard = Guard;
-        f()
-    }
-}
-
-/// Fully checked representations, reusable only under an identical computed context key.
-/// Memory only, for the store lifetime; no text, output or credential bytes are retained.
-/// Text and binary checks have different boundary inputs and must not alias.
-pub(crate) struct EchoCache {
-    key: Option<sha2::digest::Output<Sha256>>,
-    text: crate::store::protection::CleanRecords,
-    binary: crate::store::protection::CleanRecords,
-    token: crate::store::protection::CleanRecords,
-}
-
-impl Default for EchoCache {
-    fn default() -> Self {
-        Self::new(Default::default())
-    }
-}
-
-impl EchoCache {
-    pub(crate) fn new(budget: std::rc::Rc<crate::store::protection::MemoBudget>) -> Self {
-        Self {
-            key: None,
-            text: crate::store::protection::CleanRecords::new(budget.clone()),
-            binary: crate::store::protection::CleanRecords::new(budget.clone()),
-            token: crate::store::protection::CleanRecords::new(budget),
-        }
-    }
-
-    pub(crate) fn share_budget(
-        &mut self,
-        budget: std::rc::Rc<crate::store::protection::MemoBudget>,
-    ) {
-        let mut shared = Self::new(budget);
-        shared.merge(std::mem::take(self));
-        *self = shared;
-    }
-
-    pub(crate) fn bind(&mut self, key: sha2::digest::Output<Sha256>) {
-        if self.key.as_ref() != Some(&key) {
-            self.key = Some(key);
-            self.text.clear();
-            self.binary.clear();
-            self.token.clear();
-        }
-    }
-
-    pub(crate) fn merge(&mut self, other: Self) {
-        if let Some(key) = other.key {
-            self.bind(key);
-            self.text.merge(other.text);
-            self.binary.merge(other.binary);
-            self.token.merge(other.token);
-        }
-    }
-}
-
-pub(crate) struct EchoFilter {
-    representations: Vec<EchoPattern>,
-    literal: Vec<EchoPattern>,
-    decimal_free: Vec<EchoPattern>,
-    decimal_only: bool,
-    hex_free: Vec<EchoPattern>,
-    hex_only: bool,
-}
-
-/// Scan fingerprints and coarse prefilters; no key or request bytes.
+// Legacy journal payload. Old fingerprint records remain readable but no longer arm checks.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EchoFingerprints {
-    #[serde(with = "fingerprint_patterns")]
-    patterns: Vec<EchoPattern>,
-}
-impl EchoFingerprints {
-    pub(crate) fn filter(&self) -> EchoFilter {
-        EchoFilter {
-            representations: self.patterns.clone(),
-            literal: Vec::new(),
-            decimal_free: Vec::new(),
-            decimal_only: false,
-            hex_free: Vec::new(),
-            hex_only: false,
-        }
-    }
-}
-
-// Keep digest semantics in memory and the fixed-length byte-array journal format.
-mod fingerprint_patterns {
-    use super::*;
-
-    pub fn serialize<S: serde::Serializer>(
-        patterns: &[EchoPattern],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        patterns
-            .iter()
-            .map(|(len, rolling, hash, digest, sum)| {
-                (len, rolling, hash.as_slice(), digest.as_slice(), sum)
-            })
-            .collect::<Vec<_>>()
-            .serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<EchoPattern>, D::Error> {
-        let patterns = Vec::<(usize, Option<u16>, [u8; 32], [u8; 32], Option<u16>)>::deserialize(
-            deserializer,
-        )?;
-        Ok(patterns
-            .into_iter()
-            .map(|(len, rolling, hash, digest, sum)| {
-                (len, rolling, hash.into(), digest.into(), sum)
-            })
-            .collect())
-    }
-}
-
-fn echo_pattern(form: &[u8]) -> EchoPattern {
-    (
-        form.len(),
-        (form.len() >= 16).then(|| rolling_hash(form) as u16),
-        Sha256::digest(rolling_hash(form).to_be_bytes()),
-        Sha256::digest(form),
-        (form.len() >= 16).then(|| byte_sum(form)),
-    )
-}
-impl EchoFilter {
-    pub(crate) fn new(credentials: &[&[u8]]) -> Self {
-        let mut patterns = Vec::new();
-        let mut literal = Vec::new();
-        let mut decimal_free = Vec::new();
-        let mut decimal_only = false;
-        let mut hex_free = Vec::new();
-        let mut hex_only = false;
-        for credential in credentials.iter().copied().filter(|c| !c.is_empty()) {
-            literal.push(echo_pattern(credential));
-            let text = String::from_utf8_lossy(credential);
-            let escaped = Zeroizing::new(serde_json::to_string(&*text).expect("string encoding"));
-            let forms = [
-                Zeroizing::new(credential.to_vec()),
-                Zeroizing::new(hex::encode(credential).into_bytes()),
-                Zeroizing::new(hex::encode_upper(credential).into_bytes()),
-                Zeroizing::new(
-                    base64::engine::general_purpose::STANDARD
-                        .encode(credential)
-                        .into_bytes(),
-                ),
-                Zeroizing::new(
-                    base64::engine::general_purpose::STANDARD_NO_PAD
-                        .encode(credential)
-                        .into_bytes(),
-                ),
-                Zeroizing::new(
-                    base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .encode(credential)
-                        .into_bytes(),
-                ),
-                Zeroizing::new(escaped.as_bytes()[1..escaped.len() - 1].to_vec()),
-            ];
-            // Hexadecimal command payloads are outside structural admission. Only a raw
-            // or JSON-escaped credential can span their generated job field and its envelope;
-            // encoded occurrences wholly inside arbitrary payloads retain the append checks.
-            for form in [&forms[0], &forms[6]] {
-                let normalized = Zeroizing::new(
-                    form.iter()
-                        .copied()
-                        .filter(|b| !b.is_ascii_hexdigit())
-                        .collect::<Vec<_>>(),
-                );
-                if normalized.is_empty() {
-                    hex_only = true;
-                } else {
-                    hex_free.push(echo_pattern(&normalized));
-                }
-            }
-            for (index, form) in forms.iter().enumerate() {
-                // Coarse prefilters avoid digesting ordinary windows, even for short keys.
-                // A candidate still needs both cryptographic digest checks.
-                patterns.push(echo_pattern(form));
-                let normalized = Zeroizing::new(
-                    form.iter()
-                        .copied()
-                        .filter(|b| !b.is_ascii_digit())
-                        .collect::<Vec<_>>(),
-                );
-                if normalized.is_empty() {
-                    decimal_only = true;
-                } else if !matches!(index, 1 | 2) {
-                    // Hex encodings cannot cross a bounded decimal with non-hex borders.
-                    // Exact encodings and all-digit forms retain their existing checks.
-                    decimal_free.push(echo_pattern(&normalized));
-                }
-            }
-        }
-        patterns.sort();
-        patterns.dedup();
-        literal.sort();
-        literal.dedup();
-        decimal_free.sort();
-        decimal_free.dedup();
-        hex_free.sort();
-        hex_free.dedup();
-        Self {
-            representations: patterns,
-            literal,
-            decimal_free,
-            decimal_only,
-            hex_free,
-            hex_only,
-        }
-    }
-
-    /// Hash every pattern field, including prefilters, with framed vector boundaries.
-    pub(crate) fn pattern_digest(&self) -> sha2::digest::Output<Sha256> {
-        let mut hash = Sha256::new();
-        hash.update(b"protection/echo-patterns/v1");
-        for patterns in [
-            &self.representations,
-            &self.literal,
-            &self.decimal_free,
-            &self.hex_free,
-        ] {
-            hash.update((patterns.len() as u64).to_be_bytes());
-            for (length, coarse, fingerprint, digest, sum) in patterns {
-                hash.update((*length as u64).to_be_bytes());
-                for value in [coarse, sum] {
-                    hash.update([u8::from(value.is_some())]);
-                    hash.update(value.unwrap_or_default().to_be_bytes());
-                }
-                hash.update(fingerprint);
-                hash.update(digest);
-            }
-        }
-        hash.update([u8::from(self.decimal_only), u8::from(self.hex_only)]);
-        hash.finalize()
-    }
-
-    pub(crate) fn identity_key(&self) -> sha2::digest::Output<Sha256> {
-        let mut hash = Sha256::new();
-        hash.update(b"protection/echo/identity/v1");
-        hash.update(self.pattern_digest());
-        hash.finalize()
-    }
-
-    pub(crate) fn protect_bytes_memo<S: Storage>(
-        &self,
-        store: &Store<S>,
-        bytes: &[u8],
-        cache: &mut EchoCache,
-    ) -> Result<Zeroizing<Vec<u8>>, String> {
-        store.with_identity_memo(self.identity_key(), |memo| {
-            cache.bind(self.identity_key());
-            memo.merge(std::mem::take(cache));
-            self.protect_bytes_cached(bytes, memo)
-        })
-    }
-
-    pub(crate) fn fingerprints(&self) -> EchoFingerprints {
-        EchoFingerprints {
-            patterns: self.representations.clone(),
-        }
-    }
-
-    pub(crate) fn merge(&mut self, other: Self) {
-        for (ours, theirs) in [
-            (&mut self.representations, other.representations),
-            (&mut self.literal, other.literal),
-            (&mut self.decimal_free, other.decimal_free),
-            (&mut self.hex_free, other.hex_free),
-        ] {
-            ours.extend(theirs);
-            ours.sort();
-            ours.dedup();
-        }
-        self.decimal_only |= other.decimal_only;
-        self.hex_only |= other.hex_only;
-    }
-
-    /// One literal pass, with no decoding or replacement, over the exact append plaintext.
-    pub(crate) fn literal_match(&self, bytes: &[u8]) -> Result<bool, String> {
-        work::scope(|| Self::contains_patterns(&self.literal, bytes))
-    }
-
-    /// Erasing decimal digits overapproximates every symbolic decimal width and value.
-    /// Digits inside retained literals are erased too: false positives refuse admission.
-    /// Only digests survive registration; neither usable keys nor decoded history are retained.
-    pub(crate) fn symbolic_match(&self, template: &[u8]) -> Result<bool, String> {
-        work::scope(|| {
-            work::charge(template.len())?;
-            if self.decimal_only {
-                return Ok(true);
-            }
-            let normalized = Zeroizing::new(
-                template
-                    .iter()
-                    .copied()
-                    .filter(|b| !b.is_ascii_digit())
-                    .collect::<Vec<_>>(),
-            );
-            Self::contains_patterns(&self.decimal_free, &normalized)
-        })
-    }
-
-    /// Command intents generate hexadecimal job identifiers. Erasing the whole domain
-    /// overapproximates their unknown bytes and spans into the surrounding fixed envelope.
-    /// Retained references and fixed text lose hex characters too, conservatively refusing.
-    pub(crate) fn symbolic_hex_match(&self, template: &[u8]) -> Result<bool, String> {
-        work::scope(|| {
-            work::charge(template.len())?;
-            if self.hex_only {
-                return Ok(true);
-            }
-            let normalized = Zeroizing::new(
-                template
-                    .iter()
-                    .copied()
-                    .filter(|b| !b.is_ascii_hexdigit())
-                    .collect::<Vec<_>>(),
-            );
-            Self::contains_patterns(&self.hex_free, &normalized)
-        })
-    }
-
-    fn contains(&self, bytes: &[u8]) -> Result<bool, String> {
-        Self::contains_patterns(&self.representations, bytes)
-    }
-
-    fn contains_patterns(patterns: &[EchoPattern], bytes: &[u8]) -> Result<bool, String> {
-        for (length, coarse, fingerprint, digest, sum) in patterns {
-            work::charge(1)?;
-            if bytes.len() < *length {
-                continue;
-            }
-            work::charge(bytes.len().saturating_add(*length))?;
-            let power = (0..length - 1).fold(1u64, |power, _| power.wrapping_mul(257));
-            let mut rolling = rolling_hash(&bytes[..*length]);
-            let mut current_sum = u32::from(byte_sum(&bytes[..*length]));
-            for start in 0..=bytes.len() - length {
-                // Only a rolling-fingerprint match pays for hashing a credential-sized window.
-                if sum.is_none_or(|sum| u32::from(sum) == current_sum)
-                    && coarse.is_none_or(|coarse| rolling as u16 == coarse)
-                    && {
-                        work::charge(length.saturating_add(128))?;
-                        true
-                    }
-                    && Sha256::digest(rolling.to_be_bytes()).as_slice() == fingerprint.as_slice()
-                    && Sha256::digest(&bytes[start..start + length]).as_slice() == digest.as_slice()
-                {
-                    return Ok(true);
-                }
-                if start + length < bytes.len() {
-                    current_sum = (current_sum + 502 - u32::from(bytes[start])
-                        + u32::from(bytes[start + length]))
-                        % 251;
-                    rolling = rolling
-                        .wrapping_sub((u64::from(bytes[start]) + 1).wrapping_mul(power))
-                        .wrapping_mul(257)
-                        .wrapping_add(u64::from(bytes[start + length]) + 1);
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    fn marker(&self) -> Result<String, String> {
-        if self.contains(crate::redaction::MARKER.as_bytes())? {
-            Err(crate::poc::wait::PROTECTED_UNAVAILABLE.into())
-        } else {
-            Ok(crate::redaction::MARKER.into())
-        }
-    }
-
-    /// Pure fingerprint-only protection for evidence before it enters durable state.
-    /// Retaining this filter retains no usable authorization credential.
-    pub(crate) fn protect_bytes(&self, bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
-        self.protect_bytes_cached(bytes, &mut EchoCache::default())
-    }
-
-    pub(crate) fn protect_bytes_cached(
-        &self,
-        bytes: &[u8],
-        cache: &mut EchoCache,
-    ) -> Result<Zeroizing<Vec<u8>>, String> {
-        work::scope(|| {
-            cache.bind(self.identity_key());
-            work::charge(bytes.len())?;
-            if self.representations.is_empty() {
-                return Ok(Zeroizing::new(bytes.to_vec()));
-            }
-            let original = Value::String(String::from_utf8_lossy(bytes).into_owned());
-            if self.visit(&original, 0, &|v| Ok(v.clone()), cache)? != original {
-                Ok(Zeroizing::new(self.marker()?.into_bytes()))
-            } else {
-                Ok(Zeroizing::new(bytes.to_vec()))
-            }
-        })
-    }
-
-    fn value(&self, value: &Value) -> Result<Value, String> {
-        self.value_with(value, &|v| Ok(v.clone()))
-    }
-
-    fn value_memo<S: Storage>(&self, store: &Store<S>, value: &Value) -> Result<Value, String> {
-        store.with_identity_memo(self.identity_key(), |cache| {
-            work::scope(|| self.visit(value, 0, &|v| Ok(v.clone()), cache))
-        })
-    }
-
-    fn value_with(
-        &self,
-        value: &Value,
-        boundary: &impl Fn(&Value) -> Result<Value, String>,
-    ) -> Result<Value, String> {
-        work::scope(|| self.visit(value, 0, boundary, &mut EchoCache::default()))
-    }
-
-    fn visit(
-        &self,
-        value: &Value,
-        depth: usize,
-        boundary: &impl Fn(&Value) -> Result<Value, String>,
-        seen: &mut EchoCache,
-    ) -> Result<Value, String> {
-        work::charge(512)?;
-        if depth > 16 {
-            return Err(crate::poc::wait::ENCODING_DEPTH.into());
-        }
-        Ok(match value {
-            Value::String(text) => {
-                work::charge(text.len().saturating_mul(4))?;
-                // Reuse a complete unchanged, error-free check under the identical
-                // key at any depth; the visit-depth refusal above still runs first.
-                let digest = Sha256::digest(text.as_bytes());
-                if seen.text.contains(&digest, depth) {
-                    return Ok(value.clone());
-                }
-                if self.contains(text.as_bytes())? {
-                    return Ok(self.marker()?.into());
-                }
-                let checked = boundary(value)?;
-                if checked != *value {
-                    return Ok(checked);
-                }
-                let mut forms = Vec::new();
-                if let Ok(nested) = serde_json::from_str::<Value>(text)
-                    && matches!(
-                        nested,
-                        Value::Object(_) | Value::Array(_) | Value::String(_)
-                    )
-                {
-                    forms.push(nested);
-                }
-                for decoded in escaped_literals(text)? {
-                    forms.push(Value::String(decoded));
-                }
-                if let Some(decoded) = unescape_text(text) {
-                    forms.push(Value::String(decoded));
-                }
-                if let Some(decoded) = percent_text(text) {
-                    forms.push(Value::String(decoded));
-                }
-                for form in forms {
-                    if self.visit(&form, depth + 1, boundary, seen)? != form {
-                        return Ok(self.marker()?.into());
-                    }
-                }
-                for (token, parts) in encoded_containers(text, depth, seen)? {
-                    for decoded in parts {
-                        work::charge(decoded.len())?;
-                        let digest = Sha256::digest(decoded.as_slice());
-                        if seen.binary.contains(&digest, depth) {
-                            continue;
-                        }
-                        if self.contains(&decoded)? {
-                            return Ok(self.marker()?.into());
-                        }
-                        // The existing boundary also sees decoded binary material.
-                        work::charge(decoded.len().saturating_mul(2))?;
-                        let hexadecimal = Value::String(hex::encode(decoded.as_slice()));
-                        if boundary(&hexadecimal)? != hexadecimal {
-                            return Ok(self.marker()?.into());
-                        }
-                        if let Ok(text) = std::str::from_utf8(&decoded) {
-                            let form = Value::String(text.into());
-                            if self.visit(&form, depth + 1, boundary, seen)? != form {
-                                return Ok(self.marker()?.into());
-                            }
-                        }
-                        seen.binary.remember(digest, depth);
-                    }
-                    // All parts, including the UTF-8 visits, completed unchanged.
-                    seen.token.remember(token, depth);
-                }
-                seen.text.remember(digest, depth);
-                value.clone()
-            }
-            Value::Array(values) => {
-                work::charge(values.len().saturating_mul(64))?;
-                values
-                    .iter()
-                    .map(|v| self.visit(v, depth + 1, boundary, seen))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into()
-            }
-            Value::Object(values) => {
-                work::charge(values.len().saturating_mul(128))?;
-                let mut output = serde_json::Map::new();
-                for (key, value) in values {
-                    let key = self.visit(&Value::String(key.clone()), depth + 1, boundary, seen)?;
-                    let key = key.as_str().ok_or(crate::poc::wait::FIELD_NAME)?.to_owned();
-                    if output
-                        .insert(key, self.visit(value, depth + 1, boundary, seen)?)
-                        .is_some()
-                    {
-                        return Err(crate::poc::wait::FIELD_COLLISION.into());
-                    }
-                }
-                output.into()
-            }
-            _ => value.clone(),
-        })
-    }
-}
-
-/// Decode only concrete percent escapes; malformed escapes remain literal.
-fn percent_text(text: &str) -> Option<String> {
-    let mut bytes = Zeroizing::new(Vec::with_capacity(text.len()));
-    let source = text.as_bytes();
-    let mut cursor = 0;
-    let mut changed = false;
-    while cursor < source.len() {
-        if source[cursor] == b'%'
-            && cursor + 2 < source.len()
-            && let (Some(a), Some(b)) = (
-                (source[cursor + 1] as char).to_digit(16),
-                (source[cursor + 2] as char).to_digit(16),
-            )
-        {
-            bytes.push((a * 16 + b) as u8);
-            cursor += 3;
-            changed = true;
-        } else {
-            bytes.push(source[cursor]);
-            cursor += 1;
-        }
-    }
-    changed.then(|| String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn escaped_literals(text: &str) -> Result<Vec<String>, String> {
-    let mut previous = None;
-    let mut escaped = false;
-    let mut count = 0;
-    let mut fragments = Vec::new();
-    for (cursor, byte) in text.bytes().enumerate() {
-        if byte == b'"' && !escaped {
-            if let Some(start) = previous {
-                let fragment = &text[start..=cursor];
-                if fragment.contains('\\') {
-                    count += 1;
-                    if count > 4096 {
-                        return Err(crate::poc::wait::FRAGMENTS.into());
-                    }
-                    if let Ok(decoded) = serde_json::from_str::<String>(fragment) {
-                        fragments.push(decoded);
-                    }
-                }
-            }
-            // A closing quote is also a candidate opening quote in arbitrary prose.
-            previous = Some(cursor);
-        }
-        escaped = byte == b'\\' && !escaped;
-    }
-    Ok(fragments)
-}
-
-fn unescape_text(text: &str) -> Option<String> {
-    let mut result = String::with_capacity(text.len());
-    let mut cursor = 0;
-    let mut changed = false;
-    let source = text.as_bytes();
-    while cursor < source.len() {
-        if source[cursor] == b'\\' && cursor + 1 < source.len() {
-            let end = if source[cursor + 1] == b'u' {
-                if cursor + 6 <= source.len() {
-                    let first = text.get(cursor + 2..cursor + 6).unwrap_or("");
-                    if u16::from_str_radix(first, 16)
-                        .is_ok_and(|unit| (0xd800..=0xdbff).contains(&unit))
-                    {
-                        cursor + 12
-                    } else {
-                        cursor + 6
-                    }
-                } else {
-                    cursor + 2
-                }
-            } else {
-                cursor + 2
-            };
-            if end <= source.len() && text.is_char_boundary(end) {
-                let quoted = format!("\"{}\"", &text[cursor..end]);
-                if let Ok(decoded) = serde_json::from_str::<String>(&quoted) {
-                    result.push_str(&decoded);
-                    cursor = end;
-                    changed = true;
-                    continue;
-                }
-            }
-        }
-        let character = text[cursor..].chars().next().expect("character boundary");
-        result.push(character);
-        cursor += character.len_utf8();
-    }
-    changed.then_some(result)
-}
-
-fn byte_sum(bytes: &[u8]) -> u16 {
-    bytes
-        .iter()
-        .fold(0u32, |sum, byte| (sum + u32::from(*byte)) % 251) as u16
-}
-
-fn rolling_hash(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0u64, |hash, byte| {
-        hash.wrapping_mul(257).wrapping_add(u64::from(*byte) + 1)
-    })
-}
-
-type EncodedToken = (sha2::digest::Output<Sha256>, Vec<Zeroizing<Vec<u8>>>);
-
-fn encoded_containers(
-    text: &str,
-    depth: usize,
-    seen: &EchoCache,
-) -> Result<Vec<EncodedToken>, String> {
-    work::charge(text.len().saturating_mul(4))?;
-    // Common base64 wrapping whitespace is insignificant. Scan both forms, since
-    // whitespace can also separate two unrelated tokens.
-    let compact: String = text
-        .chars()
-        .filter(|c| !matches!(c, ' ' | '\t' | '\r' | '\n'))
-        .collect();
-    let mut decoded = Vec::new();
-    for text in [text, compact.as_str()] {
-        for alphabet in [0, 1, 2] {
-            let source = text.as_bytes();
-            let mut cursor = 0;
-            while cursor < source.len() {
-                let start = cursor;
-                while cursor < source.len()
-                    && match alphabet {
-                        0 => source[cursor].is_ascii_hexdigit(),
-                        1 => {
-                            source[cursor].is_ascii_alphanumeric()
-                                || b"+/".contains(&source[cursor])
-                        }
-                        _ => {
-                            source[cursor].is_ascii_alphanumeric()
-                                || b"_-".contains(&source[cursor])
-                        }
-                    }
-                {
-                    cursor += 1;
-                }
-                let end = cursor;
-                if start == end {
-                    cursor += 1;
-                    continue;
-                }
-                if alphabet != 0 {
-                    while cursor < source.len() && source[cursor] == b'=' && cursor - end < 2 {
-                        cursor += 1;
-                    }
-                }
-                if start == end {
-                    cursor += 1;
-                    continue;
-                }
-                let token = &text[start..cursor];
-                // The tokenizer includes up to two padding bytes. Alphabet and these
-                // exact bytes determine every offset/trim, engine and decoded part below.
-                work::charge(token.len().saturating_add(32))?;
-                let mut hash = Sha256::new();
-                hash.update([alphabet as u8]);
-                hash.update(token.as_bytes());
-                let digest = hash.finalize();
-                if seen.token.contains(&digest, depth) {
-                    continue;
-                }
-                let mut parts = Vec::new();
-                let alignments = if alphabet == 0 { 2 } else { 4 };
-                for offset in 0..alignments.min(token.len()) {
-                    for trim in 0..alignments.min(token.len() - offset) {
-                        let part = &token[offset..token.len() - trim];
-                        work::charge(part.len().saturating_mul(4).saturating_add(32))?;
-                        if alphabet == 0 {
-                            if part.len().is_multiple_of(2)
-                                && let Ok(bytes) = hex::decode(part)
-                            {
-                                parts.push(Zeroizing::new(bytes));
-                            }
-                        } else {
-                            let engines = if alphabet == 1 {
-                                [
-                                    base64::engine::general_purpose::STANDARD,
-                                    base64::engine::general_purpose::STANDARD_NO_PAD,
-                                ]
-                            } else {
-                                [
-                                    base64::engine::general_purpose::URL_SAFE,
-                                    base64::engine::general_purpose::URL_SAFE_NO_PAD,
-                                ]
-                            };
-                            for engine in engines {
-                                if let Ok(bytes) = engine.decode(part)
-                                    && !bytes.is_empty()
-                                    && engine.encode(&bytes) == part
-                                    && !parts.iter().any(|known| **known == bytes)
-                                {
-                                    parts.push(Zeroizing::new(bytes));
-                                }
-                            }
-                        }
-                    }
-                }
-                decoded.push((digest, parts));
-            }
-        }
-    }
-    Ok(decoded)
+    patterns: Vec<LegacyPattern>,
 }
 
 fn protected<S: Storage>(
@@ -1007,19 +202,11 @@ fn protected<S: Storage>(
     value: &Value,
     credentials: &[&[u8]],
 ) -> Result<Value, String> {
-    work::scope(|| {
-        // Scan decoded strings before JSON escaping, then the complete final encoding as well.
-        let filter = EchoFilter::new(credentials);
-        let value = store.protect_output(value)?;
-        let value = store.with_decoded_memo(&filter, |cache| {
-            filter.visit(&value, 0, &|value| store.protect_decoded(value), cache)
-        })?;
-        let bytes =
-            Zeroizing::new(serde_json::to_vec(&value).map_err(|_| "inference JSON encoding")?);
-        let redacted = Redacted::for_inference(store, &bytes, credentials)?;
-        serde_json::from_slice(redacted.as_bytes())
-            .map_err(|_| "inference protected output unavailable".into())
-    })
+    let value = store.protect_output_with(value, credentials)?;
+    let bytes = Zeroizing::new(serde_json::to_vec(&value).map_err(|_| "inference JSON encoding")?);
+    let redacted = Redacted::for_inference(store, &bytes, credentials)?;
+    serde_json::from_slice(redacted.as_bytes())
+        .map_err(|_| "inference protected output unavailable".into())
 }
 
 pub(crate) fn safe<S: Storage>(store: &Store<S>, value: &Value, credentials: &[&[u8]]) -> bool {
@@ -1089,7 +276,6 @@ impl HistoryExcerpt {
 }
 
 fn outcome_excerpt(outcome: &Value, detail: HistoryExcerpt) -> Result<String, String> {
-    work::value(outcome, 0)?;
     let Some(fields) = outcome.as_object() else {
         return Ok(detail.excerpt(&outcome.to_string(), detail.limit()));
     };
@@ -1147,7 +333,7 @@ fn step_messages(
 // reconstruct and check the selected representation in full.
 fn history_excerpts(steps: &[Step]) -> Result<Vec<HistoryExcerpt>, String> {
     fn size(step: &Step, detail: HistoryExcerpt) -> Result<usize, String> {
-        work::scope(|| {
+        (|| {
             let (id, tool, outcome) = step;
             let value = serde_json::to_value(tool).map_err(|_| "inference tool encoding")?;
             let messages = step_messages(id, &value, outcome, detail)?;
@@ -1156,7 +342,7 @@ fn history_excerpts(steps: &[Step]) -> Result<Vec<HistoryExcerpt>, String> {
             );
             // Replace the enclosing pair brackets by two message separators.
             Ok(bytes.len() - 1)
-        })
+        })()
     }
     let mut sizes = steps
         .iter()
@@ -1254,21 +440,7 @@ fn request_context<S: Storage>(
     task: Option<&crate::store::poc::Task>,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
     let details = history_excerpts(steps)?;
-    // Each completed step gets a separate synchronous budget before the request's
-    // outer scope. Discard all warm-up output and errors; only clean records survive.
-    for ((id, tool, outcome), detail) in steps.iter().zip(&details) {
-        let _ = work::scope(|| {
-            let value = serde_json::to_value(tool).map_err(|_| "inference tool encoding")?;
-            if !safe(store, &json!({"id":id,"tool":value}), credentials) {
-                return Ok(());
-            }
-            // This wrapper places both message objects at exactly their request depths.
-            let messages = step_messages(id, &value, outcome, *detail)?;
-            protected(store, &json!({"messages":messages}), credentials)?;
-            Ok(())
-        });
-    }
-    work::scope(|| {
+    (|| {
         if goal.len().saturating_add(machine.len()) >= REQUEST_BYTES {
             return Err("inference request exceeds the local size bound".into());
         }
@@ -1278,6 +450,7 @@ fn request_context<S: Storage>(
         ];
         messages.push(json!({"role":"system","content":"When the operator needs a file from the machine, such as a VPN connection file or sign-in details, offer it with offer_file instead of printing its contents. The operator downloads it from the page."}));
         if let Some(facts) = task.and_then(|t| store.poc_inference_facts(t)) {
+            let facts = store.protect_output_with(&facts, credentials)?;
             messages.push(json!({"role":"user","content":facts.to_string()}));
         }
         if let Some(task) = task
@@ -1315,7 +488,8 @@ fn request_context<S: Storage>(
             }
             // Durable evidence is independently protected by the store before append. Limit
             // this model-context projection before repeated serialization/protection.
-            messages.extend(step_messages(id, &value, outcome, *detail)?);
+            let outcome = store.protect_output_with(outcome, credentials)?;
+            messages.extend(step_messages(id, &value, &outcome, *detail)?);
         }
         let sockets = task
             .and_then(|t| t.before_setup.as_ref())
@@ -1433,7 +607,7 @@ fn request_context<S: Storage>(
         }
         // This is the last boundary before transport; Authorization is never part of this body.
         Ok(body)
-    })
+    })()
 }
 
 fn http_failure(status: u16) -> String {
@@ -1448,6 +622,18 @@ fn http_failure(status: u16) -> String {
     format!("inference {category} (HTTP {status})")
 }
 
+fn error_detail<S: Storage>(
+    store: &Store<S>,
+    value: &Value,
+    credentials: &[&[u8]],
+) -> Option<String> {
+    let message = value.pointer("/error/message")?.as_str()?;
+    protected(store, &json!(message), credentials)
+        .ok()?
+        .as_str()
+        .map(|text| excerpt(text, ERROR_BYTES))
+}
+
 pub(crate) fn normalize<S: Storage>(
     store: &Store<S>,
     status: u16,
@@ -1456,8 +642,8 @@ pub(crate) fn normalize<S: Storage>(
     steps: &[Step],
     credentials: &[&[u8]],
 ) -> Result<(String, Tool), ReplyError> {
-    work::reply(|| {
-        let value = work::scope(|| {
+    (|| {
+        let value = (|| {
             if matches!(status, 401 | 403) {
                 return Err("inference key refused; enter a usable key".into());
             }
@@ -1473,33 +659,27 @@ pub(crate) fn normalize<S: Storage>(
             if !(200..300).contains(&status) {
                 let detail = decoded
                     .ok()
-                    .and_then(|v| protected(store, &v, credentials).ok())
-                    .and_then(|v| {
-                        v.pointer("/error/message")
-                            .and_then(Value::as_str)
-                            .map(|s| excerpt(s, ERROR_BYTES))
-                    });
-                return Err(detail.filter(|s| !s.is_empty()).map_or_else(
-                    || http_failure(status),
-                    |s| format!("{}: {s}", http_failure(status)),
-                ));
+                    .and_then(|v| error_detail(store, &v, credentials));
+                return Err(detail
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(
+                        || http_failure(status),
+                        |s| format!("{}: {s}", http_failure(status)),
+                    )
+                    .into());
             }
             let value = decoded.map_err(|_| "inference response malformed JSON")?;
             if value.get("choices").and_then(Value::as_array).is_none()
                 && value.get("error").is_some_and(Value::is_object)
             {
-                let detail = protected(store, &value, credentials).ok().and_then(|v| {
-                    v.pointer("/error/message")
-                        .and_then(Value::as_str)
-                        .map(|s| excerpt(s, ERROR_BYTES))
-                });
-                return Err(detail.filter(|s| !s.is_empty()).map_or_else(
-                    || "inference provider unavailable".into(),
-                    |s| format!("inference provider unavailable: {s}"),
-                ));
-            }
-            if !safe(store, &value, credentials) {
-                return Err("inference proposal contains protected material".into());
+                let detail = error_detail(store, &value, credentials);
+                return Err(detail
+                    .filter(|s| !s.is_empty())
+                    .map_or_else(
+                        || "inference provider unavailable".into(),
+                        |s| format!("inference provider unavailable: {s}"),
+                    )
+                    .into());
             }
             let choice = value
                 .get("choices")
@@ -1507,10 +687,41 @@ pub(crate) fn normalize<S: Storage>(
                 .and_then(|a| a.first())
                 .filter(|v| v.is_object())
                 .ok_or("inference reply has no choice")?;
+            // Truncated replies are discarded, including partial calls and reasoning. Classify
+            // them before protection so the durable caller can raise the existing reply cap.
+            if choice["finish_reason"] == "length"
+                || choice["native_finish_reason"] == "max_output_tokens"
+            {
+                return Err(ReplyError::Malformed {
+                    reason: "the AI's reply was cut off".into(),
+                    cut_off: true,
+                });
+            }
             let message = choice
                 .get("message")
                 .filter(|v| v.is_object())
                 .ok_or("inference message malformed")?;
+            // Only these response fields reach proposal parsing or task history. Reasoning
+            // and other response metadata are discarded, never journaled, shown or logged.
+            let calls = message["tool_calls"].as_array().map(|calls| {
+                calls
+                    .iter()
+                    .map(|call| {
+                        json!({
+                            "id":call["id"],
+                            "name":call["function"]["name"],
+                            "arguments":call["function"]["arguments"],
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            if !safe(
+                store,
+                &json!({"content":message["content"],"calls":calls}),
+                credentials,
+            ) {
+                return Err("inference proposal contains protected material".into());
+            }
             if message
                 .get("refusal")
                 .is_some_and(|v| !v.is_null() && v != "")
@@ -1519,15 +730,10 @@ pub(crate) fn normalize<S: Storage>(
                 return Err("inference provider refused this request".into());
             }
             Ok(value)
-        })?;
+        })()?;
         let choice = &value["choices"][0];
         let message = &choice["message"];
-        let cut_off = choice["finish_reason"] == "length"
-            || choice["native_finish_reason"] == "max_output_tokens";
         let result: Result<(String, Tool), String> = (|| {
-            if cut_off {
-                return Err("the AI's reply was cut off".into());
-            }
             let calls = message
                 .get("tool_calls")
                 .and_then(Value::as_array)
@@ -1615,10 +821,13 @@ pub(crate) fn normalize<S: Storage>(
             ) {
                 ReplyError::Pause(reason)
             } else {
-                ReplyError::Malformed { reason, cut_off }
+                ReplyError::Malformed {
+                    reason,
+                    cut_off: false,
+                }
             }
         })
-    })
+    })()
 }
 
 /// Completion boundary shared by the worker exchange and host transport fixtures.
@@ -1629,7 +838,6 @@ fn complete_response<S: Storage>(
     machine: &str,
     steps: &[Step],
     credentials: &[&[u8]],
-    filter: &EchoFilter,
 ) -> Result<(String, Tool), ReplyError> {
     // HTTP failures retain their category even when the provider sends HTML or no body.
     if (200..300).contains(&status) {
@@ -1637,11 +845,8 @@ fn complete_response<S: Storage>(
             return Err(RESPONSE_TOO_LARGE.into());
         }
         std::str::from_utf8(body).map_err(|_| "inference response malformed JSON")?;
-        let decoded: Value =
+        let _: Value =
             serde_json::from_slice(body).map_err(|_| "inference response malformed JSON")?;
-        if filter.value_memo(store, &decoded)? != decoded {
-            return Err("inference proposal contains protected material".into());
-        }
     }
     normalize(store, status, body, machine, steps, credentials)
 }
@@ -1656,8 +861,8 @@ mod browser;
 pub(crate) use browser::next;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use browser::{
-    CommandResponse, approval, configuration, configure, end, freeze, key_is_set, response_pending,
-    restore, restore_credit, retry_progress, stop_session, stop_task,
+    CommandResponse, approval, configuration, configure, end, freeze, held_key, key_is_set,
+    response_pending, restore, restore_credit, retry_progress, stop_session, stop_task,
 };
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

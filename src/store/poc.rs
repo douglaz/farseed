@@ -320,22 +320,6 @@ impl<S: Storage> Store<S> {
             }
         }
     }
-    /// Warm exactly the report's completed-step projection before any report scope.
-    /// Each check has its own synchronous budget. Outputs/errors are discarded;
-    /// only completed clean checks under the current output key can be reused.
-    pub(super) fn warm_poc_report(&self) {
-        for task in self.poc.values() {
-            for step in &task.completed {
-                let _ = crate::poc::inference::work::scope(|| {
-                    let mut step =
-                        serde_json::to_value(step).map_err(|_| crate::poc::wait::TASK_ENCODING)?;
-                    Task::truncate_step_view(&mut step);
-                    self.protect_output(&json!({"tasks":[{"completed":[step]}]}))?;
-                    Ok(())
-                });
-            }
-        }
-    }
     pub(crate) fn poc_inference_facts(&self, task: &Task) -> Option<Value> {
         let machine = task.machine.as_str();
         let exposure = self
@@ -377,19 +361,14 @@ impl<S: Storage> Store<S> {
         if interrupted.is_empty() {
             return;
         }
-        let scans = self.ensure_scan_references().await;
         for (id, revision) in interrupted {
-            let result = match &scans {
-                Ok(()) => self
-                    .poc_change(
-                        &id,
-                        revision,
-                        Change::Pause(crate::poc::inference::INCOMPLETE.into()),
-                    )
-                    .await
-                    .map(|_| ()),
-                Err(why) => Err(why.clone()),
-            };
+            let result = self
+                .poc_change(
+                    &id,
+                    revision,
+                    Change::Pause(crate::poc::inference::INCOMPLETE.into()),
+                )
+                .await;
             if let Err(why) = result {
                 self.poc_reconciliation_failures.insert(
                     id,
@@ -479,42 +458,6 @@ impl<S: Storage> Store<S> {
             Err(crate::poc::wait::TASK_BOUNDARY.into())
         }
     }
-    pub(crate) fn poc_configuration_key(&self, key: &[u8]) -> Result<(), String> {
-        let filter = crate::poc::inference::EchoFilter::new(&[key]);
-        self.poc_admission(&filter, None, None)?;
-        for exposure in self
-            .exposure_ledger
-            .iter()
-            .filter(|e| !self.ended_sessions.contains(&e.session))
-        {
-            let task = self
-                .poc
-                .values()
-                .find(|t| t.start_session == exposure.session && !t.ended());
-            self.poc_admission(&filter, task, Some(exposure))?;
-        }
-        for task in self
-            .poc
-            .values()
-            .filter(|task| !task.ended() && self.ended_sessions.contains(&task.start_session))
-        {
-            self.poc_admission(&filter, Some(task), None)?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn poc_adoption_safe(
-        &self,
-        task: Option<&Task>,
-        exposure: Option<&Exposure>,
-    ) -> Result<(), String> {
-        for filter in self.poc_credential_filters.borrow().iter() {
-            self.poc_admission(filter, task, exposure)
-                .map_err(|_| "task refused".to_string())?;
-        }
-        Ok(())
-    }
-
     pub fn poc_task(&self, id: &str) -> Result<Task, String> {
         let task = self.poc.get(id).ok_or(crate::poc::wait::UNKNOWN_TASK)?;
         // Internal orchestration reads durable metadata without releasing the transcript.
@@ -791,7 +734,6 @@ impl<S: Storage> Store<S> {
         let task = self.project_poc(self.next, &record)?;
         self.poc_safe(&task)?;
         self.poc_record_safe(&record)?;
-        self.poc_adoption_safe(Some(&task), None)?;
         let number = self.commit(&Event::Poc(record.clone())).await?;
         #[cfg(all(target_arch = "wasm32", feature = "tracer"))]
         crate::testonly::session_point("poc_start_committed").await;
@@ -1725,7 +1667,5 @@ impl<S: Storage> Store<S> {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(super) mod tests;
-
-mod admission;
 
 pub(crate) mod disposition;

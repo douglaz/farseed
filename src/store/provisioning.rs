@@ -133,22 +133,6 @@ pub(crate) struct Choice {
 }
 
 impl<S: Storage> Store<S> {
-    pub(crate) fn remember_provider_filter(&mut self, filter: crate::poc::inference::EchoFilter) {
-        if let Some(known) = self.provider_filters.first_mut() {
-            known.merge(filter);
-        } else {
-            self.provider_filters.push(filter);
-        }
-    }
-    pub(crate) async fn protect_provider_request(
-        &mut self,
-        fingerprints: crate::poc::inference::EchoFingerprints,
-    ) -> Result<(), String> {
-        self.commit(&Event::ProviderProtection(fingerprints.clone()))
-            .await?;
-        self.remember_provider_filter(fingerprints.filter());
-        Ok(())
-    }
     pub(super) fn procurement_ready(&self) -> Result<(), String> {
         self.authority.ordinary()?;
         if self.inference.ended || self.failed.is_some() || self.allocation().seed_backup_owed() {
@@ -194,14 +178,8 @@ impl<S: Storage> Store<S> {
     ) -> Result<(u16, Value), protocol::ReadError> {
         self.check_api(api)?;
         let url = protocol::request_url(self.procurement_origin(), path)?;
-        if let Some(fingerprints) = api.prepare(method, &url, body.as_ref())? {
-            self.protect_provider_request(fingerprints).await?;
-        }
         self.check_api(api)?;
         let result = api.request(method, &url, body).await;
-        if let Some(filter) = api.take_filter() {
-            self.remember_provider_filter(filter);
-        }
         self.check_api(api)?;
         let value = result?;
         if !crate::poc::inference::safe(self, &value, &[]) {

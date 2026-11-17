@@ -145,16 +145,12 @@ impl<S: Storage> Store<S> {
                 }
                 live.ended.set(true);
                 live.given.borrow_mut().clear();
-                if !self.has_live_sessions() {
-                    self.scans.clear();
-                }
                 #[cfg(target_arch = "wasm32")]
                 crate::harness::goals::end_session(session);
             }
             result?;
         }
         self.authority.ordinary()?;
-        self.scan_readiness()?;
         Ok(())
     }
 
@@ -172,10 +168,6 @@ impl<S: Storage> Store<S> {
             }
         }
         Ok(())
-    }
-
-    pub(crate) fn has_live_sessions(&self) -> bool {
-        self.sessions.iter().any(|session| !session.ended.get())
     }
 
     pub fn check_current_session(&self, session: &Session) -> Result<(), String> {

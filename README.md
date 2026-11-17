@@ -472,12 +472,11 @@ and store entry compile in every build; the served build has no response-produci
 
 The following are **implementation readings**, with deliberately limited claims:
 
-- **Exact copies:** only raw bytes exactly as held. Hex, HEX, base64, base64url,
-  JSON-escaped, partial and transformed copies pass the scan. Random 32- or 64-byte keys
-  essentially cannot occur verbatim in valid UTF-8 JSON; typed JSON responses therefore catch
-  credentials held as text (the mnemonic today, a vendor credential later). The arbitrary-byte
-  injected stand-in exercises binary keys. JSON field editing serializes before the scan, so
-  an escaped copy that serialization makes exact is caught. That serialization is serde_json's
+- **Exact copies:** raw bytes exactly as held, including canonical lowercase hex text for
+  provider and deployment relay keys. Further hex, HEX, base64, base64url, JSON-escaped,
+  partial and transformed copies pass. Structured fields are checked before serialization,
+  and serialized bytes receive a final exact check for copies introduced by framing or escaping.
+  The arbitrary-byte injected stand-in also exercises binary keys. Serialization is serde_json's
   default: object members come back sorted, escapes and number text are rewritten, and an
   integer outside the 64-bit range is read as a float, losing precision. A recorded typed
   response with declared fields keeps its members' values within those limits, never the
@@ -505,12 +504,14 @@ The following are **implementation readings**, with deliberately limited claims:
   under the current seed, including reserved, failed and destroyed entries. Machines supply
   roles 0–2, passes role 3, handoffs role 4. A derived key counts as held because the held seed
   derives it at a listed identity. Existing holders are borrowed; derived copies keep their
-  registered credential types and zeroize after scanning. The passphrase and wrapping key
+  registered credential types; canonical credential text copies also zeroize after scanning.
+  The passphrase and wrapping key
   are cleared during create, unlock or re-display before responses can pass; neither lifetime
   is extended to scan for it. They are consequently absent from the scan set at response time.
-  The inference account credential and each live session inference key also join this set.
-  Later additions belong in the store's enumeration: the vendor credential and role-5 LNVPS
-  key (twr-ggw.47).
+  The inference account credential, each live session inference key, credit account credentials,
+  the held application inference key, provider account key and deployment relay key also join
+  this set. Provider and deployment relay keys use their canonical lowercase hex text. The
+  role-5 key remains separate work (twr-ggw.47).
 - **Routing:** only the boundary constructs `Redacted`, whose field is private and which
   has no constructor from bytes, `Deserialize`, `Default` or `From`. The response append and
   adapter return accept only that output; its entry obtains holdings from the store itself.
@@ -523,9 +524,11 @@ untyped vendor scope. **The repeat against real untyped responses is still owed 
 are enabled.** Independent tests derive absence needles separately, search every decrypted
 record and decoded response body (except the intentional mnemonic in record 0), and search
 returned bytes in raw, hex, HEX, base64 and base64url, including embedded byte alignments.
-The tracer checks app-origin requests and logs for STG-10. Box-plane output does not pass this
-boundary: placed-secret scanning, named markers, cross-chunk windows and withheld bytes are
-twr-ggw.23's; the minimum secret length is twr-ggw.38's.
+The tracer checks app-origin requests and logs for STG-10. Box-plane output uses the same exact
+held-credential boundary. The row-23 keyed scanner is removed; it returns with `place_secret`
+(twr-ggw.23). Placed application secrets and the rescue root password are not scanned; the rescue
+password has only declared-field withholding. The application inference key remains checked while
+held. See [the PoC contract](docs/output-protection.md).
 
 ### Dispatch
 
@@ -6344,7 +6347,7 @@ It checks protected text, tracker bytes, branch, pin and witness cleanliness, th
 files, final source hashes, ten mutation pairs, all gate exits and both 184-case count sites.
 
 
-### Surviving hidden sessions and scan consumers
+### Surviving hidden sessions and held-credential protection
 
 `STA-23` says "An ordinary visibility-only hide MUST NOT end or pause an unlocked session, clear its runtime authority, or invalidate its approvals."
 It also says "Before further ordinary sends or actionable result publication after a processed suspension or interruption, the surviving worker MUST validate its current authority, bindings, holds, connection state and scan readiness."
@@ -6370,31 +6373,22 @@ session end separately. Production minting remains refused: the consumed pin has
 issuer profile. Confirmed fixture tuples and time sources establish only synthetic consumer evidence;
 the per-session chooser and its own admission evidence remain twr-ggw.83's work.
 
-`SEC-5` says "Unscanned bytes MUST be withheld; matches become visible redaction markers naming the secret, never silent omissions."
-It also says "For row 23, retained or reloaded scan material is the same independent random key and encrypted reference already recorded, never seed-derived, regenerated on hide or replaced by machine-reported bytes."
+The PoC checks exact copies of everything tau-web holds, including the application inference
+key while held. Provider and deployment relay keys are checked as canonical lowercase hex text.
+Original output bytes and structured fields are checked before serialization; final serialized
+journal, request and report bytes receive another exact check. Output text is never decoded to
+search for transformed copies, and generic credential-shaped strings receive no special treatment.
+[The protection contract](docs/output-protection.md) describes coverage and custody exemptions.
 
-The read-only loader authenticates identified required references in the prescribed encrypted
-representation and retains unavailable material as an unarmed barrier. It never discovers authority
-from a file or machine output. The byte consumer compares the prescribed keyed digest over every
-raw window before decoding, retaining cross-chunk windows and protecting nested legacy hex copies,
-normal tool output, collection, historical/uncommitted reports and transcript-only release. Existing
-held-credential protection remains in the same boundary. Reload does no encryption or lifetime write.
-Lock/end clear working copies without retiring encrypted references.
+Row 23 is removed from this PoC: there is no scan-reference inventory, loading, readiness barrier
+or keyed window scanner. It returns with `place_secret` in twr-ggw.23. A placed secret added then
+will join the held-credential check. Today a discarded application inference key has no retained
+output filter; the rescue password retains only declared-field withholding. This contradicts the
+row-23 requirements in SEC-5 and ADR-0041; this branch claims no specification conformance.
 
-Host cases live in `clock::tests`, `inference_limits::tests`, `store::lifecycle_tests` and
-`store::scan::tests`. Browser cases in `tracer/src/lifecycle_cases.rs` exercise real page lifecycle
-messages, hidden scheduled model/tool work, the same original reference after reload, the retained
-writer, clock repair and stale-result refusal. Existing session-end, seed, goal, delivery and job
-cases retain full-end and uncertainty coverage. These are desktop loopback fixtures, not physical
-Android scheduling or live-issuer evidence; no background survival duration is promised.
-
-The synthetic scan producer runs only in isolated fixture stores. Its encrypted bytes supply no
-production enrollment, reservation, causal replay, counted-encryption or lifetime-event evidence.
-Named marker insertion into legacy job evidence supplies no intrinsic custody or completed protected
-finalization. twr-ggw.23 retains that protocol and atomic page/cache release; these cases claim no
-CNF-95(g) or complete persistent-protocol acceptance. Entry/funding, real profile admission and
-physical-device evidence remain separately owned.
-
+Existing lifecycle fixtures cover the retained writer, clock repair, stale-result refusal and
+session end. They are desktop loopback fixtures, not physical phone scheduling or live-issuer
+evidence; no background survival duration is promised. Test maintenance is currently suspended.
 
 `STG-20` says "An approval **stands** from its record until its reset is dispatched, a matching withdrawal is recorded, or the session it was rendered for ends; several approvals for an entry stand independently."
 It also says "A withdrawal whose append fails is not recorded (`STA-3`), so the approval still stands."
@@ -6410,14 +6404,9 @@ consumer and typed dispatch boundary. No dedicated vendor adapter or stage-3 adm
 there is no dedicated approval path for the stage-1 vendor. The existing comparison partition and
 its dedicated qualifications remain unchanged. No fixture reset establishes a physical disk wipe.
 
-The final inference send also compares the current scan-reference revision with the revision
-that protected the actual request body, after acquiring the Store owner. Arming or reloading a
-reference while a request waits cannot approve bytes scanned under an earlier reference set.
-A fresh operation scans those same bytes with the now-armed material. Empty placeholder route
-validation and the narrow clock read carry no scanned payload and retain their separate current
-authority checks. Browser cases exercise this last send boundary, an unchanged original mint
-through actual time verification, and dedicated approvals across actual app Lock and worker restart.
-
+The final inference send rechecks the current session after acquiring the Store owner.
+Empty placeholder route validation and the narrow clock read retain their separate authority
+checks. Only an unchanged demonstrably unsent mint can continue under its original identity.
 
 Queued goal connection admission retains the original runtime session through command and
 requested-job dispatch. After acquiring the Store writer, admission checks that exact object,

@@ -196,7 +196,7 @@ pub(crate) async fn configure(
             return Err("restore the admitted inference model for this session".into());
         }
     }
-    store.poc_configuration_key(&key)?;
+
     if !safe(
         store,
         &json!({"endpoint":config.endpoint,"model":config.model}),
@@ -204,13 +204,20 @@ pub(crate) async fn configure(
     ) {
         return Err("inference configuration contains protected material".into());
     }
-    store.remember_poc_credential(&key);
+
     crate::poc::credit::browser::select_byo();
     freeze();
     REVISION.set(REVISION.get().wrapping_add(1));
     KEY.with_borrow_mut(|held| *held = Some(InferenceAccountCredential::new(key.to_vec())));
     CONFIG.with_borrow_mut(|held| *held = Some(config));
     Ok(())
+}
+
+pub(crate) fn held_key() -> Option<InferenceAccountCredential> {
+    KEY.with_borrow(|key| {
+        key.as_ref()
+            .map(|key| InferenceAccountCredential::new(key.0.to_vec()))
+    })
 }
 
 fn with_request_key<T>(
@@ -438,7 +445,7 @@ pub(crate) async fn next(
         REQUESTS.with_borrow_mut(|requests| requests.push(Rc::downgrade(&pending)));
 
         let admission_error = |why: String| if retries == 0 { why } else { INCOMPLETE.into() };
-        let (promise, filter, is_credit, sent_at) = {
+        let (promise, is_credit, sent_at) = {
             let mut local = pending.until(local.lock()).await?;
             continuation.check().map_err(admission_error)?;
             if revision != REVISION.get() {
@@ -453,7 +460,6 @@ pub(crate) async fn next(
             store
                 .check_inference_request(task, session)
                 .map_err(admission_error)?;
-            pending.until(store.ensure_scan_references()).await??;
             store
                 .check_inference_request(task, session)
                 .map_err(admission_error)?;
@@ -463,7 +469,6 @@ pub(crate) async fn next(
             }
             with_request_key(session, store.credit_session(session), |key| {
                 let body = request_for_task(store, &config, task, &[key])?;
-                let filter = EchoFilter::new(&[key]);
                 let init = web_sys::RequestInit::new();
                 init.set_method("POST");
                 init.set_signal(Some(&pending.controller.signal()));
@@ -499,7 +504,6 @@ pub(crate) async fn next(
                 }
                 Ok::<_, String>((
                     worker.fetch_with_request(&request),
-                    filter,
                     store.credit_session(session),
                     sent_at,
                 ))
@@ -548,12 +552,9 @@ pub(crate) async fn next(
                 }
                 .into());
             }
-            // Protect the entire successful reply before classification, including unused metadata.
-            // The full response read remains bounded; no response body is retained in task facts.
+            // Bound the response read; classification and checks of consumed fields happen
+            // in the shared completion path. No complete response is retained in task facts.
             let bytes = if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
-                if (200..300).contains(&status) && filter.value(&value)? != value {
-                    return Err("inference proposal contains protected material".into());
-                }
                 if !(200..300).contains(&status)
                     && let Some(object) = value.as_object_mut()
                 {
@@ -567,16 +568,6 @@ pub(crate) async fn next(
             } else {
                 Zeroizing::new(Vec::new())
             };
-            // Apply the request's non-reversible echo filter before any lock wait or late disposal.
-            let filtered = match filter.protect_bytes(&bytes) {
-                Ok(filtered) => filtered,
-                Err(_) if !(200..300).contains(&status) => Zeroizing::new(Vec::new()),
-                Err(why) => return Err(why.into()),
-            };
-            if (200..300).contains(&status) && *filtered != *bytes {
-                return Err("inference proposal contains protected material".into());
-            }
-            let bytes = filtered;
             continuation.check().map_err(|_| INCOMPLETE)?;
             if revision != REVISION.get() || pending.stopped.get() {
                 return Err(INCOMPLETE.into());
@@ -612,15 +603,19 @@ pub(crate) async fn next(
                         == Some("provider_unavailable")
                     && !has_usage(&value, false)
                 {
-                    if !safe(store, &value, &[key]) {
+                    if !safe(
+                        store,
+                        &json!({
+                            "code":value.pointer("/error/code"),
+                            "error_type":value.pointer("/error/metadata/error_type"),
+                        }),
+                        &[key],
+                    ) {
                         return Ok(Err("inference proposal contains protected material".into()));
                     }
                     return Ok(Ok(None));
                 }
-                Ok(
-                    complete_response(store, status, &bytes, machine, steps, &[key], &filter)
-                        .map(Some),
-                )
+                Ok(complete_response(store, status, &bytes, machine, steps, &[key]).map(Some))
             })?
         };
         let result = match futures_util::future::select(Box::pin(exchange), Box::pin(ready)).await {

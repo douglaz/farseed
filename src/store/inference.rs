@@ -333,7 +333,7 @@ impl<S: Storage> Store<S> {
     #[cfg(any(test, feature = "tracer"))]
     pub fn end_inference_sessions(&mut self) -> Vec<String> {
         self.inference.ended = true;
-        self.clear_scan_working_copies();
+
         self.inference.unsent.clear();
         self.pending_requirements.clear();
         for s in &self.sessions {
@@ -394,6 +394,11 @@ impl<S: Storage> Store<S> {
             .account
             .as_ref()
             .ok_or("no inference account credential")?;
+        let body = if matches!(intent, InferenceIntent::Completion { .. }) {
+            self.protect_output(&body)?
+        } else {
+            body
+        };
         let mut request = Request {
             runtime: if is_revoke {
                 None
@@ -412,7 +417,6 @@ impl<S: Storage> Store<S> {
             } else {
                 Some(self.authority.continuation()?)
             },
-            scan_revision: self.scan_revision(),
             method: "POST",
             origin: origin.into(),
             path: "/completion",
@@ -595,7 +599,6 @@ impl<S: Storage> Store<S> {
             .remove(&call)
             .ok_or("no identifiable safe unsent continuation")?;
         request.continuation = Some(self.authority.continuation()?);
-        request.scan_revision = self.scan_revision();
         Ok(request)
     }
 
@@ -614,16 +617,9 @@ impl<S: Storage> Store<S> {
         response: &Response,
         request: &Request,
     ) -> Result<Finished, String> {
-        // Terminal/accounting cleanup remains entitled after ordinary session end. Reload only
-        // the prescribed material, and clear these temporary copies when no session owns them.
-        let _ = self.ensure_scan_references().await;
-        let result = self
-            .inference_finish_protected(call, response, request)
-            .await;
-        if self.sessions.iter().all(|s| s.ended.get()) {
-            self.clear_scan_working_copies();
-        }
-        result
+        // Terminal/accounting cleanup remains entitled after ordinary session end.
+        self.inference_finish_protected(call, response, request)
+            .await
     }
 
     async fn inference_finish_protected(
@@ -993,7 +989,6 @@ impl<S: Storage> InferenceJournal for Store<S> {
                 .continuation
                 .as_ref()
                 .is_none_or(|c| c.check().is_err())
-            || request.scan_revision != self.scan_revision()
             || self
                 .check_session_authority(&request.session, super::authority::current_pair(now))
                 .is_err()

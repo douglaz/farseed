@@ -355,14 +355,12 @@ const purchaseStatus = purchase => ({
   handed_off: 'Machine ready.',
   terms_changed: 'The price or setup changed. Review the updated plan before approving it.'
 })[purchase.phase] ?? 'Purchase status is unavailable. Open Details for the saved information.';
-const workBoundReason = 'protected output withheld: protection work bound exceeded';
 const pauseMessages = new Map();
 const pauseGroup = (reasons, message) => reasons.forEach(reason => pauseMessages.set(reason, message));
-pauseGroup([workBoundReason], 'The page stopped because checking the task’s history for secrets got too large. Resume may need several tries. If it keeps stopping here, Stop task ends it.');
 pauseGroup(['unknown task', 'stale or ended task', 'task ended'], 'This task is no longer available to continue. Review its saved details.');
 pauseGroup(['task encoding', 'task credential boundary', 'task result encoding', 'task result publication'], 'The page could not safely read or show this task. Unlock again; if it stays paused, keep the saved details for help.');
-pauseGroup(['protected output withheld: value depth exceeded', 'protected output withheld: encoding depth exceeded', 'protected output unavailable', 'inference protected field name invalid', 'inference output withheld after protected field collision', 'inference output escaped fragment count exceeds the local bound', 'scan length', 'scan marker contains protected material; output withheld', 'output hex', 'job output hex', 'output key collision after protection', 'redaction marker cannot exclude held credentials'], 'The page could not safely check the result for secrets, so it was withheld. Unlock again; if it stays paused, keep the saved details for help.');
-pauseGroup(['required scan material unavailable; output withheld', 'session credential has no response scan representation', 'held credential derivation refused', 'required scan material unavailable', 'invalid scan envelope', 'scan envelope encoding', 'noncanonical scan envelope', 'invalid scan ciphertext', 'noncanonical scan ciphertext', 'scan authentication failed', 'invalid scan material', 'scan material encoding', 'noncanonical or unsupported scan material', 'scan identity is not awaiting material'], 'Information needed to check results for secrets is unavailable or unreadable. Unlock again and resupply any requested keys before Resume.');
+pauseGroup(['protected output unavailable', 'job output hex', 'output key collision after protection', 'redaction marker cannot exclude held credentials'], 'The page could not safely check the result for secrets, so it was withheld. Unlock again; if it stays paused, keep the saved details for help.');
+pauseGroup(['session credential has no response scan representation', 'held credential derivation refused'], 'The page could not check results against its held credentials. Unlock again before Resume.');
 pauseGroup(['locked', 'response requires an unlocked seed'], 'The page is locked. Unlock it to continue.');
 pauseGroup(['missing pending job', 'missing pending identity', 'task has no pending job', 'no committed job evidence', 'job outcome is not trustworthy', 'pending task has no proposal', 'missing job exit', 'missing verification record', 'verification job mismatch'], 'The page cannot establish what happened to the earlier command. Review the saved details before deciding how to continue.');
 pauseGroup(['resolved target differs from task machine', 'fresh authority must bind only the task machine'], 'The connection points to a different machine. Restore the original machine connection before Resume.');
@@ -397,7 +395,6 @@ const plainPause = reason => {
   if (/^collection returned no outcome for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return 'The earlier command’s result is not available yet. Resume checks it again without running it twice.';
   if (/^collection record identity mismatch for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return 'The returned result does not match the earlier command. Review Details before Resume; the command will not be run twice.';
   if (/^collection (?:failed for pending call|failed for pending call \d+ job|.* for pending call) /.test(reason)) return 'The page could not establish the earlier command’s result. Review Details and check the connection before Resume; the command will not be run twice.';
-  if (reason.startsWith('scan nonce: ')) return 'The saved information needed to check for secrets is unreadable. Unlock again and resupply any requested keys before Resume.';
   return reason;
 };
 const sessionWait = reason => {

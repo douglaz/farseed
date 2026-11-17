@@ -25,43 +25,6 @@ fn reopen(store: &Store<MemoryStorage>) -> Store<MemoryStorage> {
     ))
     .unwrap()
 }
-#[test]
-fn poc_credit_account_filter_is_armed_only_after_commit_and_on_every_replay() {
-    let mut store = ready();
-    assert!(store.poc_credential_filters.borrow().is_empty());
-    block_on(store.credit_install(&account())).unwrap();
-    assert!(store.credit_account().is_some());
-    assert!(store.inference.account.is_none());
-    assert_eq!(store.next, 2);
-    assert!(block_on(store.credit_install(&account())).is_err());
-    for mut current in [store, reopen_after_install()] {
-        for text in [ID, KEY] {
-            assert!(!crate::poc::inference::safe(
-                &current,
-                &json!({"goal":text}),
-                &[]
-            ));
-            assert!(
-                block_on(current.commit(&Event::Command {
-                    machine: "fixture".into(),
-                    command: text.into()
-                }))
-                .is_err()
-            );
-            assert!(
-                !current
-                    .protect_output(&json!({"text":text}))
-                    .unwrap()
-                    .to_string()
-                    .contains(text)
-            );
-            let encoded = hex::encode(text);
-            assert!(!crate::poc::inference::safe(&current, &json!(encoded), &[]));
-        }
-        assert!(!current.credit_view().to_string().contains(ID));
-        assert!(!current.credit_view().to_string().contains(KEY));
-    }
-}
 fn reopen_after_install() -> Store<MemoryStorage> {
     let mut store = ready();
     block_on(store.credit_install(&account())).unwrap();
@@ -93,43 +56,6 @@ fn poc_credit_uncertain_account_append_holds_writes_until_replay() {
             assert!(reopened.credit_account().is_some());
             assert!(block_on(reopened.credit_install(&account())).is_err());
         }
-    }
-}
-#[test]
-fn poc_credit_only_initial_pair_is_durable_and_session_key_never_journaled() {
-    let mut store = ready();
-    block_on(store.credit_install(&account())).unwrap();
-    let session_key = "synthetic-session-credential-482700";
-    store.remember_poc_credential(session_key.as_bytes());
-    assert!(
-        block_on(store.commit(&Event::Command {
-            machine: "fixture".into(),
-            command: session_key.into()
-        }))
-        .is_err()
-    );
-    block_on(store.commit(&Event::Command {
-        machine: "fixture".into(),
-        command: "true".into(),
-    }))
-    .unwrap();
-    let mut scan = Store::new(
-        store.storage.clone(),
-        DataKey(store.key.0),
-        store.id.clone(),
-    );
-    for number in 0..store.next {
-        let bytes = block_on(scan.storage.read(&number.to_string())).unwrap();
-        let event = scan.open(number, &bytes).unwrap();
-        let plain = Zeroizing::new(serde_json::to_string(&event).unwrap());
-        assert!(
-            !plain.contains(session_key),
-            "session key reached a decrypted record"
-        );
-        if !matches!(event, Event::PocCreditAccount(_)) {
-            assert!(!plain.contains(ID) && !plain.contains(KEY));
-        }
-        scan.previous = Address(Sha256::digest(&bytes).into());
     }
 }
 #[test]

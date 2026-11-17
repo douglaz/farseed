@@ -45,59 +45,20 @@ impl Redacted {
         body: &[u8],
         credentials: &[&[u8]],
     ) -> Result<Self, String> {
-        crate::poc::inference::work::scope(|| {
-            let mut held = store.held_credentials()?;
-            held.borrowed.extend_from_slice(credentials);
-            let scanned = store.scan_output(&[body])?;
-            let output = redact(&scanned, &[], &held)?;
-            // Only replacement can introduce a new echo into already protected bytes.
-            if output.as_bytes() != scanned.as_slice()
-                && !store.poc_output_is_safe(output.as_bytes())?
-            {
-                return Err(crate::poc::wait::PROTECTED_UNAVAILABLE.into());
-            }
-            Ok(output)
-        })
+        let mut held = store.held_credentials()?;
+        held.borrowed.extend_from_slice(credentials);
+        redact(body, &[], &held)
     }
 
-    /// Refuse decoded values rather than execute a command altered by redaction.
+    /// Refuse a command altered by the exact credential boundary.
     pub(crate) fn inference_value_is_safe<S: Storage>(
         store: &Store<S>,
         value: &serde_json::Value,
         credentials: &[&[u8]],
     ) -> bool {
-        crate::poc::inference::work::scope(|| {
-            Ok((|| {
-                use serde_json::Value;
-                let Ok(mut held) = store.held_credentials() else {
-                    return false;
-                };
-                held.borrowed.extend_from_slice(credentials);
-                fn safe(value: &Value, held: &Held<'_>) -> bool {
-                    let exact = |bytes: &[u8]| {
-                        redact(bytes, &[], held).is_ok_and(|r| r.as_bytes() == bytes)
-                    };
-                    match value {
-                        Value::String(s) => exact(s.as_bytes()),
-                        Value::Array(a) => a.iter().all(|v| safe(v, held)),
-                        Value::Object(o) => {
-                            o.iter().all(|(k, v)| exact(k.as_bytes()) && safe(v, held))
-                        }
-                        _ => exact(value.to_string().as_bytes()),
-                    }
-                }
-                safe(value, &held) && store.protect_output(value).is_ok_and(|safe| safe == *value)
-            })())
-        })
-        .unwrap_or(false)
-    }
-
-    /// One decoded representation, without recursively invoking the PoC decoder.
-    pub(crate) fn decoded<S: Storage>(store: &Store<S>, body: &[u8]) -> Result<Self, String> {
-        crate::poc::inference::work::scope(|| {
-            crate::poc::inference::work::charge(body.len().saturating_mul(4))?;
-            redact(&store.scan_decoded(body)?, &[], &store.held_credentials()?)
-        })
+        store
+            .protect_output_with(value, credentials)
+            .is_ok_and(|safe| safe == *value)
     }
 
     pub(crate) fn for_store<S: Storage>(
@@ -105,28 +66,20 @@ impl Redacted {
         body: &[u8],
         fields: &[&str],
     ) -> Result<Self, String> {
-        Self::for_store_cached(store, body, fields, &mut Vec::new())
-    }
-
-    /// Echo checks reuse only an identical computed filter key, in memory for the store lifetime.
-    /// Exact placed-secret and held-credential boundaries still run on every representation
-    /// unless the enclosing output memo has a complete clean check under its full context key.
-    pub(crate) fn for_store_cached<S: Storage>(
-        store: &Store<S>,
-        body: &[u8],
-        fields: &[&str],
-        cache: &mut Vec<crate::poc::inference::EchoCache>,
-    ) -> Result<Self, String> {
-        crate::poc::inference::work::scope(|| {
-            let scanned = store.scan_output_cached(&[body], cache)?;
-            let output = redact(&scanned, fields, &store.held_credentials()?)?;
-            if output.as_bytes() != scanned.as_slice()
-                && !store.poc_output_is_safe(output.as_bytes())?
-            {
-                return Err(crate::poc::wait::PROTECTED_UNAVAILABLE.into());
-            }
-            Ok(output)
-        })
+        let held = store.held_credentials()?;
+        // Declared response fields are a protocol operation, not content decoding.
+        if fields.is_empty() {
+            redact(body, fields, &held)
+        } else {
+            let value: serde_json::Value = serde_json::from_slice(body)
+                .map_err(|_| "response is not JSON for declared fields".to_string())?;
+            let safe = store.protect_output(&value)?;
+            let bytes = Zeroizing::new(
+                serde_json::to_vec(&safe)
+                    .map_err(|_| "response JSON cannot be serialized".to_string())?,
+            );
+            redact(&bytes, fields, &held)
+        }
     }
 }
 
@@ -136,8 +89,8 @@ impl fmt::Debug for Redacted {
     }
 }
 
-/// Transient enumeration: existing holders are borrowed; derived copies keep their registered
-/// credential types and zeroize on drop. No unregistered key buffer extends their lifetime.
+/// Transient enumeration: existing holders are borrowed; derived keys and canonical credential
+/// text zeroize on drop. No copy extends the lifetime of its holder.
 pub(crate) struct Held<'a> {
     pub borrowed: Vec<&'a [u8]>,
     pub mnemonic: Zeroizing<String>,
@@ -150,24 +103,15 @@ pub(crate) enum Derived {
     Sender(AttestSenderKey),
     Recipient(AttestRecipientKey),
     Relay(RelayKey),
-    RelayText(crate::poc::credit::SecretText),
+    #[cfg(target_arch = "wasm32")]
+    Inference(crate::credential::InferenceAccountCredential),
+    #[cfg(target_arch = "wasm32")]
+    Session(crate::credential::SessionInferenceKey),
     Handoff(PostHarnessCredential),
+    Text(Zeroizing<String>),
 }
 
 impl Held<'_> {
-    pub(crate) fn digest(&self) -> sha2::digest::Output<sha2::Sha256> {
-        use sha2::{Digest, Sha256};
-        let mut values = self.values().map(Sha256::digest).collect::<Vec<_>>();
-        values.sort();
-        let mut hash = Sha256::new();
-        hash.update(b"protection/held-values/v1");
-        hash.update((values.len() as u64).to_be_bytes());
-        for value in values {
-            hash.update(value);
-        }
-        hash.finalize()
-    }
-
     fn values(&self) -> impl Iterator<Item = &[u8]> {
         self.borrowed
             .iter()
@@ -183,8 +127,12 @@ impl Held<'_> {
                 Derived::Sender(key) => key.0.as_slice(),
                 Derived::Recipient(key) => key.0.as_slice(),
                 Derived::Relay(key) => key.0.as_slice(),
-                Derived::RelayText(text) => text.0.as_bytes(),
+                #[cfg(target_arch = "wasm32")]
+                Derived::Inference(key) => key.0.as_slice(),
+                #[cfg(target_arch = "wasm32")]
+                Derived::Session(key) => key.0.as_slice(),
                 Derived::Handoff(key) => key.0.as_slice(),
+                Derived::Text(text) => text.as_bytes(),
             }))
             .filter(|value| !value.is_empty())
     }
@@ -196,7 +144,7 @@ impl fmt::Debug for Held<'_> {
     }
 }
 
-fn redact(body: &[u8], fields: &[&str], held: &Held<'_>) -> Result<Redacted, String> {
+pub(crate) fn redact(body: &[u8], fields: &[&str], held: &Held<'_>) -> Result<Redacted, String> {
     let bytes = if fields.is_empty() {
         body.to_vec()
     } else {
@@ -217,16 +165,10 @@ fn redact(body: &[u8], fields: &[&str], held: &Held<'_>) -> Result<Redacted, Str
     let mut ranges = Vec::new();
     for needle in held.values() {
         credential_matches(&bytes, needle, |start| {
-            crate::poc::inference::work::charge(32)?;
             ranges.push((start, start + needle.len()));
-            Ok(false)
-        })?;
+            false
+        });
     }
-    crate::poc::inference::work::charge(
-        ranges
-            .len()
-            .saturating_mul(ranges.len().max(1).ilog2() as usize + 1),
-    )?;
     ranges.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (start, end) in ranges {
@@ -249,26 +191,18 @@ fn redact(body: &[u8], fields: &[&str], held: &Held<'_>) -> Result<Redacted, Str
     // The marker itself (or its junction with preserved bytes) could contain a held value.
     // Refuse instead of claiming that such an output passed.
     for needle in held.values() {
-        if credential_matches(&output, needle, |_| Ok(true))? {
+        if credential_matches(&output, needle, |_| true) {
             return Err(crate::poc::wait::REDACTION_MARKER.into());
         }
     }
     Ok(Redacted { bytes: output })
 }
 
-/// KMP compares at most linear byte-work, including overlapping occurrences. Charge before
-/// allocating the prefix table or scanning, rather than charging every window's full length.
-fn credential_matches(
-    bytes: &[u8],
-    needle: &[u8],
-    mut found: impl FnMut(usize) -> Result<bool, String>,
-) -> Result<bool, String> {
-    crate::poc::inference::work::charge(
-        bytes
-            .len()
-            .saturating_mul(4)
-            .saturating_add(needle.len().saturating_mul(16)),
-    )?;
+/// Linear exact matching, including overlapping occurrences.
+fn credential_matches(bytes: &[u8], needle: &[u8], mut found: impl FnMut(usize) -> bool) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
     let mut prefix = Zeroizing::new(vec![0usize; needle.len()]);
     let mut matched = 0;
     for i in 1..needle.len() {
@@ -289,13 +223,13 @@ fn credential_matches(
             matched += 1;
         }
         if matched == needle.len() {
-            if found(i + 1 - matched)? {
-                return Ok(true);
+            if found(i + 1 - matched) {
+                return true;
             }
             matched = prefix[matched - 1];
         }
     }
-    Ok(false)
+    false
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -322,4 +256,9 @@ mod tests {
         assert_eq!(error, "redaction marker cannot exclude held credentials");
         assert_eq!(format!("{held:?}"), "Held(..)");
     }
+}
+
+/// Exact credential check for a transient boundary without a store.
+pub(crate) fn contains(bytes: &[u8], credential: &[u8]) -> bool {
+    credential_matches(bytes, credential, |_| true)
 }

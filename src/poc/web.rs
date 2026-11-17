@@ -386,7 +386,7 @@ async fn committed(
     let Some(observation) = run::committed_observation(&report) else {
         return Ok(None);
     };
-    store.ensure_scan_references().await?;
+
     let mut value = serde_json::json!({"command_result":report});
     if task
         .proposal
@@ -406,6 +406,7 @@ async fn committed(
             safe = store.protect_output(&safe)?;
         }
         let encoded = safe.to_string();
+        store.check_output_bytes(encoded.as_bytes())?;
         let message =
             js_sys::JSON::parse(&encoded).map_err(|_| crate::poc::wait::RESULT_ENCODING)?;
         if store.current_command_results(&mut safe) {
@@ -655,7 +656,7 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                     if confirmation.task != id || confirmation.session != session {
                         return Err("confirmation task or session differs".into());
                     }
-                    store.ensure_scan_references().await?;
+
                     continuation.check()?;
                     response
                         .borrow_mut()
@@ -721,7 +722,6 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                 match crate::poc::targets::resolve(store, &task.machine) {
                     Ok(resolved) => Ok(resolved),
                     Err(reason) => {
-                        store.ensure_scan_references().await?;
                         let reason = if let Some(profile) =
                             reason.strip_prefix("unsupported relay profile: ")
                         {
