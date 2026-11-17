@@ -492,9 +492,57 @@ fn request_context<S: Storage>(
         if task.and_then(|t| store.poc_machine_distribution(&t.machine)) == Some("nixos") {
             messages.push(json!({"role":"system","content":"This machine runs NixOS: make lasting changes in the system configuration (/etc/nixos/configuration.nix or a module it imports) and apply them with `nixos-rebuild switch`; packages or services installed any other way don't survive a rebuild or reboot."}));
         }
-        if let Some(facts) = task.and_then(|t| store.poc_inference_facts(t)) {
+        if let Some(mut facts) = task.and_then(|t| store.poc_inference_facts(t)) {
+            if let Some(task) = task.filter(|t| t.template.as_deref() == Some(super::template::ID))
+            {
+                let target = store
+                    .poc_target(&task.machine)
+                    .ok_or("template machine target missing")?;
+                let configuration = store.session_configuration(&task.start_session)?;
+                facts["MACHINE_ADDRESS"] = json!(target.host);
+                facts["AI_BASE_URL"] = json!(
+                    configuration
+                        .endpoint
+                        .strip_suffix("/chat/completions")
+                        .unwrap_or(&configuration.endpoint)
+                );
+                facts["AI_MODEL"] = json!(configuration.model);
+                for (name, value) in super::template::facts(task.options.as_ref()) {
+                    facts[name] = json!(value);
+                }
+            }
             let facts = store.protect_output_with(&facts, credentials)?;
             messages.push(json!({"role":"user","content":facts.to_string()}));
+        }
+        if let Some(task) = task.filter(|t| t.template.as_deref() == Some(super::template::ID)) {
+            let template = &super::template::CONTROL_CENTER;
+            let mut extra = vec![
+                json!({"role":"system","content":format!("{}\n\n{}", template.header, template.facts)}),
+            ];
+            if let Some(current) = template.current(task, store.poc_needs_declaration(machine)) {
+                extra.push(json!({"role":"user","content":current}));
+            }
+            let repair = !task.verifying && !task.findings.is_empty();
+            if repair {
+                let details = task
+                    .findings
+                    .iter()
+                    .map(|finding| finding.detail.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                extra.push(json!({"role":"user","content":format!("The checks after done found: {details} Follow Recovery, fix them, then call done again.")}));
+            }
+            if repair || template.failed(task) {
+                extra.push(json!({"role":"user","content":template.recovery}));
+            }
+            let extra = store.protect_output_with(&json!(extra), credentials)?;
+            messages.extend(
+                extra
+                    .as_array()
+                    .ok_or("template message protection")?
+                    .iter()
+                    .cloned(),
+            );
         }
         if let Some(task) = task
             && let Some(malformed) = &task.malformed
@@ -597,7 +645,13 @@ fn request_context<S: Storage>(
             let mut handover = String::from(
                 "Handover checks. After done, the harness runs these reads once and judges only them:\n",
             );
-            for read in super::completion::reads(declaration)? {
+            let mut reads = super::completion::reads(declaration)?;
+            if task.is_some_and(|t| t.template.as_deref() == Some(super::template::ID)) {
+                reads.push(super::completion::Read::ControlCenter {
+                    hashes: super::template::CONTROL_CENTER.hashes.map(str::to_owned),
+                });
+            }
+            for read in reads {
                 let passes = match &read {
                     super::completion::Read::Running { .. } => "prints active".into(),
                     super::completion::Read::Enabled { .. } => "prints enabled".into(),
@@ -608,6 +662,9 @@ fn request_context<S: Storage>(
                     ),
                     super::completion::Read::SignIn { .. } => {
                         unreachable!("declaration reads have no URLs")
+                    }
+                    super::completion::Read::ControlCenter { .. } => {
+                        "exit 0 and the last non-empty line starts with CHECKS done PASS".into()
                     }
                 };
                 handover.push_str(&format!("{}: {passes}\n", read.command()));

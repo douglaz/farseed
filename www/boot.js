@@ -723,6 +723,29 @@ const renderSetup = (store) => {
           worker.postMessage({ goal: { session: session.identity, text, document_source } });
         });
         card.append(words, source, enter);
+        for (const template of store.goal_templates ?? []) {
+          const choice = document.createElement('section');
+          paragraph(choice, 'Start from a template');
+          paragraph(choice, template.text);
+          const options = new Map();
+          for (const value of template.options) {
+            const label = document.createElement('label');
+            const option = document.createElement('input');
+            option.type = 'checkbox'; option.checked = value.default;
+            label.append(option, document.createTextNode(value.label));
+            choice.append(label);
+            options.set(value.name, option);
+          }
+          const choose = document.createElement('button');
+          choose.type = 'button'; choose.textContent = template.name;
+          choose.dataset.goalEnter = session.identity;
+          choose.addEventListener('click', () => {
+            choose.disabled = true; enter.disabled = true;
+            worker.postMessage({goal: {session: session.identity, text: '', document_source: null, template: template.id, options: Object.fromEntries([...options].map(([name, option]) => [name, option.checked]))}});
+          });
+          choice.append(choose);
+          card.append(choice);
+        }
       }
       const pending = session.pending_requirements;
       if (pending) {
@@ -1087,7 +1110,7 @@ const renderTasks = (store) => {
     }
     for (const finding of task.findings ?? []) {
       const service = finding.service?.name;
-      paragraph(card, finding.field === 'sign_in' ? finding.detail : service ? `${service} does not match the approved setup.` : finding.field === 'inbound' ? 'The listening ports do not match the approved setup.' : 'A setup check found a difference or could not finish. Open Details to review it.');
+      paragraph(card, ['sign_in', 'control_center'].includes(finding.field) ? finding.detail : service ? `${service} does not match the approved setup.` : finding.field === 'inbound' ? 'The listening ports do not match the approved setup.' : 'A setup check found a difference or could not finish. Open Details to review it.');
       rawDetails(card, finding);
     }
     for (const note of task.notes ?? []) paragraph(card, note.text === 'enabled, restart not demonstrated'

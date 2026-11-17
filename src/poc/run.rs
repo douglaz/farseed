@@ -158,6 +158,13 @@ pub async fn resume(
     if task.pending.is_some() {
         return inspect(runtime, &task, session).await;
     }
+    if task.template.as_deref() == Some(super::template::ID)
+        && task.status == Status::Paused
+        && task.pause_reason.as_deref() == Some(super::completion::FINDINGS)
+        && task.verifying
+    {
+        task = runtime.change(&task, Change::RepairFindings).await?;
+    }
     if task.proposal.is_none() {
         if task.verifying {
             task = runtime.change(&task, Change::PrepareCheck).await?;

@@ -14,11 +14,25 @@ pub struct Goal {
     pub text: String,
     pub source: String,
     pub document_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<crate::poc::template::Options>,
 }
 
 impl Goal {
     pub fn valid(&self) -> bool {
         !self.text.trim().is_empty()
+            && match (&self.template, &self.options) {
+                (None, None) => true,
+                (Some(id), options) => {
+                    id == crate::poc::template::ID
+                        && crate::poc::template::valid_options(options.as_ref())
+                        && self.text == crate::poc::template::goal(options.as_ref())
+                        && self.document_source.is_none()
+                }
+                _ => false,
+            }
             && self.source == SOURCE
             && self
                 .document_source

@@ -2603,6 +2603,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 "delivery": store.delivery_view(),
                 "sessions": store.sessions(),
                 "goals": store.goals,
+                "goal_templates": [{"id":crate::poc::template::ID,"name":crate::poc::template::NAME,"text":crate::poc::template::USER_TEXT,"options":crate::poc::template::OPTIONS.iter().map(|(name, label, default)| json!({"name":name,"label":label,"default":default})).collect::<Vec<_>>()}],
                 "mode_acceptances": store.mode_acceptances(),
                 "signature_refusals": store.signature_refusals(),
                 "installations": store.dispatch.approved_entries.keys().filter(|m| store.installation_unpinned(m)).map(|m| json!({"machine":m,"installation":"unpinned"})).collect::<Vec<_>>(),

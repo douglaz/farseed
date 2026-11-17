@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 pub const DELIVERED: &str = "Delivered (service and TCP checks only)";
 pub const DELIVERED_SIGN_IN: &str = "Delivered (service, TCP and sign-in checks only)";
+pub const DELIVERED_CONTROL_CENTER: &str =
+    "Delivered (service, TCP, sign-in and control-center checks only)";
 pub const FINDINGS: &str = "Handed over with findings";
 pub const UNKNOWN: &str = "Findings unknown until a complete re-check";
 
@@ -18,6 +20,7 @@ pub enum Read {
     Enabled { service: Service },
     Listeners,
     SignIn { url: String },
+    ControlCenter { hashes: [String; 2] },
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +46,11 @@ pub enum Observation {
         password_input: bool,
     },
     SignInUnreachable,
+    ControlCenter {
+        passed: bool,
+        names: Vec<String>,
+        checks_failed: bool,
+    },
     Failed(String),
 }
 fn template(table: &str, key: &str) -> &'static str {
@@ -69,6 +77,10 @@ impl Read {
             )
             .replace("{name}", &format!("'{}'", service.name)),
             Self::Listeners => template("listeners_inbound", "command").into(),
+            Self::ControlCenter { hashes } => format!(
+                "printf '%s  /etc/nixos/cc-rebuild.sh\\n%s  /etc/nixos/cc-check.sh\\n' {} {} | sha256sum -c --quiet && sh /etc/nixos/cc-check.sh done",
+                hashes[0], hashes[1]
+            ),
             Self::SignIn { url } => {
                 #[cfg(target_arch = "wasm32")]
                 let host = web_sys::Url::new(url)
@@ -110,6 +122,32 @@ impl Read {
                 Err(why) => Observation::Failed(why),
             },
             Self::SignIn { .. } => sign_in(exit, stdout),
+            Self::ControlCenter { .. } => {
+                let passed =
+                    exit == 0 && super::template::last_line(stdout).starts_with("CHECKS done PASS");
+                let names = stdout
+                    .lines()
+                    .filter_map(|line| {
+                        let rest = line.strip_prefix("CHECK ")?;
+                        let (name, _) = rest.split_once(" FAIL")?;
+                        (name.len() <= 64
+                            && !name.is_empty()
+                            && name
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)))
+                        .then(|| name.to_owned())
+                    })
+                    .take(8)
+                    .collect();
+                let checks_failed = stdout
+                    .lines()
+                    .any(|line| line.starts_with("CHECKS done FAIL"));
+                Observation::ControlCenter {
+                    passed,
+                    names,
+                    checks_failed,
+                }
+            }
             _ => Observation::Failed(format!("Read {} exited with status {exit}", self.command())),
         }
     }
@@ -464,6 +502,41 @@ pub fn judge(
             finding(&mut sign_in, detail);
         }
         fields.push(sign_in);
+    }
+    if plan
+        .iter()
+        .any(|read| matches!(read, Read::ControlCenter { .. }))
+    {
+        required.push(FieldId::ControlCenter);
+        let mut control_center = result(FieldId::ControlCenter, delivery::Status::Checked);
+        for (index, read) in plan.iter().enumerate() {
+            if !matches!(read, Read::ControlCenter { .. }) {
+                continue;
+            }
+            match observations.get(index).and_then(Option::as_ref) {
+                None => control_center.status = delivery::Status::Unavailable,
+                Some(Observation::ControlCenter { passed: true, .. }) => {}
+                observation => {
+                    let names = match observation {
+                        Some(Observation::ControlCenter { names, .. }) if !names.is_empty() => {
+                            names.join(", ")
+                        }
+                        Some(Observation::ControlCenter {
+                            checks_failed: true,
+                            ..
+                        }) => "some checks".into(),
+                        _ => "the check could not run".into(),
+                    };
+                    finding(
+                        &mut control_center,
+                        format!(
+                            "The control center's final check failed: {names}. Resume the task to let the AI repair it."
+                        ),
+                    );
+                }
+            }
+        }
+        fields.push(control_center);
     }
     let mut result = delivery::aggregate_selected(&required, fields, standing, true);
     if unstated(d).is_some()

@@ -48,6 +48,9 @@ struct Entry {
     session: String,
     text: String,
     document_source: Option<String>,
+    template: Option<String>,
+    #[serde(default)]
+    options: Option<crate::poc::template::Options>,
 }
 
 #[wasm_bindgen]
@@ -92,7 +95,13 @@ async fn enter(request: &str) -> Result<(), String> {
         local
             .store()
             .ok_or("locked")?
-            .enter_goal(&entry.session, entry.text, entry.document_source)
+            .enter_template_goal(
+                &entry.session,
+                entry.text,
+                entry.document_source,
+                entry.template,
+                entry.options,
+            )
             .await?;
         if source.is_some() {
             PENDING.with_borrow_mut(|p| p.insert(entry.session.clone()));

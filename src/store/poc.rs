@@ -84,6 +84,10 @@ pub struct Task {
     pub id: String,
     pub start_session: String,
     pub goal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options: Option<crate::poc::template::Options>,
     pub machine: String,
     pub approved_plan: Option<String>,
     pub completed: Vec<Step>,
@@ -213,10 +217,12 @@ pub enum Change {
         call_id: String,
         tool: Tool,
     },
-    // New done calls add sign-in reads; keep Propose's historical read plan on replay.
+    // New done calls pin template hashes and add sign-in reads; keep Propose's read plan.
     ProposeDone {
         call_id: String,
         tool: Tool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        control_center_hashes: Option<[String; 2]>,
     },
     // Record admission once; URL parsing must never change a question during replay.
     ProposeOperator {
@@ -226,6 +232,7 @@ pub enum Change {
     },
     PrepareCheck,
     RetryChecks,
+    RepairFindings,
     SkipReport(String),
     RejectDeclaration,
     AiKeyFailed(String),
@@ -622,7 +629,16 @@ impl<S: Storage> Store<S> {
                 tool,
             }
         } else if matches!(tool, Tool::Done { .. }) {
-            Change::ProposeDone { call_id, tool }
+            Change::ProposeDone {
+                call_id,
+                tool,
+                control_center_hashes: (task.template.as_deref() == Some(crate::poc::template::ID))
+                    .then(|| {
+                        crate::poc::template::CONTROL_CENTER
+                            .hashes
+                            .map(str::to_owned)
+                    }),
+            }
         } else {
             Change::Propose { call_id, tool }
         };
@@ -1005,6 +1021,8 @@ impl<S: Storage> Store<S> {
                 id: id.clone(),
                 start_session: session.clone(),
                 goal: goal.text.clone(),
+                template: goal.template.clone(),
+                options: goal.options.clone(),
                 machine: exposure.bound_set[0].machine.clone(),
                 approved_plan: None,
                 completed: vec![],
@@ -1294,7 +1312,7 @@ impl<S: Storage> Store<S> {
                         }
                     }
                     Change::Propose { call_id, tool }
-                    | Change::ProposeDone { call_id, tool }
+                    | Change::ProposeDone { call_id, tool, .. }
                     | Change::ProposeOperator { call_id, tool, .. } => {
                         if matches!(change, Change::ProposeDone { .. })
                             && !matches!(tool, Tool::Done { .. })
@@ -1423,6 +1441,33 @@ impl<S: Storage> Store<S> {
                                                 } else {
                                                     crate::poc::completion::reads(declaration)?
                                                 };
+                                            if task.template.as_deref()
+                                                == Some(crate::poc::template::ID)
+                                            {
+                                                let Change::ProposeDone {
+                                                    control_center_hashes: Some(hashes),
+                                                    ..
+                                                } = change
+                                                else {
+                                                    return Err("template done requires recorded script hashes".into());
+                                                };
+                                                if !hashes.iter().all(|hash| {
+                                                    hash.len() == 64
+                                                        && hash.bytes().all(|b| {
+                                                            b.is_ascii_digit()
+                                                                || (b'a'..=b'f').contains(&b)
+                                                        })
+                                                }) {
+                                                    return Err(
+                                                        "invalid recorded script hashes".into()
+                                                    );
+                                                }
+                                                task.read_plan.push(
+                                                    crate::poc::completion::Read::ControlCenter {
+                                                        hashes: hashes.clone(),
+                                                    },
+                                                );
+                                            }
                                             task.checks = task
                                                 .read_plan
                                                 .iter()
@@ -1571,6 +1616,24 @@ impl<S: Storage> Store<S> {
                         task.reports[index].excerpt = why.clone();
                         task.active();
                     }
+                    Change::RepairFindings => {
+                        if task.template.as_deref() != Some(crate::poc::template::ID)
+                            || task.status != Status::Paused
+                            || task.pause_reason.as_deref()
+                                != Some(crate::poc::completion::FINDINGS)
+                            || !task.verifying
+                            || task.pending.is_some()
+                            || task.proposal.is_some()
+                            || task.findings.is_empty()
+                        {
+                            return Err("template repair requires paused handover findings".into());
+                        }
+                        task.previous_reads
+                            .push(std::mem::take(&mut task.verification));
+                        task.verifying = false;
+                        task.verdict = None;
+                        task.active();
+                    }
                     Change::RetryChecks => {
                         if !task.verifying || task.pending.is_some() {
                             return Err("re-check requires no pending call".into());
@@ -1653,7 +1716,9 @@ impl<S: Storage> Store<S> {
                                 task.pause(crate::poc::completion::UNKNOWN);
                             } else if result.delivered {
                                 task.verdict = Some(
-                                    if task.read_plan.iter().any(|read| {
+                                    if task.template.as_deref() == Some(crate::poc::template::ID) {
+                                        crate::poc::completion::DELIVERED_CONTROL_CENTER
+                                    } else if task.read_plan.iter().any(|read| {
                                         matches!(read, crate::poc::completion::Read::SignIn { .. })
                                     }) {
                                         crate::poc::completion::DELIVERED_SIGN_IN
