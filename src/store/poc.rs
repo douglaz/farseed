@@ -343,6 +343,13 @@ impl<S: Storage> Store<S> {
             }
         }
     }
+    pub(crate) fn poc_machine_distribution(&self, machine: &str) -> Option<&str> {
+        self.procurement
+            .iter()
+            .chain(&self.completed_purchases)
+            .find(|p| p.machine == machine && p.target.is_some())
+            .and_then(|p| p.selected.image["distribution"].as_str())
+    }
     pub(crate) fn poc_inference_facts(&self, task: &Task) -> Option<Value> {
         let machine = task.machine.as_str();
         let exposure = self
@@ -353,6 +360,8 @@ impl<S: Storage> Store<S> {
         Some(json!({
             "session":task.start_session,
             "task":task.id,
+            "distribution":self.poc_machine_distribution(machine),
+            "user":self.poc_target(machine).map(|target| &target.user),
             "goal_source":self.goal(&task.start_session),
             "bound_set":exposure.bound_set.iter().map(|bound| &bound.machine).collect::<Vec<_>>(),
             "approved_entry":{"entry":approved.approved.entry,"access":approved.approved.access},

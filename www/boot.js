@@ -334,6 +334,8 @@ const commandSummary = command => {
   const words = {
     systemctl: ['enable', 'disable', 'start', 'stop', 'restart', 'reload', 'status', 'is-active', 'is-enabled', 'daemon-reload'],
     pacman: ['-S', '-Sy', '-Syu', '-Syyu', '-R', '-Rs', '-Rns', '-Q', '-Qi', '-Qs'],
+    'nixos-rebuild': ['switch', 'boot', 'test', 'build', 'dry-build', 'dry-activate'],
+    nix: ['build', 'shell', 'run', 'profile', 'search', 'flake', 'store', 'eval'],
     apt: ['update', 'upgrade', 'install', 'remove', 'purge', 'show', 'list'],
     'apt-get': ['update', 'upgrade', 'install', 'remove', 'purge'],
     dnf: ['update', 'upgrade', 'install', 'remove', 'info', 'list'],
@@ -1374,8 +1376,9 @@ const renderProvider = (store, enabled) => {
     }
     const images = $('provider-image'); images.replaceChildren(new Option('Choose a fetched image', ''));
     for (const image of providerCatalogue.images) {
-      const unsupported = image.encrypted || image.distribution !== 'archlinux' || (image.default_username && image.default_username !== 'arch');
-      const label = `${image.distribution} ${image.flavour} ${image.version}${unsupported ? ' — unsupported (requires unencrypted Arch without console unlock)' : ''}`;
+      const user = !Object.hasOwn(image, 'default_username') && image.distribution === 'archlinux' ? 'arch' : image.default_username;
+      const unsupported = image.encrypted !== false || !['archlinux', 'nixos'].includes(image.distribution) || typeof user !== 'string' || !/^[a-z_][a-z0-9_-]{0,31}$/.test(user) || user !== user.trim();
+      const label = `${image.distribution} ${image.flavour} ${image.version}${unsupported ? ' — unsupported (requires a supported unencrypted image without console unlock)' : ''}`;
       const option = new Option(label, String(image.id)); option.disabled = unsupported; images.add(option);
     }
     providerSelectionDirty = true; $('provider-approve-charge').checked = false;

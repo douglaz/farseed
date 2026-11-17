@@ -489,6 +489,9 @@ fn request_context<S: Storage>(
         ];
         messages.push(json!({"role":"system","content":"When the operator needs a file from the machine, such as a VPN connection file or sign-in details, offer it with offer_file instead of printing its contents. The operator downloads it from the page."}));
         messages.push(json!({"role":"system","content":"When a step needs the operator, such as approving a login in their own account at a link the software printed or choosing between options, call ask_operator with the purpose, the HTTPS link if any and short choices; wait for the answer, then check the result on the machine. Keep long-running login commands in the background under the existing background-command rules while the operator acts."}));
+        if task.and_then(|t| store.poc_machine_distribution(&t.machine)) == Some("nixos") {
+            messages.push(json!({"role":"system","content":"This machine runs NixOS: make lasting changes in the system configuration (/etc/nixos/configuration.nix or a module it imports) and apply them with `nixos-rebuild switch`; packages or services installed any other way don't survive a rebuild or reboot."}));
+        }
         if let Some(facts) = task.and_then(|t| store.poc_inference_facts(t)) {
             let facts = store.protect_output_with(&facts, credentials)?;
             messages.push(json!({"role":"user","content":facts.to_string()}));

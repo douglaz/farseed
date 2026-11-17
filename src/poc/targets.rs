@@ -62,6 +62,15 @@ fn token(value: &str, max: usize) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
 
+pub(crate) fn valid_login_user(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && (value.as_bytes()[0].is_ascii_lowercase() || value.as_bytes()[0] == b'_')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"_-".contains(&b))
+}
+
 fn host(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 253
@@ -121,7 +130,8 @@ impl TargetRecord {
         if self.port == 0 {
             return Err("invalid target port".into());
         }
-        if !token(&self.user, 64) {
+        // Keep legacy target names valid and admit every supported image login user.
+        if !token(&self.user, 64) && !valid_login_user(&self.user) {
             return Err("invalid target user".into());
         }
         let valid_pin = self.pin.strip_prefix("SHA256:").is_some_and(|encoded| {

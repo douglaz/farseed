@@ -595,11 +595,22 @@ pub(crate) fn catalogue_public(
 }
 pub fn supported_image(image: &Value) -> bool {
     id(image).is_ok()
-        && image["distribution"] == "archlinux"
+        && matches!(image["distribution"].as_str(), Some("archlinux" | "nixos"))
         && image["encrypted"] == false
-        && image.get("default_username").is_none_or(|v| v == "arch")
+        && image_user(image).is_ok()
         && text(image, "flavour", 128).is_ok()
         && text(image, "version", 128).is_ok()
+}
+pub(crate) fn image_user(image: &Value) -> Result<&str, String> {
+    let user = match image.get("default_username") {
+        None if image["distribution"] == "archlinux" => "arch",
+        Some(value) => value.as_str().ok_or(REFUSED)?,
+        None => return Err(REFUSED.into()),
+    };
+    if !super::targets::valid_login_user(user) {
+        return Err(REFUSED.into());
+    }
+    Ok(user)
 }
 fn optional_cpu(value: &Value, field: &str) -> Result<Option<String>, String> {
     if value.get(field).is_none_or(Value::is_null) {
@@ -715,7 +726,7 @@ impl Selection {
         text(&self.offer, "name", 128)?;
         if !supported_image(&self.image) {
             return Err(
-                "Choose a supported unencrypted Arch image; console unlock is unsupported.".into(),
+                "Choose a supported unencrypted image; console unlock is unsupported.".into(),
             );
         }
         if let (Some(a), Some(b)) = (

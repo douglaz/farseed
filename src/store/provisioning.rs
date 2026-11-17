@@ -37,6 +37,10 @@ fn closed_message(p: &Purchase) -> String {
     message
 }
 
+fn default_purchase_user() -> String {
+    "arch".into()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Purchase {
@@ -48,6 +52,8 @@ pub struct Purchase {
     pub account: String,
     pub relay: String,
     pub selected: Selection,
+    #[serde(default = "default_purchase_user")]
+    pub user: String,
     pub approved_at: u64,
     #[serde(default)]
     pub pending_selection: Option<Selection>,
@@ -529,6 +535,7 @@ impl<S: Storage> Store<S> {
             class_answer: approval.class_answer,
             account: api.account(),
             relay: approval.relay,
+            user: protocol::image_user(&selected.image)?.into(),
             selected,
             approved_at: api.now(),
             pending_selection: None,
@@ -580,6 +587,9 @@ impl<S: Storage> Store<S> {
                 return Err(REFUSED.into());
             }
             p.selected.validate()?;
+            if p.user != protocol::image_user(&p.selected.image)? {
+                return Err(REFUSED.into());
+            }
             if protocol::provider_origin(&p.origin)? != p.origin {
                 return Err(REFUSED.into());
             }
@@ -689,6 +699,7 @@ impl<S: Storage> Store<S> {
                     return Err(REFUSED.into());
                 }
                 selected.validate()?;
+                p.user = protocol::image_user(&selected.image)?.into();
                 p.selected = selected.clone();
                 p.approved_at = *approved_at;
                 p.pending_selection = None;
@@ -828,7 +839,7 @@ impl<S: Storage> Store<S> {
                     profile: "v1".into(),
                     host: protocol::allocated_ipv4(vm)?,
                     port: 22,
-                    user: "arch".into(),
+                    user: p.user.clone(),
                     elevation: crate::jobs::Elevation::SudoNoninteractive,
                     pin,
                 };
@@ -1313,7 +1324,7 @@ impl<S: Storage> Store<S> {
             profile: "v1".into(),
             host: protocol::allocated_ipv4(vm)?,
             port: 22,
-            user: "arch".into(),
+            user: p.user.clone(),
             elevation: crate::jobs::Elevation::SudoNoninteractive,
             pin,
         };
