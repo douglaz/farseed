@@ -427,6 +427,9 @@ pub struct Store<S> {
     conduct_acceptances: Vec<Acceptance>,
     goals: Vec<crate::goals::Goal>,
     poc: std::collections::BTreeMap<String, poc::Task>,
+    /// Memory-only diagnostics; never substitute for a journaled task transition.
+    #[cfg(target_arch = "wasm32")]
+    poc_reconciliation_failures: std::collections::BTreeMap<String, (u64, String)>,
     pending_requirements: std::collections::BTreeMap<String, goals::Pending>,
     poc_requirement_candidate: u64,
     signature_refusals: Vec<SignatureRefusal>,
@@ -598,6 +601,8 @@ impl<S: Storage> Store<S> {
             conduct_acceptances: Vec::new(),
             goals: Vec::new(),
             poc: Default::default(),
+            #[cfg(target_arch = "wasm32")]
+            poc_reconciliation_failures: Default::default(),
             pending_requirements: Default::default(),
             poc_requirement_candidate: 0,
             signature_refusals: Vec::new(),
@@ -2390,6 +2395,10 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         self.state = match unlock(self.storage.clone(), &self.kdf, passphrase).await {
             Ok(mut store) => {
                 self.restore_deployment(&mut store);
+                // A new worker has no live request future. Persist uncertainty before
+                // exposing the replayed tasks to the page's automatic wake.
+                #[cfg(target_arch = "wasm32")]
+                store.poc_pause_interrupted_requests().await;
                 if store.allocation().seed_backup_owed() {
                     self.seed_backup = BackupStage::Display;
                 }
@@ -2627,7 +2636,25 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                     store
                         .poc
                         .values()
-                        .map(|task| store.poc_task_view(task))
+                        .map(|task| {
+                            let value = store.poc_task_view(task);
+                            #[cfg(target_arch = "wasm32")]
+                            let value = {
+                                let mut value = value;
+                                if task.requesting
+                                    && !task.ended()
+                                    && !store.ended_sessions.contains(&task.start_session)
+                                    && let Some((revision, why)) =
+                                        store.poc_reconciliation_failures.get(&task.id)
+                                    && *revision == task.revision
+                                {
+                                    value["status"] = "paused".into();
+                                    value["pause_reason"] = why.clone().into();
+                                }
+                                value
+                            };
+                            value
+                        })
                         .collect::<Vec<_>>(),
                 )
                 .expect("tasks serialize");

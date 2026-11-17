@@ -6,6 +6,9 @@ use tokio::sync::Notify;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
 
+// Preserve the old one-minute busy limit independently of the reply token cap.
+const BUSY_WINDOW_MS: i32 = 60_000;
+
 thread_local! {
     static CONFIG: RefCell<Option<Configuration>> = const { RefCell::new(None) };
     static KEY: RefCell<Option<InferenceAccountCredential>> = const { RefCell::new(None) };
@@ -226,6 +229,7 @@ struct Registration {
     pending: Rc<Pending>,
     worker: web_sys::WorkerGlobalScope,
     timer: i32,
+    total_timer: Option<i32>,
     _callback: Closure<dyn FnMut()>,
 }
 impl Registration {
@@ -247,18 +251,22 @@ impl Registration {
                     1_000 << (retry - 1),
                 )
                 .map_err(|_| INCOMPLETE)?;
-            self._callback = callback;
-            self.pending
+            let result = self
+                .pending
                 .until(async {
                     crate::poc::web::publish_progress(&self.pending.session).await;
                     receive.await.map_err(|_| INCOMPLETE.to_string())
                 })
-                .await?
+                .await?;
+            drop(callback);
+            result
         }
         .await;
         self.worker.clear_timeout_with_handle(self.timer);
         self.pending.retry.set(None);
-        crate::poc::web::publish_progress(&self.pending.session).await;
+        self.pending
+            .until(crate::poc::web::publish_progress(&self.pending.session))
+            .await?;
         result
     }
 }
@@ -266,6 +274,9 @@ impl Drop for Registration {
     fn drop(&mut self) {
         self.pending.stop();
         self.worker.clear_timeout_with_handle(self.timer);
+        if let Some(timer) = self.total_timer {
+            self.worker.clear_timeout_with_handle(timer);
+        }
         REQUESTS.with_borrow_mut(|requests| {
             requests.retain(|r| r.upgrade().is_some_and(|r| !Rc::ptr_eq(&r, &self.pending)))
         });
@@ -277,6 +288,32 @@ fn method(object: &JsValue, name: &str) -> Result<js_sys::Function, String> {
         .ok()
         .and_then(|v| v.dyn_into().ok())
         .ok_or_else(|| INCOMPLETE.into())
+}
+
+fn monotonic_ms() -> Result<f64, String> {
+    let performance =
+        js_sys::Reflect::get(&js_sys::global(), &"performance".into()).map_err(|_| INCOMPLETE)?;
+    method(&performance, "now")?
+        .call0(&performance)
+        .ok()
+        .and_then(|value| value.as_f64())
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| INCOMPLETE.into())
+}
+
+// Only absent, null or zero usage permits a retry. Inspect nested metadata too;
+// unfamiliar usage values fail closed rather than risking another billed send.
+fn has_usage(value: &Value, usage: bool) -> bool {
+    match value {
+        Value::Object(object) => object.iter().any(|(name, value)| {
+            has_usage(value, usage || name == "usage" || name.ends_with("_tokens"))
+        }),
+        Value::Array(values) => values.iter().any(|value| has_usage(value, usage)),
+        Value::Null => false,
+        Value::Number(number) => usage && number.as_f64() != Some(0.0),
+        Value::String(text) => usage && text.parse::<f64>().ok() != Some(0.0),
+        Value::Bool(value) => usage && *value,
+    }
 }
 
 async fn body(
@@ -344,6 +381,15 @@ pub(crate) async fn next(
     let local = crate::worker::local();
     #[cfg(feature = "tracer")]
     crate::testonly::session_point("poc_inference_writer").await;
+    // Allow 15 ms per requested token, with at least a minute for small replies.
+    // The 16,000-token cap gets four minutes; five minutes bounds a stalled exchange.
+    let deadline_ms = task
+        .completion_tokens
+        .saturating_mul(15)
+        .clamp(60_000, 300_000) as i32;
+    // Five fast busy replies, 1+2+4+8+16 seconds of waits, then one full exchange.
+    // This timer also bounds admission and progress waits across all re-sends.
+    let total_deadline = monotonic_ms()? + f64::from(5 * BUSY_WINDOW_MS + 31_000 + deadline_ms);
     for retries in 0..=5 {
         continuation.check().map_err(|_| INCOMPLETE)?;
         if revision != REVISION.get() {
@@ -367,19 +413,32 @@ pub(crate) async fn next(
         let timer = worker
             .set_timeout_with_callback_and_timeout_and_arguments_0(
                 callback.as_ref().unchecked_ref(),
-                60_000,
+                deadline_ms,
             )
             .map_err(|_| INCOMPLETE)?;
         let mut registration = Registration {
             pending: pending.clone(),
             worker: worker.clone(),
             timer,
+            total_timer: None,
             _callback: callback,
         };
+        let remaining_ms = total_deadline - monotonic_ms()?;
+        if remaining_ms <= 0.0 {
+            return Err(INCOMPLETE.into());
+        }
+        registration.total_timer = Some(
+            worker
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    registration._callback.as_ref().unchecked_ref(),
+                    remaining_ms.ceil() as i32,
+                )
+                .map_err(|_| INCOMPLETE)?,
+        );
         REQUESTS.with_borrow_mut(|requests| requests.push(Rc::downgrade(&pending)));
 
         let admission_error = |why: String| if retries == 0 { why } else { INCOMPLETE.into() };
-        let (promise, filter, is_credit) = {
+        let (promise, filter, is_credit, sent_at) = {
             let mut local = pending.until(local.lock()).await?;
             continuation.check().map_err(admission_error)?;
             if revision != REVISION.get() {
@@ -394,7 +453,7 @@ pub(crate) async fn next(
             store
                 .check_inference_request(task, session)
                 .map_err(admission_error)?;
-            store.ensure_scan_references().await?;
+            pending.until(store.ensure_scan_references()).await??;
             store
                 .check_inference_request(task, session)
                 .map_err(admission_error)?;
@@ -434,10 +493,15 @@ pub(crate) async fn next(
                 store
                     .check_inference_request(task, session)
                     .map_err(admission_error)?;
+                let sent_at = monotonic_ms()?;
+                if sent_at >= total_deadline {
+                    return Err(INCOMPLETE.into());
+                }
                 Ok::<_, String>((
                     worker.fetch_with_request(&request),
                     filter,
                     store.credit_session(session),
+                    sent_at,
                 ))
             })?
         };
@@ -529,8 +593,13 @@ pub(crate) async fn next(
             store
                 .check_inference_request(task, session)
                 .map_err(|why| if retries == 0 { why } else { INCOMPLETE.into() })?;
+            let reply_at = monotonic_ms()?;
+            if reply_at >= total_deadline {
+                return Err(INCOMPLETE.into());
+            }
             with_request_key(session, is_credit, |key| {
                 if retries < 5
+                    && (0.0..=f64::from(BUSY_WINDOW_MS)).contains(&(reply_at - sent_at))
                     && (200..300).contains(&status)
                     && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
                     && value.is_object()
@@ -541,6 +610,7 @@ pub(crate) async fn next(
                         .pointer("/error/metadata/error_type")
                         .and_then(Value::as_str)
                         == Some("provider_unavailable")
+                    && !has_usage(&value, false)
                 {
                     if !safe(store, &value, &[key]) {
                         return Ok(Err("inference proposal contains protected material".into()));

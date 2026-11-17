@@ -359,6 +359,45 @@ impl<S: Storage> Store<S> {
             "unresolved_commands":self.dispatch.calls.values().filter(|c| c.intent.machine == machine && matches!(c.state, crate::dispatch::CallState::Unresolved)).map(|c| json!({"call":c.intent.call,"job":c.intent.job})).collect::<Vec<_>>()
         }))
     }
+    /// Recovery only closes uncertain requests; it grants no session or dispatch authority.
+    /// Failed transitions remain requesting and are reported without blocking other tasks.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn poc_pause_interrupted_requests(&mut self) {
+        self.poc_reconciliation_failures.clear();
+        let interrupted: Vec<_> = self
+            .poc
+            .values()
+            .filter(|task| {
+                task.requesting
+                    && !task.ended()
+                    && !self.ended_sessions.contains(&task.start_session)
+            })
+            .map(|task| (task.id.clone(), task.revision))
+            .collect();
+        if interrupted.is_empty() {
+            return;
+        }
+        let scans = self.ensure_scan_references().await;
+        for (id, revision) in interrupted {
+            let result = match &scans {
+                Ok(()) => self
+                    .poc_change(
+                        &id,
+                        revision,
+                        Change::Pause(crate::poc::inference::INCOMPLETE.into()),
+                    )
+                    .await
+                    .map(|_| ()),
+                Err(why) => Err(why.clone()),
+            };
+            if let Err(why) = result {
+                self.poc_reconciliation_failures.insert(
+                    id,
+                    (revision, format!("Could not pause the interrupted request: {why}. Automatic retry is blocked.")),
+                );
+            }
+        }
+    }
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn eligible_tasks(&self) -> Vec<Task> {
         self.poc
@@ -367,7 +406,8 @@ impl<S: Storage> Store<S> {
                 matches!(
                     t.status,
                     Status::Running | Status::Verifying | Status::Waiting
-                ) && !self.ended_sessions.contains(&t.start_session)
+                ) && !t.requesting
+                    && !self.ended_sessions.contains(&t.start_session)
                     && (t.status != Status::Waiting
                         || t.pending.is_some()
                             && (t.pause_reason.is_none()

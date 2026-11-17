@@ -643,6 +643,10 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                 let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
                 let task = store.poc_task(id)?;
                 store.check_task_session(&task, session)?;
+                // A queued wake may have selected this task before recovery paused it.
+                if automatic && !store.eligible_tasks().iter().any(|task| task.id == id) {
+                    return Ok(());
+                }
                 if request.action == "dispose-pending" {
                     let confirmation = request
                         .confirmation

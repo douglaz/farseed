@@ -4,7 +4,8 @@
 //! are never retried.
 //!
 //! Bounds: 8 KiB per outcome excerpt, 128 KiB serialized request, 256 KiB response,
-//! 512 bytes per provider error excerpt and 60 seconds including response reading.
+//! 512 bytes per provider error excerpt; each exchange, including response reading,
+//! gets 15 ms per requested completion token, clamped to 60–300 seconds.
 //! Protection shares 512 Mi work units across nodes/representations, with depth 16.
 //! Complexity exhaustion withholds the value; no partially scanned value is released.
 //! Excerpts signal truncation; the finite request cap can pause long transcripts.
@@ -36,7 +37,7 @@ const SHORT_EXCERPT_BYTES: usize = 768;
 const RESPONSE_BYTES: usize = 256 * 1024;
 const RESPONSE_TOO_LARGE: &str = "inference response exceeds the local size bound";
 const ERROR_BYTES: usize = 512;
-const INCOMPLETE: &str =
+pub(crate) const INCOMPLETE: &str =
     "inference request incomplete; resume when the connection and session are ready";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

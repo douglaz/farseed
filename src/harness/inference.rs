@@ -315,6 +315,11 @@ pub async fn lifecycle_transition(event: String) -> String {
         {
             return local.report(Some(&why)).to_string();
         }
+        // The old runner cannot append through its fenced continuation. Close its
+        // uncertain request before revalidation permits any automatic wake.
+        if matches!(event.as_str(), "freeze" | "resume") && owner.state() == "reconciling" {
+            store.poc_pause_interrupted_requests().await;
+        }
     }
     if event == "resume"
         && let Err(why) = owner.revalidated()
