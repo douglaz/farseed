@@ -234,6 +234,9 @@ pub(crate) enum Event {
     JobTerminal(crate::jobs::Evidence),
     JobObservation(crate::jobs::Evidence),
     Disposition(Disposition),
+    /// Continuing command choices can acknowledge existing rerun obligations.
+    /// Legacy dispositions retain their original replay meaning.
+    PocCommandDisposition(Disposition),
     /// One allocation event, recorded before it is applied: a reservation before any external
     /// effect (`STA-22b`), with its seed identifier and derivation version (`STA-22a`).
     Allocation(allocation::Event),
@@ -1723,9 +1726,9 @@ impl<S: Storage> Store<S> {
         if matches!(report, DispositionReport::Refused { .. }) {
             return Ok(report);
         }
-        let tasks = self.project_disposition(self.next, &disposition)?;
+        let tasks = self.project_command_disposition(self.next, &disposition)?;
         let number = self
-            .commit(&Event::Disposition(disposition.clone()))
+            .commit(&Event::PocCommandDisposition(disposition.clone()))
             .await?;
         #[cfg(all(test, not(target_arch = "wasm32")))]
         poc::disposition::crash_point(1).await;
@@ -1977,13 +1980,20 @@ impl<S: Storage> Store<S> {
                         )
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
-                (_, Event::Disposition(disposition)) => {
+                (
+                    _,
+                    Event::Disposition(disposition) | Event::PocCommandDisposition(disposition),
+                ) => {
                     // Project against this journal prefix, before later task revisions.
                     let tasks = if matches!(
                         self.dispatch.check_disposition(number, disposition),
                         DispositionReport::Accepted { .. }
                     ) {
-                        self.project_disposition(number, disposition)?
+                        if matches!(event, Event::PocCommandDisposition(_)) {
+                            self.project_command_disposition(number, disposition)?
+                        } else {
+                            self.project_disposition(number, disposition)?
+                        }
                     } else {
                         Vec::new()
                     };

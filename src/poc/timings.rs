@@ -442,6 +442,7 @@ pub(crate) fn change_label(change: &Change) -> &'static str {
         Change::PrepareCheckJobs => "PrepareCheckJobs",
         Change::SkipCheckBatch(_) => "SkipCheckBatch",
         Change::RetryChecks => "RetryChecks",
+        Change::CommandAlreadyRan { .. } => "CommandAlreadyRan",
         Change::RepairFindings => "RepairFindings",
         Change::SkipReport(_) => "SkipReport",
         Change::RejectDeclaration => "RejectDeclaration",

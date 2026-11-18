@@ -110,6 +110,15 @@ pub struct BeforeSetup {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct UnmetCommand {
+    pub created: u64,
+    pub call: u64,
+    pub machine: String,
+    /// Exact UTF-8 command bytes, without normalization.
+    pub command: String,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Task {
     pub id: String,
     pub start_session: String,
@@ -153,6 +162,10 @@ pub struct Task {
     pub inspection_record: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub block_origins: BTreeMap<String, BlockOrigin>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet_commands: Vec<UnmetCommand>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commands_recorded_as_run: Vec<UnmetCommand>,
 }
 impl Task {
     pub fn awaiting_operator(&self) -> bool {
@@ -367,6 +380,9 @@ pub enum Change {
     PrepareCheckJobs,
     SkipCheckBatch(String),
     RetryChecks,
+    CommandAlreadyRan {
+        obligation: u64,
+    },
     RepairFindings,
     SkipReport(String),
     RejectDeclaration,
@@ -409,6 +425,15 @@ pub(crate) enum Record {
         id: String,
         expected: u64,
         change: Change,
+    },
+    // The disposition and its single replacement proposal share one commit.
+    // Its record number links the replacement to the unknown historical outcome.
+    Rerun {
+        confirmation: disposition::Confirmation,
+        disposition: Disposition,
+        // Absent in old journals: those replay without command obligations.
+        #[serde(default)]
+        track_command: bool,
     },
     Command {
         binding: Binding,
@@ -1331,7 +1356,9 @@ impl<S: Storage> Store<S> {
         // protects its derived outcome separately before checkpointing it.
         self.poc_record_safe(record)?;
         let task = match record {
-            Record::Create { .. } | Record::Start { .. } => self.project_poc(number, record)?,
+            Record::Create { .. } | Record::Start { .. } | Record::Rerun { .. } => {
+                self.project_poc(number, record)?
+            }
             Record::Change { id, .. }
             | Record::Command {
                 binding: Binding { task: id, .. },
@@ -1344,6 +1371,13 @@ impl<S: Storage> Store<S> {
             }
         };
         self.apply_poc_key_class(record, &task);
+        if let Record::Rerun { disposition, .. } = record {
+            // project_rerun has checked this exact prefix, including duplicate refusal.
+            let report = self.dispatch.disposition(number, disposition.clone());
+            if !matches!(report, DispositionReport::Accepted { .. }) {
+                return Err("rerun disposition refused".into());
+            }
+        }
         if let Record::Command { intent, launch, .. } = record {
             self.apply_intent(number, intent.clone())?;
             if let Some(prepared) = launch {
@@ -1377,6 +1411,14 @@ impl<S: Storage> Store<S> {
         }
     }
     fn project_poc(&self, number: u64, record: &Record) -> Result<Task, String> {
+        if let Record::Rerun {
+            confirmation,
+            disposition,
+            track_command,
+        } = record
+        {
+            return self.project_rerun(number, confirmation, disposition, *track_command);
+        }
         if let Record::Create {
             id,
             session,
@@ -1442,6 +1484,8 @@ impl<S: Storage> Store<S> {
                 revision: 0,
                 inspection_record: None,
                 block_origins: BTreeMap::new(),
+                unmet_commands: Vec::new(),
+                commands_recorded_as_run: Vec::new(),
             });
         }
         let id = match record {
@@ -1476,6 +1520,13 @@ impl<S: Storage> Store<S> {
         if task.revision != expected || task.ended() {
             return Err(crate::poc::wait::STALE_TASK.into());
         }
+        task.unmet_commands = task
+            .unmet_commands
+            .iter()
+            .filter(|command| !self.command_obligation_met(&task, command))
+            .cloned()
+            .collect();
+        task.reconcile_command_findings();
         if self.ended_sessions.contains(&task.start_session)
             && !matches!(
                 record,
@@ -2105,7 +2156,10 @@ impl<S: Storage> Store<S> {
                         task.active();
                     }
                     Change::RepairFindings => {
-                        if task.template.as_deref() != Some(crate::poc::template::ID)
+                        if (task.template.as_deref() != Some(crate::poc::template::ID)
+                            && !task.findings.iter().any(|finding| {
+                                finding.field == crate::delivery::FieldId::UnmetCommand
+                            }))
                             || task.status != Status::Paused
                             || task.pause_reason.as_deref()
                                 != Some(crate::poc::completion::FINDINGS)
@@ -2114,13 +2168,24 @@ impl<S: Storage> Store<S> {
                             || task.proposal.is_some()
                             || task.findings.is_empty()
                         {
-                            return Err("template repair requires paused handover findings".into());
+                            return Err("repair requires paused handover findings".into());
                         }
                         task.previous_reads
                             .push(std::mem::take(&mut task.verification));
                         task.verifying = false;
                         task.verdict = None;
                         task.active();
+                    }
+                    Change::CommandAlreadyRan { obligation } => {
+                        let available = task.unmet_commands.iter().any(|command| {
+                            command.created == *obligation
+                                && self.command_acknowledgment_available(&task, command)
+                        });
+                        if !available {
+                            return Err("It already ran is available here only for a settled command that the AI cannot repeat, from the findings pause. Nothing was sent.".into());
+                        }
+                        task.record_command_as_run(*obligation)?;
+                        task.restart_checks();
                     }
                     Change::RetryChecks => {
                         if !task.verifying || task.pending.is_some() {
@@ -2129,18 +2194,10 @@ impl<S: Storage> Store<S> {
                         if task.status != Status::Paused {
                             return Err("re-check requires a paused task".into());
                         }
-                        task.proposal = None;
-                        for report in &mut task.reports {
-                            if matches!(report.status.as_str(), "queued" | "attempted") {
-                                report.status = "not run".into();
-                                report.excerpt =
-                                    "Complete re-check schedules only harness reads".into();
-                            }
+                        if task.rerun_proposed() {
+                            return Err("finish the queued command before re-checking".into());
                         }
-                        task.previous_reads
-                            .push(std::mem::take(&mut task.verification));
-                        task.verdict = None;
-                        task.active();
+                        task.restart_checks();
                     }
                     Change::SkipCheckBatch(why) => {
                         let proposal = task.proposal.as_ref().ok_or("no check batch")?;
@@ -2248,13 +2305,22 @@ impl<S: Storage> Store<S> {
                                     names.iter().filter_map(Value::as_str).collect::<Vec<_>>()
                                 })
                                 .unwrap_or_default();
-                            let result = crate::poc::completion::judge_with_files(
+                            let mut result = crate::poc::completion::judge_with_files(
                                 declaration,
                                 &task.read_plan,
                                 &observations,
                                 &task.findings,
                                 &missing_files,
                             );
+                            for command in &task.unmet_commands {
+                                result.delivered = false;
+                                result.findings.push(crate::delivery::Finding {
+                                    field: crate::delivery::FieldId::UnmetCommand,
+                                    service: None,
+                                    obligation: Some(command.created),
+                                    detail: self.command_obligation_finding(command),
+                                });
+                            }
                             task.findings = result.findings;
                             task.notes = result.notes;
                             if !result.complete {

@@ -861,6 +861,7 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
         continuation: Option<crate::dispatch::Continuation>,
         call_id: Option<String>,
         revision: Option<u64>,
+        obligation: Option<u64>,
         machine_class_answer: Option<crate::store::poc_targets::KeyCardAnswer>,
         answer: Option<String>,
     }
@@ -1065,6 +1066,32 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                 "end-session" => {
                     store
                         .end_session(request.session.as_deref().ok_or("session required")?)
+                        .await?;
+                }
+                "command-already-ran" => {
+                    let id = request.id.as_deref().ok_or("task ID required")?;
+                    crate::poc::run::check_raise(id)?;
+                    let task = store.poc_task(id)?;
+                    store.check_task_session(
+                        &task,
+                        request.session.as_deref().ok_or("session required")?,
+                    )?;
+                    store.poc_authority(id, &task.start_session)?;
+                    if automatic || request.revision != Some(task.revision) {
+                        return Err(
+                            "The command choice changed; review it again. Nothing was sent.".into(),
+                        );
+                    }
+                    store
+                        .poc_change(
+                            id,
+                            task.revision,
+                            Change::CommandAlreadyRan {
+                                obligation: request
+                                    .obligation
+                                    .ok_or("command obligation required")?,
+                            },
+                        )
                         .await?;
                 }
                 "retry-checks" => {

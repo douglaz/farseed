@@ -230,7 +230,11 @@ async fn resume_with_progress(
     if task.pending.is_some() {
         return inspect(runtime, &task, session).await;
     }
-    if task.template.as_deref() == Some(super::template::ID)
+    if (task.template.as_deref() == Some(super::template::ID)
+        || task
+            .findings
+            .iter()
+            .any(|finding| finding.field == crate::delivery::FieldId::UnmetCommand))
         && task.status == Status::Paused
         && task.pause_reason.as_deref() == Some(super::completion::FINDINGS)
         && task.verifying

@@ -3,6 +3,8 @@ use super::*;
 use crate::dispatch::{CallState, Continuation, DispositionRecord};
 use crate::jobs::{Record as JobRecord, State};
 
+pub(crate) const UNSENT_RERUN: &str = "tau-web has not sent this command yet, so It already ran is not available; Resume sends it once.";
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Confirmation {
@@ -35,6 +37,75 @@ impl From<&DispositionRecord> for Standing {
 }
 
 impl Task {
+    pub(super) fn record_command_as_run(&mut self, obligation: u64) -> Result<(), String> {
+        let index = self
+            .unmet_commands
+            .iter()
+            .position(|command| command.created == obligation)
+            .ok_or("This command obligation is no longer available; nothing was sent.")?;
+        self.commands_recorded_as_run
+            .push(self.unmet_commands.remove(index));
+        self.reconcile_command_findings();
+        Ok(())
+    }
+
+    pub(super) fn reconcile_command_findings(&mut self) {
+        self.findings.retain(|finding| {
+            finding.field != crate::delivery::FieldId::UnmetCommand
+                || self
+                    .unmet_commands
+                    .iter()
+                    .any(|command| finding.obligation == Some(command.created))
+        });
+    }
+
+    pub(super) fn rerun_proposed(&self) -> bool {
+        self.proposal
+            .as_ref()
+            .is_some_and(|proposal| proposal.call_id.starts_with("$rerun:"))
+    }
+
+    pub(super) fn restart_checks(&mut self) {
+        self.proposal = None;
+        for report in &mut self.reports {
+            if matches!(report.status.as_str(), "queued" | "attempted") {
+                report.status = "not run".into();
+                report.excerpt = "Complete re-check schedules only harness reads".into();
+            }
+        }
+        self.previous_reads
+            .push(std::mem::take(&mut self.verification));
+        self.verdict = None;
+        self.requesting = false;
+        self.active();
+    }
+
+    fn ai_command(&self) -> Option<(&str, &str)> {
+        let proposal = self.proposal.as_ref()?;
+        if proposal.check.is_some()
+            || proposal.report.is_some()
+            || (proposal.call_id.starts_with('$') && !proposal.call_id.starts_with("$rerun:"))
+        {
+            return None;
+        }
+        match &proposal.tool {
+            Tool::Exec { machine, command } => Some((machine, command)),
+            _ => None,
+        }
+    }
+
+    /// The one-press choice applies only to an AI exec, never a harness read/report.
+    fn missing_command(&self, read: State) -> bool {
+        self.status == Status::Paused
+            && read == State::Missing
+            && self.proposal.as_ref().is_some_and(|proposal| {
+                matches!(proposal.tool, Tool::Exec { .. })
+                    && proposal.check.is_none()
+                    && proposal.report.is_none()
+                    && !proposal.call_id.starts_with('$')
+            })
+    }
+
     pub fn disposed_check(&self, check: &Verification) -> bool {
         check.exit_status.is_none()
             && self.completed.iter().any(|(_, _, result)| {
@@ -108,6 +179,11 @@ impl<S: Storage> Store<S> {
         if crate::harness::inspection_active(session) {
             return Err("collection or wait is active for this session".into());
         }
+        self.disposition_confirmation(&task)
+    }
+
+    // Prefix-only checks also run on replay, without requiring live session keys.
+    fn disposition_confirmation(&self, task: &Task) -> Result<Confirmation, String> {
         if task.status != Status::Paused {
             return Err("disposition requires a paused task".into());
         }
@@ -124,12 +200,15 @@ impl<S: Storage> Store<S> {
                 standing.number, standing.continuation
             ));
         }
-        let read = self.disposition_read(&task)?;
-        let pending = task.pending.clone().expect("read checked pending");
+        let pending = task
+            .pending
+            .clone()
+            .ok_or("disposition requires a pending call")?;
+        let read = self.disposition_read(task)?;
         Ok(Confirmation {
-            task: id.into(),
+            task: task.id.clone(),
             revision: task.revision,
-            session: session.into(),
+            session: task.start_session.clone(),
             machine: task.machine.clone(),
             observation: read.number.expect("committed read"),
             read: read.state,
@@ -156,14 +235,179 @@ impl<S: Storage> Store<S> {
         if &current != confirmation {
             return Err("stale disposition confirmation: task, read or standing disposition changed; review the card again".into());
         }
-        let report = self.dispose(Disposition {
+        let disposition = Disposition {
             machine: confirmation.machine.clone(), calls: vec![confirmation.pending.call], continuation,
             uncertainty: "The owner accepted an unknown outcome; the earlier command may arrive or run late, overlap later commands, and the page will never show it.".into(),
-        }).await?;
+        };
+        let original = self.poc_task(&confirmation.task)?;
+        if continuation == Continuation::AsIfNotDone && original.missing_command(confirmation.read)
+        {
+            let record = self.prepare_rerun(&original, confirmation, disposition)?;
+            let number = self.commit(&Event::Poc(record.clone())).await?;
+            self.apply_poc(number, &record)
+                .expect("validated rerun applies after commit");
+            return self.poc_task(&confirmation.task);
+        }
+        let report = self.dispose(disposition).await?;
         if !matches!(report, DispositionReport::Accepted { .. }) {
             return Err("disposition refused; pending call remains held".into());
         }
         self.poc_task(&confirmation.task)
+    }
+
+    /// The view and writer use the same refusal checks; a stale card grants nothing.
+    fn prepare_rerun(
+        &self,
+        original: &Task,
+        confirmation: &Confirmation,
+        disposition: Disposition,
+    ) -> Result<Record, String> {
+        let record = Record::Rerun {
+            confirmation: confirmation.clone(),
+            disposition,
+            track_command: true,
+        };
+        let projected = self.project_poc(self.next, &record)?;
+        let proposal = projected.proposal.as_ref().expect("rerun proposal");
+        if let Some(origin) = projected.block_origins.get(&proposal.call_id) {
+            let (resolved, _) =
+                crate::poc::inference::resolve_task_block(self, original, origin, &[]).map_err(
+                    |why| -> String { match why.as_str() {
+                        "only the current step's blocks can run" =>
+                            "Cannot run it again: the task has moved to another step.".into(),
+                        "Recovery has not been sent for this task" =>
+                            "Cannot run it again: this recovery command is no longer available for the task.".into(),
+                        _ => "Cannot run it again: the page cannot safely reconstruct this saved command from the current task setup.".into(),
+                    } },
+                )?;
+            if resolved != proposal.tool {
+                let Tool::Exec {
+                    command: recorded, ..
+                } = &proposal.tool
+                else {
+                    unreachable!("rerun exec")
+                };
+                let Tool::Exec {
+                    command: current, ..
+                } = &resolved
+                else {
+                    unreachable!("resolved block exec")
+                };
+                return Err(self.command_difference(recorded, current));
+            }
+        }
+        self.poc_tool(&projected.id, &projected.start_session, &proposal.tool)?;
+        self.poc_record_safe(&record)?;
+        self.poc_safe(proposal)?;
+        Ok(record)
+    }
+
+    fn command_difference(&self, recorded: &str, current: &str) -> String {
+        let protected = self.protect_publication(&json!([recorded, current]), &[]);
+        let Ok(protected) = protected else {
+            return "Cannot run it again: the command has changed. Recorded and current command summaries were withheld for protection. Nothing will be sent.".into();
+        };
+        let recorded = protected[0].as_str().expect("protected string");
+        let current = protected[1].as_str().expect("protected string");
+        let difference = recorded
+            .bytes()
+            .zip(current.bytes())
+            .position(|(old, new)| old != new)
+            .unwrap_or(recorded.len().min(current.len()));
+        let start = difference.saturating_sub(40);
+        let excerpt = |command: &str| {
+            let mut start = start.min(command.len());
+            while !command.is_char_boundary(start) {
+                start -= 1;
+            }
+            format!(
+                "from byte {start}: {}",
+                self.command_summary(&command[start..])
+            )
+        };
+        format!(
+            "Cannot run it again: the command has changed. Recorded ({}). Current ({}). Nothing will be sent.",
+            excerpt(recorded),
+            excerpt(current),
+        )
+    }
+
+    pub(super) fn command_summary(&self, command: &str) -> String {
+        // Protect before cutting, then protect the newly exposed boundary as well.
+        let summary = self
+            .protect_publication(&json!(command), &[])
+            .and_then(|safe| {
+                let text = safe.as_str().ok_or("command summary encoding")?;
+                let mut summary: String = text.chars().take(160).collect();
+                if summary.len() < text.len() {
+                    summary.push('…');
+                }
+                self.protect_publication(&json!(summary), &[])
+            });
+        summary
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "[command summary withheld]".into())
+    }
+
+    /// This small record is the durable link: its own number is the disposition,
+    /// and $rerun:<number>:<old call> is the only proposal it can create.
+    /// Repeating it on append or replay fails against the original pending prefix.
+    pub(super) fn project_rerun(
+        &self,
+        number: u64,
+        confirmation: &Confirmation,
+        disposition: &Disposition,
+        track_command: bool,
+    ) -> Result<Task, String> {
+        let original = self.poc_task(&confirmation.task)?;
+        if !original.missing_command(confirmation.read)
+            || self.disposition_confirmation(&original)? != *confirmation
+            || disposition.machine != original.machine
+            || disposition.calls != [confirmation.pending.call]
+            || disposition.continuation != Continuation::AsIfNotDone
+            || !matches!(
+                self.dispatch.check_disposition(number, disposition),
+                DispositionReport::Accepted { .. }
+            )
+        {
+            return Err("stale or duplicate command rerun".into());
+        }
+        if original.steps >= original.limits.steps {
+            return Err("Cannot run it again: step limit reached; raise limits first.".into());
+        }
+        let old = original.proposal.as_ref().expect("AI exec checked");
+        let mut tasks = self.project_disposition(number, disposition)?;
+        if tasks.len() != 1 || tasks[0].id != original.id {
+            return Err("rerun disposition must replace exactly its pending task".into());
+        }
+        let mut task = tasks.pop().expect("one task");
+        if track_command {
+            let (machine, command) = original.ai_command().expect("AI exec checked");
+            task.unmet_commands.push(UnmetCommand {
+                created: number,
+                call: confirmation.pending.call,
+                machine: machine.into(),
+                command: command.into(),
+            });
+        }
+        let call_id = format!("$rerun:{number}:{}", confirmation.pending.call);
+        if task.completed.iter().any(|(id, _, _)| id == &call_id)
+            || task.block_origins.contains_key(&call_id)
+        {
+            return Err("duplicate command rerun".into());
+        }
+        if let Some(origin) = original.block_origins.get(&old.call_id) {
+            task.block_origins.insert(call_id.clone(), origin.clone());
+        }
+        task.proposal = Some(Proposal {
+            call_id,
+            tool: old.tool.clone(),
+            check: None,
+            report: None,
+        });
+        task.steps += 1;
+        Ok(task)
     }
 
     pub(crate) fn poc_task_view(&self, task: &Task) -> Value {
@@ -182,11 +426,33 @@ impl<S: Storage> Store<S> {
                 value["pause_reason"] = "The operator question was withheld because its display could not be protected.".into();
             }
         }
+        value["acknowledgeable_commands"] = json!(
+            task.unmet_commands
+                .iter()
+                .filter(|command| self.command_acknowledgment_available(task, command))
+                .map(|command| command.created)
+                .collect::<Vec<_>>()
+        );
         if task.status == Status::Paused && task.pending.is_some() {
             match self.poc_disposition_offer(&task.id, &task.start_session) {
                 Ok(offer) => {
+                    if task.missing_command(offer.read) {
+                        let disposition = Disposition {
+                            machine: offer.machine.clone(),
+                            calls: vec![offer.pending.call],
+                            continuation: Continuation::AsIfNotDone,
+                            uncertainty: "The owner accepted an unknown outcome; the earlier command may arrive or run late, overlap later commands, and the page will never show it.".into(),
+                        };
+                        value["rerun_refusal"] = self
+                            .prepare_rerun(task, &offer, disposition)
+                            .err()
+                            .map(|why| self.protect_publication(&json!(why), &[])
+                                .unwrap_or_else(|_| json!("Cannot run it again: the reason could not be safely displayed.")))
+                            .unwrap_or(Value::Null);
+                    }
                     value["disposition_offer"] =
-                        serde_json::to_value(offer).expect("confirmation serializes")
+                        serde_json::to_value(offer).expect("confirmation serializes");
+                    value["rerun_unsent"] = self.rerun_unsent(task).into();
                 }
                 Err(why) => value["disposition_refusal"] = why.into(),
             }
@@ -211,6 +477,136 @@ impl<S: Storage> Store<S> {
             }
         }
         value
+    }
+
+    pub(super) fn command_obligation_met(&self, task: &Task, command: &UnmetCommand) -> bool {
+        self.command_obligation_calls(task, command).any(|id| {
+            self.dispatch
+                .terminals
+                .iter()
+                .any(|terminal| terminal.terminal.call == id && terminal.number > command.created)
+                || self.dispatch.calls.get(&id).is_some_and(|call| {
+                    matches!(call.state, CallState::Background { observation } if observation > command.created)
+                })
+        })
+    }
+
+    /// A moved-on playbook can leave a real obligation that repair cannot repeat
+    /// by name. Offer the escape only after done, with all commands settled.
+    pub(super) fn command_acknowledgment_available(
+        &self,
+        task: &Task,
+        command: &UnmetCommand,
+    ) -> bool {
+        if task.status != Status::Paused
+            || task.pause_reason.as_deref() != Some(crate::poc::completion::FINDINGS)
+            || !task.verifying
+            || task.pending.is_some()
+            || task.proposal.is_some()
+            || self.command_obligation_met(task, command)
+            || !task.findings.iter().any(|finding| {
+                finding.obligation == Some(command.created)
+                    && finding.field == crate::delivery::FieldId::UnmetCommand
+            })
+        {
+            return false;
+        }
+        let origin = task
+            .completed
+            .iter()
+            .find(|(_, _, output)| output["content"]["call"].as_u64() == Some(command.call))
+            .and_then(|(id, _, _)| task.block_origins.get(id));
+        let Some(origin) = origin else {
+            return false;
+        };
+        // Match the state Resume's RepairFindings will give to the resolver.
+        let mut repair = task.clone();
+        repair.verifying = false;
+        crate::poc::template::CONTROL_CENTER
+            .block(
+                &repair,
+                self.poc_needs_declaration(&task.machine),
+                origin.step,
+                &origin.block,
+            )
+            .is_err()
+    }
+
+    fn command_obligation_calls<'a>(
+        &'a self,
+        task: &'a Task,
+        command: &'a UnmetCommand,
+    ) -> impl Iterator<Item = u64> + 'a {
+        task.completed
+            .iter()
+            .filter_map(|(_, _, output)| output["content"]["call"].as_u64())
+            .chain(task.pending.iter().map(|pending| pending.call))
+            .filter(move |call| *call > command.created)
+            .filter(move |id| {
+                self.dispatch.calls.get(id).is_some_and(|call| {
+                    call.intent.machine == command.machine
+                        && call.intent.command == hex::encode(&command.command)
+                })
+            })
+    }
+
+    pub(super) fn command_obligation_finding(&self, command: &UnmetCommand) -> String {
+        let summary = self.command_summary(&command.command);
+        format!(
+            "A command you chose to run again never ran: {}: {summary}. Resume lets the AI run it, or choose It already ran if you know it did.",
+            command.machine,
+        )
+    }
+
+    /// A pending product re-issue whose launch was prepared but never attempted has not been sent: Resume sends it
+    /// once (the i55 first-send recovery). Until then "It already ran" is refused; "Let the AI decide" stays
+    /// available, so a launch that can never be sent (e.g. a changed wrapper) still has a way on.
+    pub(in crate::store) fn rerun_unsent(&self, task: &Task) -> bool {
+        task.rerun_proposed()
+            && task.pending.as_ref().is_some_and(|pending| {
+                self.dispatch
+                    .launches
+                    .get(&pending.call)
+                    .is_some_and(|fence| !fence.attempted && !fence.resent)
+            })
+    }
+
+    /// Continuing assumptions never create obligations. Only a pending AI
+    /// command recorded as run can clear existing obligations for its bytes.
+    pub(in crate::store) fn project_command_disposition(
+        &self,
+        number: u64,
+        disposition: &Disposition,
+    ) -> Result<Vec<Task>, String> {
+        if disposition.continuation == Continuation::AsIfDone
+            && self.poc.values().any(|task| {
+                task.pending
+                    .as_ref()
+                    .is_some_and(|pending| disposition.calls.contains(&pending.call))
+                    && self.rerun_unsent(task)
+            })
+        {
+            return Err(UNSENT_RERUN.into());
+        }
+        let mut tasks = self.project_disposition(number, disposition)?;
+        if disposition.continuation != Continuation::AsIfDone {
+            return Ok(tasks);
+        }
+        for task in &mut tasks {
+            let original = self.poc.get(&task.id).expect("projected task");
+            if let Some((machine, bytes)) = original.ai_command() {
+                let recorded: Vec<_> = task
+                    .unmet_commands
+                    .iter()
+                    .filter(|command| command.machine == machine && command.command == bytes)
+                    .map(|command| command.created)
+                    .collect();
+                for obligation in recorded {
+                    task.record_command_as_run(obligation)?;
+                }
+            }
+        }
+        Ok(tasks)
     }
 
     #[cfg(all(target_arch = "wasm32", feature = "tracer"))]

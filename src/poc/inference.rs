@@ -23,7 +23,7 @@ pub type ModelReply = (String, Tool, Option<crate::store::poc::BlockOrigin>);
 pub(crate) fn model_steps(task: &crate::store::poc::Task) -> Vec<Step> {
     task.completed
         .iter()
-        .filter(|(id, _, _)| !id.starts_with('$'))
+        .filter(|(id, _, _)| !id.starts_with('$') || id.starts_with("$rerun:"))
         .cloned()
         .collect()
 }
@@ -551,11 +551,29 @@ fn resolve_block<S: Storage>(
     // The browser holds the writer and checks the request revision at this boundary.
     // Recheck here too: no snapshot from before the inference exchange can admit a block.
     store.check_inference_request(task, &task.start_session)?;
+    resolve_task_block(
+        store,
+        task,
+        &crate::store::poc::BlockOrigin {
+            step: call.step,
+            block: call.block,
+        },
+        credentials,
+    )
+}
+
+/// Product reruns and AI block calls use the same source, facts and substitutions.
+pub(crate) fn resolve_task_block<S: Storage>(
+    store: &Store<S>,
+    task: &crate::store::poc::Task,
+    origin: &crate::store::poc::BlockOrigin,
+    credentials: &[&[u8]],
+) -> Result<(Tool, crate::store::poc::BlockOrigin), String> {
     let source = super::template::CONTROL_CENTER.block(
         task,
         store.poc_needs_declaration(&task.machine),
-        call.step,
-        &call.block,
+        origin.step,
+        &origin.block,
     )?;
     let facts = template_facts(store, task)?;
     let mut substitutions = Vec::new();
@@ -566,7 +584,7 @@ fn resolve_block<S: Storage>(
         (5, "AI_MODEL"),
         (11, "MACHINE_ADDRESS"),
     ] {
-        if call.step != step || !source.contains(name) {
+        if origin.step != step || !source.contains(name) {
             continue;
         }
         let value = if name == "AI_KEY_PATH" {
@@ -622,19 +640,13 @@ fn resolve_block<S: Storage>(
     }
     command.push_str(&source[end..]);
     let tool = Tool::Exec {
-        machine: call.machine,
+        machine: task.machine.clone(),
         command,
     };
     if !safe(store, &json!(tool), credentials) {
         return Err("inference proposal contains protected material".into());
     }
-    Ok((
-        tool,
-        crate::store::poc::BlockOrigin {
-            step: call.step,
-            block: call.block,
-        },
-    ))
+    Ok((tool, origin.clone()))
 }
 
 pub(crate) fn request_for_task<S: Storage>(
@@ -723,6 +735,20 @@ fn request_context<S: Storage>(
         }
         let mut template_messages = Vec::new();
         let mut include_handover = true;
+        if let Some(task) = task
+            .filter(|task| task.template.is_none() && !task.verifying && !task.findings.is_empty())
+        {
+            let details = task
+                .findings
+                .iter()
+                .map(|finding| finding.detail.as_str())
+                .collect::<Vec<_>>()
+                .join(" | ");
+            let finding = store.protect_publication(&json!(format!(
+                "The checks after done found: {details} Fix these findings, then call done again."
+            )), credentials)?;
+            messages.push(json!({"role":"user","content":finding}));
+        }
         if let Some(task) = task.filter(|t| t.template.as_deref() == Some(super::template::ID)) {
             let template = &super::template::CONTROL_CENTER;
             let repair = !task.verifying && !task.findings.is_empty();
@@ -781,8 +807,20 @@ fn request_context<S: Storage>(
         }
         let mut ids = std::collections::BTreeSet::new();
         for (((id, tool, outcome), value), detail) in steps.iter().zip(&history).zip(&details) {
-            if !usable_id(id)
-                || !ids.insert(id)
+            // Keep the internal link for block-origin lookup, but give the provider
+            // an ordinary, unique tool-call ID. AI IDs cannot use the '$' namespace.
+            let wire_id = if id.starts_with("$rerun:") {
+                (0..=steps.len())
+                    .map(|number| format!("rerun_{number}"))
+                    .find(|candidate| {
+                        !steps.iter().any(|(id, _, _)| id == candidate) && !ids.contains(candidate)
+                    })
+                    .ok_or("inference rerun call ID unavailable")?
+            } else {
+                id.clone()
+            };
+            if !usable_id(&wire_id)
+                || !ids.insert(wire_id.clone())
                 || (!matches!(tool, Tool::AskOperator { .. }) && tool.machine() != machine)
                 || !matches!(
                     tool,
@@ -796,15 +834,15 @@ fn request_context<S: Storage>(
             {
                 return Err("inference completed-step schema invalid".into());
             }
-            if !safe(store, &json!({"id":id,"tool":tool}), credentials)
-                || !safe(store, &json!({"id":id,"tool":value}), credentials)
+            if !safe(store, &json!({"id":wire_id,"tool":tool}), credentials)
+                || !safe(store, &json!({"id":wire_id,"tool":value}), credentials)
             {
                 return Err("inference completed step contains protected material".into());
             }
             // Protect complete recorded strings, including collection boundaries, under this
             // request's holdings before any history excerpt or omission is derived.
             let outcome = store.protect_publication(outcome, credentials)?;
-            messages.extend(step_messages(id, value, &outcome, *detail, |text| {
+            messages.extend(step_messages(&wire_id, value, &outcome, *detail, |text| {
                 store
                     .protect_publication(&json!(text), credentials)?
                     .as_str()
@@ -963,6 +1001,24 @@ fn request_context<S: Storage>(
             offered
         };
         messages.extend(template_messages);
+        if let Some(task) = task.filter(|task| !task.commands_recorded_as_run.is_empty()) {
+            messages.push(json!({"role":"user","content":format!(
+                "The owner chose It already ran for these command obligations: {}. This supersedes their earlier as-if-not-done assumptions in history. Their obligations are cleared; do not run these commands to satisfy those earlier assumptions. Any newer Run it again obligations still apply. Continue with verification and any other current findings.",
+                serde_json::to_string(&task.commands_recorded_as_run)
+                    .map_err(|_| "owner command assumption encoding")?,
+            )}));
+        }
+        if let Some(task) = task.filter(|task| !task.unmet_commands.is_empty()) {
+            let commands: Vec<_> = task
+                .unmet_commands
+                .iter()
+                .map(|command| json!({"machine":command.machine,"command":command.command}))
+                .collect();
+            messages.push(json!({"role":"user","content":format!(
+                "These commands the owner chose to run again still need to run: {}. tau-web already made its one product re-issue and will not send them again by itself. Run the identical command bytes on the same machine to meet each obligation, then call done. Delivered is blocked while any remain unmet.",
+                serde_json::to_string(&commands).map_err(|_| "unmet command encoding")?,
+            )}));
+        }
         let value = published(
             store,
             &json!({"model":config.model,"max_completion_tokens":COMPLETION_TOKENS,"tool_choice":"auto","parallel_tool_calls":false,"provider":{"zdr":true},"messages":messages,"tools":tools}),

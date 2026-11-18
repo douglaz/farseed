@@ -1328,11 +1328,14 @@ const renderTasks = (store) => {
           requestCard.append(button);
         }
         card.append(requestCard);
+      } else if (task.proposal.call_id.startsWith('$rerun:')) {
+        const label = task.pending ? task.status === 'paused' ? 'Re-issued command' : 'Running again' : 'Ready to send once more';
+        paragraph(card, `${label}: ${commandSummary(task.proposal.tool.arguments.command)}`);
       } else if (!missingRecord) paragraph(card, task.proposal.call_id.startsWith('$before:') ? 'Next: read the listening ports before setup.' : task.proposal.call_id.startsWith('$verify:') || task.proposal.call_id.startsWith('$verify-batch') ? 'Next: check the machine setup.' : task.proposal.tool.name === 'exec' ? `Next: ${commandSummary(task.proposal.tool.arguments.command)}` : task.proposal.tool.name === 'propose_declaration' ? 'Next: a requirements proposal from the AI.' : task.proposal.tool.name === 'done' ? 'Next: the handover from the AI.' : task.proposal.tool.name === 'request_ai_key' ? `Creating an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} and saving it on the machine.` : 'Next: a step.');
       rawDetails(card, task.proposal.tool, ['task', task.id, 'proposal', task.proposal.call_id]);
     }
     if (task.pending && task.proposal?.report == null) {
-      if (!missingRecord) paragraph(card, 'Waiting for the earlier command. Resume checks its result without running it twice.');
+      if (!missingRecord && !(task.proposal?.call_id.startsWith('$rerun:') && task.disposition_offer)) paragraph(card, task.proposal?.call_id.startsWith('$rerun:') ? 'Waiting for the re-issued command. Resume checks its result without running it twice.' : 'Waiting for the earlier command. Resume checks its result without running it twice.');
       rawDetails(card, task.pending, ['task', task.id, 'pending']);
     }
     if (task.pause_reason) {
@@ -1350,7 +1353,7 @@ const renderTasks = (store) => {
     }
     for (const finding of task.findings ?? []) {
       const service = finding.service?.name;
-      paragraph(card, ['sign_in', 'control_center', 'control_center_files'].includes(finding.field) ? finding.detail : service ? `${service} does not match the approved setup.` : finding.field === 'inbound' ? 'The listening ports do not match the approved setup.' : 'A setup check found a difference or could not finish. Open Details to review it.');
+      paragraph(card, ['sign_in', 'control_center', 'control_center_files', 'unmet_command'].includes(finding.field) ? finding.detail : service ? `${service} does not match the approved setup.` : finding.field === 'inbound' ? 'The listening ports do not match the approved setup.' : 'A setup check found a difference or could not finish. Open Details to review it.');
       rawDetails(card, finding);
     }
     for (const note of task.notes ?? []) paragraph(card, note.text === 'enabled, restart not demonstrated'
@@ -1392,19 +1395,41 @@ const renderTasks = (store) => {
     if (session && task.verifying && task.status === 'paused' && !task.pending) {
       action('Prepare complete re-check', { action: 'retry-checks', session: session.identity });
     }
+    if (session && store.lifecycle_state !== 'ended') {
+      for (const command of task.unmet_commands ?? []) {
+        if (!(task.acknowledgeable_commands ?? []).includes(command.created)) continue;
+        const decision = document.createElement('section');
+        paragraph(decision, `Command awaiting confirmation on ${command.machine}: ${commandSummary(command.command)}`);
+        paragraph(decision, 'If you know this command already ran, record that here. Nothing is sent by this choice. Its result stays unknown; verification still decides Delivered.');
+        const choose = document.createElement('button'); choose.type = 'button'; choose.textContent = 'It already ran';
+        choose.dataset.commandObligation = String(command.created);
+        choose.addEventListener('click', () => {
+          choose.disabled = true;
+          worker.postMessage({task: {action: 'command-already-ran', id: task.id, session: session.identity, revision: task.revision, obligation: command.created}});
+        });
+        decision.append(choose);
+        card.append(decision);
+      }
+    }
     if (session && store.lifecycle_state !== 'ended' && task.disposition_offer) {
       const offer = task.disposition_offer;
       if (missingRecord) {
         taskDispositionDrafts.delete(task.id);
         const decision = document.createElement('section');
         decision.dataset.missingRecord = '';
-        paragraph(decision, 'The page sent the command, but the machine has no record of it. Most likely it never arrived.');
-        paragraph(decision, 'Running it again is the usual choice. If it did arrive, running it again repeats its changes. This is your decision.');
-        paragraph(decision, 'Either choice lets the AI carry on, with the result still unknown. The earlier command may arrive or run late, overlap later commands, and its late result will not appear here.');
+        paragraph(decision, 'The machine has no record of this command, so it may never have arrived.');
+        if (task.rerun_refusal) paragraph(decision, task.rerun_refusal);
+        else {
+          paragraph(decision, 'Running it again is the usual choice. If it did arrive, running it again repeats its changes. This is your decision.');
+          paragraph(decision, 'Run it again: tau-web will send this command to the machine once more.');
+        }
+        paragraph(decision, 'It already ran: nothing is sent, and the AI carries on.');
+        paragraph(decision, 'The earlier result stays unknown. The earlier command may arrive or run late, overlap later commands, and its late result will not appear here.');
         if (offer.remaining.length) paragraph(decision, 'Other commands still have unknown results. This choice does not clear them; the machine stays paused for them.');
         if (offer.standing) paragraph(decision, 'This replaces your earlier choice for this command. Other commands covered by that choice keep their unknown results.');
         let chosen = false;
         for (const [continuation, label] of [['as_if_not_done', 'Run it again'], ['as_if_done', 'It already ran']]) {
+          if (continuation === 'as_if_not_done' && task.rerun_refusal) continue;
           const choose = document.createElement('button'); choose.type = 'button'; choose.textContent = label;
           choose.dataset.pendingAssumption = continuation;
           if (continuation === 'as_if_not_done') choose.dataset.pendingRetry = '';
@@ -1418,7 +1443,20 @@ const renderTasks = (store) => {
         }
         card.append(decision);
       } else {
-        const labels = {as_if_not_done: "Carry on as if it didn't run", as_if_done: 'Carry on as if it ran'};
+        const reissued = task.proposal?.call_id.startsWith('$rerun:');
+        const unsent = reissued && task.rerun_unsent === true;
+        if (unsent) {
+          paragraph(card, 'tau-web has not sent this command yet. Resume sends it to the machine once.');
+          paragraph(card, "If tau-web can't send it, choose Let the AI decide: this command still needs to run, and the AI will be told so.");
+        } else if (reissued) {
+          paragraph(card, 'tau-web sent this command once more and the machine has no record of it either. tau-web will not send it again by itself.');
+          paragraph(card, 'It already ran clears the obligation and sends nothing. Let the AI decide keeps the obligation: this command still needs to run.');
+        }
+        const labels = unsent
+          ? {as_if_not_done: 'Let the AI decide'}
+          : reissued
+          ? {as_if_done: 'It already ran', as_if_not_done: 'Let the AI decide'}
+          : {as_if_not_done: "Carry on as if it didn't run", as_if_done: 'Carry on as if it ran'};
         const confirmation = document.createElement('section');
         confirmation.dataset.pendingConfirmation = task.id;
         const showConfirmation = () => {
@@ -1429,7 +1467,11 @@ const renderTasks = (store) => {
           paragraph(confirmation, `The earlier command on ${snapshot.machine} still has no confirmed result.`);
           rawDetails(confirmation, snapshot, ['task', task.id, 'confirmation']);
           paragraph(confirmation, `The result stays unknown. Your choice: ${labels[draft.continuation]}.`);
-          paragraph(confirmation, 'The AI may then run the same command again.');
+          paragraph(confirmation, reissued
+            ? draft.continuation === 'as_if_done'
+              ? 'The AI will be told you recorded this command as already run and must not run it again to meet this obligation.'
+              : 'This command still needs to run. The AI will be told that; tau-web will not send it again by itself.'
+            : 'The AI may then run the same command again.');
           paragraph(confirmation, 'If the earlier command arrives or runs late, it can overlap later commands and the page will never show it.');
           if (snapshot.read === 'incomplete') paragraph(confirmation, 'The incomplete command may still be running.');
           if (snapshot.remaining.length) paragraph(confirmation, 'Other commands still have unknown results. This choice does not clear them; the machine stays paused for them.');

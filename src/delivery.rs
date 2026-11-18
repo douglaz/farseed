@@ -27,6 +27,7 @@ pub enum FieldId {
     SignIn,
     ControlCenter,
     ControlCenterFiles,
+    UnmetCommand,
 }
 impl FieldId {
     pub const DECLARATION: [Self; 9] = [
@@ -181,6 +182,9 @@ pub struct Finding {
     pub field: FieldId,
     pub detail: String,
     pub service: Option<Service>,
+    /// The creation record of the task command obligation behind this finding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub obligation: Option<u64>,
 }
 impl Finding {
     pub fn class(&self) -> FindingClass {
@@ -225,6 +229,7 @@ impl FieldResult {
             field: self.field,
             detail,
             service,
+            obligation: None,
         });
     }
 }

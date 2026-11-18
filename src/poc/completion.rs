@@ -331,6 +331,7 @@ fn finding(result: &mut FieldResult, detail: String) {
         field: result.field,
         detail,
         service: None,
+        obligation: None,
     });
 }
 
