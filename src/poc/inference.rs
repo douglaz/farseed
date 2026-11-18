@@ -246,6 +246,21 @@ pub(crate) fn safe<S: Storage>(store: &Store<S>, value: &Value, credentials: &[&
     protected(store, value, credentials).is_ok_and(|p| p == *value)
 }
 
+fn published<S: Storage>(
+    store: &Store<S>,
+    value: &Value,
+    credentials: &[&[u8]],
+) -> Result<Value, String> {
+    let value = store.protect_publication(value, credentials)?;
+    let bytes =
+        Zeroizing::new(serde_json::to_vec(&value).map_err(|_| "inference output encoding")?);
+    // Boundaries were checked on string values; the encoded envelope keeps exact checking
+    // so punctuation inside object keys cannot become a publication cut boundary.
+    let redacted = Redacted::for_inference(store, &bytes, credentials)?;
+    serde_json::from_slice(redacted.as_bytes())
+        .map_err(|_| "inference protected output unavailable".into())
+}
+
 fn excerpt(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.into();
@@ -269,9 +284,13 @@ fn omitted_output(bytes: usize) -> String {
     format!("[{bytes} bytes of output omitted]")
 }
 
-fn head_tail_excerpt(text: &str, limit: usize) -> String {
+fn head_tail_excerpt(
+    text: &str,
+    limit: usize,
+    protect_cut: &impl Fn(&str) -> Result<String, String>,
+) -> Result<String, String> {
     if text.len() <= limit {
-        return text.into();
+        return Ok(text.into());
     }
     // The longest possible decimal count reserves enough room before slicing.
     let room = limit.saturating_sub(omitted_output(text.len()).len() + 2);
@@ -283,12 +302,12 @@ fn head_tail_excerpt(text: &str, limit: usize) -> String {
     while !text.is_char_boundary(tail) {
         tail += 1;
     }
-    format!(
+    Ok(format!(
         "{}\n{}\n{}",
-        &text[..head],
+        protect_cut(&text[..head])?,
         omitted_output(tail - head),
-        &text[tail..]
-    )
+        protect_cut(&text[tail..])?
+    ))
 }
 
 impl HistoryExcerpt {
@@ -299,18 +318,37 @@ impl HistoryExcerpt {
             Self::Omitted => 0,
         }
     }
-    fn excerpt(self, text: &str, limit: usize) -> String {
+    fn excerpt(
+        self,
+        text: &str,
+        limit: usize,
+        protect_cut: &impl Fn(&str) -> Result<String, String>,
+    ) -> Result<String, String> {
         match self {
-            Self::Full => excerpt(text, limit),
-            Self::Short => head_tail_excerpt(text, limit),
-            Self::Omitted => omitted_output(text.len()),
+            Self::Full if text.len() > limit => {
+                let cut = excerpt(text, limit);
+                let end = cut.len() - "\n[truncated]".len().min(limit);
+                // Check the retained head before attaching the truncation notice.
+                Ok(format!("{}{}", protect_cut(&cut[..end])?, &cut[end..]))
+            }
+            Self::Full => Ok(text.into()),
+            Self::Short => head_tail_excerpt(text, limit, protect_cut),
+            Self::Omitted => Ok(omitted_output(text.len())),
         }
     }
 }
 
-fn outcome_excerpt(outcome: &Value, detail: HistoryExcerpt) -> Result<String, String> {
+fn outcome_excerpt(
+    outcome: &Value,
+    detail: HistoryExcerpt,
+    protect_framed: impl Fn(&str) -> Result<String, String>,
+) -> Result<String, String> {
     let Some(fields) = outcome.as_object() else {
-        return Ok(detail.excerpt(&outcome.to_string(), detail.limit()));
+        return detail.excerpt(
+            &protect_framed(&outcome.to_string())?,
+            detail.limit(),
+            &protect_framed,
+        );
     };
     let streams: Vec<_> = ["stdout", "stderr"]
         .into_iter()
@@ -323,7 +361,11 @@ fn outcome_excerpt(outcome: &Value, detail: HistoryExcerpt) -> Result<String, St
         })
         .collect();
     if streams.is_empty() {
-        return Ok(detail.excerpt(&outcome.to_string(), detail.limit()));
+        return detail.excerpt(
+            &protect_framed(&outcome.to_string())?,
+            detail.limit(),
+            &protect_framed,
+        );
     }
     if matches!(detail, HistoryExcerpt::Omitted) {
         return Ok(omitted_output(
@@ -335,7 +377,7 @@ fn outcome_excerpt(outcome: &Value, detail: HistoryExcerpt) -> Result<String, St
     for (name, content) in streams {
         text.push_str(&format!(
             "{name}:\n{}\n",
-            detail.excerpt(content, per_stream)
+            detail.excerpt(content, per_stream, &protect_framed)?
         ));
     }
     let mut rest = fields.clone();
@@ -345,7 +387,8 @@ fn outcome_excerpt(outcome: &Value, detail: HistoryExcerpt) -> Result<String, St
     if !rest.is_empty() {
         text.push_str(&Value::Object(rest).to_string());
     }
-    Ok(detail.excerpt(&text, detail.limit()))
+    // Labels and metadata form new text; protect that complete representation before its cut.
+    detail.excerpt(&protect_framed(&text)?, detail.limit(), &protect_framed)
 }
 
 fn step_messages(
@@ -353,12 +396,13 @@ fn step_messages(
     value: &Value,
     outcome: &Value,
     detail: HistoryExcerpt,
+    protect_framed: impl Fn(&str) -> Result<String, String>,
 ) -> Result<[Value; 2], String> {
     let outcome = Zeroizing::new(
         if value["name"] == "ask_operator" && outcome["answer"].is_string() {
             outcome.to_string()
         } else {
-            outcome_excerpt(outcome, detail)?
+            outcome_excerpt(outcome, detail, protect_framed)?
         },
     );
     Ok([
@@ -375,7 +419,7 @@ fn history_excerpts(steps: &[Step]) -> Result<Vec<HistoryExcerpt>, String> {
         (|| {
             let (id, tool, outcome) = step;
             let value = serde_json::to_value(tool).map_err(|_| "inference tool encoding")?;
-            let messages = step_messages(id, &value, outcome, detail)?;
+            let messages = step_messages(id, &value, outcome, detail, |text| Ok(text.into()))?;
             let bytes = Zeroizing::new(
                 serde_json::to_vec(&messages).map_err(|_| "inference request encoding")?,
             );
@@ -531,7 +575,7 @@ fn request_context<S: Storage>(
                     );
                 }
             }
-            let facts = store.protect_output_with(&facts, credentials)?;
+            let facts = store.protect_publication(&facts, credentials)?;
             messages.push(json!({"role":"user","content":facts.to_string()}));
         }
         let mut template_messages = Vec::new();
@@ -570,7 +614,7 @@ fn request_context<S: Storage>(
             if recovery {
                 extra.push(json!({"role":"user","content":template.recovery}));
             }
-            let extra = store.protect_output_with(&json!(extra), credentials)?;
+            let extra = store.protect_publication(&json!(extra), credentials)?;
             let mut extra = extra
                 .as_array()
                 .ok_or("template message protection")?
@@ -613,10 +657,16 @@ fn request_context<S: Storage>(
             if !safe(store, &json!({"id":id,"tool":value}), credentials) {
                 return Err("inference completed step contains protected material".into());
             }
-            // Durable evidence is independently protected by the store before append. Limit
-            // this model-context projection before repeated serialization/protection.
-            let outcome = store.protect_output_with(outcome, credentials)?;
-            messages.extend(step_messages(id, &value, &outcome, *detail)?);
+            // Protect complete recorded strings, including collection boundaries, under this
+            // request's holdings before any history excerpt or omission is derived.
+            let outcome = store.protect_publication(outcome, credentials)?;
+            messages.extend(step_messages(id, &value, &outcome, *detail, |text| {
+                store
+                    .protect_publication(&json!(text), credentials)?
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "inference protected output unavailable".into())
+            })?);
         }
         let sockets = task
             .and_then(|t| t.before_setup.as_ref())
@@ -766,7 +816,7 @@ fn request_context<S: Storage>(
             offered
         };
         messages.extend(template_messages);
-        let value = protected(
+        let value = published(
             store,
             &json!({"model":config.model,"max_completion_tokens":COMPLETION_TOKENS,"tool_choice":"auto","parallel_tool_calls":false,"provider":{"zdr":true},"messages":messages,"tools":tools}),
             credentials,

@@ -12,25 +12,66 @@ impl<S: Storage> Store<S> {
         value: &Value,
         credentials: &[&[u8]],
     ) -> Result<Value, String> {
+        self.protect_value(value, credentials, false, false)
+    }
+
+    /// Publication checks complete strings and already-cut boundaries under current holdings.
+    /// This entry is never used by journal append, replay or evidence admission.
+    pub(crate) fn protect_publication(
+        &self,
+        value: &Value,
+        credentials: &[&[u8]],
+    ) -> Result<Value, String> {
+        self.protect_value(value, credentials, true, false)
+    }
+
+    /// Bound only page/task-details envelopes, never arbitrary model tool output.
+    pub(crate) fn protect_page_publication(&self, value: &Value) -> Result<Value, String> {
+        self.protect_value(value, &[], true, true)
+    }
+
+    fn protect_value(
+        &self,
+        value: &Value,
+        credentials: &[&[u8]],
+        publication: bool,
+        page: bool,
+    ) -> Result<Value, String> {
         let mut held = self.held_credentials()?;
         held.extend_borrowed(credentials);
-        fn text(text: &str, held: &crate::redaction::Held<'_>) -> Result<String, String> {
-            let safe = crate::redaction::redact(text.as_bytes(), &[], held)?;
+        fn text(
+            text: &str,
+            held: &crate::redaction::Held<'_>,
+            publication: bool,
+        ) -> Result<String, String> {
+            let safe = if publication {
+                crate::redaction::redact_publication(text.as_bytes(), held)?
+            } else {
+                crate::redaction::redact(text.as_bytes(), &[], held)?
+            };
             Ok(String::from_utf8_lossy(safe.as_bytes()).into_owned())
         }
-        fn protect(value: &Value, held: &crate::redaction::Held<'_>) -> Result<Value, String> {
+        fn protect(
+            value: &Value,
+            held: &crate::redaction::Held<'_>,
+            publication: bool,
+        ) -> Result<Value, String> {
             Ok(match value {
-                Value::String(s) => text(s, held)?.into(),
+                Value::String(s) => text(s, held, publication)?.into(),
                 Value::Array(a) => a
                     .iter()
-                    .map(|v| protect(v, held))
+                    .map(|v| protect(v, held, publication))
                     .collect::<Result<Vec<_>, _>>()?
                     .into(),
                 Value::Object(o) => {
                     let mut result = serde_json::Map::new();
                     for (key, value) in o {
-                        let key = text(key, held)?;
-                        if result.insert(key, protect(value, held)?).is_some() {
+                        // Schema keys retain exact protection; only string values have cuts.
+                        let key = text(key, held, false)?;
+                        if result
+                            .insert(key, protect(value, held, publication)?)
+                            .is_some()
+                        {
                             return Err(crate::poc::wait::OUTPUT_COLLISION.into());
                         }
                     }
@@ -38,7 +79,7 @@ impl<S: Storage> Store<S> {
                 }
                 _ => {
                     let raw = value.to_string();
-                    let safe = text(&raw, held)?;
+                    let safe = text(&raw, held, false)?;
                     if safe == raw {
                         value.clone()
                     } else {
@@ -47,7 +88,18 @@ impl<S: Storage> Store<S> {
                 }
             })
         }
-        let safe = protect(value, &held)?;
+        let mut safe = protect(value, &held, publication)?;
+        if page {
+            // Complete fields pass once above; bound the page before its envelope is encoded.
+            if let Some(tasks) = safe.get_mut("tasks").and_then(Value::as_array_mut) {
+                for task in tasks {
+                    super::poc::Task::truncate_view(task, &|cut| text(cut, &held, true))?;
+                }
+            }
+            if let Some(task) = safe.pointer_mut("/task_details/task") {
+                super::poc::Task::truncate_view(task, &|cut| text(cut, &held, true))?;
+            }
+        }
         let bytes = Zeroizing::new(serde_json::to_vec(&safe).map_err(|_| "output JSON encoding")?);
         self.check_output_bytes_with(&bytes, &held)?;
         Ok(safe)

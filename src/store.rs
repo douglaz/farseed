@@ -2814,7 +2814,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                         delivery["verdict_is_historical"] = true.into();
                     }
                 }
-                store.protect_output(&history).unwrap_or_else(|_| json!({"state":"unlocked","lifecycle_state":"ended","seed_backup_stage":"inactive","error":"sessions ended; protected history unavailable"}))
+                store.protect_page_publication(&history).unwrap_or_else(|_| json!({"state":"unlocked","lifecycle_state":"ended","seed_backup_stage":"inactive","error":"sessions ended; protected history unavailable"}))
             }
             State::Unlocked(store) if store.authority.state() == "reconciling" => {
                 let endable = store.exposure_ledger.iter()
@@ -2826,10 +2826,10 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                     "lifecycle_generation":store.authority.generation().to_string(),
                     "seed_backup_stage":self.seed_backup,"endable_sessions":endable,
                     "error":"Reconciliation or clock verification required after suspension."});
-                store.protect_output(&controls).unwrap_or_else(|_| json!({"state":"unlocked",
+                store.protect_page_publication(&controls).unwrap_or_else(|_| json!({"state":"unlocked",
                     "lifecycle_state":"reconciling","error":"Protected session controls unavailable."}))
             }
-            State::Unlocked(store) => store.protect_output(&report).and_then(|mut protected| {
+            State::Unlocked(store) => store.protect_page_publication(&report).and_then(|mut protected| {
                 // Keep durable delivery facts distinct from the current caller's ability to act.
                 if let Some(deliveries) = protected["delivery"].as_array_mut() {
                     for delivery in deliveries {

@@ -99,7 +99,7 @@ async fn publication(
         metadata.insert("actionable".into(), false.into());
         let store = local.store()?;
         measure(cycle, Mark::PublishProtect, || {
-            store.protect_output(&json!({"session":session,"outcome":metadata}))
+            store.protect_publication(&json!({"session":session,"outcome":metadata}), &[])
         })
         .ok()
     })();
@@ -121,7 +121,9 @@ async fn publication(
                 // No incoming fields to release; report() protects the current store view.
                 value
             } else {
-                measure(cycle, Mark::PublishProtect, || store.protect_output(&value))?
+                measure(cycle, Mark::PublishProtect, || {
+                    store.protect_publication(&value, &[])
+                })?
             };
             let mut current = local.report_timed(None, cycle);
             if safe["payment_timer"] == true {
@@ -206,7 +208,7 @@ async fn publication(
             .store()
             .and_then(|store| {
                 measure(cycle, Mark::PublishProtect, || {
-                    store.protect_output(&configuration)
+                    store.protect_publication(&configuration, &[])
                 })
                 .ok()
             })
@@ -219,13 +221,16 @@ async fn publication(
             let mut fallback = provider_configuration;
             fallback["recorded"] = store.provider_account().is_some().into();
             measure(cycle, Mark::PublishProtect, || {
-                store.protect_output(&json!({
-                    "key_set":crate::poc::provisioning::browser::key_is_set(),
-                    "origin":store.procurement_origin(),
-                    "account":store.provider_account().map(|a| a.public()),
-                    "recorded":store.provider_account().is_some(),
-                    "relay_deployed":store.deployment_relay_present(),
-                }))
+                store.protect_publication(
+                    &json!({
+                        "key_set":crate::poc::provisioning::browser::key_is_set(),
+                        "origin":store.procurement_origin(),
+                        "account":store.provider_account().map(|a| a.public()),
+                        "recorded":store.provider_account().is_some(),
+                        "relay_deployed":store.deployment_relay_present(),
+                    }),
+                    &[],
+                )
             })
             .unwrap_or(fallback)
         } else {
@@ -240,7 +245,7 @@ async fn publication(
                 .store()
                 .and_then(|store| {
                     measure(cycle, Mark::PublishProtect, || {
-                        store.protect_output(&readiness)
+                        store.protect_publication(&readiness, &[])
                     })
                     .ok()
                 })

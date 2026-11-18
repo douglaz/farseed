@@ -438,22 +438,22 @@ async fn committed(
     {
         value["command_result"]["optional_report"] = true.into();
     }
-    let mut safe = store.protect_output(&value)?;
+    let mut safe = store.protect_publication(&value, &[])?;
     if store.current_command_results(&mut safe) {
-        safe = store.protect_output(&safe)?;
+        safe = store.protect_publication(&safe, &[])?;
     }
     let worker: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
     loop {
         if continuation.check().is_err() && safe["historical"] != true {
             crate::jobs::historical(&mut safe, "stale result after suspension");
-            safe = store.protect_output(&safe)?;
+            safe = store.protect_publication(&safe, &[])?;
         }
         let encoded = safe.to_string();
         store.check_output_bytes(encoded.as_bytes())?;
         let message =
             js_sys::JSON::parse(&encoded).map_err(|_| crate::poc::wait::RESULT_ENCODING)?;
         if store.current_command_results(&mut safe) {
-            safe = store.protect_output(&safe)?;
+            safe = store.protect_publication(&safe, &[])?;
             continue;
         }
         // The same writer and response reservation cover scanning, encoding and post.
@@ -1062,7 +1062,7 @@ pub async fn publish_task_details(generation: u64, id: String, request: String) 
     let protected = details.and_then(|task| {
         let value = serde_json::json!({"task_details":{"id":id,"request":request,
             "generation":generation.to_string(),"task":store.poc_task_view(&task)}});
-        let protected = store.protect_output(&value).ok()?;
+        let protected = store.protect_page_publication(&value).ok()?;
         // A protected correlation field must still identify this exact request and task.
         (protected["task_details"]["id"] == id
             && protected["task_details"]["request"] == request
@@ -1074,7 +1074,7 @@ pub async fn publish_task_details(generation: u64, id: String, request: String) 
         protected
     } else {
         let refusal = serde_json::json!({"task_details_unavailable":request});
-        let Ok(protected) = store.protect_output(&refusal) else {
+        let Ok(protected) = store.protect_publication(&refusal, &[]) else {
             return false;
         };
         // Even fixed framing and the page's token must survive protection unchanged.

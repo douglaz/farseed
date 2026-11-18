@@ -170,15 +170,32 @@ impl Task {
                         })
             })
     }
-    /// The page card shows bounded excerpts; complete outcomes remain in the journal
-    /// and the command evidence view. Repeating them here can exhaust a whole report.
+    /// Keep complete text until the publication boundary protects it and bounds the card.
     pub(super) fn view(&self) -> Value {
         let mut value = serde_json::to_value(self).expect("task serializes");
         value["file_offers"] = serde_json::to_value(self.file_offers()).expect("offers serialize");
-        for step in value["completed"].as_array_mut().expect("completed array") {
-            Self::truncate_step_view(step);
-        }
+        value["pause_reason"] = self.publication_pause_reason();
         value
+    }
+    fn publication_pause_reason(&self) -> Value {
+        if let Some(reason) = &self.pause_reason
+            && let Some(malformed) = self.malformed.as_ref().filter(|m| m.count == 3)
+            && let Some(prefix) = Self::malformed_pause_prefix(reason)
+        {
+            // Rebuild from the complete recorded diagnostic; append/replay keep their old cut.
+            return format!("{prefix}{}. Resume asks the model again.", malformed.reason).into();
+        }
+        json!(self.pause_reason)
+    }
+    fn malformed_pause_prefix(reason: &str) -> Option<&'static str> {
+        [
+            "the AI's reply was cut off; 3 unusable replies in a row; last reason: ",
+            "3 malformed replies in a row; last reason: ",
+        ]
+        .into_iter()
+        .find(|prefix| {
+            reason.starts_with(prefix) && reason.ends_with(". Resume asks the model again.")
+        })
     }
     /// Only the card heading and the cross-card lookups; never serialize old outcomes here.
     pub(super) fn summary_view(&self) -> Value {
@@ -216,20 +233,47 @@ impl Task {
         json!({"summary":true,"id":self.id,"start_session":self.start_session,
             "machine":self.machine,"status":self.status,
             "goal":self.goal,
-            "pause_reason":self.pause_reason,"verdict":self.verdict,
+            "pause_reason":self.publication_pause_reason(),"verdict":self.verdict,
             "delivered_urls":delivered_urls})
     }
-    fn truncate_step_view(step: &mut Value) {
+    pub(super) fn truncate_view(
+        value: &mut Value,
+        protect_cut: &impl Fn(&str) -> Result<String, String>,
+    ) -> Result<(), String> {
+        if let Some(steps) = value.get_mut("completed").and_then(Value::as_array_mut) {
+            for step in steps {
+                Self::truncate_step_view(step, protect_cut)?;
+            }
+        }
+        if let Some(reason) = value["pause_reason"].as_str()
+            && reason.len() > 512
+            && Self::malformed_pause_prefix(reason).is_some()
+        {
+            const SUFFIX: &str = ". Resume asks the model again.";
+            let mut end = 512 - SUFFIX.len() - "…".len();
+            while !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            // Recheck the newly exposed end before adding the pause framing.
+            value["pause_reason"] = format!("{}…{SUFFIX}", protect_cut(&reason[..end])?).into();
+        }
+        Ok(())
+    }
+    fn truncate_step_view(
+        step: &mut Value,
+        protect_cut: &impl Fn(&str) -> Result<String, String>,
+    ) -> Result<(), String> {
         let content = &mut step[2]["content"];
         for field in ["stdout", "stderr"] {
             if let Some(text) = content[field].as_str() {
                 let excerpt: String = text.chars().take(1024).collect();
                 if excerpt.len() < text.len() {
-                    content[field] = excerpt.into();
+                    content[field] = protect_cut(&excerpt)?.into();
                     content[format!("{field}_truncated")] = true.into();
                 }
             }
         }
+        Ok(())
     }
     pub fn ended(&self) -> bool {
         matches!(self.status, Status::Complete | Status::Abandoned)

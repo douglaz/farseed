@@ -170,12 +170,21 @@ impl<'a> Held<'a> {
     }
 
     fn matches(&self, bytes: &[u8], mut found: impl FnMut(usize, usize) -> bool) -> bool {
+        self.matches_with_boundaries(bytes, false, &mut found)
+    }
+
+    fn matches_with_boundaries(
+        &self,
+        bytes: &[u8],
+        publication: bool,
+        mut found: impl FnMut(usize, usize) -> bool,
+    ) -> bool {
         let matcher = self.derived.iter().find_map(|key| match key {
             Derived::Matcher(matcher) => Some(matcher.get_or_init(|| Matcher::new(self))),
             _ => None,
         });
         if let Some(matcher) = matcher
-            && matcher.matches(bytes, &mut found)
+            && matcher.matches(bytes, publication, &mut found)
         {
             return true;
         }
@@ -201,6 +210,7 @@ impl Drop for Prefix {
 
 pub(crate) struct Matcher {
     prefixes: HashMap<Prefix, Zeroizing<Vec<Zeroizing<Vec<u8>>>>>,
+    suffixes: HashMap<Prefix, Zeroizing<Vec<Zeroizing<Vec<u8>>>>>,
 }
 
 impl Matcher {
@@ -209,16 +219,30 @@ impl Matcher {
         // holding prefix copies without zeroizing them.
         let long = held.values().filter(|value| value.len() >= 8).count();
         let mut prefixes = HashMap::with_capacity(long);
+        let mut suffixes = HashMap::with_capacity(long);
         for value in held.values().filter(|value| value.len() >= 8) {
             prefixes
                 .entry(Prefix(value[..8].try_into().expect("credential prefix")))
                 .or_insert_with(|| Zeroizing::new(Vec::new()))
                 .push(Zeroizing::new(value.to_vec()));
+            suffixes
+                .entry(Prefix(
+                    value[value.len() - 8..]
+                        .try_into()
+                        .expect("credential suffix"),
+                ))
+                .or_insert_with(|| Zeroizing::new(Vec::new()))
+                .push(Zeroizing::new(value.to_vec()));
         }
-        Self { prefixes }
+        Self { prefixes, suffixes }
     }
 
-    fn matches(&self, bytes: &[u8], found: &mut impl FnMut(usize, usize) -> bool) -> bool {
+    fn matches(
+        &self,
+        bytes: &[u8],
+        publication: bool,
+        found: &mut impl FnMut(usize, usize) -> bool,
+    ) -> bool {
         if self.prefixes.is_empty() {
             return false;
         }
@@ -226,7 +250,37 @@ impl Matcher {
             let prefix = Prefix(window.try_into().expect("eight-byte window"));
             if let Some(candidates) = self.prefixes.get(&prefix) {
                 for value in candidates.iter() {
-                    if bytes[start..].starts_with(value) && found(start, start + value.len()) {
+                    if publication {
+                        let remaining = &bytes[start..];
+                        let matched = value
+                            .iter()
+                            .zip(remaining)
+                            .take_while(|(a, b)| a == b)
+                            .count();
+                        if (matched == value.len() || matched == remaining.len())
+                            && found(start, start + matched)
+                        {
+                            return true;
+                        }
+                        // Legacy diagnostics wrap pre-cut text in punctuation. A marker
+                        // inside the matching prefix is also an end, without another text pass.
+                        if let Some(end) = (8..=matched).find(|end| {
+                            remaining[*end..].starts_with("…".as_bytes())
+                                || remaining[*end..].starts_with(b"\n[truncated]")
+                        }) && found(start, start + end)
+                        {
+                            return true;
+                        }
+                    } else if bytes[start..].starts_with(value) && found(start, start + value.len())
+                    {
+                        return true;
+                    }
+                }
+            }
+            if publication && let Some(candidates) = self.suffixes.get(&prefix) {
+                let end = start + 8;
+                for value in candidates.iter() {
+                    if end < value.len() && value.ends_with(&bytes[..end]) && found(0, end) {
                         return true;
                     }
                 }
@@ -243,6 +297,20 @@ impl fmt::Debug for Held<'_> {
 }
 
 pub(crate) fn redact(body: &[u8], fields: &[&str], held: &Held<'_>) -> Result<Redacted, String> {
+    redact_with_boundaries(body, fields, held, false)
+}
+
+/// Publication only: durable checks continue to use exact matching through `redact`.
+pub(crate) fn redact_publication(body: &[u8], held: &Held<'_>) -> Result<Redacted, String> {
+    redact_with_boundaries(body, &[], held, true)
+}
+
+fn redact_with_boundaries(
+    body: &[u8],
+    fields: &[&str],
+    held: &Held<'_>,
+    publication: bool,
+) -> Result<Redacted, String> {
     let bytes = if fields.is_empty() {
         body.to_vec()
     } else {
@@ -261,7 +329,7 @@ pub(crate) fn redact(body: &[u8], fields: &[&str], held: &Held<'_>) -> Result<Re
     // Collect before replacing: overlapping copies must produce a single marker, and replacing
     // one needle must not conceal an overlapping needle from another credential.
     let mut ranges = Vec::new();
-    held.matches(&bytes, |start, end| {
+    held.matches_with_boundaries(&bytes, publication, |start, end| {
         ranges.push((start, end));
         false
     });

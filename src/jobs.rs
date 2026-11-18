@@ -326,6 +326,7 @@ pub struct ReadDelivery {
     pub stderr: Vec<u8>,
     pub status: Option<u32>,
     pub closed: bool,
+    stderr_capped: bool,
 }
 
 pub const WRAPPER_STDERR_LIMIT: usize = 2048;
@@ -333,16 +334,28 @@ pub const WRAPPER_STDERR_LIMIT: usize = 2048;
 impl ReadDelivery {
     pub fn extended_data(&mut self, bytes: &[u8]) {
         let remaining = WRAPPER_STDERR_LIMIT.saturating_sub(self.stderr.len());
+        self.stderr_capped |= bytes.len() > remaining;
         self.stderr
             .extend_from_slice(&bytes[..bytes.len().min(remaining)]);
     }
 
     pub fn record(self) -> Result<Record, String> {
         if self.status != Some(0) {
+            let mut stderr = self.stderr.as_slice();
+            if self.stderr_capped
+                && let Some(chunk) = stderr.utf8_chunks().last()
+                && !chunk.invalid().is_empty()
+                && std::str::from_utf8(chunk.invalid()).is_err_and(|e| e.error_len().is_none())
+            {
+                // A cap-split code point must not become a replacement character before
+                // the marker: publication needs the retained held-value prefix intact.
+                stderr = &stderr[..stderr.len() - chunk.invalid().len()];
+            }
             return Err(format!(
-                "job read ended without a complete record (wrapper status {:?} is not a command status): {}",
+                "job read ended without a complete record (wrapper status {:?} is not a command status): {}{}",
                 self.status,
-                String::from_utf8_lossy(&self.stderr)
+                String::from_utf8_lossy(stderr),
+                if self.stderr_capped { "…" } else { "" }
             ));
         }
         if !self.closed {
