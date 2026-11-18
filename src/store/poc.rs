@@ -684,13 +684,20 @@ impl<S: Storage> Store<S> {
         task: &Task,
         session: &str,
         call_id: String,
-        tool: Tool,
+        mut tool: Tool,
     ) -> Result<Task, String> {
         self.poc_authority(&task.id, session)?;
         self.poc_safe(&tool)?;
         #[cfg(target_arch = "wasm32")]
         if let Some(display) = crate::poc::question::display(&tool) {
             self.poc_safe(&display)?;
+        }
+        // Normalize only new admissions; recorded done calls keep their replay meaning.
+        // The control-center template's final check supplies its proof.
+        if task.template.as_deref() == Some(crate::poc::template::ID)
+            && let Tool::Done { checks, .. } = &mut tool
+        {
+            checks.clear();
         }
         let change = if matches!(tool, Tool::AskOperator { .. }) {
             Change::ProposeOperator {
