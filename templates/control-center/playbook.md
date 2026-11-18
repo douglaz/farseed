@@ -206,6 +206,9 @@ visit() { case "$1" in *.onion*) x="--socks5-hostname 127.0.0.1:9050" ;; *) x=""
 linked() { timeout 25 t3c connect status --json 2>/dev/null | jq -e '.authenticated and .linked and (.revoked | not)'; }
 tunnel() { curl -sf -m 5 -o /dev/null http://127.0.0.1:20241/ready; }
 both() { linked && tunnel; }
+# The user may link T3 Code later: Step 8's Later block leaves this marker. While the machine isn't linked, the
+# checks then ask for T3 Code running and no sign-in left waiting, instead of the link and the tunnel.
+later() { [ -e $S/t3-link-later ] && ! linked >/dev/null 2>&1; }
 ready() { jq -e '.status == "ready" and .driver == "acpRegistry"' /var/lib/t3code/caches/hermes.json; }
 dash() { curl -sf -m 2 -o /dev/null http://127.0.0.1:9119/api/status; }
 tor_on() { systemctl is-enabled -q tor 2>/dev/null; }
@@ -254,6 +257,13 @@ t3() {
   t t3_sees_hermes_ready ready
 }
 connect() {
+  if later; then
+    echo "T3 Code: not linked yet (the user chose Later)"
+    t t3_link_later_chosen m $S/t3-link-later "600 root"
+    t t3_link_later_t3code_up up t3code
+    t t3_link_later_no_signin_waiting sh -c '! systemctl is-active -q t3-connect'
+    return
+  fi
   w 120 both
   tu t3_connect_linked linked
   # Without the link the tunnel can't connect (the user's part); with it, a restart of t3code is the fix.
@@ -284,7 +294,8 @@ handover() {
   t conf_has_server_key has "$H/wireguard.conf" "PublicKey = " $S/wg-server.pub
   t conf_has_endpoint grep -qE '^Endpoint = .+:51820$' "$H/wireguard.conf"
   t login_has_password has "$H/control-center-login.txt" "password: " $S/dashboard-password
-  t login_names_t3_app grep -qF 'https://app.t3.codes' "$H/control-center-login.txt"
+  if later; then t login_says_t3_not_linked_yet grep -qxF 'T3 Code: not linked yet.' "$H/control-center-login.txt"
+  else t login_names_t3_app grep -qF 'https://app.t3.codes' "$H/control-center-login.txt"; fi
   t url_wireguard grep -qx 'http://10.88.0.1:9119/' "$H/app-url.txt"
   if tor_on; then t url_onion grep -qxF "http://$(cat $O)/" "$H/app-url.txt"
   else t no_onion_url_without_tor sh -c "! grep -q onion $H/app-url.txt"; fi
@@ -314,7 +325,7 @@ STEP
 ```
 **Check** (run it alone, exactly as written; the two scripts must match byte for byte):
 ```sh
-printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22aba7edd6ad35a83f9ce5fe1b73ac01ed5b4d3d7e2564d2022839f ae593b1ac49e7df7a684ecac4c878d4cd20c6ef259b536a7eb7dc3b460905daa | sha256sum -c && echo "CHECKS scripts PASS" || echo "CHECKS scripts FAIL"
+printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22aba7edd6ad35a83f9ce5fe1b73ac01ed5b4d3d7e2564d2022839f ea4bc57b6bbb983e9ea836542278b0d0ab405d5063ba7da08edb399f9789591e | sha256sum -c && echo "CHECKS scripts PASS" || echo "CHECKS scripts FAIL"
 ```
 Expect `CHECKS scripts PASS`.
 
@@ -716,23 +727,25 @@ Expect `CHECKS t3 PASS`. The check waits up to a minute for T3 to start and to r
 ## Step 8: T3 Connect (the user approves this machine)
 
 This links the machine to the user's T3 account, so the user reaches T3 Code from app.t3.codes or the T3 apps,
-with no open port. Nothing is typed back on this machine: it notices the user's approval by itself.
+with no open port. Nothing is typed back on this machine: it notices the user's approval by itself. The user may
+also choose `Later`: T3 Code still runs here, not linked yet, and the user's files say how to link it.
 
 1. Run the Do block. It prints a sign-in link (`https://accounts.t3.codes/device?user_code=...`) and its code. The
    link expires after 10 minutes.
 2. Then call `ask_operator` with:
-   - `purpose`: `Approve this machine in your T3 account: open the link, check the code, approve`;
+   - `purpose`: `Approve this machine in your T3 account: open the link, check the code, approve. Or choose Later to link it afterwards`;
    - `link`: the printed `https://accounts.t3.codes/device?user_code=...` address, copied exactly;
-   - `choices`: `["Approved", "Can't"]`.
+   - `choices`: `["Approved", "Later"]`.
 
    The user opens the link in a browser signed in to their T3 account (or creates the account there: email and
    password, or Google, GitHub, Apple or Microsoft), checks the code and approves.
-3. If the answer is `Approved`, run the Wait block, then the Check. If the answer is `Can't`, stop and report that
-   T3 Connect needs the user's approval.
+3. If the answer is `Approved`, run the Wait block, then the Check. If the answer is `Later`, run the Later block
+   (not the Wait block), then the Check.
 
 **Do**
 ```sh
 sh -eu <<'STEP'
+rm -f /var/lib/control-center/t3-link-later
 L=/var/lib/t3code/connect.log
 if ! systemctl is-active -q t3-connect; then
   install -m 600 -o hermes -g hermes /dev/null $L
@@ -746,22 +759,35 @@ STEP
 **Wait** (each call waits up to 4 minutes; repeat while it says STILL WAITING):
 ```sh
 sh <<'STEP'
-ok() { timeout 25 t3c connect status --json 2>/dev/null | jq -e '.authenticated and .linked' >/dev/null; }
+ok() { grep -q 'to make this machine reachable' /var/lib/t3code/connect.log; }
 for i in $(seq 40); do ok && break; systemctl is-active -q t3-connect || break; sleep 5; done
-if ok; then systemctl restart t3code; echo "APPROVED: linked; T3 Code restarted to open the tunnel"
+if ok; then
+  for i in $(seq 6); do systemctl is-active -q t3-connect || break; sleep 5; done
+  systemctl restart t3code; echo "APPROVED: T3 Code restarted to apply the link and open the tunnel"
 elif systemctl is-active -q t3-connect; then echo "STILL WAITING for the user's approval. Run the same Wait block again."
 else echo "SIGN-IN ENDED without approval (expired or cancelled): run the Do block again and ask the user again."; fi
+STEP
+```
+**Later** (when the answer is `Later`; it ends the waiting sign-in and records the choice):
+```sh
+sh <<'STEP'
+systemctl stop t3-connect 2>/dev/null || true
+install -m 600 -o root -g root /dev/null /var/lib/control-center/t3-link-later
+echo "LATER: T3 Code: not linked yet. The user's files will say how to link it."
 STEP
 ```
 **Check** (run it alone, exactly as written)
 ```sh
 sh /etc/nixos/cc-check.sh connect
 ```
-Expect `CHECKS connect PASS`. The check waits up to 2 minutes for the tunnel to connect.
+Expect `CHECKS connect PASS`. After `Approved`, the check waits up to 2 minutes for the tunnel to connect. After
+`Later`, it prints `T3 Code: not linked yet` and checks that T3 Code runs and no sign-in is left waiting.
 
 **If it fails:** if the Wait said SIGN-IN ENDED, or a FAIL line says `(needs the user: ask_operator)`, run the Do
 block again (a new link) and call `ask_operator` again. If only `t3_tunnel_connected` fails, without that note,
-run `systemctl restart t3code`, wait one minute, and check again.
+run `systemctl restart t3code`, wait one minute, and check again. If `t3_link_later_no_signin_waiting` fails, run
+the Later block again; if `t3_link_later_t3code_up` fails, run `systemctl restart t3code`, wait one minute, and
+check again.
 
 ---
 
@@ -871,8 +897,17 @@ umask 077
 {
   echo "Your control center"
   echo ""
-  echo "T3 Code (main way in): open https://app.t3.codes (or the T3 desktop or phone app), sign in to the T3"
-  echo "account you approved this machine with, choose this machine, and start a thread with Hermes Agent."
+  if [ -e $S/t3-link-later ]; then
+    echo "T3 Code: not linked yet."
+    echo "T3 Code runs on this machine, but the machine isn't linked to a T3 account yet, so app.t3.codes and the"
+    echo "T3 apps can't reach it. To link it, run as root on this machine:"
+    echo "  t3c connect link --headless"
+    echo "open the link it prints, check the code and approve, then run: systemctl restart t3code"
+    echo "After that, open https://app.t3.codes, choose this machine, and start a thread with Hermes Agent."
+  else
+    echo "T3 Code (main way in): open https://app.t3.codes (or the T3 desktop or phone app), sign in to the T3"
+    echo "account you approved this machine with, choose this machine, and start a thread with Hermes Agent."
+  fi
   echo ""
   echo "Hermes dashboard over WireGuard: import wireguard.conf from this folder, then open http://10.88.0.1:9119/"
   echo "user: owner"
@@ -919,7 +954,7 @@ STEP
 ```
 **Check** (run it alone, exactly as written; it takes up to 5 minutes: it also checks T3 Connect and visits every address in app-url.txt):
 ```sh
-printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22aba7edd6ad35a83f9ce5fe1b73ac01ed5b4d3d7e2564d2022839f ae593b1ac49e7df7a684ecac4c878d4cd20c6ef259b536a7eb7dc3b460905daa | sha256sum -c --quiet && sh /etc/nixos/cc-check.sh done
+printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22aba7edd6ad35a83f9ce5fe1b73ac01ed5b4d3d7e2564d2022839f ea4bc57b6bbb983e9ea836542278b0d0ab405d5063ba7da08edb399f9789591e | sha256sum -c --quiet && sh /etc/nixos/cc-check.sh done
 ```
 Expect `CHECKS done PASS`. If only a `visit_` check fails for an onion address, wait 2 minutes and run it again: a
 new onion service can take a few minutes to become reachable.
@@ -930,9 +965,16 @@ import `wireguard.conf` from your home folder and open http://10.88.0.1:9119/. Y
 `control-center-login.txt` in your home folder, readable only by you. Everything is declared in /etc/nixos and
 comes back after a reboot. To add software later, ask me, or ask Hermes."
 
-Then call `done` with `urls`: `https://app.t3.codes` (label `T3 Code`), `http://10.88.0.1:9119/` (label
-`Hermes dashboard over WireGuard`), and, if Tor is on, the onion address from app-url.txt (label
-`Hermes dashboard over Tor`).
+If the check printed `T3 Code: not linked yet`, report this instead: "Your control center is ready. T3 Code: not
+linked yet. T3 Code runs on the machine, and `control-center-login.txt` in your home folder says how to link it
+to your T3 account; until then, reach Hermes' own dashboard over WireGuard: import `wireguard.conf` from your
+home folder and open http://10.88.0.1:9119/. Your sign-in details are in `control-center-login.txt`, readable only
+by you. Everything is declared in /etc/nixos and comes back after a reboot. To add software later, ask me, or ask
+Hermes."
+
+Then call `done` with `urls`: `https://app.t3.codes` (label `T3 Code`, or `T3 Code (not linked yet)` if the check
+printed `T3 Code: not linked yet`), `http://10.88.0.1:9119/` (label `Hermes dashboard over WireGuard`), and, if
+Tor is on, the onion address from app-url.txt (label `Hermes dashboard over Tor`).
 
 ---
 
