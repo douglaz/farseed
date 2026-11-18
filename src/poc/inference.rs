@@ -685,12 +685,31 @@ fn request_context<S: Storage>(
                 };
                 handover.push_str(&format!("{}: {passes}\n", read.command()));
             }
-            let undeclared: Vec<_> = tcp_ports.keys().filter(|port| {
-                !matches!(&declaration.listeners.inbound, crate::declaration::Field::Value(entries)
-                    if entries.iter().any(|e| e.proto == crate::declaration::Protocol::Tcp && e.port == **port))
-            }).map(|port| format!("tcp port {port}")).collect();
-            if !undeclared.is_empty() {
-                handover.push_str(&format!("Seen before setup and not declared: {}. Remove each before done, or it is a finding.\n", undeclared.join(", ")));
+            if !task.is_some_and(|t| t.template.as_deref() == Some(super::template::ID)) {
+                let latest_sockets = task.and_then(|t| {
+                    t.previous_reads
+                        .iter()
+                        .flatten()
+                        .chain(&t.verification)
+                        .rev()
+                        .find_map(|read| match &read.observation {
+                            Some(super::completion::Observation::Sockets(sockets)) => Some(sockets),
+                            _ => None,
+                        })
+                });
+                let undeclared: Vec<_> = tcp_ports.keys().filter(|port| {
+                    !matches!(&declaration.listeners.inbound, crate::declaration::Field::Value(entries)
+                        if entries.iter().any(|e| e.proto == crate::declaration::Protocol::Tcp && e.port == **port))
+                        && latest_sockets.is_none_or(|sockets| sockets.iter().any(|socket|
+                            socket.proto == crate::declaration::Protocol::Tcp && socket.port == **port))
+                }).map(|port| format!("tcp port {port}")).collect();
+                if !undeclared.is_empty() {
+                    if latest_sockets.is_some() {
+                        handover.push_str(&format!("Seen before setup and not declared: {}. Remove each before done, or it is a finding.\n", undeclared.join(", ")));
+                    } else {
+                        handover.push_str(&format!("Seen listening before setup and not declared: {}. If it still listens, remove it before done, or it is a finding.\n", undeclared.join(", ")));
+                    }
+                }
             }
             handover.push_str("These harness reads already run after done, so checks must not repeat them; a check equal to a harness read is dropped and not run.\n");
             handover.push_str("Each address passed to done is visited anonymously from the machine after done and must ask for sign-in (HTTP 401/403, a redirect to a login page, or a page with a password field); an address that opens without signing in is a finding.\n");
