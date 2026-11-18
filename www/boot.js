@@ -1671,6 +1671,45 @@ const providerRequest = action => worker.postMessage({provider_request: action})
 const updateProviderResources = () => {
   $('provider-resources-field').hidden = !$('provider-offer').value.startsWith('custom:');
 };
+const readableMoney = (amount, currency) => {
+  const unit = currency === 'BTC' ? 'millisats' : `${currency} cents`;
+  const raw = `${amount} ${unit}`;
+  if (!Number.isSafeInteger(amount)) return raw;
+  const value = BigInt(amount);
+  if (currency === 'BTC') {
+    const sat = value / 1000n + (value % 1000n > 0n ? 1n : 0n);
+    return `${sat.toLocaleString('en-US')} sat (${raw})`;
+  }
+  const absolute = value < 0n ? -value : value;
+  const decimal = `${value < 0n ? '-' : ''}${absolute / 100n}.${String(absolute % 100n).padStart(2, '0')}`;
+  return `${decimal} ${currency} (${raw})`;
+};
+const boundInvoiceTotal = invoice => {
+  const parts = [invoice.amount, invoice.tax, invoice.processing_fee];
+  if (!parts.every(Number.isSafeInteger)) return parts.join(' + ');
+  const total = parts.reduce((sum, part) => sum + BigInt(part), 0n);
+  return total <= BigInt(Number.MAX_SAFE_INTEGER) && total >= BigInt(Number.MIN_SAFE_INTEGER) ? Number(total) : String(total);
+};
+const readableInterval = (amount, type) => {
+  if (['month', 'day', 'hour'].includes(type) && Number.isSafeInteger(amount) && amount >= 1) {
+    return amount === 1 ? `per ${type}` : `per ${amount} ${type}s`;
+  }
+  return `${amount} ${type}`;
+};
+const readableSize = bytes => {
+  if (!Number.isSafeInteger(bytes) || bytes < 0) return `${bytes} bytes`;
+  const unit = bytes >= 1024 ** 3 ? 'GB' : 'MB';
+  const size = bytes / 1024 ** (unit === 'GB' ? 3 : 2);
+  return `${Number.isInteger(size) ? size : size.toFixed(1)} ${unit}`;
+};
+const readableCpus = count => `${count} ${count === 1 ? 'CPU' : 'CPUs'}`;
+const readableDuration = seconds => {
+  if (Number.isSafeInteger(seconds) && seconds > 0) {
+    if (seconds % 86400 === 0) return `${seconds / 86400} days`;
+    if (seconds % 3600 === 0) return `${seconds / 3600} hours`;
+  }
+  return `${seconds} seconds`;
+};
 const renderProvider = (store, enabled) => {
   const worker = snapshotWorker();
   const recorded = store.provider_configuration?.recorded === true;
@@ -1762,7 +1801,7 @@ const renderProvider = (store, enabled) => {
       for (const offer of offers) {
         const terms = offer.cost_plan ?? offer;
         const hourly = terms.interval_type === 'hour';
-        const label = `${kind}: ${offer.name}; ${offer.region?.name}; ${kind === 'fixed' ? `${offer.cpu} CPU, ${offer.memory} memory bytes, ${offer.disk_size} disk bytes; ${terms.amount} ${terms.currency} smallest units; ` : 'choose resources and request price; '}${terms.interval_amount} ${terms.interval_type}${hourly ? ' — unsupported credit-only hourly plan' : ''}`;
+        const label = `${kind === 'fixed' ? `${offer.name}, ${offer.region?.name}: ${readableCpus(offer.cpu)}, ${readableSize(offer.memory)} memory, ${readableSize(offer.disk_size)} disk, ${readableMoney(terms.amount, terms.currency)}` : `Custom size, ${offer.region?.name}: choose resources and request a price,`} ${readableInterval(terms.interval_amount, terms.interval_type)}${hourly ? ' — unsupported credit-only hourly plan' : ''}`;
         paragraph(catalogue, label);
         const option = new Option(label, `${kind}:${offer.id}`); option.disabled = hourly; offerSelect.add(option);
         if (kind === 'custom') { readableFacts(catalogue, offer); rawDetails(catalogue, offer); }
@@ -1783,11 +1822,11 @@ const renderProvider = (store, enabled) => {
   if (purchase.selection) {
     paragraph(selection, `Provider origin: ${purchase.origin}`);
     const c = purchase.selection.charge;
-    paragraph(selection, `Recurring charge: ${c.amount} ${c.currency === 'BTC' ? 'millisats' : c.currency + ' cents'} per ${c.interval_amount} ${c.interval_type}. Tax and processing fee are shown on the initial invoice.`);
+    paragraph(selection, `Recurring charge: ${readableMoney(c.amount, c.currency)} ${readableInterval(c.interval_amount, c.interval_type)}. Tax and processing fee are shown on the initial invoice.`);
     const selected = purchase.selection;
     const resources = selected.resources ?? selected.offer;
     paragraph(selection, `${selected.offer.name}; ${selected.offer.region?.name ?? 'region not stated'}; ${selected.image.distribution} ${selected.image.flavour} ${selected.image.version}.`);
-    paragraph(selection, `${resources.cpu} CPUs; ${resources.memory} bytes of memory; ${resources.disk_size ?? resources.disk} bytes of disk space.`);
+    paragraph(selection, `${readableCpus(resources.cpu)}, ${readableSize(resources.memory)} memory (${resources.memory} bytes), ${readableSize(resources.disk_size ?? resources.disk)} disk (${resources.disk_size ?? resources.disk} bytes).`);
     rawDetails(selection, purchase.selection, ['purchase', purchase.origin, purchase.account ?? null]);
   }
   const progress = $('provider-progress'); progress.replaceChildren();
@@ -1802,10 +1841,12 @@ const renderProvider = (store, enabled) => {
     paragraph(progress, `Automatic renewal: ${purchase.auto_renewal_enabled === true ? 'on' : purchase.auto_renewal_enabled === false ? 'off' : 'unknown'}. This page does not change it.`);
     if (purchase.billing) {
       const quote = purchase.billing.terms;
+      paragraph(progress, `Initial invoice: ${readableMoney(boundInvoiceTotal(quote), quote.currency)} for ${readableDuration(quote.time)} (${readableMoney(quote.amount, quote.currency)}, tax ${readableMoney(quote.tax, quote.currency)}, processing fee ${readableMoney(quote.processing_fee, quote.currency)}).`);
       paragraph(progress, `Initial Lightning quote: ${quote.amount}, plus tax ${quote.tax} and processing fee ${quote.processing_fee} (${quote.currency === 'BTC' ? 'millisats' : quote.currency + ' cents'}), covering ${quote.time} seconds. Review these terms before requesting the invoice. Refresh may update the quote.`);
     }
     if (purchase.payment) {
       const pay = purchase.payment;
+      paragraph(progress, `To pay: ${readableMoney(boundInvoiceTotal(pay), pay.currency)} (amount ${readableMoney(pay.amount, pay.currency)}, tax ${readableMoney(pay.tax, pay.currency)}, processing fee ${readableMoney(pay.processing_fee, pay.currency)}).`);
       paragraph(progress, `Invoice ${pay.is_paid ? 'paid' : 'awaiting payment'}; expires ${pay.expires}. Amount ${pay.amount}, tax ${pay.tax}, processing fee ${pay.processing_fee} (${pay.currency === 'BTC' ? 'millisats' : pay.currency + ' cents'}).`);
       if (!pay.is_paid) {
         invoiceControls(progress, pay.data.lightning, Math.floor(Date.parse(pay.expires) / 1000));
