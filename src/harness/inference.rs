@@ -3,6 +3,7 @@ use crate::inference::{self, Candidate, Finished, Intent, Journal, Request, Resp
 use crate::poc::timings::{Mark, Timer, measure};
 use crate::store::Local;
 use crate::store::opfs::{Opfs, WebCrypto};
+use crate::store::unlock_marks;
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -121,8 +122,10 @@ async fn publication(
                 // No incoming fields to release; report() protects the current store view.
                 value
             } else {
-                measure(cycle, Mark::PublishProtect, || {
-                    store.protect_publication(&value, &[])
+                unlock_marks::measure(unlock_marks::Mark::PublishIncomingProtect, || {
+                    measure(cycle, Mark::PublishProtect, || {
+                        store.protect_publication(&value, &[])
+                    })
                 })?
             };
             let mut current = local.report_timed(None, cycle);
@@ -254,6 +257,8 @@ async fn publication(
                 );
         }
         let serialize_timing = Timer::new(cycle, Mark::PublishSerialize);
+        let unlock_serialize_timing =
+            unlock_marks::Timer::new(unlock_marks::Mark::PublishSerialize);
         let encoded = value.to_string();
         let mut sections = BTreeMap::new();
         let message = if post {
@@ -277,8 +282,10 @@ async fn publication(
             None
         };
         drop(serialize_timing);
+        drop(unlock_serialize_timing);
         // Encoding and scanning can consume lifetime too. Validate after all preparation,
         // under the same writer, immediately before the actual release.
+        let unlock_check_timing = unlock_marks::Timer::new(unlock_marks::Mark::PublishCheck);
         let final_check = (|| {
             if value.get("provider_catalogue").is_some()
                 || value.get("provider_selection_reviewed").is_some()
@@ -311,6 +318,7 @@ async fn publication(
             }
             Ok::<_, String>(())
         })();
+        drop(unlock_check_timing);
         if let Err(why) = final_check {
             if last_refusal.as_ref() == Some(&why)
                 && value["error"] == "Protected report authority unavailable."
@@ -330,8 +338,12 @@ async fn publication(
         if let Some(message) = message.and_then(|message| js_sys::JSON::parse(&message).ok()) {
             let worker: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
             let _timing = Timer::new(cycle, Mark::PublishPost(bytes));
+            let unlock_post_timing = unlock_marks::Timer::new(unlock_marks::Mark::PublishPost);
+            unlock_post_timing.count(unlock_marks::Counter::PublishBytes, bytes);
             if worker.post_message(&message).is_ok() {
                 crate::poc::timings::published_sections(cycle, sections);
+                drop(unlock_post_timing);
+                unlock_marks::published(local.store().map(|store| &*store));
             }
         }
         return encoded;

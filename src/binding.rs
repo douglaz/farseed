@@ -127,7 +127,11 @@ impl InferenceApproval {
         .map(|_| ())
     }
 
-    #[cfg(any(test, feature = "tracer"))]
+    #[cfg(any(
+        test,
+        feature = "tracer",
+        all(feature = "history-bench", not(target_arch = "wasm32"))
+    ))]
     pub fn synthetic() -> Self {
         Self {
             approved: true,

@@ -114,6 +114,8 @@ const clearWords = () => $('seed-backup-words-slot').replaceChildren();
 let redisplay = false;
 let ceremony = false;
 let suspended = false;
+const unlockNow = performance.now.bind(performance);
+let unlockPageMarks = null;
 const goalOutcomes = new Map();
 const creditGoalDrafts = new Map();
 const creditTemplateDrafts = new Map();
@@ -297,7 +299,14 @@ const render = (store, forceRender = false) => {
   $('session-controls').replaceChildren();
   renderSetup(store);
   renderPoc(store);
-  renderTasks(store);
+  if (unlockPageMarks?.rendering) {
+    const started = unlockNow();
+    renderTasks(store);
+    unlockPageMarks.cards_ms += unlockNow() - started;
+    const slot = $('tasks');
+    unlockPageMarks.cards = slot?.querySelectorAll(':scope > [data-task]').length ?? 0;
+    unlockPageMarks.card_nodes = slot?.querySelectorAll('*').length ?? 0;
+  } else renderTasks(store);
   $('store').dataset.state = state;
   $('store-state').textContent = texts[state] ?? state;
   $('store-explanation').textContent = state === 'refused'
@@ -1922,6 +1931,7 @@ let worker;
 let firstStart = true;
 
 const start = () => {
+  unlockPageMarks = null;
   worker = firstStart ? firstWorker : new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
   firstStart = false;
   $('loading').hidden = false;
@@ -1959,6 +1969,14 @@ const start = () => {
       renderPocKeyStatus(data.poc_configure_status === 'applied' ? {poc_configuration: {key_set: true}} : taskDetailsStore);
       return;
     }
+    if (data.unlock_timings) {
+      $('store').dataset.unlockTimings = JSON.stringify(data.unlock_timings);
+      return;
+    }
+    if (data.unlock_worker_timings) {
+      $('store').dataset.unlockWorkerTimings = JSON.stringify(data.unlock_worker_timings);
+      return;
+    }
     if (data.app_load_failed === true) {
       current.onerror({message: 'the app did not load'});
       return;
@@ -1986,9 +2004,22 @@ const start = () => {
       show('ready', `Harness ready (spec ${data.harness_ready}).`);
     }
     else if (data.store) {
+      const marks = unlockPageMarks;
+      const received = marks ? unlockNow() : null;
       const { store_state: state, store_error: error, store_reason: reason, ...rest } = data.store;
       if (rest.goal_outcome) goalOutcomes.set(rest.goal_outcome.session, rest.goal_outcome.outcome);
+      if (marks) marks.rendering = true;
+      const renderStarted = marks ? unlockNow() : null;
       render({ state, error, reason, ...rest });
+      if (marks) {
+        const renderEnded = unlockNow();
+        unlockPageMarks = null;
+        $('store').dataset.unlockPageTimings = JSON.stringify({
+          press_to_store_ms: Math.round(received - marks.pressed),
+          render_ms: Math.round(renderEnded - renderStarted),
+          cards_ms: Math.round(marks.cards_ms), cards: marks.cards, card_nodes: marks.card_nodes,
+        });
+      }
     }
     else if (data.command_result) renderCommandResult(data.command_result);
     else if (Object.keys(data).length === 1 && typeof data.seed_backup_display === 'string') {
@@ -2007,6 +2038,7 @@ const start = () => {
   };
   worker.onerror = (event) => {
     if (worker !== current) return;
+    unlockPageMarks = null;
     current.terminate();
     clearWords();
     $('seed-backup-input').value = '';
@@ -2077,6 +2109,12 @@ addEventListener('pageshow', (event) => {
 $('lock').addEventListener('click', lock);
 
 const send = (kind) => {
+  if (kind === 'unlock') {
+    unlockPageMarks = { pressed: unlockNow(), rendering: false, cards_ms: 0, cards: 0, card_nodes: 0 };
+    delete $('store').dataset.unlockTimings;
+    delete $('store').dataset.unlockWorkerTimings;
+    delete $('store').dataset.unlockPageTimings;
+  }
   const passphrase = $('passphrase');
   const confirm = $('confirm');
   const differ = kind === 'create' && passphrase.value !== confirm.value;

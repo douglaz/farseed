@@ -19,6 +19,12 @@ crate-type = ["cdylib", "rlib"]
 # one of which makes the local store's append fail. Never in the served build
 # (`scripts/build-web.sh served`).
 tracer = []
+history-bench = []
+
+[[bin]]
+name = "history-bench"
+path = "src/bin/history-bench.rs"
+required-features = ["history-bench"]
 
 [dependencies]
 # The relay AUTH (`WIR-5` of paid-tcp-relay at `844e834`): a NIP-01 event id and a BIP-340 signature. Pure Rust,

@@ -621,6 +621,8 @@ impl<S: Storage> Store<S> {
         Ok(())
     }
     fn poc_record_safe(&self, record: &Record) -> Result<(), String> {
+        let timing = super::unlock_marks::Timer::new(super::unlock_marks::Mark::RecordCheck);
+        timing.count(super::unlock_marks::Counter::RecordChecks, 1);
         let event = Event::Poc(record.clone());
         self.poc_safe(&event)?;
         let encoded = Zeroizing::new(
@@ -633,6 +635,15 @@ impl<S: Storage> Store<S> {
         } else {
             Err(crate::poc::wait::TASK_BOUNDARY.into())
         }
+    }
+    fn measured_dispatch_copy(&self) -> crate::dispatch::Dispatch {
+        let timing = super::unlock_marks::Timer::new(super::unlock_marks::Mark::DispatchCopy);
+        timing.count(super::unlock_marks::Counter::DispatchCopies, 1);
+        timing.count(
+            super::unlock_marks::Counter::DispatchCopyEntries,
+            (self.dispatch.calls.len() + self.dispatch.jobs.len()) as u64,
+        );
+        self.dispatch.clone()
     }
     pub fn poc_task(&self, id: &str) -> Result<Task, String> {
         let task = self.poc.get(id).ok_or(crate::poc::wait::UNKNOWN_TASK)?;
@@ -1186,7 +1197,10 @@ impl<S: Storage> Store<S> {
         Ok(number)
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(
+        target_arch = "wasm32",
+        all(feature = "history-bench", not(target_arch = "wasm32"))
+    ))]
     pub(crate) async fn poc_launch_transmission(
         &mut self,
         call: u64,
@@ -1433,11 +1447,16 @@ impl<S: Storage> Store<S> {
             Record::Command { binding, .. } => (&binding.task, binding.revision),
             _ => unreachable!(),
         };
-        let mut task = self
-            .poc
-            .get(id)
-            .ok_or(crate::poc::wait::UNKNOWN_TASK)?
-            .clone();
+        let task = self.poc.get(id).ok_or(crate::poc::wait::UNKNOWN_TASK)?;
+        let mut task = {
+            let timing = super::unlock_marks::Timer::new(super::unlock_marks::Mark::TaskCopy);
+            timing.count(super::unlock_marks::Counter::TaskCopies, 1);
+            timing.count(
+                super::unlock_marks::Counter::TaskCopySteps,
+                task.completed.len() as u64,
+            );
+            task.clone()
+        };
         if task.revision != expected || task.ended() {
             return Err(crate::poc::wait::STALE_TASK.into());
         }
@@ -1506,7 +1525,7 @@ impl<S: Storage> Store<S> {
                     .as_ref()
                     .ok_or("task command requires job identity")?
                     .clone();
-                let mut dispatch = self.dispatch.clone();
+                let mut dispatch = self.measured_dispatch_copy();
                 dispatch.intent(number, intent.clone())?;
                 if let Some(prepared) = launch {
                     dispatch.prepare_launch(prepared.clone())?;

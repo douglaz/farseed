@@ -94,7 +94,30 @@ mod worker {
     #[wasm_bindgen]
     pub async fn unlock(passphrase: Uint8Array) -> String {
         let passphrase = take(&passphrase);
-        local().lock().await.unlock(passphrase).await.to_string()
+        let shared = local();
+        let mut local = shared.lock().await;
+        let report = local.unlock(passphrase).await;
+        let timing = crate::store::unlock_marks::Timer::new(
+            crate::store::unlock_marks::Mark::UnlockSerialize,
+        );
+        let encoded = report.to_string();
+        timing.count(
+            crate::store::unlock_marks::Counter::UnlockReportBytes,
+            encoded.len() as u64,
+        );
+        encoded
+    }
+
+    /// Numeric-only JS measurements use the same output scan as Rust's timing post.
+    #[wasm_bindgen]
+    pub async fn publish_unlock_worker_timings(call_ms: f64, json_ms: f64) {
+        let shared = local();
+        let mut local = shared.lock().await;
+        crate::store::unlock_marks::post_worker(
+            local.store().map(|store| &*store),
+            call_ms,
+            json_ms,
+        );
     }
 
     #[wasm_bindgen]
@@ -149,12 +172,18 @@ mod worker {
     #[wasm_bindgen]
     pub async fn seed_backup_redisplay(passphrase: Uint8Array) -> String {
         let passphrase = take(&passphrase);
-        local()
-            .lock()
-            .await
-            .seed_backup_redisplay(passphrase)
-            .await
-            .to_string()
+        let shared = local();
+        let mut local = shared.lock().await;
+        let report = local.seed_backup_redisplay(passphrase).await;
+        let timing = crate::store::unlock_marks::Timer::new(
+            crate::store::unlock_marks::Mark::UnlockSerialize,
+        );
+        let encoded = report.to_string();
+        timing.count(
+            crate::store::unlock_marks::Counter::UnlockReportBytes,
+            encoded.len() as u64,
+        );
+        encoded
     }
 
     #[wasm_bindgen]

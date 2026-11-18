@@ -23,7 +23,11 @@ impl<S: Storage> Store<S> {
         Ok((self.authority.clock_continuation()?, live.clone()))
     }
     /// Explicitly synthetic confirmed sessions; never compiled into the served build.
-    #[cfg(any(test, feature = "tracer"))]
+    #[cfg(any(
+        test,
+        feature = "tracer",
+        all(feature = "history-bench", not(target_arch = "wasm32"))
+    ))]
     pub fn synthetic_confirm_limits(&mut self, issuer_seconds: u64) -> Result<(), String> {
         let pair = current_pair(issuer_seconds);
         for session in self
@@ -70,7 +74,11 @@ impl<S: Storage> Store<S> {
         confirmed: Confirmed,
         observation: Observation,
     ) -> Result<(), String> {
-        if !cfg!(any(test, feature = "tracer")) {
+        if !cfg!(any(
+            test,
+            feature = "tracer",
+            all(feature = "history-bench", not(target_arch = "wasm32"))
+        )) {
             return Err("missing reviewed issuer profile".into());
         }
         self.authority.ordinary()?;
@@ -154,7 +162,7 @@ impl<S: Storage> Store<S> {
         Ok(())
     }
 
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", feature = "history-bench"))]
     pub(crate) fn check_report_sessions(&self, report: &Value) -> Result<(), String> {
         if let Some(views) = report["sessions"].as_array() {
             for view in views {
@@ -232,6 +240,11 @@ pub(crate) fn current_pair(fallback_seconds: u64) -> Pair {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
+        // The history benchmark holds one fixed fixture time, as host fixtures do.
+        #[cfg(feature = "history-bench")]
+        if let Some(pair) = BENCH_PAIR.with(std::cell::Cell::get) {
+            return pair;
+        }
         fallback_seconds.checked_mul(crate::clock::TICKS).map_or(
             Pair {
                 monotonic: u64::MAX,
@@ -245,6 +258,8 @@ pub(crate) fn current_pair(fallback_seconds: u64) -> Pair {
     }
 }
 
+#[cfg(all(feature = "history-bench", not(target_arch = "wasm32")))]
+thread_local! { pub(crate) static BENCH_PAIR: std::cell::Cell<Option<Pair>> = const { std::cell::Cell::new(None) }; }
 #[cfg(all(feature = "tracer", target_arch = "wasm32"))]
 thread_local! { static SAMPLE: std::cell::Cell<Option<Pair>> = const { std::cell::Cell::new(None) }; }
 #[cfg(all(feature = "tracer", target_arch = "wasm32"))]

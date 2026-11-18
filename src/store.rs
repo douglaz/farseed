@@ -79,6 +79,8 @@ mod journal;
 mod provider;
 mod sessions;
 use journal::journal;
+#[cfg(all(feature = "history-bench", not(target_arch = "wasm32")))]
+pub mod history_bench;
 pub(crate) mod inference;
 mod output;
 pub mod poc;
@@ -92,6 +94,7 @@ pub mod poc_targets;
 )]
 pub mod provisioning;
 pub mod reinstall;
+pub(crate) mod unlock_marks;
 
 /// The directory the store owns in the origin-private file system.
 pub const DIRECTORY: &str = "tau-web-store";
@@ -521,12 +524,17 @@ pub async fn unlock<S: Storage>(
     kdf: &impl Kdf,
     passphrase: LocalPassphrase,
 ) -> Result<Store<S>, String> {
+    let _unlock_end = unlock_marks::begin();
+    let envelope_timing = unlock_marks::Timer::new(unlock_marks::Mark::Envelope);
     if probe(&storage).await? != Found::Envelope {
         return Err("there is no store to unlock".into());
     }
     let envelope = Envelope::parse(&storage.read(ENVELOPE).await?)
         .map_err(|e| format!("the envelope is not a v1 local envelope: {e}"))?;
+    drop(envelope_timing);
+    let kdf_timing = unlock_marks::Timer::new(unlock_marks::Mark::Kdf);
     let wrapping = kdf.derive(passphrase, &envelope.salt).await?;
+    drop(kdf_timing);
     let unwrapped = cipher(&wrapping.0).decrypt(
         &envelope.nonce.into(),
         Payload {
@@ -540,6 +548,7 @@ pub async fn unlock<S: Storage>(
     key.0.copy_from_slice(&unwrapped);
     let mut store = Store::new(storage, key, envelope.id);
     store.replay().await.map_err(journal::refusal)?;
+    let _restore_timing = unlock_marks::Timer::new(unlock_marks::Mark::Restore);
     store.inference.recovered = store.inference_revocations().into_iter().collect();
     if store.next == FIRST {
         store.finish_creation().await?;
@@ -765,7 +774,11 @@ impl<S: Storage> Store<S> {
         Err("explicit inference approval required".into())
     }
 
-    #[cfg(any(test, feature = "tracer"))]
+    #[cfg(any(
+        test,
+        feature = "tracer",
+        all(feature = "history-bench", not(target_arch = "wasm32"))
+    ))]
     pub async fn admit_fixture(&mut self, machine: &str) -> Result<String, String> {
         self.admit(machine, &[], crate::binding::InferenceApproval::synthetic())
             .await
@@ -1494,6 +1507,8 @@ impl<S: Storage> Store<S> {
 
     pub(crate) fn held_credentials(&self) -> Result<crate::redaction::Held<'_>, String> {
         use crate::redaction::{Derived, Held};
+        let timing = unlock_marks::Timer::new(unlock_marks::Mark::HeldCredentials);
+        timing.count(unlock_marks::Counter::HeldCredentials, 1);
         let seed = self.seed.as_ref().ok_or(crate::poc::wait::UNLOCKED_SEED)?;
         let mut borrowed: Vec<&[u8]> = vec![seed.bytes(), &self.key.0];
         let mut derived = Vec::new();
@@ -1546,12 +1561,19 @@ impl<S: Storage> Store<S> {
             let result = (|| -> Result<(), crate::seed::DeriveError> {
                 match identity.family {
                     Family::Machines => {
+                        timing.count(unlock_marks::Counter::DerivedKeys, 1);
                         derived.push(Derived::Ssh(seed.ssh_client_key(v, i)?));
+                        timing.count(unlock_marks::Counter::DerivedKeys, 1);
                         derived.push(Derived::Sender(seed.attest_sender_key(v, i)?));
+                        timing.count(unlock_marks::Counter::DerivedKeys, 1);
                         derived.push(Derived::Recipient(seed.attest_recipient_key(v, i)?));
                     }
-                    Family::Passes => derived.push(Derived::Relay(seed.relay_key(v, i)?)),
+                    Family::Passes => {
+                        timing.count(unlock_marks::Counter::DerivedKeys, 1);
+                        derived.push(Derived::Relay(seed.relay_key(v, i)?));
+                    }
                     Family::Handoffs => {
+                        timing.count(unlock_marks::Counter::DerivedKeys, 1);
                         derived.push(Derived::Handoff(seed.post_harness_credential(v, i)?))
                     }
                 }
@@ -1674,7 +1696,10 @@ impl<S: Storage> Store<S> {
     /// Names that are not record names are not records, and are ignored.
     async fn replay(&mut self) -> Result<(), String> {
         let mut numbers = Vec::new();
-        for name in self.storage.list().await? {
+        let list_timing = unlock_marks::Timer::new(unlock_marks::Mark::List);
+        let names = self.storage.list().await?;
+        drop(list_timing);
+        for name in names {
             if is_record_name(&name) {
                 let number: u64 = name.parse().map_err(|_| "record number is out of range")?;
                 numbers.push(number);
@@ -1688,14 +1713,21 @@ impl<S: Storage> Store<S> {
                     "record {expected} is missing before record {number}; replay stopped"
                 ));
             }
+            let read_timing = unlock_marks::Timer::new(unlock_marks::Mark::Read);
+            read_timing.count(unlock_marks::Counter::Records, 1);
             let bytes = self.storage.read(&number.to_string()).await?;
+            read_timing.count(unlock_marks::Counter::RecordBytes, bytes.len() as u64);
+            drop(read_timing);
             let (event, plaintext) = self
                 .open_record(number, &bytes)
                 .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
-            self.previous = Address(Sha256::digest(&bytes).into());
+            self.previous = unlock_marks::measure(unlock_marks::Mark::Hash, || {
+                Address(Sha256::digest(&bytes).into())
+            });
             records.push((number, bytes, event, plaintext));
         }
         self.previous = Address([0; 32]);
+        let apply_timing = unlock_marks::Timer::new(unlock_marks::Mark::Apply);
         for (number, bytes, event, _plaintext) in records {
             match (number, &event) {
                 (FIRST, Event::Seed { mnemonic }) => {
@@ -1914,8 +1946,12 @@ impl<S: Storage> Store<S> {
                 }
             }
             self.next = number + 1;
-            self.previous = Address(Sha256::digest(&bytes).into());
+            self.previous = unlock_marks::measure(unlock_marks::Mark::Hash, || {
+                Address(Sha256::digest(&bytes).into())
+            });
         }
+        drop(apply_timing);
+        let _restore_timing = unlock_marks::Timer::new(unlock_marks::Mark::Restore);
         self.restore_sessions()?;
         Ok(())
     }
@@ -1926,6 +1962,7 @@ impl<S: Storage> Store<S> {
         number: u64,
         bytes: &[u8],
     ) -> Result<(Event, Zeroizing<Vec<u8>>), String> {
+        let parse_timing = unlock_marks::Timer::new(unlock_marks::Mark::Parse);
         let record: RecordJson =
             serde_json::from_slice(bytes).map_err(|_| "invalid record envelope")?;
         // Only this serialization is ever written, so any other bytes are a modification, even
@@ -1953,6 +1990,8 @@ impl<S: Storage> Store<S> {
         let ciphertext = URL_SAFE_NO_PAD
             .decode(&record.ciphertext)
             .map_err(|e| format!("ciphertext: not unpadded base64url ({e})"))?;
+        drop(parse_timing);
+        let decrypt_timing = unlock_marks::Timer::new(unlock_marks::Mark::Decrypt);
         let plaintext = Zeroizing::new(
             cipher(&self.key.0)
                 .decrypt(
@@ -1964,6 +2003,8 @@ impl<S: Storage> Store<S> {
                 )
                 .map_err(|_| "authentication failed".to_string())?,
         );
+        drop(decrypt_timing);
+        let _parse_timing = unlock_marks::Timer::new(unlock_marks::Mark::Parse);
         // Parser errors must never quote decrypted plaintext. Parse directly into Event so
         // duplicate members are rejected and mnemonic buffers retain Event's zeroization.
         let event = journal::decode(&plaintext)?;
@@ -2565,7 +2606,13 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         {
             crate::poc::inference::restore(exposure.inference_approval.configuration.clone());
         }
-        self.report(None)
+        unlock_marks::after_replay();
+        let report = unlock_marks::measure(unlock_marks::Mark::UnlockReportBuild, || {
+            self.build_report(None)
+        });
+        unlock_marks::measure(unlock_marks::Mark::UnlockReportProtect, || {
+            self.protect_report(report)
+        })
     }
 
     /// Re-display uses a fresh, locked worker: the passphrase really unwraps the envelope.
@@ -2739,8 +2786,12 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn report_timed(&self, error: Option<&str>, cycle: Option<u64>) -> Value {
         use crate::poc::timings::{Mark, measure};
-        let report = measure(cycle, Mark::PublishBuild, || self.build_report(error));
-        measure(cycle, Mark::PublishProtect, || self.protect_report(report))
+        let report = unlock_marks::measure(unlock_marks::Mark::PublishBuild, || {
+            measure(cycle, Mark::PublishBuild, || self.build_report(error))
+        });
+        unlock_marks::measure(unlock_marks::Mark::PublishProtect, || {
+            measure(cycle, Mark::PublishProtect, || self.protect_report(report))
+        })
     }
 
     fn build_report(&self, error: Option<&str>) -> Value {
@@ -2824,7 +2875,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
     }
 
     /// Protect fields and the final bytes after a caller adds report members.
-    #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg(any(test, target_arch = "wasm32", feature = "history-bench"))]
     pub(crate) fn encode_report(&self, report: Value) -> String {
         let encoded = self.protect_report(report).to_string();
         if let State::Unlocked(store) = &self.state
@@ -2968,11 +3019,19 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
 /// close, and `rename` silently replaces an existing name. A `Fault` makes one operation fail,
 /// land and then report failure, or "die": that operation and every later one do nothing, as
 /// when the worker is killed. Clones share the files.
-#[cfg(any(test, feature = "tracer"))]
+#[cfg(any(
+    test,
+    feature = "tracer",
+    all(feature = "history-bench", not(target_arch = "wasm32"))
+))]
 #[derive(Clone, Default)]
 pub struct MemoryStorage(std::rc::Rc<std::cell::RefCell<Memory>>);
 
-#[cfg(any(test, feature = "tracer"))]
+#[cfg(any(
+    test,
+    feature = "tracer",
+    all(feature = "history-bench", not(target_arch = "wasm32"))
+))]
 #[derive(Default)]
 pub struct Memory {
     pub files: std::collections::BTreeMap<String, Vec<u8>>,
@@ -2983,7 +3042,11 @@ pub struct Memory {
 }
 
 /// One storage operation that goes wrong, counted from 1 since the fault was set.
-#[cfg(any(test, feature = "tracer"))]
+#[cfg(any(
+    test,
+    feature = "tracer",
+    all(feature = "history-bench", not(target_arch = "wasm32"))
+))]
 #[derive(Clone, Copy, Debug)]
 pub enum Fault {
     /// The operation fails and does nothing.
@@ -2994,7 +3057,11 @@ pub enum Fault {
     Die(usize),
 }
 
-#[cfg(any(test, feature = "tracer"))]
+#[cfg(any(
+    test,
+    feature = "tracer",
+    all(feature = "history-bench", not(target_arch = "wasm32"))
+))]
 impl MemoryStorage {
     /// A fresh storage holding a copy of `files`: a reopened store, after a reload.
     pub fn with_files(files: std::collections::BTreeMap<String, Vec<u8>>) -> MemoryStorage {
@@ -3044,7 +3111,11 @@ impl MemoryStorage {
     }
 }
 
-#[cfg(any(test, feature = "tracer"))]
+#[cfg(any(
+    test,
+    feature = "tracer",
+    all(feature = "history-bench", not(target_arch = "wasm32"))
+))]
 impl Storage for MemoryStorage {
     async fn list(&self) -> Result<Vec<String>, String> {
         self.step("list", |files| Ok(files.keys().cloned().collect()))
@@ -3082,7 +3153,11 @@ impl Storage for MemoryStorage {
 }
 
 /// Runs a future that never waits, as every `MemoryStorage` and host KDF call is.
-#[cfg(any(test, feature = "tracer"))]
+#[cfg(any(
+    test,
+    feature = "tracer",
+    all(feature = "history-bench", not(target_arch = "wasm32"))
+))]
 pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
     let mut future = std::pin::pin!(future);
     let mut context = std::task::Context::from_waker(std::task::Waker::noop());

@@ -4,6 +4,17 @@ import init, { spec_commit, open, create, unlock, seed_backup_display, seed_back
 import { identify_execution, wake_tasks, task_presence, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_download, publish_task_details, publish_delivery_details } from './pkg/tau_web.js';
 import { credit_request, retry_ended_credit } from './pkg/tau_web.js';
 import { deployment_configure, provider_configure, provider_key_is_set, provider_visibility, provider_action_delay, provider_request } from './pkg/tau_web.js';
+import { publish_unlock_worker_timings } from './pkg/tau_web.js';
+
+const unlockNow = performance.now.bind(performance);
+// Marks belong to one unlock request and are passed explicitly, so a request that interleaves
+// during the awaited unlock never adds its own JSON work to them.
+const unlockJson = (marks, operation, value) => {
+  if (!marks) return operation(value);
+  const started = unlockNow();
+  try { return operation(value); }
+  finally { marks.worker_json_ms += unlockNow() - started; }
+};
 
 const clearInput = request => {
   if (request?.provider_request && Object.hasOwn(request.provider_request, 'email')) delete request.provider_request.email;
@@ -247,14 +258,14 @@ const refreshPayments = async (wake = {reads:readinessReads, lifecycle:readiness
   stopReadiness();
   await readinessRead(true);
 };
-const presentationReport = (report, step) => {
-  const value = JSON.parse(report);
+const presentationReport = (report, step, marks = null) => {
+  const value = unlockJson(marks, JSON.parse, report);
   if (value.error) value.page_error_step = step;
-  return JSON.stringify(value);
+  return unlockJson(marks, JSON.stringify, value);
 };
-const reportStore = (report, generation = publication_generation(), session = '', step = 'store', paymentTimerReport = false) => {
-  report = presentationReport(report, step);
-  const value = JSON.parse(report);
+const reportStore = (report, generation = publication_generation(), session = '', step = 'store', paymentTimerReport = false, marks = null) => {
+  report = presentationReport(report, step, marks);
+  const value = unlockJson(marks, JSON.parse, report);
   lastReport = value;
   if (Array.isArray(value.sessions)) latestSessions = value.sessions;
   discardStalePocConfiguration(value);
@@ -264,7 +275,7 @@ const reportStore = (report, generation = publication_generation(), session = ''
   value.poc_configuration = { key_set: poc_key_is_set() };
   value.provider_configuration = { key_set: provider_key_is_set() };
   if (paymentTimerReport) value.payment_timer = true;
-  return publish_report(generation, session, JSON.stringify(value));
+  return publish_report(generation, session, unlockJson(marks, JSON.stringify, value));
 };
 const exactMembers = (value, names) => value && typeof value === 'object' &&
   !Array.isArray(value) && Object.keys(value).length === names.length &&
@@ -416,6 +427,8 @@ onmessage = async ({ data: envelope }) => {
   // Stale keys reach configurePoc only to be wiped with a plain rejection. Keep
   // the lifecycle and presence exceptions required by recovery.
   if (envelope.generation !== publication_generation().toString() && !data?.poc_configure && data?.retire_runtime !== true && typeof data?.lifecycle !== 'string' && !data?.task_presence) { clearInput(data); return; }
+  let unlockMarks = null;
+  let unlockMarksDone = false;
   try {
   if (!data || typeof data !== 'object' || Object.keys(data).length !== 1) {
     clearInput(data);
@@ -498,8 +511,14 @@ onmessage = async ({ data: envelope }) => {
     : data.poc_bind || data.poc_public_keys || data.poc_accept || data.bind || data.verify_clock || data.withdraw_reinstall || data.task || data.goal || data.requirements_answer || data.delivery || data.goal_accept ? 'task' : 'store';
   const session = data.task?.action === 'end-session' ? '' : data.goal?.session ?? data.goal_accept?.session ?? data.requirements_answer?.session ?? data.delivery?.session ?? data.task?.session ?? '';
   if (data.create instanceof Uint8Array) report = await create(data.create);
-  else if (data.unlock instanceof Uint8Array) report = await unlock(data.unlock);
-  else if (data.seed_backup_redisplay instanceof Uint8Array) report = await seed_backup_redisplay(data.seed_backup_redisplay);
+  else if (data.unlock instanceof Uint8Array || data.seed_backup_redisplay instanceof Uint8Array) {
+    const marks = { unlock_call_ms: 0, worker_json_ms: 0 };
+    unlockMarks = marks;
+    const started = unlockNow();
+    try {
+      report = data.unlock instanceof Uint8Array ? await unlock(data.unlock) : await seed_backup_redisplay(data.seed_backup_redisplay);
+    } finally { marks.unlock_call_ms += unlockNow() - started; }
+  }
   else if (data.seed_backup_reentry instanceof Uint8Array) report = await seed_backup_reentry(data.seed_backup_reentry);
   else if (data.seed_backup_answer === true) report = await seed_backup_answer();
   else if (data.seed_backup_skip === true) report = await seed_backup_skip();
@@ -614,9 +633,9 @@ onmessage = async ({ data: envelope }) => {
     return;
   }
   else return;
-  Object.assign(wake, {generation:publication_generation(), identity:JSON.stringify(JSON.parse(report).procurement?.identity)});
-  await reportStore(report, generation, session, step);
-  const result = JSON.parse(report);
+  Object.assign(wake, {generation:publication_generation(), identity:unlockJson(unlockMarks, JSON.stringify, unlockJson(unlockMarks, JSON.parse, report).procurement?.identity)});
+  await reportStore(report, generation, session, step, false, unlockMarks);
+  const result = unlockJson(unlockMarks, JSON.parse, report);
   if (!result.error && !result.credit_error) {
     if (data.requirements_answer?.decision === 'approve' && generation === publication_generation()) {
       const task = result.tasks?.find(task => task.start_session === data.requirements_answer.session && task.machine === data.requirements_answer.machine && ['running','verifying','waiting'].includes(task.status));
@@ -640,7 +659,8 @@ onmessage = async ({ data: envelope }) => {
   }
   if (data.unlock instanceof Uint8Array || data.seed_backup_redisplay instanceof Uint8Array) {
     setTimeout(() => sweep_inference(), 0);
-    if (data.unlock instanceof Uint8Array && JSON.parse(report).state === 'unlocked' && !JSON.parse(report).error) setTimeout(() => retry_ended_credit(), 0);
+    if (data.unlock instanceof Uint8Array && unlockJson(unlockMarks, JSON.parse, report).state === 'unlocked' && !unlockJson(unlockMarks, JSON.parse, report).error) setTimeout(() => retry_ended_credit(), 0);
+    unlockMarksDone = unlockMarks !== null;
     wake_tasks();
     await refreshPayments(wake);
   }
@@ -650,6 +670,8 @@ onmessage = async ({ data: envelope }) => {
     // Prerequisite changes wake interrupted work; task controls retain their explicit workflow.
     if (data && (data.unlock instanceof Uint8Array || (data.poc_configure && !emptyPocSubmission) || data.credit_request || data.lifecycle === 'resume' ||
         Object.keys(data).some(name => name.startsWith('seed_backup_')))) wake_tasks();
+    // Posted last and not awaited, so it orders after every original step of this request.
+    if (unlockMarksDone) publish_unlock_worker_timings(unlockMarks.unlock_call_ms, unlockMarks.worker_json_ms).catch(() => {});
   }
 };
 task_presence(initialPresence?.visible === true, initialPresence?.online === true);
