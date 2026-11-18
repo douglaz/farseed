@@ -1,5 +1,7 @@
 // The page sends passphrase and re-entry bytes once and clears fields immediately. The only
 // mnemonic display is the dedicated seed-backup ceremony; lock removes its words and inputs.
+// Begin module loading before page setup or deployment-default reads.
+const firstWorker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
 const $ = (id) => document.getElementById(`tau-${id}`);
 const status = $('status');
 const show = (state, text) => {
@@ -1864,14 +1866,20 @@ $('poc-target-form').addEventListener('submit', event => {
   } });
 });
 let worker;
+let firstStart = true;
 
 const start = () => {
+  worker = firstStart ? firstWorker : new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+  firstStart = false;
+  $('loading').hidden = false;
+  $('loading').querySelector('progress').hidden = false;
+  $('loading-text').textContent = 'Loading the app…';
+  $('store').inert = $('poc').inert = true;
   goalOutcomes.clear();
   show('starting', 'Starting the harness…');
   render({ state: 'starting' });
   suspended = false;
   ceremony = false;
-  worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
   const current = worker;
   const incarnation = crypto.randomUUID();
   current.generation = '0';
@@ -1893,6 +1901,17 @@ const start = () => {
     if (data.delivery_details) { receiveDeliveryDetails(data.delivery_details, current); return; }
     if (typeof data.delivery_details_unavailable === 'string') { receiveDeliveryDetails({request: data.delivery_details_unavailable, error: true}, current); return; }
     if (worker !== current) return;
+    if (data.app_load_failed === true) {
+      current.onerror({message: 'the app did not load'});
+      return;
+    }
+    if (data.app_loading) {
+      const {loaded, total, complete} = data.app_loading;
+      $('loading-text').textContent = total
+        ? `Loading the app: ${(loaded / 1000000).toFixed(1)} of ${(total / 1000000).toFixed(1)} MB${complete ? ' — preparing the app…' : ''}`
+        : 'Loading the app…';
+      return;
+    }
     if (typeof data.deployment_ready === 'boolean') {
       publishDefaults(deploymentMaterial, data.deployment_ready);
       return;
@@ -1903,7 +1922,11 @@ const start = () => {
     }
     if (worker !== current) return;
     if (typeof data.store?.lifecycle_generation === 'string') current.generation = data.store.lifecycle_generation;
-    if (data.harness_ready) show('ready', `Harness ready (spec ${data.harness_ready}).`);
+    if (data.harness_ready) {
+      $('loading').hidden = true;
+      $('store').inert = $('poc').inert = false;
+      show('ready', `Harness ready (spec ${data.harness_ready}).`);
+    }
     else if (data.store) {
       const { store_state: state, store_error: error, store_reason: reason, ...rest } = data.store;
       if (rest.goal_outcome) goalOutcomes.set(rest.goal_outcome.session, rest.goal_outcome.outcome);
@@ -1931,6 +1954,9 @@ const start = () => {
     $('seed-backup-input').value = '';
     $('passphrase').value = $('confirm').value = '';
     render({ state: 'lost' });
+    $('loading').hidden = false;
+    $('loading').querySelector('progress').hidden = true;
+    $('loading-text').textContent = 'The app could not load. Reload this page to retry.';
     show('failed', `Harness lost: ${event.message ?? 'the worker did not load'}. Reload to reopen locked.`);
   };
 };
@@ -1994,6 +2020,8 @@ const send = (kind) => {
     render({ state: 'none', error: 'The two passphrases differ.' });
     return;
   }
+  // Ask within the Create/Unlock gesture, before posting the store operation.
+  requestPersistence();
   render({ state: 'working' });
   const operation = kind === 'unlock' && redisplay ? 'seed_backup_redisplay' : kind;
   redisplay = false;
@@ -2021,9 +2049,17 @@ $('seed-backup-skip').addEventListener('click', () => {
   worker.postMessage({ seed_backup_skip: true });
 });
 
-// STA-23: "The browser MUST request persistent storage and visibly report a refusal." Asked once
-// per load, unless already granted.
+// STA-23: request on every load unless already granted, and again in Create/Unlock.
 const persist = $('persist');
+// Only the most recently started request may draw the line; an older answer arriving late is dropped.
+let persistGeneration = 0;
+const renderPersistence = (generation, granted) => {
+  if (generation !== persistGeneration) return;
+  persist.dataset.state = granted ? 'granted' : 'refused';
+  persist.textContent = `${granted
+    ? 'Persistent storage is granted.'
+    : "Persistent storage: the browser refused the request. The browser may clear this site's data under storage pressure."} This is a request, not a guarantee: eviction, device loss or corruption can still lose the local store, so the seed backup and recovery remain necessary.`;
+};
 const request = async () => {
   try {
     return (await navigator.storage.persisted()) || (await navigator.storage.persist());
@@ -2031,11 +2067,16 @@ const request = async () => {
     return false;
   }
 };
-request().then((granted) => {
-  persist.dataset.state = granted ? 'granted' : 'refused';
-  persist.textContent = `${granted
-    ? 'Persistent storage is granted.'
-    : 'Persistent storage: the browser refused the request.'} This is a request, not a guarantee: eviction, device loss or corruption can still lose the local store, so the seed backup and recovery remain necessary.`;
-});
+const loadGeneration = ++persistGeneration;
+request().then(granted => renderPersistence(loadGeneration, granted));
+const requestPersistence = async () => {
+  const generation = ++persistGeneration;
+  let granted = false;
+  try {
+    // Do not await persisted() first: persist() must start in the gesture.
+    granted = await navigator.storage.persist();
+  } catch { /* An unavailable persistence API is also a refusal. */ }
+  renderPersistence(generation, granted);
+};
 
 start();

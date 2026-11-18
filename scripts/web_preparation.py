@@ -77,6 +77,11 @@ def command(arguments, descriptors=()):
 
 
 def build(root, variant, lock):
+    optimizer = shutil.which(os.environ.get("WASM_OPT", "wasm-opt"))
+    brotli = shutil.which(os.environ.get("BROTLI", "brotli"))
+    gzip = shutil.which("gzip")
+    if not optimizer or not brotli or not gzip:
+        raise ValueError("web preparation requires wasm-opt, brotli and gzip")
     locked = re.search(r'^name = "wasm-bindgen"\nversion = "([^"]+)"',
                        (root / "Cargo.lock").read_text(), re.MULTILINE).group(1)
     cli = subprocess.check_output(["wasm-bindgen", "--version"], text=True).split()[1]
@@ -103,8 +108,26 @@ def build(root, variant, lock):
             command(["wasm-bindgen", "--target", "web", "--no-typescript", "--out-dir",
                      str(stage / "pkg"), str(target / "wasm32-unknown-unknown/release/tau_web.wasm")],
                     (lock, consumption.fileno()))
+            wasm = stage / "pkg/tau_web_bg.wasm"
+            optimized = stage / "pkg/tau_web_bg.optimized.wasm"
+            command([optimizer, "-Oz", "--enable-bulk-memory", "--enable-nontrapping-float-to-int",
+                     "--enable-sign-ext", "--enable-mutable-globals", "--enable-multivalue",
+                     "--enable-reference-types", str(wasm), "-o", str(optimized)],
+                    (lock, consumption.fileno()))
+            optimized.replace(wasm)
             for name in ("index.html", "boot.js", "worker.js"):
                 shutil.copyfile(root / "www" / name, stage / name)
+            # Sidecars are part of the published bundle and its file manifest.
+            # Deployment defaults are supplied later and must never get stale sidecars.
+            for path in sorted(stage.rglob("*")):
+                if (not path.is_file() or path.name == "poc-defaults.json" or
+                        path.suffix not in (".html", ".js", ".css", ".json", ".wasm")):
+                    continue
+                command([brotli, "-q", "11", "-f", "-o", str(path) + ".br", str(path)],
+                        (lock, consumption.fileno()))
+                with Path(str(path) + ".gz").open("wb") as compressed:
+                    subprocess.run([gzip, "-9", "-n", "-c", str(path)], stdout=compressed,
+                                   check=True, pass_fds=(lock, consumption.fileno()))
             publish(stage, root / "dist" / variant)
     print(f"built dist/{variant}")
 

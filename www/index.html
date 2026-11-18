@@ -51,8 +51,9 @@ section section { min-width: 0; }
 </head>
 <body>
 <h1>Set up your machine</h1>
+<p id="tau-loading" role="status"><progress aria-label="Loading the app"></progress> <span id="tau-loading-text">Loading the app…</span></p>
 
-<section id="tau-store" aria-live="polite">
+<section id="tau-store" aria-live="polite" inert>
 <div id="tau-lifecycle-line"><p id="tau-store-state"></p>
 <button id="tau-lock" type="button" hidden>Lock</button></div>
 <p id="tau-lifecycle-disclosure">Switching apps or locking the screen can leave your keys and account unlocked in memory indefinitely. Approved work, including disk wipes, may continue unseen or after a reload without asking again. End stops new work; Lock pauses it and keeps each session’s machine. Remote work already accepted can continue after End. Your phone can freeze or close this page without warning.</p>
@@ -89,7 +90,7 @@ section section { min-width: 0; }
 <details id="tau-harness-details" open><summary>Details</summary><p id="tau-status" role="status">Starting the harness…</p></details>
 </section>
 </section>
-<div id="tau-poc">
+<div id="tau-poc" inert>
 <section class="step" data-step="credit">
 <h2>2 Inference credit</h2>
 <p id="tau-credit-status" class="step-status" role="status">No inference credit yet.</p>

@@ -19,6 +19,40 @@ let incarnation;
 let deployment;
 let retirementRequested = false;
 const lockWait = new AbortController();
+// Fetch and compile while the page prepares its deployment initialization.
+// Count decoded bytes. Content-Length describes encoded bytes when compressed,
+// so only advertise a total for an unencoded response.
+const wasmReady = (async () => {
+  const response = await fetch(new URL('./pkg/tau_web_bg.wasm', import.meta.url));
+  if (!response.ok) throw Error('The app download failed.');
+  const length = Number(response.headers.get('Content-Length'));
+  const encoding = response.headers.get('Content-Encoding');
+  const total = (!encoding || encoding === 'identity') && Number.isSafeInteger(length) && length > 0 ? length : null;
+  if (!response.body) return init({module_or_path: response});
+  const reader = response.body.getReader();
+  let loaded = 0, lastUpdate = -Infinity;
+  const body = new ReadableStream({
+    async pull(controller) {
+      try {
+        const {done, value} = await reader.read();
+        if (!done) loaded += value.byteLength;
+        const now = performance.now();
+        if (done || now - lastUpdate >= 100) {
+          postMessage({app_loading: {loaded, total, complete: done}});
+          lastUpdate = now;
+        }
+        if (done) controller.close(); else controller.enqueue(value);
+      } catch (error) { controller.error(error); }
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  });
+  // wasm-bindgen uses instantiateStreaming for a Response with this MIME type.
+  return init({module_or_path: new Response(body, {headers: {'Content-Type': response.headers.get('Content-Type') ?? ''}})});
+})().then(() => ({error: null}), error => {
+  // Settle even if defaults have not arrived yet; no unhandled rejection window.
+  postMessage({app_load_failed: true});
+  return {error};
+});
 await new Promise(resolve => {
   onmessage = ({data}) => {
     if (!incarnation && data && Object.keys(data).every(k => ['initialize','deployment'].includes(k)) && typeof data.initialize === 'string') {
@@ -43,7 +77,8 @@ await new Promise(resolve => {
   };
 });
 try {
-  await init();
+  const result = await wasmReady;
+  if (result.error) throw result.error;
   identify_execution(incarnation);
   try {
     const accepted = await deployment_configure(typeof deployment?.origin === 'string' ? deployment.origin : undefined,
