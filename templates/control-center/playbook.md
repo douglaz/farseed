@@ -40,6 +40,9 @@ You are building the user's control center on this NixOS machine. Follow the ste
     `http://10.88.0.1:9119/` (label `Hermes dashboard over WireGuard`), and, if Tor is on, the onion address from
     app-url.txt (label `Hermes dashboard over Tor`). If the final check printed `T3 Code: not linked yet`, leave
     `https://app.t3.codes` out of `urls` completely: the machine isn't linked, so that address can't reach it yet.
+11. Do only the step tau-web sent you, as its text says. Never start a later step early, and never write your
+    own version of a step's block or file (a `cc-*.nix` file, for example): tau-web sends each step's exact blocks
+    when that step's turn comes.
 
 ## Facts (tau-web fills these in)
 
@@ -729,6 +732,9 @@ Expect `CHECKS t3 PASS`. The check waits up to a minute for T3 to start and to r
 ---
 
 ## Step 8: T3 Connect (the user approves this machine)
+
+Do this step now, starting with its Do block. WireGuard is Step 9: it comes only after this step's
+`CHECKS connect PASS`.
 
 This links the machine to the user's T3 account, so the user reaches T3 Code from app.t3.codes or the T3 apps,
 with no open port. Nothing is typed back on this machine: it notices the user's approval by itself. The user may
