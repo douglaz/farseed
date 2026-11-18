@@ -449,7 +449,7 @@ const operatorLink = link => {
 };
 const taskStatus = (status, task) => awaitingAiKey(task) || awaitingOperator(task) ? 'waiting for you' : ({running:'working', waiting:'waiting for the machine', verifying:'checking the result', paused:'paused', complete:'done', abandoned:'stopped'})[status] ?? status;
 const purchaseStatus = purchase => ({
-  approved: 'Purchase approved; preparing access to the machine.',
+  approved: "Purchase approved; the machine hasn't been ordered yet. Press Create the server to order it.",
   registration_uncertain: 'Waiting to confirm that the provider saved the access key. The page will check before continuing.',
   registered: 'Access key saved; preparing the machine order.',
   create_uncertain: 'Waiting to confirm the machine order. The page will check before continuing.',
@@ -2011,6 +2011,8 @@ const renderProvider = (store, enabled) => {
     }
   }
   const canReview = !purchase.phase || ['approved', 'registered', 'terms_changed', 'handed_off'].includes(purchase.phase);
+  $('provider-approval-form').querySelector('button[type="submit"]').textContent = purchase.phase === 'terms_changed' ? 'Approve the new terms' : 'Approve and order this machine';
+  $('provider-approval-note').textContent = purchase.phase === 'terms_changed' ? 'This records the new terms only. Then press Create the server to order the machine. Nothing is paid until you pay its first invoice in your wallet.' : 'This orders the machine from the provider. Nothing is paid until you pay its first invoice in your wallet.';
   for (const control of $('provider-selection-form').elements) control.disabled = !enabled || !canReview;
   for (const control of $('provider-approval-form').elements) control.disabled = !enabled || (Boolean(purchase.phase) && !renewal && purchase.phase !== 'handed_off') || providerSelectionDirty || !purchase.selection;
   if (renewal) {

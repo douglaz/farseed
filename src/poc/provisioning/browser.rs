@@ -256,7 +256,17 @@ pub async fn provider_request(request: String) -> String {
                 if !store.procurement_review_selection().is_some_and(|current| current.same_terms(&selection)) {
                     return Err("The displayed configuration is stale or missing; review the current selection and approve it again.".into());
                 }
-                store.procurement_approve(&mut api, approval).await.map(|_| None)
+                let fresh = matches!(store.procurement_view()["phase"].as_str(), None | Some("handed_off"));
+                store.procurement_approve(&mut api, approval).await?;
+                if fresh {
+                    // Give ordering its own budget without renewing lifecycle authority.
+                    api.started = monotonic_ms()?;
+                    api.requests = 0;
+                    api.response_status = 0;
+                    store.procurement_resume(&mut api, false).await.map(|_| None)
+                } else {
+                    Ok(None)
+                }
             }
             Action::ReadinessCheck => store.procurement_readiness_check(&mut api).await.map(|_| None),
             Action::EmailCheck => store.procurement_resume(&mut api, false).await.map(|_| None),

@@ -178,7 +178,8 @@ section section { min-width: 0; }
 <p><label>Class answer <select id="tau-provider-class" required><option value="">Choose an answer</option><option value="yes">Yes</option><option value="no">No, only me and people I know</option><option value="not_sure">Not sure</option></select></label></p>
 <p><label><input id="tau-provider-approve-charge" type="checkbox" required>I approve buying this machine exactly as shown above: its offer, region, system image, resources and recurring charge.</label></p>
 <p><label><input id="tau-provider-approve-access" type="checkbox" required>I let tau-web's AI log in to this machine whenever it needs to, now and later, as the image's login user, and run whole scripts on it as administrator without a password (sudo -n).</label></p>
-<button type="submit">Approve these exact purchase terms</button>
+<p id="tau-provider-approval-note">This orders the machine from the provider. Nothing is paid until you pay its first invoice in your wallet.</p>
+<button type="submit">Approve and order this machine</button>
 </form>
 <section id="tau-provider-email" hidden aria-label="Verify your email with the machine provider">
 <p>The machine provider requires a verified email address before it creates a machine. Your address goes to the provider only; tau-web uses it for nothing else. It is kept encrypted in this browser so the page can check that the provider verified the address you entered.</p>
