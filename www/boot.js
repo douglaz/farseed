@@ -389,6 +389,13 @@ const rawDetails = (parent, value, identity) => {
   details.append(summary, text); parent.append(details);
   return details;
 };
+const detailFold = (parent, label, identity) => {
+  const details = document.createElement('details');
+  details.dataset.foldKey = JSON.stringify(identity);
+  const summary = document.createElement('summary'); summary.textContent = label;
+  details.append(summary); parent.append(details);
+  return details;
+};
 // These summaries affect the page only; saved records retain their original text.
 const shortLine = (value, limit = 80) => {
   const line = String(value ?? '').replace(/\s+/g, ' ').trim();
@@ -1657,6 +1664,9 @@ let providerDisplayedBilling = null;
 let providerDisplayedSelection = null;
 let providerDisplayedOrigin = null;
 const providerRequest = action => worker.postMessage({provider_request: action});
+const updateProviderResources = () => {
+  $('provider-resources-field').hidden = !$('provider-offer').value.startsWith('custom:');
+};
 const renderProvider = (store, enabled) => {
   const worker = snapshotWorker();
   const recorded = store.provider_configuration?.recorded === true;
@@ -1668,6 +1678,10 @@ const renderProvider = (store, enabled) => {
   $('provider-key-form').hidden = fixed;
   $('provider-account-fixed').hidden = !fixed;
   const deployed = store.provider_configuration?.relay_deployed === true;
+  const relayFold = $('provider-relay-fold');
+  relayFold.hidden = !deployed;
+  if (deployed) relayFold.append($('provider-relay-guidance'));
+  else relayFold.after($('provider-relay-guidance'));
   $('provider-relay-guidance').textContent = deployed
     ? 'Registering the machine SSH public key with the provider does not enroll the relay. The deployment relay key is in use. You still need published pins and approvals for the goal, class, access and installation declaration.'
     : 'Registering the machine SSH public key with the provider does not enroll the relay. Before configuration, copy the separate relay public key and ask your relay operator to enroll it. You still need published pins and approvals for the goal, class, access and installation declaration.';
@@ -1759,6 +1773,7 @@ const renderProvider = (store, enabled) => {
     }
     providerSelectionDirty = true; $('provider-approve-charge').checked = false;
   }
+  updateProviderResources();
   if (store.provider_selection_reviewed || renewal) providerSelectionDirty = false;
   const selection = $('provider-selection-view'); selection.replaceChildren();
   if (purchase.selection) {
@@ -1814,14 +1829,18 @@ const renderProvider = (store, enabled) => {
       }
     }
     if (purchase.public_keys) {
-      paragraph(progress, deployed ? 'Registering the machine SSH public key with the provider does not enroll the relay. The deployment relay key is in use.' : 'Registering the machine SSH public key with the provider does not enroll the relay. Copy the separate relay public key and ask your relay operator to enroll it before configuration.');
-      paragraph(progress, deployed ? 'Deployment relay public key:' : 'Relay public key — enroll this separately with the relay operator:');
-      const publicKey = document.createElement('pre'); publicKey.textContent = purchase.public_keys.relay_pubkey; progress.append(publicKey);
+      const relay = deployed ? detailFold(progress, 'Relay details', ['purchase-relay', purchase.machine]) : progress;
+      paragraph(relay, deployed ? 'Registering the machine SSH public key with the provider does not enroll the relay. The deployment relay key is in use.' : 'Registering the machine SSH public key with the provider does not enroll the relay. Copy the separate relay public key and ask your relay operator to enroll it before configuration.');
+      paragraph(relay, deployed ? 'Deployment relay public key:' : 'Relay public key — enroll this separately with the relay operator:');
+      const publicKey = document.createElement('pre'); publicKey.textContent = purchase.public_keys.relay_pubkey; relay.append(publicKey);
     }
     if (purchase.target) paragraph(progress, `The machine’s published host key is saved. Press Start session ${purchase.machine} below to continue setup.`);
   }
-  for (const completed of purchase.completed ?? []) {
-    paragraph(progress, `${completed.machine}: Purchase completed. Provider: ${completed.origin}. VM: ${completed.vm_id ?? 'unknown'}. Payment: ${completed.payment_id ?? 'none'} (${completed.is_paid ? 'paid' : 'not recorded as paid'}). Target saved: ${completed.target_saved ? 'yes' : 'no'}.`);
+  if (purchase.completed?.length) {
+    const earlier = detailFold(progress, `Earlier purchases (${purchase.completed.length})`, ['purchase-completed']);
+    for (const completed of purchase.completed) {
+      paragraph(earlier, `${completed.machine}: Purchase completed. Provider: ${completed.origin}. VM: ${completed.vm_id ?? 'unknown'}. Payment: ${completed.payment_id ?? 'none'} (${completed.is_paid ? 'paid' : 'not recorded as paid'}). Target saved: ${completed.target_saved ? 'yes' : 'no'}.`);
+    }
   }
   const canReview = !purchase.phase || ['approved', 'registered', 'terms_changed', 'handed_off'].includes(purchase.phase);
   for (const control of $('provider-selection-form').elements) control.disabled = !enabled || !canReview;
@@ -1846,6 +1865,7 @@ $('provider-key-form').addEventListener('submit', event => {
 });
 $('provider-catalogue').addEventListener('click', () => providerRequest({action: 'catalogue'}));
 $('provider-selection-form').addEventListener('input', () => {
+  updateProviderResources();
   providerSelectionDirty = true; $('provider-approve-charge').checked = false;
   for (const control of $('provider-approval-form').elements) control.disabled = true;
 });
@@ -2022,7 +2042,8 @@ const renderPoc = (store) => {
         else worker.postMessage({ [kind]: { machine: target.machine, ...(kind === 'poc_bind' ? inputs() : {}) } });
       });
       if (kind === 'poc_bind') startDisclosure(row);
-      row.append(button);
+      const actions = kind === 'poc_public_keys' ? detailFold(row, `More for ${target.machine}`, ['target-more', target.machine]) : row;
+      actions.append(button);
     }
     for (const session of store.sessions ?? []) {
       if (!session.credit_backed || session.session_state === 'ended' || !(session.bound_set ?? []).includes(target.machine)) continue;

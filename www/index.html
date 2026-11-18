@@ -161,11 +161,12 @@ section section { min-width: 0; }
 <form id="tau-provider-selection-form">
 <p><label>Fetched offer <select id="tau-provider-offer" required><option value="">Choose a fetched offer</option></select></label></p>
 <p><label>Fetched image <select id="tau-provider-image" required><option value="">Choose a fetched image</option></select></label></p>
-<p><label>Custom resources JSON (custom offers only; bytes for memory/disk) <textarea id="tau-provider-resources" autocomplete="off" spellcheck="false">{}</textarea></label></p>
+<p id="tau-provider-resources-field" hidden><label>Custom resources JSON (custom offers only; bytes for memory/disk) <textarea id="tau-provider-resources" autocomplete="off" spellcheck="false">{}</textarea></label></p>
 <button type="submit">Review selected configuration and price</button>
 </form>
 <div id="tau-purchase-review">
 <div id="tau-provider-selection-view"></div>
+<details id="tau-provider-relay-fold" data-fold-key='["purchase-review-relay"]' hidden><summary>Relay details</summary></details>
 <p id="tau-provider-relay-guidance">Registering the machine SSH public key with the provider does not enroll the relay. Before configuration, copy the separate relay public key and ask your relay operator to enroll it. You still need published pins and approvals for the goal, class, access and installation declaration.</p>
 <form id="tau-provider-approval-form">
 <p><label>Machine name <input id="tau-provider-machine" required autocomplete="off"></label></p>
