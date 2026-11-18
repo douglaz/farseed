@@ -10,6 +10,11 @@ use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
 pub const MARKER: &str = "<redacted>";
+/// Whole published strings shorter than this are exempt from the publication boundary rule when
+/// they consist of nothing but a held value's prefix or suffix (B524). No cut leaves a string this
+/// short: the smallest cut segment, one half of a short model-history excerpt of one of three
+/// streams, keeps about 100 bytes ((768 - 64) / 3 per stream, less the omission notice, halved).
+const SHORT_WHOLE: usize = 64;
 
 /// A response that has passed the store's credential boundary. Only the boundary constructs it.
 ///
@@ -257,7 +262,12 @@ impl Matcher {
                             .zip(remaining)
                             .take_while(|(a, b)| a == b)
                             .count();
-                        if (matched == value.len() || matched == remaining.len())
+                        // A whole string under SHORT_WHOLE bytes that is only a value's prefix is a
+                        // fixed value (a status, a protocol word), never a cut text: every cut keeps
+                        // hundreds of bytes. Longer strings and partial ends are still checked.
+                        if (matched == value.len()
+                            || (matched == remaining.len()
+                                && (start > 0 || bytes.len() >= SHORT_WHOLE)))
                             && found(start, start + matched)
                         {
                             return true;
@@ -280,7 +290,11 @@ impl Matcher {
             if publication && let Some(candidates) = self.suffixes.get(&prefix) {
                 let end = start + 8;
                 for value in candidates.iter() {
-                    if end < value.len() && value.ends_with(&bytes[..end]) && found(0, end) {
+                    if end < value.len()
+                        && (end < bytes.len() || bytes.len() >= SHORT_WHOLE)
+                        && value.ends_with(&bytes[..end])
+                        && found(0, end)
+                    {
                         return true;
                     }
                 }
