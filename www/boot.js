@@ -321,6 +321,7 @@ const render = (store, forceRender = false) => {
   $('create-help').hidden = $('confirm-field').hidden = $('create').hidden = state !== 'none';
   $('passphrase-field').hidden = state !== 'none' && state !== 'locked';
   $('passphrase').autocomplete = state === 'none' ? 'new-password' : 'current-password';
+  $('passphrase').enterKeyHint = state === 'none' ? 'next' : 'go';
   $('unlock').hidden = state !== 'locked';
   $('lock').hidden = state !== 'unlocked';
   if ($('lock').hidden) $('store-disclosure-slot').append($('lifecycle-disclosure'));
@@ -2291,6 +2292,21 @@ const send = (kind) => {
 };
 $('create').addEventListener('click', () => send('create'));
 $('unlock').addEventListener('click', () => send('unlock'));
+$('passphrase').addEventListener('keydown', event => {
+  if (event.key !== 'Enter' || event.isComposing) return;
+  if (!$('unlock').hidden && !$('unlock').disabled) {
+    event.preventDefault();
+    $('unlock').click();
+  } else if (!$('create').hidden) {
+    event.preventDefault();
+    $('confirm').focus();
+  }
+});
+$('confirm').addEventListener('keydown', event => {
+  if (event.key !== 'Enter' || event.isComposing || $('create').hidden || $('create').disabled) return;
+  event.preventDefault();
+  $('create').click();
+});
 
 $('redisplay').addEventListener('click', () => {
   lock();
