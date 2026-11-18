@@ -27,15 +27,16 @@ You are building the user's control center on this NixOS machine. Follow the ste
    an echo. tau-web counts a step as passed only when the check's `CHECKS ... PASS` line is the last line of the
    command's output. On FAIL, do what "If it fails" says, at most twice. If it still fails, stop and report the
    FAIL lines and the step number.
-7. If tau-web sends you the same step again after its check printed PASS, run that step's Check block alone,
-   once more, and nothing else. Never explore instead: don't look for other steps' text, read package sources,
-   check ports, or build anything a step doesn't ask for. tau-web sends the next step itself.
+7. If tau-web sends you the same step again after that step's own Check printed PASS while it was the step
+   tau-web had sent you, run that step's Check block alone, once more, and nothing else. A PASS from before
+   tau-web sent the step doesn't count: do the whole step as written. Never explore instead: don't look for
+   other steps' text, read package sources, check ports, or build anything a step doesn't ask for. tau-web sends
+   the next step itself.
 8. Commands already run as root. Keep output short: only the first 8 KiB of output comes back, and the
    scripts print only what matters.
-9. Change the `cc-*.nix` files, the two scripts and the user's files (wireguard.conf,
-   control-center-login.txt, app-url.txt) only by running a step's Do block. A FAIL line that ends with
-   `(needs the user: ask_operator)` can only be fixed by the user: ask with `ask_operator`, wait for the
-   answer, then run that step's Wait and Check again. Don't work around it.
+9. Change the `cc-*.nix` files, the two scripts and the user's files (Step 11 writes them) only by running a
+   step's Do block. A FAIL line that ends with `(needs the user: ask_operator)` can only be fixed by the user:
+   ask with `ask_operator`, wait for the answer, then run that step's Wait and Check again. Don't work around it.
 10. When tau-web says every step passed, call `done` with `urls`: `https://app.t3.codes` (label `T3 Code`),
     `http://10.88.0.1:9119/` (label `Hermes dashboard over WireGuard`), and, if Tor is on, the onion address from
     app-url.txt (label `Hermes dashboard over Tor`). If the final check printed `T3 Code: not linked yet`, leave
@@ -626,7 +627,8 @@ again exactly, then the Wait, then the Check.
 ## Step 7: T3 Code, driving Hermes
 
 T3 Code is the user's main way in. It runs as a service, and it drives Hermes over ACP (Hermes' `hermes-acp`
-command). This step also adds this machine's workspace as a T3 project.
+command). Its Check, run after the Do and the Wait as always, also adds this machine's workspace as a T3
+project.
 
 **Do**
 ```sh
@@ -733,8 +735,8 @@ Expect `CHECKS t3 PASS`. The check waits up to a minute for T3 to start and to r
 
 ## Step 8: T3 Connect (the user approves this machine)
 
-Do this step now, starting with its Do block. WireGuard is Step 9: it comes only after this step's
-`CHECKS connect PASS`.
+Do this step now: run its Do block first, unless you already have. WireGuard is Step 9: it comes only after
+this step's `CHECKS connect PASS`.
 
 This links the machine to the user's T3 account, so the user reaches T3 Code from app.t3.codes or the T3 apps,
 with no open port. Nothing is typed back on this machine: it notices the user's approval by itself. The user may
@@ -784,7 +786,7 @@ STEP
 sh <<'STEP'
 systemctl stop t3-connect 2>/dev/null || true
 install -m 600 -o root -g root /dev/null /var/lib/control-center/t3-link-later
-echo "LATER: T3 Code: not linked yet. The user's files will say how to link it."
+echo "LATER: T3 Code: not linked yet."
 sh /etc/nixos/cc-check.sh connect
 STEP
 ```
