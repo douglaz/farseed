@@ -697,8 +697,10 @@ fn request_context<S: Storage>(
             if task.is_some_and(|t| t.template.as_deref() == Some(super::template::ID)) {
                 handover.push_str("The T3 app address https://app.t3.codes is listed for the user and not visited.\n");
                 handover.push_str("Before done, offer wireguard.conf and control-center-login.txt with offer_file; a missing offer is a finding.\n");
+                handover.push_str("Differences found after done pause the task as findings; the template's final step already runs the same final check.");
+            } else {
+                handover.push_str("Before calling done, run these same commands yourself with exec and fix every difference. Differences found after done pause the task as findings.");
             }
-            handover.push_str("Before calling done, run these same commands yourself with exec and fix every difference. Differences found after done pause the task as findings.");
             messages.push(json!({"role":"user", "content":handover}));
             messages.push(json!({"role":"user", "content":"For an application the operator asked for that needs its own AI access, call request_ai_key with a short plain application name and purpose, never for your own use and never with a secret; after the operator presses Create key on its card, tau-web creates an application inference key capped at 0.25 USD, expiring in 30 days, and saves it on the machine at the path in the reply, which also gives the chat-completions API base URL to configure the application with. The key outlives this session; use the file, never print the key, and never ask the operator for keys."}));
             let mut offered: Vec<_> = definitions.as_array().expect("tool definitions").iter()
