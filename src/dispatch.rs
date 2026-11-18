@@ -241,6 +241,11 @@ pub struct Dispatch {
     pub receipts: Vec<ReceiptRecord>,
     pub current_installations: BTreeMap<String, u64>,
     pub inference_standing: Option<DispositionRecord>,
+    // Append-only indexes, maintained only by intent and terminal application
+    // in live operation and replay. They never replace call state or authority.
+    command_jobs: std::rc::Rc<std::collections::BTreeSet<String>>,
+    command_sessions: std::rc::Rc<std::collections::BTreeSet<String>>,
+    terminal_calls: std::rc::Rc<std::collections::BTreeSet<u64>>,
 }
 
 impl Dispatch {
@@ -395,6 +400,12 @@ impl Dispatch {
         } else {
             CallState::Cancelled
         };
+        if let Some(job) = &intent.job {
+            std::rc::Rc::make_mut(&mut self.command_jobs).insert(job.clone());
+        }
+        if let Some(session) = intent.provenance.as_ref().and_then(|p| p.session.as_ref()) {
+            std::rc::Rc::make_mut(&mut self.command_sessions).insert(session.clone());
+        }
         self.calls.insert(number, Call { intent, state });
         self.intent_order.push(number);
         self.current_installations
@@ -412,15 +423,15 @@ impl Dispatch {
             return Err("intent command is not lowercase hex".into());
         }
         if let Some(job) = &intent.job
-            && (!crate::jobs::valid_id(job)
-                || self
-                    .calls
-                    .values()
-                    .any(|c| c.intent.job.as_ref() == Some(job)))
+            && (!crate::jobs::valid_id(job) || self.command_jobs.contains(job))
         {
             return Err("intent job identity is invalid or reused".into());
         }
         Ok(())
+    }
+
+    pub(crate) fn has_session_command(&self, session: &str) -> bool {
+        self.command_sessions.contains(session)
     }
 
     pub fn terminal(&mut self, number: u64, terminal: Terminal) -> Result<(), String> {
@@ -433,6 +444,7 @@ impl Dispatch {
             };
         }
         // Later evidence is shown but cannot reopen a disposed call or remove its disposition.
+        std::rc::Rc::make_mut(&mut self.terminal_calls).insert(terminal.call);
         self.terminals.push(TerminalRecord { number, terminal });
         Ok(())
     }
@@ -512,10 +524,7 @@ impl Dispatch {
         if matches!(
             call.state,
             CallState::Cancelled | CallState::Finished { .. } | CallState::Background { .. }
-        ) || self
-            .terminals
-            .iter()
-            .any(|t| t.terminal.call == evidence.call)
+        ) || self.terminal_calls.contains(&evidence.call)
         {
             return Err("job evidence names a cancelled or already finished call".into());
         }

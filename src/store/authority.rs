@@ -13,9 +13,8 @@ impl<S: Storage> Store<S> {
             return Err(crate::poc::wait::SESSIONS_ENDED.into());
         }
         let live = self
-            .sessions
-            .iter()
-            .find(|s| s.identity == session && !s.ended.get())
+            .stored_session(session)
+            .filter(|s| !s.ended.get())
             .ok_or("no live clock-verification session")?;
         if !self.inference.limits.borrow().contains_key(session) {
             return Err("no issuer clock profile".into());
@@ -97,10 +96,7 @@ impl<S: Storage> Store<S> {
             return Err("unsupported profile/unit or reused choice generation".into());
         }
         if self.inference.account_record != Some(confirmed.account_record)
-            || !self
-                .sessions
-                .iter()
-                .any(|s| s.identity == confirmed.session)
+            || self.stored_session(&confirmed.session).is_none()
             || self
                 .inference
                 .limits
@@ -134,9 +130,7 @@ impl<S: Storage> Store<S> {
             return Err(crate::poc::wait::SESSIONS_ENDED.into());
         }
         let live = self
-            .sessions
-            .iter()
-            .find(|s| s.identity == session)
+            .stored_session(session)
             .ok_or(crate::poc::wait::NO_SESSION)?;
         if live.ended.get() {
             return Err(crate::poc::wait::SESSION_ENDED.into());

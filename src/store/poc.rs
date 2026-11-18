@@ -704,24 +704,18 @@ impl<S: Storage> Store<S> {
         if self.pending_requirements.contains_key(session) {
             return Err(crate::poc::wait::APPROVAL_PENDING.into());
         }
-        if !self
-            .conduct_acceptances
-            .iter()
-            .any(|a| a.session == session && a.mode == Mode::NoBrief)
-        {
+        if !self.accepted_no_brief(session) {
             return Err(crate::poc::wait::ACCEPTANCE.into());
         }
         Ok(live)
     }
     fn poc_session_task(&self, session: &str) -> Option<&Task> {
-        self.poc.values().find(|t| t.start_session == session)
+        self.poc_by_session
+            .get(session)
+            .and_then(|id| self.poc.get(id))
     }
     fn poc_new_acceptance(&self, session: &str) -> Result<Option<Acceptance>, String> {
-        if self
-            .conduct_acceptances
-            .iter()
-            .any(|a| a.session == session && a.mode == Mode::NoBrief)
-        {
+        if self.accepted_no_brief(session) {
             return Ok(None);
         }
         let acceptance = Acceptance {
@@ -1359,10 +1353,12 @@ impl<S: Storage> Store<S> {
         if let Record::Start { session, .. } = record
             && let Some(acceptance) = self.poc_new_acceptance(session)?
         {
-            self.conduct_acceptances.push(acceptance);
+            self.push_acceptance(acceptance);
         }
         if matches!(record, Record::Create { .. } | Record::Start { .. }) {
             self.poc_creation_order.push(task.id.clone());
+            self.poc_by_session
+                .insert(task.start_session.clone(), task.id.clone());
         }
         self.poc.insert(task.id.clone(), task);
         Ok(())
@@ -1397,9 +1393,7 @@ impl<S: Storage> Store<S> {
             }
             let goal = self.goal(session).ok_or("task requires recorded goal")?;
             let exposure = self
-                .exposure_ledger
-                .iter()
-                .find(|e| e.session == *session)
+                .session_exposure(session)
                 .ok_or("task requires binding")?;
             if self.ended_sessions.contains(session)
                 || id.len() != 48
@@ -1409,11 +1403,7 @@ impl<S: Storage> Store<S> {
                 || exposure.bound_set.len() != 1
                 || limits.requests == 0
                 || limits.steps == 0
-                || (matches!(record, Record::Create { .. })
-                    && !self
-                        .conduct_acceptances
-                        .iter()
-                        .any(|a| a.session == *session && a.mode == Mode::NoBrief))
+                || (matches!(record, Record::Create { .. }) && !self.accepted_no_brief(session))
             {
                 return Err("invalid task creation".into());
             }

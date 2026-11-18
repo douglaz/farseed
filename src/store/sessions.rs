@@ -7,7 +7,7 @@ impl<S: Storage> Store<S> {
         if self.ended_sessions.contains(session) {
             return Ok(());
         }
-        if !self.exposure_ledger.iter().any(|e| e.session == session) {
+        if self.session_exposure(session).is_none() {
             return Err("unknown session".into());
         }
         let end = End {
@@ -26,16 +26,12 @@ impl<S: Storage> Store<S> {
     }
 
     pub(super) fn apply_end(&mut self, end: &End) -> Result<(), String> {
-        if !self
-            .exposure_ledger
-            .iter()
-            .any(|e| e.session == end.session)
-        {
+        if self.session_exposure(&end.session).is_none() {
             return Err("End names no admitted session".into());
         }
         self.ended_sessions.insert(end.session.clone());
         self.pending_requirements.remove(&end.session);
-        if let Some(session) = self.sessions.iter().find(|s| s.identity == end.session) {
+        if let Some(session) = self.stored_session(&end.session) {
             session.ended.set(true);
             session.given.borrow_mut().clear();
         }
@@ -56,6 +52,9 @@ impl<S: Storage> Store<S> {
                 session.ended.set(true);
                 session.given.borrow_mut().clear();
             }
+            self.sessions_by_id
+                .entry(session.identity.clone())
+                .or_insert(self.sessions.len());
             self.sessions.push(Rc::new(session));
         }
         Ok(())
@@ -65,9 +64,7 @@ impl<S: Storage> Store<S> {
         &self,
         session: &str,
     ) -> Result<crate::poc::inference::Configuration, String> {
-        self.exposure_ledger
-            .iter()
-            .find(|e| e.session == session)
+        self.session_exposure(session)
             .map(|e| e.inference_approval.configuration.clone())
             .ok_or("unknown session".into())
     }

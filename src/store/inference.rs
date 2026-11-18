@@ -341,6 +341,7 @@ impl<S: Storage> Store<S> {
             s.given.borrow_mut().clear();
         }
         self.sessions.clear();
+        self.sessions_by_id.clear();
         self.inference_revocations()
     }
 

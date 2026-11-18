@@ -407,6 +407,7 @@ pub struct Store<S> {
     dispatch: Dispatch,
     delivery: delivery::State,
     sessions: Vec<Rc<Session>>,
+    sessions_by_id: std::collections::BTreeMap<String, usize>,
     inference: inference::State,
     credit: credit::State,
     ai_keys: Vec<ai_keys::Entry>,
@@ -426,10 +427,14 @@ pub struct Store<S> {
     authority: Rc<crate::lifecycle::Authority>,
     response_calls: std::collections::BTreeSet<u64>,
     exposure_ledger: Vec<Exposure>,
+    exposures_by_session: std::collections::BTreeMap<String, usize>,
     ended_sessions: std::collections::BTreeSet<String>,
     conduct_acceptances: Vec<Acceptance>,
+    acceptances_by_session: std::collections::BTreeMap<String, usize>,
     goals: Vec<crate::goals::Goal>,
+    goals_by_session: std::collections::BTreeMap<String, usize>,
     poc: std::collections::BTreeMap<String, poc::Task>,
+    poc_by_session: std::collections::BTreeMap<String, String>,
     /// Creation-record order, rebuilt by the same Create/Start projection on unlock.
     poc_creation_order: Vec<String>,
     /// Memory-only diagnostics; never substitute for a journaled task transition.
@@ -589,6 +594,7 @@ impl<S: Storage> Store<S> {
             dispatch: Dispatch::default(),
             delivery: delivery::State::default(),
             sessions: Vec::new(),
+            sessions_by_id: Default::default(),
             inference: inference::State::default(),
             credit: credit::State::default(),
             ai_keys: Vec::new(),
@@ -607,10 +613,14 @@ impl<S: Storage> Store<S> {
             authority,
             response_calls: std::collections::BTreeSet::new(),
             exposure_ledger: Vec::new(),
+            exposures_by_session: Default::default(),
             ended_sessions: Default::default(),
             conduct_acceptances: Vec::new(),
+            acceptances_by_session: Default::default(),
             goals: Vec::new(),
+            goals_by_session: Default::default(),
             poc: Default::default(),
+            poc_by_session: Default::default(),
             poc_creation_order: Vec::new(),
             #[cfg(target_arch = "wasm32")]
             poc_reconciliation_failures: Default::default(),
@@ -758,6 +768,17 @@ impl<S: Storage> Store<S> {
     }
 
     async fn setup_record(&mut self, record: crate::dispatch::SetupRecord) -> Result<(), String> {
+        if let crate::dispatch::SetupRecord::Requirements(approval) = &record {
+            // Requirements change one approved machine and no allocation metadata.
+            // Validate before commit without copying unrelated calls and evidence.
+            self.dispatch.check_requirements(approval)?;
+            let number = self.commit(&Event::Setup(record.clone())).await?;
+            self.apply_requirements_task(number, &record);
+            self.dispatch
+                .apply_setup(self.allocation.as_mut().expect("seed first"), &record)
+                .expect("validated requirements apply after commit");
+            return Ok(());
+        }
         let mut dispatch = self.measured_dispatch_copy();
         let mut allocation = self.allocation().clone();
         dispatch.apply_setup(&mut allocation, &record)?;
@@ -874,14 +895,54 @@ impl<S: Storage> Store<S> {
             self.credit.sessions.insert(session.clone());
         }
         self.pending_requirements.retain(|owner, _| {
-            self.sessions
-                .iter()
-                .any(|s| s.identity == *owner && !s.ended.get())
+            self.sessions_by_id
+                .get(owner)
+                .is_some_and(|index| !self.sessions[*index].ended.get())
         });
-        self.exposure_ledger.push(exposure);
-        self.sessions
-            .push(Rc::new(Session::new(session.clone(), machine.into(), key)));
+        self.push_exposure(exposure);
+        self.push_session(Session::new(session.clone(), machine.into(), key));
         Ok(session)
+    }
+
+    // These vectors retain journal order; the indexes borrow their positions and
+    // are populated only when the corresponding committed projection is applied.
+    fn push_exposure(&mut self, exposure: Exposure) {
+        self.exposures_by_session
+            .entry(exposure.session.clone())
+            .or_insert(self.exposure_ledger.len());
+        self.exposure_ledger.push(exposure);
+    }
+
+    fn session_exposure(&self, session: &str) -> Option<&Exposure> {
+        self.exposures_by_session
+            .get(session)
+            .map(|index| &self.exposure_ledger[*index])
+    }
+
+    fn push_session(&mut self, session: Session) {
+        self.sessions_by_id
+            .entry(session.identity.clone())
+            .or_insert(self.sessions.len());
+        self.sessions.push(Rc::new(session));
+    }
+
+    fn stored_session(&self, session: &str) -> Option<&Rc<Session>> {
+        self.sessions_by_id
+            .get(session)
+            .map(|index| &self.sessions[*index])
+    }
+
+    fn push_acceptance(&mut self, acceptance: Acceptance) {
+        self.acceptances_by_session
+            .entry(acceptance.session.clone())
+            .or_insert(self.conduct_acceptances.len());
+        self.conduct_acceptances.push(acceptance);
+    }
+
+    fn accepted_no_brief(&self, session: &str) -> bool {
+        self.acceptances_by_session
+            .get(session)
+            .is_some_and(|index| self.conduct_acceptances[*index].mode == Mode::NoBrief)
     }
 
     fn page_latest_ended_task(&self) -> Option<&str> {
@@ -986,21 +1047,11 @@ impl<S: Storage> Store<S> {
     fn check_acceptance(&self, acceptance: &Acceptance) -> Result<(), String> {
         if self.ended_sessions.contains(&acceptance.session)
             || acceptance.mode != Mode::NoBrief
-            || !self
-                .exposure_ledger
-                .iter()
-                .any(|e| e.session == acceptance.session)
+            || self.session_exposure(&acceptance.session).is_none()
             || self
-                .conduct_acceptances
-                .iter()
-                .any(|a| a.session == acceptance.session)
-            || self.dispatch.calls.values().any(|c| {
-                c.intent
-                    .provenance
-                    .as_ref()
-                    .and_then(|p| p.session.as_ref())
-                    == Some(&acceptance.session)
-            })
+                .acceptances_by_session
+                .contains_key(&acceptance.session)
+            || self.dispatch.has_session_command(&acceptance.session)
         {
             return Err("mode acceptance is outside its window".into());
         }
@@ -1008,7 +1059,7 @@ impl<S: Storage> Store<S> {
     }
 
     pub async fn accept_mode(&mut self, session: &str, mode: Mode) -> Result<(), String> {
-        if self.inference.ended || !self.sessions.iter().any(|s| s.identity == session) {
+        if self.inference.ended || self.stored_session(session).is_none() {
             return Err("mode acceptance requires a live session".into());
         }
         self.check_session_authority(session, self.session_pair(session))?;
@@ -1019,7 +1070,7 @@ impl<S: Storage> Store<S> {
         self.check_acceptance(&acceptance)?;
         self.commit(&Event::ModeAcceptance(acceptance.clone()))
             .await?;
-        self.conduct_acceptances.push(acceptance);
+        self.push_acceptance(acceptance);
         Ok(())
     }
 
@@ -1251,7 +1302,7 @@ impl<S: Storage> Store<S> {
                 .check_binding(&bound.machine)
                 .map_err(|_| "exposure lacks binding prerequisites")?;
         }
-        self.exposure_ledger.push(exposure.clone());
+        self.push_exposure(exposure.clone());
         Ok(())
     }
 
@@ -1435,9 +1486,8 @@ impl<S: Storage> Store<S> {
         self.pending_requirements.iter().any(|(owner, pending)| {
             pending.proposal.machine() == machine
                 && self
-                    .sessions
-                    .iter()
-                    .any(|session| session.identity == *owner && !session.ended.get())
+                    .stored_session(owner)
+                    .is_some_and(|session| !session.ended.get())
         })
     }
 
@@ -1556,7 +1606,11 @@ impl<S: Storage> Store<S> {
                     return Err(crate::poc::wait::CREDENTIAL_SCAN.into());
                 }
             }
-            bindings.push(given);
+            // Empty holders contribute no values. Keeping them would revisit every
+            // historical session for every string and byte scan in this boundary.
+            if !given.is_empty() {
+                bindings.push(given);
+            }
         }
         let cached = self.seed_keys.try_borrow().ok().and_then(|cache| {
             if cache
@@ -1795,12 +1849,12 @@ impl<S: Storage> Store<S> {
                 (_, Event::Goal(goal)) => {
                     self.check_goal(goal)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
-                    self.goals.push(goal.clone());
+                    self.push_goal(goal.clone());
                 }
                 (_, Event::ModeAcceptance(acceptance)) => {
                     self.check_acceptance(acceptance)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
-                    self.conduct_acceptances.push(acceptance.clone());
+                    self.push_acceptance(acceptance.clone());
                 }
                 (_, Event::SignatureRefusal(refusal)) => {
                     if !self.installation_unpinned(&refusal.machine) {

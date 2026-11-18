@@ -291,6 +291,25 @@ impl Dispatch {
         }
     }
 
+    pub(crate) fn check_requirements(
+        &self,
+        record: &crate::declaration::ApprovalRecord,
+    ) -> Result<(), String> {
+        self.check_proposal(&record.proposal)?;
+        if self.approved_entries.values().any(|m| {
+            m.requirements
+                .iter()
+                .any(|r| r.session == record.session && r.candidate == record.candidate)
+        }) {
+            return Err("repeated requirements approval".into());
+        }
+        let machine = &self.approved_entries[record.proposal.machine()];
+        if machine.approved.access.as_ref() != Some(&record.access) || record.session.is_empty() {
+            return Err("requirements profile provenance".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn apply_setup(
         &mut self,
         allocation: &mut Metadata,
@@ -358,23 +377,11 @@ impl Dispatch {
                 machine.class = Some(record.class);
             }
             SetupRecord::Requirements(record) => {
-                self.check_proposal(&record.proposal)?;
-                if self.approved_entries.values().any(|m| {
-                    m.requirements
-                        .iter()
-                        .any(|r| r.session == record.session && r.candidate == record.candidate)
-                }) {
-                    return Err("repeated requirements approval".into());
-                }
+                self.check_requirements(record)?;
                 let machine = self
                     .approved_entries
                     .get_mut(record.proposal.machine())
                     .expect("checked machine");
-                if machine.approved.access.as_ref() != Some(&record.access)
-                    || record.session.is_empty()
-                {
-                    return Err("requirements profile provenance".into());
-                }
                 match &record.proposal {
                     crate::declaration::Proposal::Declaration { declaration, .. } => {
                         machine.declaration = Some(declaration.clone())

@@ -421,8 +421,9 @@ impl Dispatch {
     }
 
     pub fn unresolved(&self, resource: &Resource) -> Vec<u64> {
-        self.call_ids()
-            .into_iter()
+        self.intent_order
+            .iter()
+            .copied()
             .filter(|id| {
                 self.call_resource(*id).as_ref() == Some(resource)
                     && self.call_state(*id) == Some(&CallState::Unresolved)

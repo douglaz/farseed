@@ -14,11 +14,7 @@ impl<S: Storage> Store<S> {
         if self.pending_requirements.contains_key(session) {
             return Err("proposal approval pending".into());
         }
-        if !self
-            .conduct_acceptances
-            .iter()
-            .any(|a| a.session == session && a.mode == Mode::NoBrief)
-        {
+        if !self.accepted_no_brief(session) {
             return Err("Acting on a goal with no brief requires acceptance".into());
         }
         Ok(())
@@ -148,11 +144,8 @@ impl<S: Storage> Store<S> {
             || !goal.valid()
             || !crate::poc::template::valid_inputs(goal.inputs.as_ref())
             || (goal.template.is_none() && goal.inputs.is_some())
-            || !self
-                .exposure_ledger
-                .iter()
-                .any(|e| e.session == goal.session)
-            || self.goals.iter().any(|g| g.session == goal.session)
+            || self.session_exposure(&goal.session).is_none()
+            || self.goal(&goal.session).is_some()
         {
             return Err("invalid or repeated session goal".into());
         }
@@ -160,7 +153,16 @@ impl<S: Storage> Store<S> {
     }
 
     pub fn goal(&self, session: &str) -> Option<&Goal> {
-        self.goals.iter().find(|g| g.session == session)
+        self.goals_by_session
+            .get(session)
+            .map(|index| &self.goals[*index])
+    }
+
+    pub(super) fn push_goal(&mut self, goal: Goal) {
+        self.goals_by_session
+            .entry(goal.session.clone())
+            .or_insert(self.goals.len());
+        self.goals.push(goal);
     }
 
     pub fn live_goal_session(&self, session: &str) -> Result<Rc<Session>, String> {
@@ -168,9 +170,7 @@ impl<S: Storage> Store<S> {
         if self.inference.ended {
             return Err(crate::poc::wait::SESSIONS_ENDED.into());
         }
-        self.sessions
-            .iter()
-            .find(|s| s.identity == session)
+        self.stored_session(session)
             .cloned()
             .ok_or(crate::poc::wait::LIVE_GOAL.into())
     }
@@ -235,9 +235,7 @@ impl<S: Storage> Store<S> {
         self.live_goal_session(session)?;
         let machine = if template.is_some() {
             let exposure = self
-                .exposure_ledger
-                .iter()
-                .find(|e| e.session == session)
+                .session_exposure(session)
                 .ok_or("missing goal binding")?;
             if exposure.bound_set.len() != 1 {
                 return Err(crate::poc::template::NEEDS_NIXOS.into());
@@ -265,7 +263,7 @@ impl<S: Storage> Store<S> {
             return Err("goal credential boundary".into());
         }
         self.commit(&Event::Goal(goal.clone())).await?;
-        self.goals.push(goal);
+        self.push_goal(goal);
         Ok(())
     }
 
@@ -305,12 +303,7 @@ impl<S: Storage> Store<S> {
             return Err("bound set".into());
         }
         self.goal(session).ok_or("missing goal")?;
-        if !matches!(tool, Tool::Done { .. })
-            && !self
-                .conduct_acceptances
-                .iter()
-                .any(|a| a.session == session && a.mode == Mode::NoBrief)
-        {
+        if !matches!(tool, Tool::Done { .. }) && !self.accepted_no_brief(session) {
             return Err("Acting on a goal with no brief requires acceptance".into());
         }
         Ok(())

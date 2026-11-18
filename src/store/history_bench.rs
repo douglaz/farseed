@@ -92,29 +92,47 @@ fn done() -> Tool {
     }
 }
 
-fn start_task(store: &mut Store<MemoryStorage>) -> BenchResult<Task> {
-    let session = block_on(store.admit_fixture(MACHINE)).map_err(|_| "fixture_admission_failed")?;
+fn start_task(
+    store: &mut Store<MemoryStorage>,
+    mut timing: Option<&mut Sample>,
+) -> BenchResult<Task> {
+    let session = step(&mut timing, "start_admit_ms", || {
+        block_on(store.admit_fixture(MACHINE))
+    })
+    .map_err(|_| "fixture_admission_failed")?;
     // One fixed fixture time (authority::BENCH_PAIR) serves every native clock read,
     // so the confirmed limits never age. There is no wall-clock wait.
     authority::BENCH_PAIR.with(|pair| pair.set(Some(authority::current_pair(FIXTURE_SECONDS))));
-    store
-        .synthetic_confirm_limits(FIXTURE_SECONDS)
-        .map_err(|_| "fixture_limits_failed")?;
-    block_on(store.enter_goal(&session, "install and run a small service".into(), None))
-        .map_err(|_| "fixture_goal_failed")?;
-    block_on(store.accept_mode(&session, Mode::NoBrief)).map_err(|_| "fixture_mode_failed")?;
-    let task = block_on(store.poc_create(&session)).map_err(|_| "fixture_task_failed")?;
+    step(&mut timing, "start_limits_ms", || {
+        store.synthetic_confirm_limits(FIXTURE_SECONDS)
+    })
+    .map_err(|_| "fixture_limits_failed")?;
+    step(&mut timing, "start_goal_ms", || {
+        block_on(store.enter_goal(&session, "install and run a small service".into(), None))
+    })
+    .map_err(|_| "fixture_goal_failed")?;
+    step(&mut timing, "start_mode_ms", || {
+        block_on(store.accept_mode(&session, Mode::NoBrief))
+    })
+    .map_err(|_| "fixture_mode_failed")?;
+    let task = step(&mut timing, "start_create_ms", || {
+        block_on(store.poc_create(&session))
+    })
+    .map_err(|_| "fixture_task_failed")?;
     let proposal = crate::declaration::Proposal::parse(&json!({
         "kind":"declaration", "machine":MACHINE,
         "declaration":crate::declaration::ad_hoc_minimum()
     }))
     .map_err(|_| "fixture_declaration_failed")?;
     let candidate = store.next;
-    store
-        .propose_requirements(&session, candidate, proposal, &done())
-        .map_err(|_| "fixture_proposal_failed")?;
-    block_on(store.approve_requirements(&session, MACHINE, candidate))
-        .map_err(|_| "fixture_approval_failed")?;
+    step(&mut timing, "start_propose_requirements_ms", || {
+        store.propose_requirements(&session, candidate, proposal, &done())
+    })
+    .map_err(|_| "fixture_proposal_failed")?;
+    step(&mut timing, "start_approve_requirements_ms", || {
+        block_on(store.approve_requirements(&session, MACHINE, candidate))
+    })
+    .map_err(|_| "fixture_approval_failed")?;
     // Requirements approval can advance the task revision.
     store.poc_task(&task.id).map_err(|_| "fixture_task_failed")
 }
@@ -128,9 +146,22 @@ fn command(step: usize) -> String {
     text
 }
 
+/// Times `action` under `name` when the steady-state cycle is being measured.
+fn step<T>(timing: &mut Option<&mut Sample>, name: &'static str, action: impl FnOnce() -> T) -> T {
+    match timing {
+        Some(sample) => timed(sample, name, action),
+        None => action(),
+    }
+}
+
 /// Same append/evidence/Settle sequence as the host task fixtures. The command is
 /// recorded only, never executed. Evidence represents a completed synthetic job.
-fn settle(store: &mut Store<MemoryStorage>, task: &Task, stdout: &str) -> BenchResult<Task> {
+fn settle(
+    store: &mut Store<MemoryStorage>,
+    task: &Task,
+    stdout: &str,
+    mut timing: Option<&mut Sample>,
+) -> BenchResult<Task> {
     let Some(proposal) = &task.proposal else {
         return Err("fixture_proposal_missing");
     };
@@ -146,18 +177,20 @@ fn settle(store: &mut Store<MemoryStorage>, task: &Task, stdout: &str) -> BenchR
             requester: crate::dispatch::Requester::Session,
         }),
     };
-    block_on(store.poc_append(
-        &Binding {
-            task: task.id.clone(),
-            revision: task.revision,
-            session: task.start_session.clone(),
-        },
-        &entry,
-        &Approval::HarnessPin {
-            machine: machine.clone(),
-            fingerprint: "SHA256:fixture".into(),
-        },
-    ))
+    step(&mut timing, "cycle_append_ms", || {
+        block_on(store.poc_append(
+            &Binding {
+                task: task.id.clone(),
+                revision: task.revision,
+                session: task.start_session.clone(),
+            },
+            &entry,
+            &Approval::HarnessPin {
+                machine: machine.clone(),
+                fingerprint: "SHA256:fixture".into(),
+            },
+        ))
+    })
     .map_err(|_| "fixture_append_failed")?;
     let task = store
         .poc_task(&task.id)
@@ -171,44 +204,60 @@ fn settle(store: &mut Store<MemoryStorage>, task: &Task, stdout: &str) -> BenchR
         .ok_or("fixture_target_missing")?;
     let sent =
         crate::jobs::launch_with_elevation(&pending.job, machine, command.as_bytes(), elevation);
-    block_on(store.poc_launch_transmission(pending.call, sent.as_bytes()))
-        .map_err(|_| "fixture_transmission_failed")?;
-    block_on(store.job_evidence(&crate::jobs::Evidence {
-        call: pending.call,
-        job: pending.job.clone(),
-        record: crate::jobs::Record::Present {
-            machine: hex::encode(machine),
-            command: hex::encode(command),
-            boot: "fixture-boot".into(),
-            current_boot: "fixture-boot".into(),
-            pid: 123,
-            alive: false,
-            exit_status: Some(0),
-            stdout: hex::encode(stdout),
-            stderr: String::new(),
-        },
-    }))
+    step(&mut timing, "cycle_transmission_ms", || {
+        block_on(store.poc_launch_transmission(pending.call, sent.as_bytes()))
+    })
+    .map_err(|_| "fixture_transmission_failed")?;
+    step(&mut timing, "cycle_evidence_ms", || {
+        block_on(store.job_evidence(&crate::jobs::Evidence {
+            call: pending.call,
+            job: pending.job.clone(),
+            record: crate::jobs::Record::Present {
+                machine: hex::encode(machine),
+                command: hex::encode(command),
+                boot: "fixture-boot".into(),
+                current_boot: "fixture-boot".into(),
+                pid: 123,
+                alive: false,
+                exit_status: Some(0),
+                stdout: hex::encode(stdout),
+                stderr: String::new(),
+            },
+        }))
+    })
     .map_err(|_| "fixture_evidence_failed")?;
-    change(store, &task, Change::Settle)
+    step(&mut timing, "cycle_settle_ms", || {
+        change(store, &task, Change::Settle)
+    })
 }
 
-fn exec_step(store: &mut Store<MemoryStorage>, task: &Task, step: usize) -> BenchResult<Task> {
-    let task = change(store, task, Change::Request)?;
-    let task = change(
-        store,
-        &task,
-        Change::Propose {
-            call_id: format!("fixture-step-{step}"),
-            tool: Tool::Exec {
-                machine: MACHINE.into(),
-                command: command(step),
+fn exec_step(
+    store: &mut Store<MemoryStorage>,
+    task: &Task,
+    number: usize,
+    mut timing: Option<&mut Sample>,
+) -> BenchResult<Task> {
+    let task = step(&mut timing, "cycle_request_ms", || {
+        change(store, task, Change::Request)
+    })?;
+    let task = step(&mut timing, "cycle_propose_ms", || {
+        change(
+            store,
+            &task,
+            Change::Propose {
+                call_id: format!("fixture-step-{number}"),
+                tool: Tool::Exec {
+                    machine: MACHINE.into(),
+                    command: command(number),
+                },
             },
-        },
-    )?;
+        )
+    })?;
     settle(
         store,
         &task,
-        &"o".repeat(OUTPUT_BYTES[step % OUTPUT_BYTES.len()]),
+        &"o".repeat(OUTPUT_BYTES[number % OUTPUT_BYTES.len()]),
+        timing,
     )
 }
 
@@ -232,7 +281,12 @@ fn finish_task(store: &mut Store<MemoryStorage>, task: &Task) -> BenchResult<Tas
         if task.proposal.is_none() {
             return Err("fixture_verification_failed");
         }
-        task = settle(store, &task, "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n")?;
+        task = settle(
+            store,
+            &task,
+            "tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\n",
+            None,
+        )?;
     }
     Err("fixture_verification_failed")
 }
@@ -242,7 +296,7 @@ fn history_task(store: &mut Store<MemoryStorage>, started: Instant) -> BenchResu
         block_on(store.allocate(Family::Machines)).map_err(|_| "fixture_allocation_failed")?;
     block_on(store.observe(allocation::Event::Created(identity.clone())))
         .map_err(|_| "fixture_created_failed")?;
-    let mut task = start_task(store)?;
+    let mut task = start_task(store, None)?;
     // One interrupted AI request per run, re-made after the page reopened (RecoverRequest).
     let requested = change(store, &task, Change::Request)?;
     task = change(store, &requested, Change::RecoverRequest)?;
@@ -250,7 +304,7 @@ fn history_task(store: &mut Store<MemoryStorage>, started: Instant) -> BenchResu
         if started.elapsed() >= budget() {
             return Err("runtime_budget_exceeded");
         }
-        task = exec_step(store, &task, step)?;
+        task = exec_step(store, &task, step, None)?;
     }
     let task = finish_task(store, &task)?;
     block_on(store.end_session(&task.start_session)).map_err(|_| "fixture_end_failed")?;
@@ -530,8 +584,15 @@ fn measure(files: &Files, oldest: &str, meter: &MemoryMeter) -> BenchResult<Samp
     );
     details(store, oldest, &mut sample)?;
     let cycle = Instant::now();
-    let task = timed(&mut sample, "cycle_start_ms", || start_task(store))?;
-    let task = timed(&mut sample, "cycle_exec_ms", || exec_step(store, &task, 0))?;
+    let start = Instant::now();
+    let task = start_task(store, Some(&mut sample))?;
+    sample.insert("cycle_start_ms", start.elapsed().as_secs_f64() * 1000.0);
+    // The command's steps are timed one by one too (cycle_request_ms ... cycle_settle_ms).
+    let exec = Instant::now();
+    let mut steps = Sample::new();
+    let task = exec_step(store, &task, 0, Some(&mut steps))?;
+    sample.insert("cycle_exec_ms", exec.elapsed().as_secs_f64() * 1000.0);
+    sample.extend(steps);
     if task.pending.is_some() || task.completed.is_empty() {
         return Err("cycle_unsettled");
     }
