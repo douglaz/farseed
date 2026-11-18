@@ -13,8 +13,9 @@ declaration phase, and then **one step at a time**. Each step is a **Do** block,
 
 You are building the user's control center on this NixOS machine. Follow the step below exactly.
 
-1. Run the step's commands exactly as written. Change only the words in CAPITALS that the step tells you to
-   replace with a fact. Send each block as one command.
+1. Run each block of the step as one command, exactly as written: by name with `run_step_block`, and tau-web then
+   fills in the words in CAPITALS itself. Only if `run_step_block` isn't offered, copy the block out and replace
+   only the CAPITALS words the step names, with their values.
 2. Never print a secret. Don't cat, echo or grep the files in /var/lib/control-center, except files ending in
    `.pub`. Don't print the user's wireguard.conf or login file.
 3. Never put a secret in /etc/nixos or in any `.nix` file.
@@ -337,9 +338,9 @@ printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22a
 ```
 Expect `CHECKS scripts PASS`.
 
-**If it fails:** a script that says FAILED was copied wrongly. Run the Do block again, copying it exactly with
-nothing added, removed or reformatted, then check again. The final check repeats this hash check, so an edited
-script fails the whole goal.
+**If it fails:** a script that says FAILED doesn't match the playbook's copy. Run the Do block again by name (only
+if `run_step_block` isn't offered, copy it exactly, with nothing added, removed or reformatted), then check again.
+The final check repeats this hash check, so an edited script fails the whole goal.
 
 ---
 
@@ -347,8 +348,8 @@ script fails the whole goal.
 
 This writes the flake (pinned to the nixpkgs revision the machine already runs, plus Hermes Agent), the base
 module (tools, and the user's own SSH key if there is one), the `extra/` loader, and empty modules that later
-steps fill in. Replace `USER_SSH_KEY` in the first line with the fact, keeping the quotes; if the fact is empty,
-leave the quotes empty (`KEY=''`).
+steps fill in. The first line takes the `USER_SSH_KEY` fact inside its quotes (empty quotes, `KEY=''`, when the
+fact is empty); tau-web fills it in when you run the block by name.
 The base module also turns off the name-resolution extras (LLMNR on port 5355, mDNS), so port 5355 stops
 listening after this step's rebuild; the check confirms it. Nothing else is needed about it.
 
@@ -460,8 +461,9 @@ minute and run the Do block again. On `REBUILD FAILED`, see **Recovery R1**.
 ## Step 4: Create the keys and the secrets file
 
 First call `request_ai_key` with application `Hermes Agent` and purpose `The control center's own AI agent`.
-The user approves it on a card. The reply gives the path of the key file on this machine: put that path in the
-first line of the Do block instead of `AI_KEY_PATH`. All values go only into files, and nothing here prints them.
+The user approves it on a card. The reply gives the path of the key file on this machine. The Do block's first
+line takes that path in place of `AI_KEY_PATH`; tau-web fills it in when you run the block by name. All values go
+only into files, and nothing here prints them.
 
 **Do**
 ```sh
@@ -491,17 +493,19 @@ sh /etc/nixos/cc-check.sh keys
 ```
 Expect `CHECKS keys PASS`.
 
-**If it fails:** `install: cannot stat` means the key path is wrong: use the path from the `request_ai_key`
-reply exactly. The block never overwrites a WireGuard key or password that already exists, so running it again is
-safe.
+**If it fails:** `install: cannot stat` means no key file is at that path. Run the Do block again by name, so
+tau-web fills in the path from the `request_ai_key` reply; if it fails the same way, call `request_ai_key` again,
+then run the Do block again. The block never overwrites a WireGuard key or password that already exists, so
+running it again is safe.
 
 ---
 
 ## Step 5: Hermes Agent with its web dashboard
 
-Replace `AI_BASE_URL` and `AI_MODEL` in the first two lines with the facts, keeping the quotes. The first Hermes
-build downloads and builds a lot: **expect 5 minutes, and up to 40 on a slow network.** Keep running the Wait
-block until it says REBUILD OK or REBUILD FAILED. Do nothing else meanwhile.
+The first two lines take the `AI_BASE_URL` and `AI_MODEL` facts inside their quotes; tau-web fills them in when
+you run the block by name. The first Hermes build downloads and builds a lot: **expect 5 minutes, and up to 40
+on a slow network.** Keep running the Wait block until it says REBUILD OK or REBUILD FAILED. Do nothing else
+meanwhile.
 
 **Do**
 ```sh
@@ -890,7 +894,8 @@ Expect `CHECKS tor PASS`. The check waits up to a minute for Tor to make the oni
 
 ## Step 11: The user's files
 
-Replace `MACHINE_ADDRESS` with the fact (an IP address or a name, without a port).
+The Do block takes the `MACHINE_ADDRESS` fact (an IP address or a name, without a port); tau-web fills it in
+when you run the block by name.
 
 **Do**
 ```sh
@@ -953,8 +958,8 @@ sh /etc/nixos/cc-check.sh handover
 ```
 Expect `CHECKS handover PASS`.
 
-**If it fails:** if `conf_has_endpoint` fails, `MACHINE_ADDRESS` wasn't replaced. Run the Do block again with the
-fact filled in.
+**If it fails:** if `conf_has_endpoint` fails, `MACHINE_ADDRESS` wasn't filled in. Run the Do block again, by
+name or with the fact in its place.
 
 ---
 
