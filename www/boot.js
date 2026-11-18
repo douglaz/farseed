@@ -1957,7 +1957,7 @@ const templateControls = (parent, template, draft) => {
   });
 };
 
-const startInputs = (row, machine, initialGoal = '', documentSource = true, creditMode = false, templates = []) => {
+const startInputs = (row, machine, initialGoal = '', documentSource = true, creditMode = false, templates = [], defaultTemplateSelected = false) => {
   const goal = document.createElement('textarea'); if (creditMode) goal.dataset.creditGoal = machine; goal.dataset.startGoal = machine;
   goal.setAttribute('aria-label', 'Goal before Start session'); goal.value = creditGoalDrafts.get(machine) ?? initialGoal;
   goal.addEventListener('input', () => creditGoalDrafts.set(machine, goal.value));
@@ -1966,21 +1966,26 @@ const startInputs = (row, machine, initialGoal = '', documentSource = true, cred
   source.value = startDrafts.get(machine)?.[1] ?? '';
   source.addEventListener('input', () => startDrafts.set(machine, ['', source.value]));
   paragraph(row, 'Acting on a goal with no brief');
-  row.append(goal);
   const template = templates.find(value => value.id === 'control-center@1');
   let selected;
   let values;
   if (template) {
-    const draft = creditTemplateDrafts.get(machine) ?? {selected: false, options: {}, inputs: {}};
+    const draft = creditTemplateDrafts.get(machine) ?? {selected: defaultTemplateSelected, options: {}, inputs: {}};
     creditTemplateDrafts.set(machine, draft);
     const label = document.createElement('label');
     selected = document.createElement('input');
     selected.type = 'checkbox'; selected.dataset.creditTemplate = template.id; selected.checked = draft.selected;
     selected.addEventListener('change', () => { draft.selected = selected.checked; });
+    goal.addEventListener('input', () => {
+      if (goal.value.length && selected.checked) selected.checked = draft.selected = false;
+    });
     label.append(selected, document.createTextNode('Use the Control center template'));
     row.append(label); paragraph(row, template.text);
     values = templateControls(row, template, draft);
-  }
+    const goalLabel = document.createElement('label');
+    goalLabel.append(document.createTextNode('Or write your own goal instead:'), goal);
+    row.append(goalLabel);
+  } else row.append(goal);
   if (documentSource) row.append(source);
   return () => ({goal:goal.value, document_source:selected?.checked ? null : source.value || null,
     ...(selected?.checked ? {template: template.id, ...values()} : {})});
@@ -2023,7 +2028,9 @@ const renderPoc = (store) => {
     row.append(configuration);
     if (liveSession) paragraph(row, `A session is running for ${target.machine}. Its progress is on the task card above.`);
     else paragraph(row, `Start session approves the selected AI connection for ${target.machine}.`);
-    const inputs = liveSession ? null : startInputs(row, target.machine, '', !useCredit, useCredit, store.goal_templates);
+    const defaultTemplateSelected = store.procurement?.machine === target.machine &&
+      store.procurement?.approved_selection?.image?.distribution === 'nixos';
+    const inputs = liveSession ? null : startInputs(row, target.machine, '', !useCredit, useCredit, store.goal_templates, defaultTemplateSelected);
     if (liveSession && creditSession) {
       paragraph(row, store.credit.disclosure);
       if (store.credit_error) paragraph(row, store.credit_error);
