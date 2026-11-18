@@ -2866,16 +2866,25 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             }
             if !store.poc.is_empty() {
                 let in_use = store.page_in_use_machines();
+                // Task ids are random; the page orders finished tasks by when they were created.
+                let ranks: std::collections::BTreeMap<&str, usize> = store
+                    .poc_creation_order
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, id)| (id.as_str(), rank))
+                    .collect();
                 report["tasks"] = serde_json::to_value(
                     store
                         .poc
                         .values()
                         .map(|task| {
-                            if store.page_task_is_full(task, &in_use) {
+                            let mut view = if store.page_task_is_full(task, &in_use) {
                                 store.poc_task_view(task)
                             } else {
                                 task.summary_view()
-                            }
+                            };
+                            view["creation_rank"] = json!(ranks.get(task.id.as_str()));
+                            view
                         })
                         .collect::<Vec<_>>(),
                 )

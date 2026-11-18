@@ -243,6 +243,8 @@ const renderSteps = store => {
   restoreMainActions(retained);
 };
 let renderedReport;
+let renderedReportJson;
+const reportJson = ({payment_timer, ...content}) => JSON.stringify(content);
 const taskDetails = new Map();
 const deliveryDetails = {entry: new Map(), commands: new Map()};
 const clearDetails = () => {
@@ -252,10 +254,14 @@ const clearDetails = () => {
 };
 let taskDetailsStore;
 const render = (store, forceRender = false) => {
-  const { payment_timer, ...content } = store;
-  const report = JSON.stringify(content);
-  if (payment_timer === true && report === renderedReport && !store.error && !store.credit_error && !forceRender) return;
-  renderedReport = report;
+  let report;
+  if (store.payment_timer === true) {
+    report = reportJson(store);
+    if (renderedReport !== undefined) renderedReportJson ??= reportJson(renderedReport);
+    if (report === renderedReportJson && !store.error && !store.credit_error && !forceRender) return;
+  }
+  renderedReport = store;
+  renderedReportJson = report;
   if (store.state !== 'unlocked' || ['suspended', 'reconciling'].includes(store.lifecycle_state) ||
       store.lifecycle_generation !== taskDetailsStore?.lifecycle_generation) clearDetails();
   else {
@@ -600,6 +606,38 @@ const renderDeclaration = (parent, d) => {
   if (d.default_credentials === 'none') paragraph(parent, 'Default credentials: none.');
   else list('Default credentials to change', d.default_credentials, 'none declared', e => e);
 };
+// Remember nested raw folds even while their lazy history disclosure has no children.
+const endedSessionFolds = new Map();
+const renderEndedSessions = (section, machine, store) => {
+  const ended = (store.sessions ?? []).filter(session => session.session_state === 'ended' && session.bound_set.includes(machine));
+  if (!ended.length) return;
+  const details = document.createElement('details');
+  details.dataset.endedSessions = machine;
+  details.dataset.foldKey = JSON.stringify(['ended-sessions', machine]);
+  const summary = document.createElement('summary');
+  summary.textContent = `${ended.length} earlier sessions ended. Their approvals can no longer be used.`;
+  details.append(summary);
+  const populate = () => {
+    if (details.childElementCount > 1) return;
+    for (const session of ended) {
+      paragraph(details, 'An earlier session ended. Its approvals can no longer be used.');
+      const raw = rawDetails(details, session, ['ended-session', session.identity]);
+      const key = raw.dataset.foldKey;
+      const open = rawFoldChoices.get(key) ?? endedSessionFolds.get(key) ?? false;
+      rawFoldChoices.set(key, open);
+      endedSessionFolds.set(key, open);
+      raw.open = open;
+      raw.querySelector('summary').addEventListener('click', () => endedSessionFolds.set(key, !raw.open));
+      raw.addEventListener('toggle', () => {
+        if (raw.isConnected) endedSessionFolds.set(key, raw.open);
+      });
+    }
+  };
+  details.open = rawFoldChoices.get(details.dataset.foldKey) ?? false;
+  if (details.open) populate();
+  details.addEventListener('toggle', () => { if (details.open && details.isConnected) populate(); });
+  section.append(details);
+};
 const renderSetup = (store) => {
   const worker = snapshotWorker();
   const slot = $('setup');
@@ -721,10 +759,7 @@ const renderSetup = (store) => {
     }
     const installation = (store.installations ?? []).find(i => i.machine === machine.entry.machine);
     if (installation) paragraph(section, `Installation: ${installation.installation}.`);
-    for (const ended of (store.sessions ?? []).filter(s => s.session_state === 'ended' && s.bound_set.includes(machine.entry.machine))) {
-      paragraph(section, 'An earlier session ended. Its approvals can no longer be used.');
-      rawDetails(section, ended, ['ended-session', ended.identity]);
-    }
+    renderEndedSessions(section, machine.entry.machine, store);
     const session = (store.sessions ?? []).find(s => s.session_state !== 'ended' && s.bound_set.includes(machine.entry.machine));
     if (session) {
       paragraph(section, `Session open for ${session.bound_set.join(', ')}.`);
@@ -1063,7 +1098,54 @@ const deliveryDetailsButton = (card, machine, kind, label, store) => {
   return state?.value;
 };
 
+const recentTaskSummaries = 3;
+const taskHistoryPageSize = 20;
+let taskHistoryPage = null;
+let taskHistoryGeneration;
+function* visibleTasks(store, slot) {
+  const tasks = store.tasks ?? [];
+  // Newest first by creation (`creation_rank`, the store's task creation order); task IDs are random,
+  // and a session can be opened long before its task starts. A task without a rank sorts oldest.
+  const summaries = tasks.filter(task => task.summary)
+    .sort((a, b) => (b.creation_rank ?? -1) - (a.creation_rank ?? -1) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  const recent = new Set(summaries.slice(0, recentTaskSummaries).map(task => task.id));
+  // Keep the existing relative order of every full card and the recent summaries.
+  yield* tasks.filter(task => !task.summary || recent.has(task.id));
+  const earlier = summaries.slice(recentTaskSummaries);
+  if (!earlier.length) { taskHistoryPage = null; return; }
+  const pages = Math.ceil(earlier.length / taskHistoryPageSize);
+  if (taskHistoryPage !== null) taskHistoryPage = Math.min(taskHistoryPage, pages - 1);
+  const line = paragraph(slot, `${earlier.length} earlier tasks${taskHistoryPage === null ? '' : ` — page ${taskHistoryPage + 1} of ${pages}`}. `);
+  line.dataset.taskHistoryCount = String(earlier.length);
+  const control = (action, label, page, disabled = false) => {
+    const button = document.createElement('button');
+    button.type = 'button'; button.dataset.taskHistory = action;
+    button.textContent = label; button.disabled = disabled;
+    button.addEventListener('click', () => {
+      taskHistoryPage = page;
+      render(store, true);
+      const next = $('tasks').querySelector(`[data-task-history="${action}"]`);
+      (next && !next.disabled ? next : $('tasks').querySelector('[data-task-history]'))?.focus({preventScroll: true});
+    });
+    line.append(button);
+  };
+  control('toggle', taskHistoryPage === null ? 'Show earlier tasks' : 'Hide earlier tasks', taskHistoryPage === null ? 0 : null);
+  if (taskHistoryPage !== null) {
+    control('newer', 'Newer tasks', taskHistoryPage - 1, taskHistoryPage === 0);
+    control('older', 'Older tasks', taskHistoryPage + 1, taskHistoryPage === pages - 1);
+  }
+  const start = (taskHistoryPage ?? 0) * taskHistoryPageSize;
+  // An opened card stays rendered when paging away or folding the history.
+  for (let index = 0; index < earlier.length; index++) {
+    const task = earlier[index];
+    if (taskDetails.has(task.id) || taskHistoryPage !== null && index >= start && index < start + taskHistoryPageSize) yield task;
+  }
+}
 const renderTasks = (store) => {
+  if (store.state !== 'unlocked' || store.lifecycle_generation !== taskHistoryGeneration) {
+    taskHistoryPage = null;
+    taskHistoryGeneration = store.lifecycle_generation;
+  }
   if (store.state !== 'unlocked' || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state)) fileDownloads.clear();
   const worker = snapshotWorker();
   let slot = $('tasks');
@@ -1086,7 +1168,7 @@ const renderTasks = (store) => {
   slot.replaceChildren();
   slot.hidden = store.state !== 'unlocked' || store.seed_backup_stage !== 'inactive';
   if (slot.hidden) return;
-  for (const entry of store.tasks ?? []) {
+  for (const entry of visibleTasks(store, slot)) {
     const opened = entry.summary ? taskDetails.get(entry.id) : undefined;
     const task = opened?.task ?? entry;
     const missingRecord = task.status === 'paused' && task.disposition_offer?.read === 'missing' &&
@@ -1714,6 +1796,8 @@ $('provider-invoice').addEventListener('click', () => providerRequest({action: '
 const clearPocInputs = () => {
   pocKeySubmission = null;
   rawFoldChoices.clear();
+  // Fold choices of ended sessions hidden inside their closed list live here; reset with the rest.
+  endedSessionFolds.clear();
   providerCatalogue = null;
   providerCompletedMachine = null;
   providerSelectionDirty = true;
