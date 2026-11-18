@@ -114,15 +114,16 @@ pub(crate) fn wake() {
 }
 
 pub(crate) async fn publish_progress(session: &str) {
-    let generation = crate::harness::inference::publication_generation();
-    #[cfg(feature = "tracer")]
-    crate::testonly::session_point("poc_progress_publication").await;
-    crate::harness::inference::publish_report(generation, session.into(), "{}".into()).await;
+    publish_cycle_progress(session, None).await;
 }
 
 async fn publish_cycle_progress(session: &str, cycle: Option<u64>) {
     let _timing = super::timings::Timer::new(cycle, super::timings::Mark::Progress);
-    publish_progress(session).await;
+    let generation = crate::harness::inference::publication_generation();
+    #[cfg(feature = "tracer")]
+    crate::testonly::session_point("poc_progress_publication").await;
+    crate::harness::inference::publish_report_timed(generation, session.into(), "{}".into(), cycle)
+        .await;
 }
 
 pub(crate) async fn resume_with(

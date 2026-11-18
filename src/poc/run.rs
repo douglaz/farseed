@@ -218,7 +218,6 @@ pub async fn resume(
         return Ok(task);
     }
     if task.proposal.is_some() {
-        runtime.progress(&task).await;
         if let Err(why) = runtime.authority(id, session).await {
             return pause_authority(runtime, &task, why).await;
         }

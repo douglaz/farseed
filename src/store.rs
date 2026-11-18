@@ -2684,6 +2684,17 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
     /// The state the page shows: `none`, `locked`, `unlocked` or `refused` with its reason, and
     /// an `error` for a request that changed nothing.
     pub fn report(&self, error: Option<&str>) -> Value {
+        self.protect_report(self.build_report(error))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn report_timed(&self, error: Option<&str>, cycle: Option<u64>) -> Value {
+        use crate::poc::timings::{Mark, measure};
+        let report = measure(cycle, Mark::PublishBuild, || self.build_report(error));
+        measure(cycle, Mark::PublishProtect, || self.protect_report(report))
+    }
+
+    fn build_report(&self, error: Option<&str>) -> Value {
         let mut report = match &self.state {
             State::Unopened => json!({ "state": "unopened" }),
             State::NoStore => json!({ "state": "none" }),
@@ -2772,7 +2783,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 report["lifecycle_state"] = crate::lifecycle::owner().state().into();
             }
         }
-        self.protect_report(report)
+        report
     }
 
     /// Protect fields and the final bytes after a caller adds report members.

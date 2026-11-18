@@ -1,5 +1,6 @@
 //! Browser transport and the short writer acquisitions around the shared inference driver.
 use crate::inference::{self, Candidate, Finished, Intent, Journal, Request, Response, Transport};
+use crate::poc::timings::{Mark, Timer, measure};
 use crate::store::Local;
 use crate::store::opfs::{Opfs, WebCrypto};
 use serde_json::{Value, json};
@@ -39,15 +40,30 @@ pub fn publication_generation() -> u64 {
 
 #[wasm_bindgen]
 pub async fn protect_publication(generation: u64, session: String, report: String) -> String {
-    publication(generation, session, report, false).await
+    publication(generation, session, report, false, None).await
 }
 
 #[wasm_bindgen]
 pub async fn publish_report(generation: u64, session: String, report: String) {
-    publication(generation, session, report, true).await;
+    publish_report_timed(generation, session, report, None).await;
 }
 
-async fn publication(generation: u64, session: String, report: String, post: bool) -> String {
+pub(crate) async fn publish_report_timed(
+    generation: u64,
+    session: String,
+    report: String,
+    cycle: Option<u64>,
+) {
+    publication(generation, session, report, true, cycle).await;
+}
+
+async fn publication(
+    generation: u64,
+    session: String,
+    report: String,
+    post: bool,
+    cycle: Option<u64>,
+) -> String {
     #[cfg(feature = "tracer")]
     crate::testonly::session_point("publication_writer").await;
     let local = crate::worker::local();
@@ -81,10 +97,11 @@ async fn publication(generation: u64, session: String, report: String, post: boo
         }
         metadata.insert("historical".into(), true.into());
         metadata.insert("actionable".into(), false.into());
-        local
-            .store()?
-            .protect_output(&json!({"session":session,"outcome":metadata}))
-            .ok()
+        let store = local.store()?;
+        measure(cycle, Mark::PublishProtect, || {
+            store.protect_output(&json!({"session":session,"outcome":metadata}))
+        })
+        .ok()
     })();
     let result = (|| {
         let owner = crate::lifecycle::owner();
@@ -104,9 +121,9 @@ async fn publication(generation: u64, session: String, report: String, post: boo
                 // No incoming fields to release; report() protects the current store view.
                 value
             } else {
-                store.protect_output(&value)?
+                measure(cycle, Mark::PublishProtect, || store.protect_output(&value))?
             };
-            let mut current = local.report(None);
+            let mut current = local.report_timed(None, cycle);
             if safe["payment_timer"] == true {
                 current["payment_timer"] = true.into();
             }
@@ -157,11 +174,11 @@ async fn publication(generation: u64, session: String, report: String, post: boo
             }
             Ok(current)
         } else {
-            Ok(local.report(value.get("error").and_then(Value::as_str)))
+            Ok(local.report_timed(value.get("error").and_then(Value::as_str), cycle))
         }
     })();
     let mut carries_result = result.is_ok() && !session.is_empty();
-    let mut value = result.unwrap_or_else(|why| local.report(Some(&why)));
+    let mut value = result.unwrap_or_else(|why| local.report_timed(Some(&why), cycle));
     let display_step = serde_json::from_str::<Value>(&report)
         .ok()
         .and_then(|value| match value["page_error_step"].as_str() {
@@ -187,7 +204,12 @@ async fn publication(generation: u64, session: String, report: String, post: boo
         let configuration = json!({"key_set":crate::poc::inference::key_is_set(),"configuration":crate::poc::inference::configuration()});
         value["poc_configuration"] = local
             .store()
-            .and_then(|store| store.protect_output(&configuration).ok())
+            .and_then(|store| {
+                measure(cycle, Mark::PublishProtect, || {
+                    store.protect_output(&configuration)
+                })
+                .ok()
+            })
             .unwrap_or_else(|| json!({"key_set":crate::poc::inference::key_is_set()}));
         let provider_configuration = json!({
             "key_set":crate::poc::provisioning::browser::key_is_set(),
@@ -196,15 +218,16 @@ async fn publication(generation: u64, session: String, report: String, post: boo
         value["provider_configuration"] = if let Some(store) = local.store() {
             let mut fallback = provider_configuration;
             fallback["recorded"] = store.provider_account().is_some().into();
-            store
-                .protect_output(&json!({
+            measure(cycle, Mark::PublishProtect, || {
+                store.protect_output(&json!({
                     "key_set":crate::poc::provisioning::browser::key_is_set(),
                     "origin":store.procurement_origin(),
                     "account":store.provider_account().map(|a| a.public()),
                     "recorded":store.provider_account().is_some(),
                     "relay_deployed":store.deployment_relay_present(),
                 }))
-                .unwrap_or(fallback)
+            })
+            .unwrap_or(fallback)
         } else {
             provider_configuration
         };
@@ -215,11 +238,17 @@ async fn publication(generation: u64, session: String, report: String, post: boo
                 crate::poc::provisioning::browser::readiness_report(&value["procurement"]);
             value["readiness"] = local
                 .store()
-                .and_then(|store| store.protect_output(&readiness).ok())
+                .and_then(|store| {
+                    measure(cycle, Mark::PublishProtect, || {
+                        store.protect_output(&readiness)
+                    })
+                    .ok()
+                })
                 .unwrap_or_else(
                     || json!({"kind":"refused","inactive":"diagnostic protection is unavailable"}),
                 );
         }
+        let serialize_timing = Timer::new(cycle, Mark::PublishSerialize);
         let encoded = value.to_string();
         let message = if post {
             let mut message = value.clone();
@@ -238,6 +267,7 @@ async fn publication(generation: u64, session: String, report: String, post: boo
         } else {
             None
         };
+        drop(serialize_timing);
         // Encoding and scanning can consume lifetime too. Validate after all preparation,
         // under the same writer, immediately before the actual release.
         let final_check = (|| {
@@ -263,6 +293,7 @@ async fn publication(generation: u64, session: String, report: String, post: boo
                     .check_session_authority(&session, crate::store::authority::current_pair(0))?;
             }
             if let Some(store) = local.store() {
+                let _timing = Timer::new(cycle, Mark::PublishProtect);
                 store.check_output_bytes(encoded.as_bytes())?;
                 if let Some(message) = &message {
                     store.check_output_bytes(message.as_bytes())?;
@@ -281,13 +312,15 @@ async fn publication(generation: u64, session: String, report: String, post: boo
             value = if last_refusal.as_ref() == Some(&why) {
                 json!({"state":"unlocked","lifecycle_state":"reconciling","seed_backup_stage":"inactive","error":"Protected report authority unavailable."})
             } else {
-                local.report(Some(&why))
+                local.report_timed(Some(&why), cycle)
             };
             last_refusal = Some(why);
             continue;
         }
+        let bytes = message.as_ref().map_or(0, String::len) as u64;
         if let Some(message) = message.and_then(|message| js_sys::JSON::parse(&message).ok()) {
             let worker: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
+            let _timing = Timer::new(cycle, Mark::PublishPost(bytes));
             let _ = worker.post_message(&message);
         }
         return encoded;

@@ -19,6 +19,11 @@ struct Cycle {
     journal: Vec<Commit>,
     progress_count: u64,
     progress_ms: u64,
+    publish_build_ms: u64,
+    publish_protect_ms: u64,
+    publish_serialize_ms: u64,
+    publish_post_ms: u64,
+    publish_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     total_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,6 +221,14 @@ pub(crate) enum Mark {
     Collect,
     Journal(&'static str),
     Progress,
+    PublishBuild,
+    PublishProtect,
+    PublishSerialize,
+    PublishPost(u64),
+}
+pub(crate) fn measure<T>(token: Option<u64>, mark: Mark, f: impl FnOnce() -> T) -> T {
+    let _timing = Timer::new(token, mark);
+    f()
 }
 pub(crate) struct Timer {
     token: Option<u64>,
@@ -264,6 +277,19 @@ impl Drop for Timer {
                 Mark::Progress => {
                     cycle.progress_count = cycle.progress_count.saturating_add(1);
                     cycle.progress_ms = cycle.progress_ms.saturating_add(ms);
+                }
+                Mark::PublishBuild => {
+                    cycle.publish_build_ms = cycle.publish_build_ms.saturating_add(ms);
+                }
+                Mark::PublishProtect => {
+                    cycle.publish_protect_ms = cycle.publish_protect_ms.saturating_add(ms);
+                }
+                Mark::PublishSerialize => {
+                    cycle.publish_serialize_ms = cycle.publish_serialize_ms.saturating_add(ms);
+                }
+                Mark::PublishPost(bytes) => {
+                    cycle.publish_post_ms = cycle.publish_post_ms.saturating_add(ms);
+                    cycle.publish_bytes = bytes;
                 }
             }
         });
