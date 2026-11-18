@@ -1656,7 +1656,11 @@ setInterval(() => {
   for (const node of document.querySelectorAll('[data-invoice-expires]')) node.textContent = `${Math.max(0, Math.ceil((Number(node.dataset.invoiceExpires) - Date.now() / 1000) / 60))} minutes left`;
   updateProviderClose();
 }, 1000);
+// Measured by the test side on 2026-11-18 with the default model: 0.14-0.17 USD per setup
+// on older builds, 0.07 USD on the build that runs every block by name. Update when that changes.
+const setupCreditUsd = {low: '0.10', high: '0.20', suggested: '0.50'};
 const renderCredit = (store, enabled) => {
+  $('credit-guidance').textContent = `Setting up one machine usually uses about ${setupCreditUsd.low}-${setupCreditUsd.high} USD of AI credit. Buying ${setupCreditUsd.suggested} USD leaves room to spare; unused credit stays in your account.`;
   const credit = store.credit;
   const invoices = credit?.invoices ?? [];
   const latest = invoices.at(-1);
