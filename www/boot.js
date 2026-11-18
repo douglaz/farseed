@@ -227,11 +227,20 @@ const renderSteps = store => {
   restoreMainActions(retained);
 };
 let renderedReport;
-const render = (store) => {
+const taskDetails = new Map();
+let taskDetailsStore;
+const render = (store, forceRender = false) => {
   const { payment_timer, ...content } = store;
   const report = JSON.stringify(content);
-  if (payment_timer === true && report === renderedReport && !store.error && !store.credit_error) return;
+  if (payment_timer === true && report === renderedReport && !store.error && !store.credit_error && !forceRender) return;
   renderedReport = report;
+  if (store.state !== 'unlocked' || ['suspended', 'reconciling'].includes(store.lifecycle_state) ||
+      store.lifecycle_generation !== taskDetailsStore?.lifecycle_generation) taskDetails.clear();
+  else {
+    const summaries = new Set((store.tasks ?? []).filter(task => task.summary).map(task => task.id));
+    for (const id of taskDetails.keys()) if (!summaries.has(id)) taskDetails.delete(id);
+  }
+  taskDetailsStore = store;
   const focused = document.activeElement;
   const selection = [focused?.selectionStart, focused?.selectionEnd, focused?.selectionDirection];
   for (const details of document.querySelectorAll('details[data-fold-key]')) {
@@ -907,6 +916,7 @@ const deliveredHostKind = (hostname) => {
   return 'public';
 };
 const taskDeliveredUrls = (task) => {
+  if (task.summary) return task.delivered_urls ?? [];
   const done = task.completed?.findLast(([, tool, outcome]) => tool.name === 'done' && outcome.content?.verification_required === true);
   return (done?.[1].arguments.urls ?? []).map(entry => ({...entry, notVisited: done[2].content.unvisited_urls?.find(skipped => skipped.url === entry.url)?.label}));
 };
@@ -943,6 +953,18 @@ const renderDeliveredUrls = (parent, entries) => {
   parent.append(section);
 };
 
+const receiveTaskDetails = (data, current) => {
+  if (worker !== current || document.visibilityState === 'hidden' ||
+      data.generation !== undefined && data.generation !== current.generation) return;
+  const entry = [...taskDetails].find(([, state]) => state.pending && state.request === data.request);
+  if (!entry) return;
+  const [id, state] = entry;
+  state.pending = false;
+  if (!data.error && data.id === id && data.task?.id === id && !data.task.summary) state.task = data.task;
+  else state.error = true;
+  render(taskDetailsStore, true);
+};
+
 const renderTasks = (store) => {
   if (store.state !== 'unlocked' || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state)) fileDownloads.clear();
   const worker = snapshotWorker();
@@ -966,12 +988,41 @@ const renderTasks = (store) => {
   slot.replaceChildren();
   slot.hidden = store.state !== 'unlocked' || store.seed_backup_stage !== 'inactive';
   if (slot.hidden) return;
-  for (const task of store.tasks ?? []) {
+  for (const entry of store.tasks ?? []) {
+    const opened = entry.summary ? taskDetails.get(entry.id) : undefined;
+    const task = opened?.task ?? entry;
     const card = document.createElement('section');
     card.dataset.task = task.id;
     card.dataset.cycleTimings = JSON.stringify(task.cycle_timings ?? []);
     const session = (store.sessions ?? []).find(s => s.identity === task.start_session && s.session_state !== 'ended' && s.bound_set.length === 1 && s.bound_set[0] === task.machine);
     paragraph(card, `Setting up ${task.machine}: ${taskStatus(task.status, task)}.`);
+    if (entry.summary) {
+      const open = document.createElement('button');
+      open.type = 'button'; open.dataset.openTask = entry.id;
+      open.textContent = opened ? 'Close task' : 'Open task';
+      open.disabled = ['suspended', 'reconciling'].includes(store.lifecycle_state);
+      open.addEventListener('click', () => {
+        if (taskDetails.has(entry.id)) {
+          taskDetails.delete(entry.id);
+          render(store, true);
+        } else {
+          const request = crypto.randomUUID();
+          taskDetails.set(entry.id, {request, pending: true});
+          render(store, true);
+          worker.postMessage({task_details: {id: entry.id, request}});
+        }
+      });
+      card.append(open);
+    }
+    if (task.summary) {
+      card.dataset.taskSummary = 'true';
+      paragraph(card, shortLine(task.goal, 120));
+      if (task.verdict) paragraph(card, task.verdict);
+      if (opened?.pending) paragraph(card, 'Opening task…');
+      if (opened?.error) paragraph(card, 'This task could not be shown.');
+      slot.append(card);
+      continue;
+    }
     if (task.goal.length <= 120) paragraph(card, task.goal);
     else {
       const firstSentence = task.goal.match(/^.*?[.!?](?=\s|$)/s)?.[0] ?? task.goal;
@@ -1734,6 +1785,8 @@ const start = () => {
   });
   worker.onmessage = ({ data }) => {
     if (data.file_download) { receiveFileDownload(data.file_download, current); return; }
+    if (data.task_details) { receiveTaskDetails(data.task_details, current); return; }
+    if (typeof data.task_details_unavailable === 'string') { receiveTaskDetails({request: data.task_details_unavailable, error: true}, current); return; }
     if (worker !== current) return;
     if (typeof data.deployment_ready === 'boolean') {
       publishDefaults(deploymentMaterial, data.deployment_ready);
@@ -1805,11 +1858,13 @@ const lock = () => {
 document.addEventListener('visibilitychange', () => {
   const hidden = document.visibilityState === 'hidden';
   if (hidden) interruptFileDownloads();
+  if (hidden && taskDetails.size) { taskDetails.clear(); render(taskDetailsStore, true); }
   if (hidden && ceremony) { lock(); return; }
   worker?.postMessage({ lifecycle: hidden ? 'hidden' : 'visible' });
 });
 document.addEventListener('freeze', () => {
   interruptFileDownloads();
+  if (taskDetails.size) { taskDetails.clear(); render(taskDetailsStore, true); }
   if (ceremony) { lock(); return; }
   suspended = true;
   worker?.postMessage({ lifecycle: 'freeze' });

@@ -166,7 +166,7 @@ impl<S: Storage> Store<S> {
         self.poc_task(&confirmation.task)
     }
 
-    pub(in crate::store) fn poc_task_view(&self, task: &Task) -> Value {
+    pub(crate) fn poc_task_view(&self, task: &Task) -> Value {
         let mut value = task.view();
         #[cfg(target_arch = "wasm32")]
         if task.awaiting_operator() {
@@ -196,6 +196,19 @@ impl<S: Storage> Store<S> {
             .iter()
             .any(|check| task.disposed_check(check))
             .into();
+        #[cfg(target_arch = "wasm32")]
+        {
+            value["cycle_timings"] = crate::poc::timings::view(&task.id);
+            if task.requesting
+                && !task.ended()
+                && !self.ended_sessions.contains(&task.start_session)
+                && let Some((revision, why)) = self.poc_reconciliation_failures.get(&task.id)
+                && *revision == task.revision
+            {
+                value["status"] = "paused".into();
+                value["pause_reason"] = why.clone().into();
+            }
+        }
         value
     }
 

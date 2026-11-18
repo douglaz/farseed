@@ -1042,6 +1042,62 @@ impl Default for TaskPublication {
     }
 }
 
+/// Read one ended task under the report writer, without restoring any action authority.
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub async fn publish_task_details(generation: u64, id: String, request: String) -> bool {
+    let local = local();
+    let mut writer = local.lock().await;
+    let owner = crate::lifecycle::owner();
+    if generation != owner.generation()
+        || owner.state() == "reconciling"
+        || crate::harness::inference::ending()
+        || writer.dispatch_refusal().is_some()
+    {
+        return false;
+    }
+    let Some(store) = writer.store() else {
+        return false;
+    };
+    let details = store.poc_task(&id).ok().filter(|task| task.ended());
+    let protected = details.and_then(|task| {
+        let value = serde_json::json!({"task_details":{"id":id,"request":request,
+            "generation":generation.to_string(),"task":store.poc_task_view(&task)}});
+        let protected = store.protect_output(&value).ok()?;
+        // A protected correlation field must still identify this exact request and task.
+        (protected["task_details"]["id"] == id
+            && protected["task_details"]["request"] == request
+            && protected["task_details"]["generation"] == value["task_details"]["generation"]
+            && protected["task_details"]["task"]["id"] == id)
+            .then_some(protected)
+    });
+    let protected = if let Some(protected) = protected {
+        protected
+    } else {
+        let refusal = serde_json::json!({"task_details_unavailable":request});
+        let Ok(protected) = store.protect_output(&refusal) else {
+            return false;
+        };
+        // Even fixed framing and the page's token must survive protection unchanged.
+        if protected != refusal {
+            return false;
+        }
+        protected
+    };
+    let encoded = protected.to_string();
+    if store.check_output_bytes(encoded.as_bytes()).is_err()
+        || generation != owner.generation()
+        || owner.state() == "reconciling"
+        || crate::harness::inference::ending()
+    {
+        return false;
+    }
+    let Ok(message) = js_sys::JSON::parse(&encoded) else {
+        return false;
+    };
+    let worker: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
+    worker.post_message(&message).is_ok()
+}
+
 /// The caller supplies an offer identity, never a path. This result is private binary data,
 /// outside the report publisher; the worker transfers it only to the download handler.
 #[wasm_bindgen::prelude::wasm_bindgen]

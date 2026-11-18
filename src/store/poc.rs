@@ -180,6 +180,45 @@ impl Task {
         }
         value
     }
+    /// Only the card heading and the cross-card lookups; never serialize old outcomes here.
+    pub(super) fn summary_view(&self) -> Value {
+        let delivered_urls = self
+            .completed
+            .iter()
+            .rev()
+            .find_map(|(_, tool, outcome)| {
+                let Tool::Done { urls, .. } = tool else {
+                    return None;
+                };
+                if outcome["content"]["verification_required"] != true {
+                    return None;
+                }
+                Some(
+                    urls.iter()
+                        .map(|entry| {
+                            let mut value =
+                                serde_json::to_value(entry).expect("address serializes");
+                            if let Some(label) = outcome["content"]["unvisited_urls"]
+                                .as_array()
+                                .and_then(|skipped| {
+                                    skipped.iter().find(|skipped| skipped["url"] == entry.url)
+                                })
+                                .and_then(|skipped| skipped.get("label"))
+                            {
+                                value["notVisited"] = label.clone();
+                            }
+                            value
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
+        json!({"summary":true,"id":self.id,"start_session":self.start_session,
+            "machine":self.machine,"status":self.status,
+            "goal":self.goal,
+            "pause_reason":self.pause_reason,"verdict":self.verdict,
+            "delivered_urls":delivered_urls})
+    }
     fn truncate_step_view(step: &mut Value) {
         let content = &mut step[2]["content"];
         for field in ["stdout", "stderr"] {
@@ -1060,6 +1099,9 @@ impl<S: Storage> Store<S> {
             && let Some(acceptance) = self.poc_new_acceptance(session)?
         {
             self.conduct_acceptances.push(acceptance);
+        }
+        if matches!(record, Record::Create { .. } | Record::Start { .. }) {
+            self.poc_creation_order.push(task.id.clone());
         }
         self.poc.insert(task.id.clone(), task);
         Ok(())

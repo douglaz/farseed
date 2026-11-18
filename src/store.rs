@@ -420,6 +420,8 @@ pub struct Store<S> {
     conduct_acceptances: Vec<Acceptance>,
     goals: Vec<crate::goals::Goal>,
     poc: std::collections::BTreeMap<String, poc::Task>,
+    /// Creation-record order, rebuilt by the same Create/Start projection on unlock.
+    poc_creation_order: Vec<String>,
     /// Memory-only diagnostics; never substitute for a journaled task transition.
     #[cfg(target_arch = "wasm32")]
     poc_reconciliation_failures: std::collections::BTreeMap<String, (u64, String)>,
@@ -590,6 +592,7 @@ impl<S: Storage> Store<S> {
             conduct_acceptances: Vec::new(),
             goals: Vec::new(),
             poc: Default::default(),
+            poc_creation_order: Vec::new(),
             #[cfg(target_arch = "wasm32")]
             poc_reconciliation_failures: Default::default(),
             pending_requirements: Default::default(),
@@ -2731,29 +2734,24 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 report["poc_targets"] = store.poc_targets_view();
             }
             if !store.poc.is_empty() {
+                let latest_ended = store
+                    .poc_creation_order
+                    .iter()
+                    .rev()
+                    .find(|id| store.poc.get(*id).is_some_and(poc::Task::ended));
                 report["tasks"] = serde_json::to_value(
                     store
                         .poc
                         .values()
                         .map(|task| {
-                            let value = store.poc_task_view(task);
-                            #[cfg(target_arch = "wasm32")]
-                            let value = {
-                                let mut value = value;
-                                value["cycle_timings"] = crate::poc::timings::view(&task.id);
-                                if task.requesting
-                                    && !task.ended()
-                                    && !store.ended_sessions.contains(&task.start_session)
-                                    && let Some((revision, why)) =
-                                        store.poc_reconciliation_failures.get(&task.id)
-                                    && *revision == task.revision
-                                {
-                                    value["status"] = "paused".into();
-                                    value["pause_reason"] = why.clone().into();
-                                }
-                                value
-                            };
-                            value
+                            if !task.ended()
+                                || !store.ended_sessions.contains(&task.start_session)
+                                || latest_ended == Some(&task.id)
+                            {
+                                store.poc_task_view(task)
+                            } else {
+                                task.summary_view()
+                            }
                         })
                         .collect::<Vec<_>>(),
                 )
