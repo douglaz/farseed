@@ -1610,8 +1610,31 @@ const renderDelivery = (section, machine, store) => {
   }
   section.append(card);
 };
-const invoiceControls = (parent, savedInvoice, expires) => {
+const bolt11AmountTenths = invoice => {
+  if (typeof invoice !== 'string' || (invoice !== invoice.toLowerCase() && invoice !== invoice.toUpperCase())) return null;
+  const normalized = invoice.toLowerCase();
+  const separator = normalized.lastIndexOf('1');
+  if (separator < 0 || separator === normalized.length - 1) return null;
+  const amount = /^lnbc([0-9]+)([munp]?)$/.exec(normalized.slice(0, separator));
+  if (!amount) return null;
+  // Tenths of a millisat keep the p multiplier exact, including fractional millisats.
+  const multiplier = {'': 1000000000000n, m: 1000000000n, u: 1000000n, n: 1000n, p: 1n};
+  return BigInt(amount[1]) * multiplier[amount[2]];
+};
+const roundedInvoiceSats = tenths => ((tenths + 9999n) / 10000n).toLocaleString('en-US');
+const invoiceControls = (parent, savedInvoice, expires, totalMillisats) => {
   const wallet = document.createElement('a'); wallet.textContent = 'Open in wallet'; wallet.href = `lightning:${savedInvoice}`;
+  const bound = Number.isSafeInteger(totalMillisats) && totalMillisats >= 0 ? BigInt(totalMillisats)
+    : typeof totalMillisats === 'string' && /^[0-9]+$/.test(totalMillisats) ? BigInt(totalMillisats) : null;
+  const requested = bolt11AmountTenths(savedInvoice);
+  let guidance = null;
+  if (bound === null) guidance = 'Check the amount shown here in your wallet.';
+  else {
+    const expected = roundedInvoiceSats(bound * 10n);
+    if (requested === bound * 10n) wallet.textContent = `Pay ${expected} sat in your wallet`;
+    else if (requested === null) guidance = `Check that your wallet asks for ${expected} sat.`;
+    else guidance = `This invoice asks for ${roundedInvoiceSats(requested)} sat, not the ${expected} sat shown here. Don't pay it.`;
+  }
   const copy = document.createElement('button'); copy.type = 'button'; copy.textContent = 'Copy';
   copy.addEventListener('click', async () => {
     try { await navigator.clipboard.writeText(savedInvoice); copy.textContent = 'Copied'; }
@@ -1620,6 +1643,7 @@ const invoiceControls = (parent, savedInvoice, expires) => {
   const remaining = document.createElement('span'); remaining.dataset.invoiceExpires = String(expires);
   remaining.textContent = `${Math.max(0, Math.ceil((expires - Date.now() / 1000) / 60))} minutes left`;
   parent.append(wallet, ' ', copy, ' ', remaining);
+  if (guidance) paragraph(parent, guidance);
 };
 let providerCloseState = {purchase: {}, enabled: false};
 const updateProviderClose = () => {
@@ -1647,7 +1671,7 @@ const renderCredit = (store, enabled) => {
   for (const invoice of invoices) {
     const row = document.createElement('section'); row.dataset.creditInvoice = invoice.id;
     paragraph(row, `${invoice.amount_sat} sat. ${({abandoned:'Invoice marked abandoned.',pending:'Waiting for external payment.',paid:'Payment seen; inference credit read.',expired_unpaid:'This invoice expired unpaid, according to the credit service.',unknown:'Payment status unknown.',seen:'Payment seen; balance not read yet.'})[invoice.outcome]}`);
-    if (!['paid', 'seen'].includes(invoice.outcome)) invoiceControls(row, invoice.bolt11, invoice.expires_at);
+    if (!['paid', 'seen'].includes(invoice.outcome)) invoiceControls(row, invoice.bolt11, invoice.expires_at, invoice.amount_sat * 1000);
     slot.append(row);
   }
 };
@@ -1849,7 +1873,7 @@ const renderProvider = (store, enabled) => {
       paragraph(progress, `To pay: ${readableMoney(boundInvoiceTotal(pay), pay.currency)} (amount ${readableMoney(pay.amount, pay.currency)}, tax ${readableMoney(pay.tax, pay.currency)}, processing fee ${readableMoney(pay.processing_fee, pay.currency)}).`);
       paragraph(progress, `Invoice ${pay.is_paid ? 'paid' : 'awaiting payment'}; expires ${pay.expires}. Amount ${pay.amount}, tax ${pay.tax}, processing fee ${pay.processing_fee} (${pay.currency === 'BTC' ? 'millisats' : pay.currency + ' cents'}).`);
       if (!pay.is_paid) {
-        invoiceControls(progress, pay.data.lightning, Math.floor(Date.parse(pay.expires) / 1000));
+        invoiceControls(progress, pay.data.lightning, Math.floor(Date.parse(pay.expires) / 1000), boundInvoiceTotal(pay));
         const check = document.createElement('button'); check.type = 'button'; check.textContent = 'Check now'; check.disabled = !enabled;
         check.addEventListener('click', () => providerRequest({action:'payment_check'})); progress.append(check);
       }
