@@ -1950,6 +1950,7 @@ const renderPoc = (store) => {
     paragraph(row, `Connect to ${target.host} on port ${target.port} as ${target.user}. ${target.elevation === 'sudo -n' ? 'Commands can use administrator access without a password.' : target.elevation === 'none' ? 'Commands use this login’s normal access.' : 'Open Details for command access settings.'}`);
     paragraph(row, `Trusted machine host key: ${target.pin}`);
     rawDetails(row, target, ['target', target.machine]);
+    const liveSession = (store.sessions ?? []).find(session => session.session_state !== 'ended' && (session.bound_set ?? []).includes(target.machine));
     const creditSession = (store.sessions ?? []).some(session => session.credit_backed && session.session_state !== 'ended' && (session.bound_set ?? []).includes(target.machine));
     const creditChoice = store.credit?.selected || !store.poc_configuration?.key_set;
     const readingCredit = store.credit?.account && store.credit.balance === null && !store.credit_error;
@@ -1958,15 +1959,21 @@ const renderPoc = (store) => {
     if (useCredit) configuration.dataset.inferenceApproval = '';
     else configuration.textContent = `Inference endpoint: ${store.poc_configuration?.configuration?.endpoint ?? 'unavailable'}; model: ${store.poc_configuration?.configuration?.model ?? 'unavailable'}.`;
     row.append(configuration);
-    paragraph(row, `Start session approves the selected AI connection for ${target.machine}.`);
-    const inputs = startInputs(row, target.machine, '', !useCredit, useCredit, store.goal_templates);
-    if (useCredit) {
+    if (liveSession) paragraph(row, `A session is running for ${target.machine}. Its progress is on the task card above.`);
+    else paragraph(row, `Start session approves the selected AI connection for ${target.machine}.`);
+    const inputs = liveSession ? null : startInputs(row, target.machine, '', !useCredit, useCredit, store.goal_templates);
+    if (liveSession && creditSession) {
+      paragraph(row, store.credit.disclosure);
+      if (store.credit_error) paragraph(row, store.credit_error);
+      paragraph(row, 'New key: only if the task says its AI key ran out.');
+    } else if (!liveSession && useCredit) {
       paragraph(row, store.credit.disclosure);
       if (readingCredit) paragraph(row, 'Reading AI credit balance…');
       else if (store.credit_error) paragraph(row, store.credit_error);
       else if (!store.credit.can_start) paragraph(row, store.credit.balance_text);
     }
     for (const [kind, label] of [['poc_bind', 'Start session'], ['poc_public_keys', 'Show public keys']]) {
+      if (liveSession && kind === 'poc_bind') continue;
       const button = document.createElement('button');
       button.type = 'button';
       button.disabled = !enabled || (kind === 'poc_bind' && (useCredit ? !store.credit?.can_start : !store.poc_configuration?.configuration));
