@@ -695,7 +695,7 @@ fn request_context<S: Storage>(
             handover.push_str("These harness reads already run after done, so checks must not repeat them; a check equal to a harness read is dropped and not run.\n");
             handover.push_str("Each address passed to done is visited anonymously from the machine after done and must ask for sign-in (HTTP 401/403, a redirect to a login page, or a page with a password field); an address that opens without signing in is a finding.\n");
             if task.is_some_and(|t| t.template.as_deref() == Some(super::template::ID)) {
-                handover.push_str("The T3 app address https://app.t3.codes is listed for the user and not visited.\n");
+                handover.push_str("List the T3 app address https://app.t3.codes in done only when T3 Connect is linked; leave it out if the final check printed \"T3 Code: not linked yet\". When listed, it is shown to the user and not visited.\n");
                 handover.push_str("Before done, offer wireguard.conf and control-center-login.txt with offer_file; a missing offer is a finding.\n");
                 handover.push_str("Differences found after done pause the task as findings; the template's final step already runs the same final check.");
             } else {
