@@ -23,11 +23,16 @@ You are building the user's control center on this NixOS machine. Follow the ste
 5. Never reboot. Never run `nixos-rebuild` yourself: `cc-rebuild.sh` runs it the right way (switch, the flake
    output `control`, in the background). Never change SSH settings or host keys. (Step 3 adding the user's own
    public key from `USER_SSH_KEY` is not an SSH settings change.)
-6. Go to the next step only when the check's last line says PASS. On FAIL, do what "If it fails" says, at most
-   twice. If it still fails, stop and report the FAIL lines and the step number.
-7. Commands already run as root. Keep output short: only the first 8 KiB of output comes back, and the
+6. Run every Check block exactly as written and alone: nothing before or after it in the same command, not even
+   an echo. tau-web counts a step as passed only when the check's `CHECKS ... PASS` line is the last line of the
+   command's output. On FAIL, do what "If it fails" says, at most twice. If it still fails, stop and report the
+   FAIL lines and the step number.
+7. If tau-web sends you the same step again after its check printed PASS, run that step's Check block alone,
+   once more, and nothing else. Never explore instead: don't look for other steps' text, read package sources,
+   check ports, or build anything a step doesn't ask for. tau-web sends the next step itself.
+8. Commands already run as root. Keep output short: only the first 8 KiB of output comes back, and the
    scripts print only what matters.
-8. Change the `cc-*.nix` files, the two scripts and the user's files (wireguard.conf,
+9. Change the `cc-*.nix` files, the two scripts and the user's files (wireguard.conf,
    control-center-login.txt, app-url.txt) only by running a step's Do block. A FAIL line that ends with
    `(needs the user: ask_operator)` can only be fixed by the user: ask with `ask_operator`, wait for the
    answer, then run that step's Wait and Check again. Don't work around it.
@@ -109,7 +114,7 @@ home.
 
 ## Step 1: Look at the machine
 
-**Do** (this block is also the check)
+**Do** (this block is also the check; run it alone, exactly as written)
 ```sh
 sh <<'STEP'
 . /etc/os-release
@@ -209,6 +214,8 @@ base() {
   t flake_lock_tracked git -C /etc/nixos ls-files --error-unmatch flake.lock
   t running_is_boot_default test "$(readlink -f /run/current-system)" = "$(readlink -f /nix/var/nix/profiles/system)"
   t tools_on_path sh -c 'command -v wg && command -v jq'
+  t port_5355_closed sh -c '! ss -H -n -l -t | grep -q ":5355 "'
+  t binary_cache_configured sh -c 'nix config show 2>/dev/null | grep -E "^(extra-)?substituters" | grep -q app.poc.asf0.org/images/nix-cache'
   if [ -s /etc/nixos/user-ssh-key.pub ]; then
     t user_ssh_key_authorized grep -qxFf /etc/nixos/user-ssh-key.pub "/etc/ssh/authorized_keys.d/$U"
   fi
@@ -305,9 +312,9 @@ git -C /etc/nixos add -A
 echo SCRIPTS_WRITTEN
 STEP
 ```
-**Check** (the two scripts must match byte for byte):
+**Check** (run it alone, exactly as written; the two scripts must match byte for byte):
 ```sh
-printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22aba7edd6ad35a83f9ce5fe1b73ac01ed5b4d3d7e2564d2022839f 9893ad673d5aafe3ea544949898c73b9a2e12702bc21d4e1fcc5251a5b46669a | sha256sum -c && echo "CHECKS scripts PASS" || echo "CHECKS scripts FAIL"
+printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22aba7edd6ad35a83f9ce5fe1b73ac01ed5b4d3d7e2564d2022839f ae593b1ac49e7df7a684ecac4c878d4cd20c6ef259b536a7eb7dc3b460905daa | sha256sum -c && echo "CHECKS scripts PASS" || echo "CHECKS scripts FAIL"
 ```
 Expect `CHECKS scripts PASS`.
 
@@ -323,6 +330,8 @@ This writes the flake (pinned to the nixpkgs revision the machine already runs, 
 module (tools, and the user's own SSH key if there is one), the `extra/` loader, and empty modules that later
 steps fill in. Replace `USER_SSH_KEY` in the first line with the fact, keeping the quotes; if the fact is empty,
 leave the quotes empty (`KEY=''`).
+The base module also turns off the name-resolution extras (LLMNR on port 5355, mDNS), so port 5355 stops
+listening after this step's rebuild; the check confirms it. Nothing else is needed about it.
 
 **Do**
 ```sh
@@ -372,6 +381,14 @@ in
   environment.systemPackages = with pkgs; [ git curl jq wireguard-tools ];
   # No name-resolution listeners beyond the local DNS stub (127.0.0.53 and 127.0.0.54, port 53).
   services.resolved.settings.Resolve = { LLMNR = false; MulticastDNS = false; };
+  # tau-web's binary cache: Hermes Agent and T3 Code prebuilt for these exact pins, signed with this public key.
+  # If the cache can't be reached, nix builds from source instead (slower, never a failure).
+  nix.settings = {
+    extra-substituters = [ "https://app.poc.asf0.org/images/nix-cache" ];
+    extra-trusted-public-keys = [ "app.poc.asf0.org-cc-cache-1:S7kgCCntlcwvl0ntC6O4duUCc4uaUn9SERTUqA6+7gM=" ];
+    fallback = true;
+    connect-timeout = 10;
+  };
   # Lets the user log in to the machine directly with their own key, next to the keys already there.
   users.users = lib.mkIf (userKey != "") {
     ${loginUser} = {
@@ -410,7 +427,7 @@ STEP
 ```sh
 sh /etc/nixos/cc-rebuild.sh wait
 ```
-**Check**
+**Check** (run it alone, exactly as written)
 ```sh
 sh /etc/nixos/cc-check.sh base
 ```
@@ -449,7 +466,7 @@ wg pubkey < wg-user.key > wg-user.pub
 echo KEYS_WRITTEN
 STEP
 ```
-**Check**
+**Check** (run it alone, exactly as written)
 ```sh
 sh /etc/nixos/cc-check.sh keys
 ```
@@ -509,7 +526,7 @@ STEP
 ```sh
 sh /etc/nixos/cc-rebuild.sh wait
 ```
-**Check**
+**Check** (run it alone, exactly as written)
 ```sh
 sh /etc/nixos/cc-check.sh hermes
 ```
@@ -577,7 +594,7 @@ STEP
 ```sh
 sh /etc/nixos/cc-rebuild.sh wait
 ```
-**Check** (asks for one rebuild as the hermes user, the way the agent will; takes up to a minute):
+**Check** (run it alone, exactly as written; it asks for one rebuild as the hermes user, the way the agent will, and takes up to a minute):
 ```sh
 sh /etc/nixos/cc-check.sh agent
 ```
@@ -685,7 +702,7 @@ STEP
 ```sh
 sh /etc/nixos/cc-rebuild.sh wait
 ```
-**Check**
+**Check** (run it alone, exactly as written)
 ```sh
 sh -c 't3c project add /var/lib/hermes/workspace --title control-center >/dev/null 2>&1; sh /etc/nixos/cc-check.sh t3'
 ```
@@ -736,7 +753,7 @@ elif systemctl is-active -q t3-connect; then echo "STILL WAITING for the user's 
 else echo "SIGN-IN ENDED without approval (expired or cancelled): run the Do block again and ask the user again."; fi
 STEP
 ```
-**Check**
+**Check** (run it alone, exactly as written)
 ```sh
 sh /etc/nixos/cc-check.sh connect
 ```
@@ -782,7 +799,7 @@ STEP
 ```sh
 sh /etc/nixos/cc-rebuild.sh wait
 ```
-**Check**
+**Check** (run it alone, exactly as written)
 ```sh
 sh /etc/nixos/cc-check.sh wireguard
 ```
@@ -819,7 +836,7 @@ STEP
 ```sh
 sh /etc/nixos/cc-rebuild.sh wait
 ```
-**Check**
+**Check** (run it alone, exactly as written)
 ```sh
 sh /etc/nixos/cc-check.sh tor
 ```
@@ -876,7 +893,7 @@ Then call `offer_file` for each `OFFER` path the block printed, so the user can 
 
 Never print these two files: their contents only reach the user through `offer_file`.
 
-**Check**
+**Check** (run it alone, exactly as written)
 ```sh
 sh /etc/nixos/cc-check.sh handover
 ```
@@ -900,9 +917,9 @@ git -C /etc/nixos -c user.name=control-center -c user.email=root@localhost commi
 git -C /etc/nixos log --oneline | head -n 3
 STEP
 ```
-**Check** (takes up to 5 minutes: it also checks T3 Connect and visits every address in app-url.txt):
+**Check** (run it alone, exactly as written; it takes up to 5 minutes: it also checks T3 Connect and visits every address in app-url.txt):
 ```sh
-printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22aba7edd6ad35a83f9ce5fe1b73ac01ed5b4d3d7e2564d2022839f 9893ad673d5aafe3ea544949898c73b9a2e12702bc21d4e1fcc5251a5b46669a | sha256sum -c --quiet && sh /etc/nixos/cc-check.sh done
+printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22aba7edd6ad35a83f9ce5fe1b73ac01ed5b4d3d7e2564d2022839f ae593b1ac49e7df7a684ecac4c878d4cd20c6ef259b536a7eb7dc3b460905daa | sha256sum -c --quiet && sh /etc/nixos/cc-check.sh done
 ```
 Expect `CHECKS done PASS`. If only a `visit_` check fails for an onion address, wait 2 minutes and run it again: a
 new onion service can take a few minutes to become reachable.
