@@ -1,7 +1,7 @@
 // The harness worker alone holds the seed and keys. Only the dedicated seed-backup display
 // carries words to the page; re-entry and passphrase buffers are zero-filled by the module.
 import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, accept_page_goal, TaskPublication, requirements_answer, delivery_request, retire_runtime, sweep_inference, lifecycle_transition, publication_generation, publish_report, verify_inference_clock, withdraw_reinstall } from './pkg/tau_web.js';
-import { identify_execution, wake_tasks, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_download, publish_task_details } from './pkg/tau_web.js';
+import { identify_execution, wake_tasks, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_download, publish_task_details, publish_delivery_details } from './pkg/tau_web.js';
 import { credit_request, retry_ended_credit } from './pkg/tau_web.js';
 import { deployment_configure, provider_configure, provider_key_is_set, provider_visibility, provider_action_delay, provider_request } from './pkg/tau_web.js';
 
@@ -258,6 +258,17 @@ onmessage = async ({ data: envelope }) => {
     try {
       if (!retirementRequested && pageVisible && typeof request.id === 'string' && /^[a-f0-9]{48}$/.test(request.id))
         await publish_task_details(publication_generation(), request.id, request.request);
+    } catch { /* Only the protected publisher may release a reply. */ }
+    return;
+  }
+  if (data.delivery_details) {
+    const request = data.delivery_details;
+    if (!exactMembers(request, ['machine', 'request', 'kind']) ||
+        typeof request.machine !== 'string' || typeof request.request !== 'string' ||
+        request.request.length !== 36 || !['entry', 'commands'].includes(request.kind)) return;
+    try {
+      if (!retirementRequested && pageVisible)
+        await publish_delivery_details(publication_generation(), request.machine, request.request, request.kind === 'commands');
     } catch { /* Only the protected publisher may release a reply. */ }
     return;
   }

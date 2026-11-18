@@ -228,6 +228,12 @@ const renderSteps = store => {
 };
 let renderedReport;
 const taskDetails = new Map();
+const deliveryDetails = {entry: new Map(), commands: new Map()};
+const clearDetails = () => {
+  taskDetails.clear();
+  deliveryDetails.entry.clear();
+  deliveryDetails.commands.clear();
+};
 let taskDetailsStore;
 const render = (store, forceRender = false) => {
   const { payment_timer, ...content } = store;
@@ -235,10 +241,33 @@ const render = (store, forceRender = false) => {
   if (payment_timer === true && report === renderedReport && !store.error && !store.credit_error && !forceRender) return;
   renderedReport = report;
   if (store.state !== 'unlocked' || ['suspended', 'reconciling'].includes(store.lifecycle_state) ||
-      store.lifecycle_generation !== taskDetailsStore?.lifecycle_generation) taskDetails.clear();
+      store.lifecycle_generation !== taskDetailsStore?.lifecycle_generation) clearDetails();
   else {
     const summaries = new Set((store.tasks ?? []).filter(task => task.summary).map(task => task.id));
     for (const id of taskDetails.keys()) if (!summaries.has(id)) taskDetails.delete(id);
+    // Replies can be ahead of their requesting report; refresh only for a different report version.
+    for (const task of store.tasks ?? []) {
+      const opened = taskDetails.get(task.id);
+      if (opened && (opened.task?.revision ?? opened.revision) !== task.revision &&
+          opened.revision !== task.revision) {
+        const request = crypto.randomUUID();
+        taskDetails.set(task.id, {request, pending: true, revision: task.revision});
+        snapshotWorker().postMessage({task_details: {id: task.id, request}});
+      }
+    }
+    const machines = new Set((store.delivery ?? []).map(entry => entry.machine));
+    const deliverySummaries = new Set((store.delivery ?? []).filter(entry => entry.summary).map(entry => entry.machine));
+    for (const machine of deliveryDetails.entry.keys()) if (!deliverySummaries.has(machine)) deliveryDetails.entry.delete(machine);
+    for (const machine of deliveryDetails.commands.keys()) if (!machines.has(machine)) deliveryDetails.commands.delete(machine);
+    for (const entry of store.delivery ?? []) {
+      const opened = deliveryDetails.commands.get(entry.machine);
+      if (opened && (opened.fetchedRevision ?? opened.revision) !== entry.reports_revision &&
+          opened.revision !== entry.reports_revision) {
+        const request = crypto.randomUUID();
+        deliveryDetails.commands.set(entry.machine, {request, pending: true, revision: entry.reports_revision});
+        snapshotWorker().postMessage({delivery_details: {machine: entry.machine, request, kind: 'commands'}});
+      }
+    }
   }
   taskDetailsStore = store;
   const focused = document.activeElement;
@@ -965,6 +994,48 @@ const receiveTaskDetails = (data, current) => {
   render(taskDetailsStore, true);
 };
 
+const receiveDeliveryDetails = (data, current) => {
+  if (worker !== current || document.visibilityState === 'hidden' ||
+      data.generation !== undefined && data.generation !== current.generation) return;
+  for (const [kind, states] of Object.entries(deliveryDetails)) {
+    const entry = [...states].find(([, state]) => state.pending && state.request === data.request);
+    if (!entry) continue;
+    const [machine, state] = entry;
+    state.pending = false;
+    if (!data.error && data.machine === machine && data.kind === kind &&
+        (kind === 'commands' ? Array.isArray(data.value) && Number.isSafeInteger(data.reports_revision) : data.value?.machine === machine && !data.value.summary)) {
+      state.value = data.value;
+      state.fetchedRevision = data.reports_revision;
+    } else state.error = true;
+    render(taskDetailsStore, true);
+    return;
+  }
+};
+
+const deliveryDetailsButton = (card, machine, kind, label, store) => {
+  const worker = snapshotWorker();
+  const states = deliveryDetails[kind];
+  const state = states.get(machine);
+  const button = document.createElement('button');
+  button.type = 'button'; button.dataset.deliveryDetails = kind;
+  button.textContent = state ? `Close ${label}` : `Show ${label}`;
+  button.disabled = ['suspended', 'reconciling'].includes(store.lifecycle_state);
+  button.addEventListener('click', () => {
+    if (states.has(machine)) states.delete(machine);
+    else {
+      const request = crypto.randomUUID();
+      const revision = (store.delivery ?? []).find(entry => entry.machine === machine)?.reports_revision;
+      states.set(machine, {request, pending: true, revision});
+      worker.postMessage({delivery_details: {machine, request, kind}});
+    }
+    render(store, true);
+  });
+  card.append(button);
+  if (state?.pending) paragraph(card, `Opening ${label}…`);
+  if (state?.error) paragraph(card, `These ${label} could not be shown.`);
+  return state?.value;
+};
+
 const renderTasks = (store) => {
   if (store.state !== 'unlocked' || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state)) fileDownloads.clear();
   const worker = snapshotWorker();
@@ -1007,7 +1078,7 @@ const renderTasks = (store) => {
           render(store, true);
         } else {
           const request = crypto.randomUUID();
-          taskDetails.set(entry.id, {request, pending: true});
+          taskDetails.set(entry.id, {request, pending: true, revision: entry.revision});
           render(store, true);
           worker.postMessage({task_details: {id: entry.id, request}});
         }
@@ -1018,6 +1089,7 @@ const renderTasks = (store) => {
       card.dataset.taskSummary = 'true';
       paragraph(card, shortLine(task.goal, 120));
       if (task.verdict) paragraph(card, task.verdict);
+      if (!session && !['complete', 'abandoned'].includes(task.status)) paragraph(card, 'This task’s session has ended. Its history stays here, but it cannot continue.');
       if (opened?.pending) paragraph(card, 'Opening task…');
       if (opened?.error) paragraph(card, 'This task could not be shown.');
       slot.append(card);
@@ -1202,7 +1274,7 @@ const renderTasks = (store) => {
     };
     if (session && store.lifecycle_state !== 'ended' && !awaitingAiKey(task) && !awaitingOperator(task)) {
       action('Resume', { action: 'resume', session: session.identity });
-    } else if ((store.sessions ?? []).some(s => s.identity === task.start_session && s.session_state === 'ended')) paragraph(card, 'This task’s session has ended. Its history stays here, but it cannot continue.');
+    } else if (entry.summary || (store.sessions ?? []).some(s => s.identity === task.start_session && s.session_state === 'ended')) paragraph(card, 'This task’s session has ended. Its history stays here, but it cannot continue.');
     else if (!session) paragraph(card, 'Unlock to restore this task’s session.');
     if (session && task.verifying && task.status === 'paused' && !task.pending) {
       action('Prepare complete re-check', { action: 'retry-checks', session: session.identity });
@@ -1267,19 +1339,26 @@ const renderTasks = (store) => {
 
 const renderDelivery = (section, machine, store) => {
   const worker = snapshotWorker();
-  const delivery = (store.delivery ?? []).find(d => d.machine === machine);
-  if (!delivery) return;
+  const entry = (store.delivery ?? []).find(d => d.machine === machine);
+  if (!entry) return;
+  const delivery = deliveryDetails.entry.get(machine)?.value ?? entry;
   const card = document.createElement('section');
   card.dataset.deliveryCard = machine;
   const heading = document.createElement('h3');
   heading.textContent = `Delivery for ${machine}`;
   card.append(heading);
-  paragraph(card, delivery.fixture_limit);
+  if (delivery.fixture_limit) paragraph(card, delivery.fixture_limit);
   const verdict = document.createElement('p');
   verdict.dataset.deliveryVerdict = machine;
   verdict.textContent = delivery.verdict;
   if (delivery.verdict_is_historical && delivery.last_completed_check) paragraph(card, 'The last completed result is historical; a final demonstration is still needed.');
   card.append(verdict);
+  if (entry.summary) deliveryDetailsButton(card, machine, 'entry', 'delivery details', store);
+  if (delivery.summary) {
+    paragraph(card, `${delivery.findings_count} findings recorded.`);
+    section.append(card);
+    return;
+  }
   // Tasks arrive keyed by random id, not in time order: show addresses here only when exactly one task on this machine
   // has a verdict; otherwise each task's own card shows its addresses.
   const verdictTasks = (store.tasks ?? []).filter(task => task.machine === machine && task.verdict);
@@ -1310,9 +1389,13 @@ const renderDelivery = (section, machine, store) => {
     card.append(application);
   }
   for (const session of delivery.subsequent_placement_sessions ?? []) paragraph(card, 'Placement since the last check in session ' + session + '; final lifecycle demonstration not supplied.');
-  if (delivery.reports?.length) {
-    paragraph(card, delivery.report_label);
-    for (const [index, report] of delivery.reports.entries()) rawDetails(card, report, ['delivery', machine, 'report', index]);
+  if (Number.isInteger(delivery.reports_count)) {
+    const reports = document.createElement('section');
+    paragraph(reports, delivery.report_label);
+    const count = deliveryDetails.commands.get(machine)?.value?.length ?? delivery.reports_count;
+    const records = deliveryDetailsButton(reports, machine, 'commands', `commands (${count})`, store);
+    for (const [index, report] of (records ?? []).entries()) rawDetails(reports, report, ['delivery', machine, 'report', index]);
+    card.append(reports);
   }
   const session = (store.sessions ?? []).find(s => s.session_state !== 'ended' && s.bound_set.includes(machine));
   if (session && session.inference_limits?.state !== 'clock-withheld') {
@@ -1787,6 +1870,8 @@ const start = () => {
     if (data.file_download) { receiveFileDownload(data.file_download, current); return; }
     if (data.task_details) { receiveTaskDetails(data.task_details, current); return; }
     if (typeof data.task_details_unavailable === 'string') { receiveTaskDetails({request: data.task_details_unavailable, error: true}, current); return; }
+    if (data.delivery_details) { receiveDeliveryDetails(data.delivery_details, current); return; }
+    if (typeof data.delivery_details_unavailable === 'string') { receiveDeliveryDetails({request: data.delivery_details_unavailable, error: true}, current); return; }
     if (worker !== current) return;
     if (typeof data.deployment_ready === 'boolean') {
       publishDefaults(deploymentMaterial, data.deployment_ready);
@@ -1858,13 +1943,13 @@ const lock = () => {
 document.addEventListener('visibilitychange', () => {
   const hidden = document.visibilityState === 'hidden';
   if (hidden) interruptFileDownloads();
-  if (hidden && taskDetails.size) { taskDetails.clear(); render(taskDetailsStore, true); }
+  if (hidden && (taskDetails.size || deliveryDetails.entry.size || deliveryDetails.commands.size)) { clearDetails(); render(taskDetailsStore, true); }
   if (hidden && ceremony) { lock(); return; }
   worker?.postMessage({ lifecycle: hidden ? 'hidden' : 'visible' });
 });
 document.addEventListener('freeze', () => {
   interruptFileDownloads();
-  if (taskDetails.size) { taskDetails.clear(); render(taskDetailsStore, true); }
+  if (taskDetails.size || deliveryDetails.entry.size || deliveryDetails.commands.size) { clearDetails(); render(taskDetailsStore, true); }
   if (ceremony) { lock(); return; }
   suspended = true;
   worker?.postMessage({ lifecycle: 'freeze' });

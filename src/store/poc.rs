@@ -230,7 +230,7 @@ impl Task {
                 )
             })
             .unwrap_or_default();
-        json!({"summary":true,"id":self.id,"start_session":self.start_session,
+        json!({"summary":true,"id":self.id,"revision":self.revision,"start_session":self.start_session,
             "machine":self.machine,"status":self.status,
             "goal":self.goal,
             "pause_reason":self.publication_pause_reason(),"verdict":self.verdict,

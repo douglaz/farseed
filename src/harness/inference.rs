@@ -255,6 +255,7 @@ async fn publication(
         }
         let serialize_timing = Timer::new(cycle, Mark::PublishSerialize);
         let encoded = value.to_string();
+        let mut sections = BTreeMap::new();
         let message = if post {
             let mut message = value.clone();
             if let Some(object) = message.as_object_mut() {
@@ -267,6 +268,9 @@ async fn publication(
                         object.insert(to.into(), value);
                     }
                 }
+            }
+            if cycle.is_some() {
+                sections = crate::poc::timings::section_bytes(&message);
             }
             Some(json!({"store":message}).to_string())
         } else {
@@ -326,7 +330,9 @@ async fn publication(
         if let Some(message) = message.and_then(|message| js_sys::JSON::parse(&message).ok()) {
             let worker: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
             let _timing = Timer::new(cycle, Mark::PublishPost(bytes));
-            let _ = worker.post_message(&message);
+            if worker.post_message(&message).is_ok() {
+                crate::poc::timings::published_sections(cycle, sections);
+            }
         }
         return encoded;
     }

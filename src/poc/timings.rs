@@ -24,6 +24,7 @@ struct Cycle {
     publish_serialize_ms: u64,
     publish_post_ms: u64,
     publish_bytes: u64,
+    publish_sections: BTreeMap<&'static str, u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     total_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -208,6 +209,74 @@ pub(crate) fn view(id: &str) -> serde_json::Value {
             },
         )
     })
+}
+
+/// Serialized value lengths in the posted store report, with fixed schema keys only.
+pub(crate) fn section_bytes(value: &serde_json::Value) -> BTreeMap<&'static str, u64> {
+    [
+        "store_state",
+        "store_error",
+        "store_reason",
+        "seed_backup_owed",
+        "seed_backup_completion",
+        "seed_backup_stage",
+        "setup",
+        "delivery",
+        "sessions",
+        "goals",
+        "goal_templates",
+        "mode_acceptances",
+        "signature_refusals",
+        "installations",
+        "exposure_ledger",
+        "connection_refusals",
+        "setup_offer",
+        "fixture_admission",
+        "credit",
+        "procurement",
+        "poc_targets",
+        "tasks",
+        "reinstall_approvals",
+        "lifecycle_generation",
+        "lifecycle_state",
+        "endable_sessions",
+        "payment_timer",
+        "goal_outcome",
+        "credit_error",
+        "poc_configuration",
+        "poc_keys",
+        "provider_catalogue",
+        "provider_selection_reviewed",
+        "credit_started_machine",
+        "page_error_step",
+        "goal_history",
+        "provider_configuration",
+        "readiness",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        value
+            .get(key)
+            .map(|value| (key, value.to_string().len() as u64))
+    })
+    .collect()
+}
+
+pub(crate) fn published_sections(token: Option<u64>, sections: BTreeMap<&'static str, u64>) {
+    let Some(token) = token else { return };
+    TIMINGS.with(|cell| {
+        let Ok(mut timings) = cell.try_borrow_mut() else {
+            return;
+        };
+        if let Some(entry) = timings
+            .tasks
+            .values_mut()
+            .flat_map(|r| r.entries.iter_mut())
+            .find(|e| e.token == token && e.recording)
+        {
+            entry.cycle.publish_sections = sections;
+        }
+    });
 }
 
 #[derive(Clone, Copy)]

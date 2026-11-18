@@ -861,6 +861,39 @@ impl<S: Storage> Store<S> {
         Ok(session)
     }
 
+    fn page_latest_ended_task(&self) -> Option<&str> {
+        self.poc_creation_order
+            .iter()
+            .rev()
+            .find(|id| self.poc.get(*id).is_some_and(poc::Task::ended))
+            .map(String::as_str)
+    }
+
+    fn page_in_use_machines(&self) -> std::collections::BTreeSet<&str> {
+        // Seed the rule with live bindings and tasks that are full independently of
+        // machine use. Old unfinished tasks cannot keep each other full in a cycle.
+        self.sessions
+            .iter()
+            .filter(|session| !session.ended.get())
+            .flat_map(|session| session.bound_set.iter().map(String::as_str))
+            .chain(self.poc.values().filter_map(|task| {
+                (!self.ended_sessions.contains(&task.start_session)
+                    || self.page_latest_ended_task() == Some(task.id.as_str()))
+                .then_some(task.machine.as_str())
+            }))
+            .collect()
+    }
+
+    fn page_task_is_full(
+        &self,
+        task: &poc::Task,
+        in_use: &std::collections::BTreeSet<&str>,
+    ) -> bool {
+        (!task.ended() && in_use.contains(task.machine.as_str()))
+            || !self.ended_sessions.contains(&task.start_session)
+            || self.page_latest_ended_task() == Some(task.id.as_str())
+    }
+
     pub fn sessions(&self) -> Vec<Value> {
         self.sessions
             .iter()
@@ -2734,20 +2767,13 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 report["poc_targets"] = store.poc_targets_view();
             }
             if !store.poc.is_empty() {
-                let latest_ended = store
-                    .poc_creation_order
-                    .iter()
-                    .rev()
-                    .find(|id| store.poc.get(*id).is_some_and(poc::Task::ended));
+                let in_use = store.page_in_use_machines();
                 report["tasks"] = serde_json::to_value(
                     store
                         .poc
                         .values()
                         .map(|task| {
-                            if !task.ended()
-                                || !store.ended_sessions.contains(&task.start_session)
-                                || latest_ended == Some(&task.id)
-                            {
+                            if store.page_task_is_full(task, &in_use) {
                                 store.poc_task_view(task)
                             } else {
                                 task.summary_view()
@@ -2810,6 +2836,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 history["error"] = crate::poc::wait::SESSIONS_ENDED.into();
                 if let Some(deliveries) = history["delivery"].as_array_mut() {
                     for delivery in deliveries {
+                        if delivery["summary"] == true { continue; }
                         delivery["placement_eligible"] = false.into();
                         delivery["verdict_is_historical"] = true.into();
                     }
@@ -2833,6 +2860,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 // Keep durable delivery facts distinct from the current caller's ability to act.
                 if let Some(deliveries) = protected["delivery"].as_array_mut() {
                     for delivery in deliveries {
+                        if delivery["summary"] == true { continue; }
                         let entitled = delivery["machine"].as_str().is_some_and(|machine| store.sessions.iter().any(|session| {
                             !session.ended.get() && session.bound_set.iter().any(|bound| bound == machine)
                                 && store.check_current_session(session).is_ok()

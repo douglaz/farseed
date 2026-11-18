@@ -109,6 +109,11 @@ pub trait Runtime {
     async fn load(&mut self, id: &str) -> Result<Task, String>;
     async fn authority(&mut self, id: &str, session: &str) -> Result<(), String>;
     async fn change(&mut self, task: &Task, change: Change) -> Result<Task, String>;
+    // A runtime may rule out waiting only when preparation needs neither a writer wait
+    // nor an asynchronous read or change. Otherwise publish before entering prepare.
+    fn prepare_may_wait(&self, _task: &Task) -> bool {
+        true
+    }
     async fn prepare(&mut self, task: &Task, session: &str) -> Result<Task, String>;
     async fn propose(
         &mut self,
@@ -119,6 +124,39 @@ pub trait Runtime {
     ) -> Result<Task, String>;
     async fn execute(&mut self, binding: Binding, task: &Task) -> Result<(), String>;
     async fn observe(&mut self, task: &Task, session: &str) -> Result<Observation, String>;
+}
+
+async fn publish_on_pending<T>(
+    work: impl Future<Output = T>,
+    progress: impl Future<Output = ()>,
+) -> (T, bool) {
+    let mut work = std::pin::pin!(work);
+    if let std::task::Poll::Ready(result) =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(work.as_mut().poll(cx))).await
+    {
+        return (result, false);
+    }
+    let mut progress = std::pin::pin!(progress);
+    let mut published = false;
+    let mut result = None;
+    let result = std::future::poll_fn(|cx| {
+        if !published {
+            published = progress.as_mut().poll(cx).is_ready();
+        }
+        // Keep polling work too: it may need to release a writer queued before progress.
+        if result.is_none()
+            && let std::task::Poll::Ready(value) = work.as_mut().poll(cx)
+        {
+            result = Some(value);
+        }
+        if published && result.is_some() {
+            std::task::Poll::Ready(result.take().expect("work completed"))
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await;
+    (result, true)
 }
 
 /// Continue only after the previous action has checkpointed. Budgets bound unavailable and
@@ -133,12 +171,31 @@ pub async fn drive(
         return Err("task action already active; collection may be waiting for the recorded job; let it finish or interrupt the session before Resume".into());
     }
     let _active = Active(id.into());
+    let mut publish_initial = true;
     loop {
-        let task = resume(runtime, model, id, session).await?;
-        runtime.progress(&task).await;
+        let task = match resume_with_progress(runtime, model, id, session, publish_initial).await {
+            Ok(task) => task,
+            Err(why) => {
+                if !publish_initial && let Ok(task) = runtime.load(id).await {
+                    runtime.progress(&task).await;
+                }
+                return Err(why);
+            }
+        };
+        let continues = task.pending.is_none()
+            && task.proposal.is_none()
+            && task.status == Status::Running
+            && !task.verifying
+            && !task.requesting;
+        if !continues {
+            runtime.progress(&task).await;
+        }
         if task.pending.is_some() || !matches!(task.status, Status::Running | Status::Verifying) {
             return Ok(task);
         }
+        // The next recorded request publishes this settlement together with its request
+        // count. Preserve progress when returning, checking, or waiting on a proposal.
+        publish_initial = !continues;
     }
 }
 
@@ -149,11 +206,23 @@ pub async fn resume(
     id: &str,
     session: &str,
 ) -> Result<Task, String> {
+    resume_with_progress(runtime, model, id, session, true).await
+}
+
+async fn resume_with_progress(
+    runtime: &mut impl Runtime,
+    model: &mut impl Model,
+    id: &str,
+    session: &str,
+    publish_initial: bool,
+) -> Result<Task, String> {
     let mut task = runtime.load(id).await?;
     if task.ended() {
         return Ok(task);
     }
-    runtime.progress(&task).await;
+    if publish_initial {
+        runtime.progress(&task).await;
+    }
     if let Err(why) = runtime.authority(id, session).await {
         return pause_authority(runtime, &task, why).await;
     }
@@ -171,8 +240,22 @@ pub async fn resume(
         if task.verifying {
             task = runtime.change(&task, Change::PrepareCheckJobs).await?;
         } else {
-            model.ready(&task, session).await?;
+            let mut deferred = !publish_initial;
+            if deferred {
+                let (ready, published) =
+                    publish_on_pending(model.ready(&task, session), runtime.progress(&task)).await;
+                deferred = !published;
+                ready?;
+            } else {
+                model.ready(&task, session).await?;
+            }
+            if deferred && runtime.prepare_may_wait(&task) {
+                runtime.progress(&task).await;
+            }
             task = runtime.prepare(&task, session).await?;
+            if !publish_initial && task.proposal.is_some() {
+                runtime.progress(&task).await;
+            }
             if task.proposal.is_none() {
                 task = runtime.change(&task, Change::Request).await?;
                 if !task.requesting {

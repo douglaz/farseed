@@ -224,6 +224,15 @@ impl<P: PinSource> Runtime for Web<'_, P> {
         drop(writer);
         Ok(changed)
     }
+    fn prepare_may_wait(&self, task: &Task) -> bool {
+        let local = local();
+        let Ok(mut writer) = local.try_lock() else {
+            return true;
+        };
+        writer.store().is_some_and(|store| {
+            store.poc_needs_declaration(&task.machine) && task.before_setup.is_none()
+        })
+    }
     async fn prepare(&mut self, task: &Task, session: &str) -> Result<Task, String> {
         let local = local();
         let mut writer = local.lock().await;
@@ -1042,7 +1051,7 @@ impl Default for TaskPublication {
     }
 }
 
-/// Read one ended task under the report writer, without restoring any action authority.
+/// Read one task under the report writer, without restoring any action authority.
 #[wasm_bindgen::prelude::wasm_bindgen]
 pub async fn publish_task_details(generation: u64, id: String, request: String) -> bool {
     let local = local();
@@ -1058,7 +1067,7 @@ pub async fn publish_task_details(generation: u64, id: String, request: String) 
     let Some(store) = writer.store() else {
         return false;
     };
-    let details = store.poc_task(&id).ok().filter(|task| task.ended());
+    let details = store.poc_task(&id).ok();
     let protected = details.and_then(|task| {
         let value = serde_json::json!({"task_details":{"id":id,"request":request,
             "generation":generation.to_string(),"task":store.poc_task_view(&task)}});
@@ -1078,6 +1087,77 @@ pub async fn publish_task_details(generation: u64, id: String, request: String) 
             return false;
         };
         // Even fixed framing and the page's token must survive protection unchanged.
+        if protected != refusal {
+            return false;
+        }
+        protected
+    };
+    let encoded = protected.to_string();
+    if store.check_output_bytes(encoded.as_bytes()).is_err()
+        || generation != owner.generation()
+        || owner.state() == "reconciling"
+        || crate::harness::inference::ending()
+    {
+        return false;
+    }
+    let Ok(message) = js_sys::JSON::parse(&encoded) else {
+        return false;
+    };
+    let worker: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
+    worker.post_message(&message).is_ok()
+}
+
+/// Read one delivery entry or its commands using the task-details publication boundary.
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub async fn publish_delivery_details(
+    generation: u64,
+    machine: String,
+    request: String,
+    commands: bool,
+) -> bool {
+    let local = local();
+    let mut writer = local.lock().await;
+    let owner = crate::lifecycle::owner();
+    if generation != owner.generation()
+        || owner.state() == "reconciling"
+        || crate::harness::inference::ending()
+        || writer.dispatch_refusal().is_some()
+    {
+        return false;
+    }
+    let Some(store) = writer.store() else {
+        return false;
+    };
+    let kind = if commands { "commands" } else { "entry" };
+    let details = if commands {
+        store.delivery_command_records(&machine)
+    } else {
+        store.delivery_entry_view(&machine, false)
+    };
+    let protected = details.and_then(|details| {
+        let value = serde_json::json!({"delivery_details":{"machine":machine,"request":request,
+            "generation":generation.to_string(),"kind":kind,"value":details,
+            "reports_revision":store.delivery_command_revision(&machine)}});
+        let protected = store.protect_page_publication(&value).ok()?;
+        (protected["delivery_details"]["machine"] == machine
+            && protected["delivery_details"]["request"] == request
+            && protected["delivery_details"]["generation"]
+                == value["delivery_details"]["generation"]
+            && protected["delivery_details"]["kind"] == kind
+            && if commands {
+                protected["delivery_details"]["value"].is_array()
+            } else {
+                protected["delivery_details"]["value"]["machine"] == machine
+            })
+        .then_some(protected)
+    });
+    let protected = if let Some(protected) = protected {
+        protected
+    } else {
+        let refusal = serde_json::json!({"delivery_details_unavailable":request});
+        let Ok(protected) = store.protect_publication(&refusal, &[]) else {
+            return false;
+        };
         if protected != refusal {
             return false;
         }

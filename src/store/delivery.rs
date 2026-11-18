@@ -214,35 +214,114 @@ impl<S: Storage> Store<S> {
         self.delivery_record(record).await
     }
     pub fn delivery_view(&self) -> Value {
-        self.dispatch.approved_entries.keys().map(|machine| {
-            let m = self.delivery.0.get(machine).cloned().unwrap_or_default();
-            let last = m.checks.last();
-            let completed = m.checks.iter().rfind(|c| c.result.complete);
-            let current = last.is_some_and(|c| self.journaled_delivery_authority(machine).as_ref() == Ok(&c.authority));
-            let completed_current = completed.is_some_and(|c| self.journaled_delivery_authority(machine).as_ref() == Ok(&c.authority));
-            // A completed verdict may stand through unavailable reads, but must never
-            // conceal new findings, restored unknown state or changed requirements.
-            let unavailable_only = last.is_some_and(|c| c.result.fields.iter().all(|f| matches!(f.status,
-                delivery::Status::Checked | delivery::Status::Unavailable)));
-            let verdict = if m.unknown { "findings unknown — re-check required" }
-                else if !m.findings.is_empty() { "handed over with findings" }
-                else if completed_current && unavailable_only && completed.is_some_and(|c| c.result.delivered) { "Delivered" }
-                else { "delivery evidence not yet supplied" };
-            let reports: Vec<_> = self.dispatch.calls.values().filter(|c| c.intent.machine == *machine)
-                .map(|c| json!({"command": c.intent.command, "terminal":self.dispatch.terminals.iter().find(|t| t.terminal.call == c.intent.call),
-                    "evidence":self.dispatch.jobs.iter().filter(|e| e.evidence.call == c.intent.call).collect::<Vec<_>>()})).collect();
-            let value = json!({"machine":machine,"verdict":verdict,"fixture_limit":delivery::FIXTURE_LIMIT,
+        let in_use = self.page_in_use_machines();
+        self.dispatch
+            .approved_entries
+            .keys()
+            .filter_map(|machine| {
+                self.delivery_entry_view(machine, !in_use.contains(machine.as_str()))
+            })
+            .collect::<Vec<_>>()
+            .into()
+    }
+
+    pub(crate) fn delivery_entry_view(&self, machine: &str, summary: bool) -> Option<Value> {
+        if !self.dispatch.approved_entries.contains_key(machine) {
+            return None;
+        }
+        let empty = Machine::default();
+        let m = self.delivery.0.get(machine).unwrap_or(&empty);
+        let last = m.checks.last();
+        let completed = m.checks.iter().rfind(|c| c.result.complete);
+        let current = last.is_some_and(|c| {
+            self.journaled_delivery_authority(machine).as_ref() == Ok(&c.authority)
+        });
+        let completed_current = completed.is_some_and(|c| {
+            self.journaled_delivery_authority(machine).as_ref() == Ok(&c.authority)
+        });
+        // A completed verdict may stand through unavailable reads, but must never
+        // conceal new findings, restored unknown state or changed requirements.
+        let unavailable_only = last.is_some_and(|c| {
+            c.result.fields.iter().all(|f| {
+                matches!(
+                    f.status,
+                    delivery::Status::Checked | delivery::Status::Unavailable
+                )
+            })
+        });
+        let verdict = if m.unknown {
+            "findings unknown — re-check required"
+        } else if !m.findings.is_empty() {
+            "handed over with findings"
+        } else if completed_current
+            && unavailable_only
+            && completed.is_some_and(|c| c.result.delivered)
+        {
+            "Delivered"
+        } else {
+            "delivery evidence not yet supplied"
+        };
+        let entitled = self.sessions.iter().any(|session| {
+            !session.ended.get()
+                && session.bound_set.iter().any(|bound| bound == machine)
+                && self.check_current_session(session).is_ok()
+        });
+        let reports_count = self
+            .dispatch
+            .calls
+            .values()
+            .filter(|c| c.intent.machine == machine)
+            .count();
+        let reports_revision = self.delivery_command_revision(machine);
+        let value = if summary {
+            json!({"machine":machine,"verdict":verdict,"findings_count":m.findings.len(),"summary":true,
+                "reports_revision":reports_revision})
+        } else {
+            json!({"machine":machine,"verdict":verdict,"fixture_limit":delivery::FIXTURE_LIMIT,
                 "findings":m.findings.iter().map(|f|json!({"field":f.field,"class":f.class(),"detail":f.detail})).collect::<Vec<_>>(),
                 "findings_unknown":m.unknown,"last_check":last,"current_declaration_checked":current,
                 "last_completed_check":completed,"completed_declaration_current":completed_current,
-                "verdict_is_historical":last.is_some_and(|c|!c.result.complete) || !completed_current || !m.placements_since_check.is_empty(),
-                "placement_eligible":!m.unknown && current && m.placements_since_check.is_empty() && last.is_some_and(|c|c.result.placement_eligible),
+                "verdict_is_historical":!entitled || last.is_some_and(|c|!c.result.complete) || !completed_current || !m.placements_since_check.is_empty(),
+                "placement_eligible":entitled && !m.unknown && current && m.placements_since_check.is_empty() && last.is_some_and(|c|c.result.placement_eligible),
                 "applications":m.applications,"subsequent_placement_sessions":m.placements_since_check,
-                "report_label":delivery::REPORT_LABEL,"reports":reports});
-            // Recheck current holdings at rendering, including names and historical output.
-            if crate::redaction::Redacted::inference_value_is_safe(self, &value, &[]) { value }
-            else { json!({"machine":machine,"verdict":"delivery display withheld at credential boundary","fixture_limit":delivery::FIXTURE_LIMIT}) }
-        }).collect::<Vec<_>>().into()
+                "report_label":delivery::REPORT_LABEL,
+                "reports_count":reports_count,"reports_revision":reports_revision})
+        };
+        // Every string is protected under current holdings before publication.
+        self.protect_publication(&value, &[]).ok()
+    }
+
+    pub(crate) fn delivery_command_revision(&self, machine: &str) -> usize {
+        self.dispatch
+            .calls
+            .values()
+            .filter(|c| c.intent.machine == machine)
+            .map(|c| {
+                1 + self
+                    .dispatch
+                    .terminals
+                    .iter()
+                    .filter(|t| t.terminal.call == c.intent.call)
+                    .count()
+                    + self
+                        .dispatch
+                        .jobs
+                        .iter()
+                        .filter(|e| e.evidence.call == c.intent.call)
+                        .count()
+            })
+            .sum()
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn delivery_command_records(&self, machine: &str) -> Option<Value> {
+        self.dispatch.approved_entries.contains_key(machine).then(|| {
+            self.dispatch.calls.values().filter(|c| c.intent.machine == machine)
+                .map(|c| json!({"command":c.intent.command,
+                    "terminal":self.dispatch.terminals.iter().find(|t| t.terminal.call == c.intent.call),
+                    "evidence":self.dispatch.jobs.iter().filter(|e| e.evidence.call == c.intent.call).collect::<Vec<_>>()}))
+                .collect::<Vec<_>>().into()
+        })
     }
 }
 
