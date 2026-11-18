@@ -36,6 +36,10 @@ You are building the user's control center on this NixOS machine. Follow the ste
    control-center-login.txt, app-url.txt) only by running a step's Do block. A FAIL line that ends with
    `(needs the user: ask_operator)` can only be fixed by the user: ask with `ask_operator`, wait for the
    answer, then run that step's Wait and Check again. Don't work around it.
+10. When tau-web says every step passed, call `done` with `urls`: `https://app.t3.codes` (label `T3 Code`),
+    `http://10.88.0.1:9119/` (label `Hermes dashboard over WireGuard`), and, if Tor is on, the onion address from
+    app-url.txt (label `Hermes dashboard over Tor`). If the final check printed `T3 Code: not linked yet`, leave
+    `https://app.t3.codes` out of `urls` completely: the machine isn't linked, so that address can't reach it yet.
 
 ## Facts (tau-web fills these in)
 
@@ -928,6 +932,9 @@ Then call `offer_file` for each `OFFER` path the block printed, so the user can 
 
 Never print these two files: their contents only reach the user through `offer_file`.
 
+After the two `offer_file` calls, run the Check below. This step isn't done until it prints
+`CHECKS handover PASS`; don't go on to the final check or commit before that.
+
 **Check** (run it alone, exactly as written)
 ```sh
 sh /etc/nixos/cc-check.sh handover
@@ -972,9 +979,8 @@ home folder and open http://10.88.0.1:9119/. Your sign-in details are in `contro
 by you. Everything is declared in /etc/nixos and comes back after a reboot. To add software later, ask me, or ask
 Hermes."
 
-Then call `done` with `urls`: `https://app.t3.codes` (label `T3 Code`, or `T3 Code (not linked yet)` if the check
-printed `T3 Code: not linked yet`), `http://10.88.0.1:9119/` (label `Hermes dashboard over WireGuard`), and, if
-Tor is on, the onion address from app-url.txt (label `Hermes dashboard over Tor`).
+Then call `done` with the `urls` that Header rule 10 lists. If the check printed `T3 Code: not linked yet`, leave
+`https://app.t3.codes` out of `urls` completely.
 
 ---
 
