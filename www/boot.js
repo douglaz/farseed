@@ -347,10 +347,14 @@ const render = (store, forceRender = false) => {
       : ' Seed-backup record: re-entry check skipped.';
   }
   $('seed-backup-state').textContent = active
-    ? ['Seed-backup ceremony.', store.seed_backup_owed
-      ? 'New machines, relay passes and handoffs are refused until the seed backup is recorded.'
-      : stage !== 'append_failed' && 'Re-display: record a new full re-entry or skip.',
-    'Dispatch is stopped.', store.error].filter(Boolean).join(' ')
+    ? [stage === 'showing_words'
+      ? 'Your seed backup: write these 12 words on paper, in order, and keep them private. They back up the keys this store uses for your machines. Your AI credit and provider account are not in them: those are kept only in this browser.'
+      : stage === 'answering' ? 'Type all 12 words to check your copy, or skip the check.'
+      : stage === 'append_failed' ? 'Your seed backup could not be saved. Reload this page to try again.' : 'Seed backup.',
+    store.seed_backup_owed
+      ? 'Until this is recorded, no new machine, relay pass or handover is allowed.'
+      : stage !== 'append_failed' && 'You asked to see the words again: record a new full re-entry, or skip.',
+    'No commands are sent while this is open.', store.error].filter(Boolean).join(' ')
     : '';
   if (state === 'locked' && redisplay) $('store-explanation').textContent += ' Enter the local passphrase again to show the seed backup.';
   renderSteps(store);

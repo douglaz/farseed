@@ -60,7 +60,7 @@ section section { min-width: 0; }
 <button id="tau-lock" type="button" hidden>Lock</button></div>
 <p id="tau-lifecycle-disclosure">Switching apps or locking the screen can leave your keys and account unlocked in memory indefinitely. Approved work, including disk wipes, may continue unseen or after a reload without asking again. End stops new work; Lock pauses it and keeps each session’s machine. Remote work already accepted can continue after End. Your phone can freeze or close this page without warning.</p>
 <section class="step" data-step="store">
-<h2>1 Local store</h2>
+<h2>1 Your store on this device</h2>
 <p id="tau-step-store-status" class="step-status"></p>
 <p id="tau-step-store-error" class="step-error" role="status"></p>
 <div id="tau-step-store-action"></div>
@@ -77,14 +77,14 @@ section section { min-width: 0; }
 <section id="tau-seed-backup" hidden aria-label="Seed-backup ceremony">
 <p id="tau-seed-backup-state"></p>
 <div id="tau-seed-backup-words-slot"></div>
-<button id="tau-seed-backup-answer" type="button" hidden>Hide words and answer</button>
+<button id="tau-seed-backup-answer" type="button" hidden>I wrote them down: hide the words</button>
 <div id="tau-seed-backup-entry" hidden>
 <label>Re-enter all twelve words <textarea id="tau-seed-backup-input" autocomplete="OFF" spellcheck="FALSE" autocapitalize="none"></textarea></label>
 <button id="tau-seed-backup-check" type="button">Check all twelve words</button>
 <button id="tau-seed-backup-skip" type="button">Skip the re-entry check</button>
 </div>
 </section>
-<details id="tau-step-store-fold" open><summary>Local store options</summary>
+<details id="tau-step-store-fold" open><summary>Store options</summary>
 <button id="tau-redisplay" type="button" hidden>Show seed backup again</button>
 
 </details>
@@ -94,7 +94,7 @@ section section { min-width: 0; }
 </section>
 <div id="tau-poc" inert>
 <section class="step" data-step="credit">
-<h2>2 Inference credit</h2>
+<h2>2 AI credit</h2>
 <p id="tau-credit-status" class="step-status" role="status">No inference credit yet.</p>
 <p id="tau-step-credit-error" class="step-error" role="status"></p>
 <div id="tau-step-credit-action"></div>
@@ -107,7 +107,7 @@ section section { min-width: 0; }
 <div id="tau-credit-invoices"></div>
 <details><summary>Details</summary><p id="tau-credit-details"></p></details>
 </section></div>
-<details id="tau-step-credit-fold"><summary>Inference credit options</summary>
+<details id="tau-step-credit-fold"><summary>AI credit options</summary>
 <div class="requires-store" hidden>
 <details><summary>Details</summary><p id="tau-defaults-status">Reading deployment defaults…</p></details>
 
@@ -126,7 +126,7 @@ section section { min-width: 0; }
 </details>
 </section>
 <section class="step" data-step="machine">
-<h2>3 Machine</h2>
+<h2>3 Your machine</h2>
 <p id="tau-step-machine-status" class="step-status"></p>
 <p id="tau-step-machine-error" class="step-error" role="status"></p>
 <div id="tau-step-machine-action"></div>
@@ -219,7 +219,7 @@ section section { min-width: 0; }
 </details>
 </section>
 <section class="step" data-step="task">
-<h2>4 Task</h2>
+<h2>4 Setup</h2>
 <p id="tau-step-task-status" class="step-status"></p>
 <p id="tau-step-task-error" class="step-error" role="status"></p>
 <div id="tau-step-task-action"></div>
@@ -228,7 +228,7 @@ section section { min-width: 0; }
 <div id="tau-task-progress"></div>
 <div class="requires-store" hidden><div id="tau-poc-targets"></div></div>
 <div class="requires-store" hidden><div id="tau-poc-public-keys" aria-live="polite"></div></div>
-<details id="tau-step-task-fold"><summary>Task options</summary>
+<details id="tau-step-task-fold"><summary>Setup options</summary>
 <div class="requires-store" hidden>
 <p id="tau-relay-task-guidance">After enrollment, configure inference, then press Start session for the displayed model and machine. Copy its public keys. Install the SSH line and enroll the separate relay public key with the relay operator.</p>
 <p>Set the session’s goal. Accept it with commands that check the result. Edit and propose the installation declaration, then approve its requirements card. Press Resume to continue. Commands require that approval.</p>
