@@ -311,27 +311,28 @@ impl Template {
         if declaration_needed {
             return self.declaration;
         }
-        Some(
-            self.steps
+        let mut steps = self.steps.iter().filter(|step| {
+            step.conditions
                 .iter()
-                .filter(|step| {
-                    step.conditions
-                        .iter()
-                        .all(|name| fact(name, task.options.as_ref()) == "yes")
+                .all(|name| fact(name, task.options.as_ref()) == "yes")
+        });
+        let mut current = steps.next();
+        for (_, tool, output) in &task.completed[..completed] {
+            let Some(step) = current else {
+                break;
+            };
+            if matches!(tool, Tool::Exec { .. })
+                && output["content"]["stdout"].as_str().is_some_and(|text| {
+                    markers(text)
+                        .rev()
+                        .find(|(part, _)| *part == step.part)
+                        .is_some_and(|(_, passed)| passed)
                 })
-                .find(|step| {
-                    !task.completed[..completed].iter().any(|(_, tool, output)| {
-                        matches!(tool, Tool::Exec { .. })
-                            && output["content"]["stdout"].as_str().is_some_and(|text| {
-                                markers(text)
-                                    .rev()
-                                    .find(|(part, _)| *part == step.part)
-                                    .is_some_and(|(_, passed)| passed)
-                            })
-                    })
-                })
-                .map_or(FINISHED, |step| step.text),
-        )
+            {
+                current = steps.next();
+            }
+        }
+        Some(current.map_or(FINISHED, |step| step.text))
     }
 
     pub fn failed(&self, task: &Task) -> bool {
