@@ -766,7 +766,9 @@ if ! systemctl is-active -q t3-connect; then
     /run/current-system/sw/bin/t3c connect link --headless
 fi
 for i in $(seq 30); do grep -q 'user_code=' $L && break; sleep 1; done
-grep -E 'user_code=|^Code:|Expires in' $L | tail -n 3
+grep -E 'user_code=|^Code:' $L | tail -n 2
+if grep -q 'user_code=' $L; then echo "LINK READY: the sign-in waits in the background for 10 minutes. Next: call ask_operator with this link."
+else echo "NO LINK YET: run this block again."; fi
 STEP
 ```
 **Wait** (each call waits up to 4 minutes; repeat while it says STILL WAITING):
