@@ -1070,6 +1070,7 @@ const renderTasks = (store) => {
     const card = document.createElement('section');
     card.dataset.task = task.id;
     card.dataset.cycleTimings = JSON.stringify(task.cycle_timings ?? []);
+    card.dataset.replyTools = JSON.stringify(task.reply_tools ?? []);
     const session = (store.sessions ?? []).find(s => s.identity === task.start_session && s.session_state !== 'ended' && s.bound_set.length === 1 && s.bound_set[0] === task.machine);
     paragraph(card, `Setting up ${task.machine}: ${taskStatus(task.status, task)}.`);
     if (entry.summary) {

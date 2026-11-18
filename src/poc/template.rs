@@ -285,7 +285,7 @@ impl Template {
             return None;
         }
         Some(format!(
-            "Step {number} is not passed yet. Carry on from the last block you ran, following the step's text and that block's output: use run_step_block with this step number and the next block's label, including the block for the operator's answer and any ask_operator, request_ai_key or offer_file call it asks for; run a block again only when its output, the step's \"If it fails\" or Recovery tells you to, and don't start the step over. Then run its Check block alone with run_step_block; go on only when its output shows \"CHECKS {} PASS\".",
+            "Step {number} is not passed yet. Continue from the last block and its output; don't start over. Use run_step_block with this step number and the next label for every block, including Steps 4, 5 and 11; never type blocks out. The product fills AI_KEY_PATH, AI_BASE_URL, AI_MODEL, USER_SSH_KEY and MACHINE_ADDRESS itself. Follow any ask_operator, request_ai_key or offer_file instruction. Repeat a block only when its output, If it fails or Recovery says to. Use exec only for reads and fixes. Run Check alone by name; advance only on \"CHECKS {} PASS\".",
             step.part
         ))
     }

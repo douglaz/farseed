@@ -1,8 +1,16 @@
 //! Durable local orchestration. A session supplies current authority, never continuation state.
 use super::*;
 use crate::goals::Tool;
+use std::collections::BTreeMap;
 
 pub type Step = (String, Tool, Value);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BlockOrigin {
+    pub step: usize,
+    pub block: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -143,6 +151,8 @@ pub struct Task {
     /// Compare-and-append token: stale requests cannot publish or arm a command.
     pub revision: u64,
     pub inspection_record: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub block_origins: BTreeMap<String, BlockOrigin>,
 }
 impl Task {
     pub fn awaiting_operator(&self) -> bool {
@@ -344,6 +354,11 @@ pub enum Change {
         call_id: String,
         tool: Tool,
         refusal: Option<String>,
+    },
+    ProposeBlock {
+        call_id: String,
+        tool: Tool,
+        origin: BlockOrigin,
     },
     PrepareCheck,
     // New attempts batch harness reads; PrepareCheck keeps its historical replay meaning.
@@ -730,6 +745,7 @@ impl<S: Storage> Store<S> {
         session: &str,
         call_id: String,
         mut tool: Tool,
+        origin: Option<BlockOrigin>,
     ) -> Result<Task, String> {
         self.poc_authority(&task.id, session)?;
         self.poc_safe(&tool)?;
@@ -744,7 +760,14 @@ impl<S: Storage> Store<S> {
         {
             checks.clear();
         }
-        let change = if matches!(tool, Tool::AskOperator { .. }) {
+        let change = if let Some(origin) = origin {
+            self.poc_safe(&origin)?;
+            Change::ProposeBlock {
+                call_id,
+                tool,
+                origin,
+            }
+        } else if matches!(tool, Tool::AskOperator { .. }) {
             Change::ProposeOperator {
                 call_id,
                 refusal: crate::poc::question::validate(&tool)
@@ -1402,6 +1425,7 @@ impl<S: Storage> Store<S> {
                 before_setup: None,
                 revision: 0,
                 inspection_record: None,
+                block_origins: BTreeMap::new(),
             });
         }
         let (id, expected) = match record {
@@ -1708,8 +1732,18 @@ impl<S: Storage> Store<S> {
                         }
                     }
                     Change::Propose { call_id, tool }
+                    | Change::ProposeBlock { call_id, tool, .. }
                     | Change::ProposeDone { call_id, tool, .. }
                     | Change::ProposeOperator { call_id, tool, .. } => {
+                        if matches!(change, Change::ProposeBlock { .. })
+                            && (task.template.as_deref() != Some(crate::poc::template::ID)
+                                || !matches!(tool, Tool::Exec { machine, .. } if machine == &task.machine))
+                        {
+                            return Err(
+                                "block origin requires an exec on the control-center machine"
+                                    .into(),
+                            );
+                        }
                         if matches!(change, Change::ProposeDone { .. })
                             && !matches!(tool, Tool::Done { .. })
                         {
@@ -1743,6 +1777,9 @@ impl<S: Storage> Store<S> {
                             || task.completed.iter().any(|(id, _, _)| id == call_id)
                         {
                             return Err("invalid or duplicate task call ID".into());
+                        }
+                        if let Change::ProposeBlock { origin, .. } = change {
+                            task.block_origins.insert(call_id.clone(), origin.clone());
                         }
                         if task.steps >= task.limits.steps {
                             task.pause("step limit reached; raise limits and Resume");

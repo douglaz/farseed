@@ -317,7 +317,7 @@ pub fn test_poc_model_clear() {
 pub(crate) fn poc_model_next(
     machine: &str,
     needs_declaration: bool,
-) -> Option<(String, crate::goals::Tool)> {
+) -> Option<crate::poc::inference::ModelReply> {
     POC_MODEL.with_borrow_mut(|model| {
         let (command, count, executed) = model.as_mut()?;
         *count += 1;
@@ -339,7 +339,7 @@ pub(crate) fn poc_model_next(
                 checks: vec![],
             }
         };
-        Some((format!("fixture-call-{count}"), tool))
+        Some((format!("fixture-call-{count}"), tool, None))
     })
 }
 

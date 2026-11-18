@@ -268,7 +268,7 @@ mod worker {
             Err(pause) => return serde_json::json!({"pause":pause}).to_string(),
         };
         match crate::poc::inference::next(&task, &session).await {
-            Ok((id, tool)) => serde_json::json!({"id":id,"tool":tool}).to_string(),
+            Ok((id, tool, _)) => serde_json::json!({"id":id,"tool":tool}).to_string(),
             Err(crate::poc::inference::ReplyError::Pause(reason)) => {
                 serde_json::json!({"pause":reason}).to_string()
             }

@@ -316,12 +316,15 @@ impl<P: PinSource> Runtime for Web<'_, P> {
         session: &str,
         call_id: String,
         tool: crate::goals::Tool,
+        origin: Option<crate::store::poc::BlockOrigin>,
     ) -> Result<Task, String> {
         let local = local();
         let mut writer = local.lock().await;
         self.continuation.check()?;
         let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
-        let changed = store.poc_propose(task, session, call_id, tool).await?;
+        let changed = store
+            .poc_propose(task, session, call_id, tool, origin)
+            .await?;
         drop(writer);
         Ok(changed)
     }
@@ -1156,7 +1159,7 @@ impl run::Model for Configured {
         &mut self,
         task: &Task,
         session: &str,
-    ) -> Result<(String, crate::goals::Tool), crate::poc::inference::ReplyError> {
+    ) -> Result<crate::poc::inference::ModelReply, crate::poc::inference::ReplyError> {
         // Progress has released the preceding result. Configuration may change during
         // the next request, whose adapter detects changes and aborts honestly.
         self.response.borrow_mut().take();
@@ -1171,12 +1174,17 @@ impl run::Model for Configured {
                 .poc_needs_declaration(&task.machine),
         ) {
             *self.response.borrow_mut() = Some(crate::poc::inference::CommandResponse::reserve());
+            super::timings::reply(&task.id, Some(&next));
             return Ok(next);
         }
         let next = crate::poc::inference::next(task, session).await;
         if matches!(&next, Err(crate::poc::inference::ReplyError::Pause(why)) if why == crate::poc::inference::TRANSPORT_INTERRUPTED)
         {
             self.automatic = true;
+        }
+        // Malformed JSON is rejected by the browser before the shared completion path.
+        if matches!(&next, Err(why) if &**why == "inference response malformed JSON") {
+            super::timings::reply(&task.id, None);
         }
         // A failed request has no new command result to release. In particular, let
         // the operator configure an endpoint/key while its pause is being recorded.

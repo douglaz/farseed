@@ -47,6 +47,7 @@ struct Entry {
 struct Ring {
     number: u64,
     entries: VecDeque<Entry>,
+    reply_tools: VecDeque<&'static str>,
 }
 #[derive(Default)]
 struct Timings {
@@ -128,6 +129,7 @@ pub(crate) fn proposal(task: &Task, record: &Record, started: Option<f64>) {
         record,
         Record::Change {
             change: Change::Propose { .. }
+                | Change::ProposeBlock { .. }
                 | Change::PrepareRead
                 | Change::PrepareCheck
                 | Change::PrepareCheckBatch
@@ -207,6 +209,39 @@ pub(crate) fn view(id: &str) -> serde_json::Value {
                 serde_json::to_value(ring.entries.iter().map(|e| &e.cycle).collect::<Vec<_>>())
                     .unwrap_or_else(|_| serde_json::json!([]))
             },
+        )
+    })
+}
+
+/// One fixed word per completed AI reply; no arguments or model-supplied names.
+pub(crate) fn reply(id: &str, reply: Option<&super::inference::ModelReply>) {
+    let name = match reply {
+        Some((_, _, Some(_))) => "run_step_block",
+        Some((_, tool, None)) => match tool {
+            crate::goals::Tool::Exec { .. } => "exec",
+            crate::goals::Tool::Done { .. } => "done",
+            crate::goals::Tool::ProposeDeclaration { .. } => "propose_declaration",
+            crate::goals::Tool::RequestAiKey { .. } => "request_ai_key",
+            crate::goals::Tool::OfferFile { .. } => "offer_file",
+            crate::goals::Tool::AskOperator { .. } => "ask_operator",
+            _ => "none",
+        },
+        None => "none",
+    };
+    TIMINGS.with_borrow_mut(|timings| {
+        let ring = timings.tasks.entry(id.into()).or_default();
+        if ring.reply_tools.len() == 256 {
+            ring.reply_tools.pop_front();
+        }
+        ring.reply_tools.push_back(name);
+    });
+}
+
+pub(crate) fn reply_tools(id: &str) -> serde_json::Value {
+    TIMINGS.with_borrow(|timings| {
+        timings.tasks.get(id).map_or_else(
+            || serde_json::json!([]),
+            |ring| serde_json::json!(ring.reply_tools),
         )
     })
 }
@@ -399,6 +434,7 @@ pub(crate) fn change_label(change: &Change) -> &'static str {
         Change::CutOff { .. } => "CutOff",
         Change::CutOffAtLimit { .. } => "CutOffAtLimit",
         Change::Propose { .. } => "Propose",
+        Change::ProposeBlock { .. } => "Propose",
         Change::ProposeDone { .. } => "ProposeDone",
         Change::ProposeOperator { .. } => "ProposeOperator",
         Change::PrepareCheck => "PrepareCheck",

@@ -66,7 +66,7 @@ pub trait Model {
         &mut self,
         task: &Task,
         session: &str,
-    ) -> Result<(String, Tool), super::inference::ReplyError>;
+    ) -> Result<super::inference::ModelReply, super::inference::ReplyError>;
 }
 
 pub struct Unconfigured;
@@ -75,7 +75,7 @@ impl Model for Unconfigured {
         &mut self,
         _: &Task,
         _: &str,
-    ) -> Result<(String, Tool), super::inference::ReplyError> {
+    ) -> Result<super::inference::ModelReply, super::inference::ReplyError> {
         Err("no inference endpoint configured".into())
     }
 }
@@ -121,6 +121,7 @@ pub trait Runtime {
         session: &str,
         call_id: String,
         tool: Tool,
+        origin: Option<crate::store::poc::BlockOrigin>,
     ) -> Result<Task, String>;
     async fn execute(&mut self, binding: Binding, task: &Task) -> Result<(), String>;
     async fn observe(&mut self, task: &Task, session: &str) -> Result<Observation, String>;
@@ -290,8 +291,8 @@ async fn resume_with_progress(
                     return pause_authority(runtime, &task, why).await;
                 }
                 task = match next {
-                    Ok((call_id, tool)) => {
-                        match runtime.propose(&task, session, call_id, tool).await {
+                    Ok((call_id, tool, origin)) => {
+                        match runtime.propose(&task, session, call_id, tool, origin).await {
                             Ok(task) => task,
                             Err(why) => {
                                 return runtime

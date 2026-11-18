@@ -199,6 +199,7 @@ impl<S: Storage> Store<S> {
         #[cfg(target_arch = "wasm32")]
         {
             value["cycle_timings"] = crate::poc::timings::view(&task.id);
+            value["reply_tools"] = crate::poc::timings::reply_tools(&task.id);
             if task.requesting
                 && !task.ended()
                 && !self.ended_sessions.contains(&task.start_session)

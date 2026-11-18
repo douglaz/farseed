@@ -376,7 +376,7 @@ async fn body(
 pub(crate) async fn next(
     task: &crate::store::poc::Task,
     session: &str,
-) -> Result<(String, crate::goals::Tool), ReplyError> {
+) -> Result<ModelReply, ReplyError> {
     let revision = REVISION.get();
     let continuation = crate::lifecycle::owner().continuation()?;
     match exchange(task, session).await {
@@ -390,10 +390,7 @@ pub(crate) async fn next(
     }
 }
 
-async fn exchange(
-    task: &crate::store::poc::Task,
-    session: &str,
-) -> Result<(String, crate::goals::Tool), ReplyError> {
+async fn exchange(task: &crate::store::poc::Task, session: &str) -> Result<ModelReply, ReplyError> {
     let machine = task.machine.as_str();
     let history = model_steps(task);
     let steps = history.as_slice();
