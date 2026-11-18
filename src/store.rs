@@ -756,7 +756,7 @@ impl<S: Storage> Store<S> {
     }
 
     async fn setup_record(&mut self, record: crate::dispatch::SetupRecord) -> Result<(), String> {
-        let mut dispatch = self.dispatch.clone();
+        let mut dispatch = self.measured_dispatch_copy();
         let mut allocation = self.allocation().clone();
         dispatch.apply_setup(&mut allocation, &record)?;
         if matches!(record, crate::dispatch::SetupRecord::Approval(_)) {
@@ -1374,8 +1374,8 @@ impl<S: Storage> Store<S> {
         &mut self,
         evidence: crate::dispatch::StoredAssociation,
     ) -> Result<(), String> {
-        let mut next = self.dispatch.clone();
-        next.associate_stored(self.next, evidence.clone())?;
+        self.dispatch.check_associate_stored(self.next, &evidence)?;
+        let number = self.next;
         let prior_diagnostic = self.uncommitted_evidence.clone();
         if matches!(evidence, crate::dispatch::StoredAssociation::Protected(_)) {
             self.uncommitted_evidence = Some(crate::dispatch::EvidenceDiagnostic::Association {
@@ -1383,14 +1383,16 @@ impl<S: Storage> Store<S> {
                 association: evidence.clone(),
             });
         }
-        if let Err(why) = self.commit(&Event::Association(evidence)).await {
+        if let Err(why) = self.commit(&Event::Association(evidence.clone())).await {
             if why == crate::poc::wait::JOURNAL_REFUSED && self.failed.is_none() {
                 self.uncommitted_evidence = prior_diagnostic;
             }
             return Err(why);
         }
         self.uncommitted_evidence = None;
-        self.dispatch = next;
+        self.dispatch
+            .associate_stored(number, evidence)
+            .expect("validated association applies after commit");
         Ok(())
     }
 
@@ -1588,11 +1590,14 @@ impl<S: Storage> Store<S> {
         &mut self,
         observation: crate::dispatch::Observation,
     ) -> Result<Vec<u64>, String> {
-        let mut next = self.dispatch.clone();
-        let settled = next.observe(self.next, observation.clone())?;
-        self.commit(&Event::OperationObservation(observation))
+        self.dispatch.check_observation(&observation)?;
+        let number = self
+            .commit(&Event::OperationObservation(observation.clone()))
             .await?;
-        self.dispatch = next;
+        let settled = self
+            .dispatch
+            .observe(number, observation)
+            .expect("validated observation applies after commit");
         Ok(settled)
     }
 
@@ -1620,8 +1625,8 @@ impl<S: Storage> Store<S> {
         &mut self,
         evidence: crate::dispatch::StoredReceipt,
     ) -> Result<Vec<u64>, String> {
-        let mut next = self.dispatch.clone();
-        let settled = next.receive_stored(self.next, evidence.clone())?;
+        self.dispatch.validate_receipt(self.next, &evidence)?;
+        let number = self.next;
         let prior_diagnostic = self.uncommitted_evidence.clone();
         if matches!(evidence, crate::dispatch::StoredReceipt::Protected(_)) {
             self.uncommitted_evidence = Some(crate::dispatch::EvidenceDiagnostic::Receipt {
@@ -1629,14 +1634,20 @@ impl<S: Storage> Store<S> {
                 receipt: evidence.clone(),
             });
         }
-        if let Err(why) = self.commit(&Event::OperationReceipt(evidence)).await {
+        if let Err(why) = self
+            .commit(&Event::OperationReceipt(evidence.clone()))
+            .await
+        {
             if why == crate::poc::wait::JOURNAL_REFUSED && self.failed.is_none() {
                 self.uncommitted_evidence = prior_diagnostic;
             }
             return Err(why);
         }
         self.uncommitted_evidence = None;
-        self.dispatch = next;
+        let settled = self
+            .dispatch
+            .receive_stored(number, evidence)
+            .expect("validated receipt applies after commit");
         Ok(settled)
     }
 
@@ -2421,10 +2432,11 @@ impl<S: Storage> Journal for Store<S> {
     }
 
     async fn terminal(&mut self, terminal: &Terminal) -> Result<u64, String> {
-        let mut next = self.dispatch.clone();
-        next.terminal(self.next, terminal.clone())?;
+        self.dispatch.check_terminal(terminal)?;
         let number = self.commit(&Event::Terminal(terminal.clone())).await?;
-        self.dispatch = next;
+        self.dispatch
+            .terminal(number, terminal.clone())
+            .expect("validated terminal applies after commit");
         Ok(number)
     }
 
@@ -2455,8 +2467,9 @@ impl<S: Storage> Journal for Store<S> {
             intent.map_or("", |i| i.command.as_str()),
         )?;
         let terminal = report.state == crate::jobs::State::Finished;
-        let mut next = self.dispatch.clone();
-        let mut report = next.job_evidence(self.next, report.evidence.clone(), terminal)?;
+        let mut report = self
+            .dispatch
+            .check_job_evidence(self.next, &report.evidence, terminal)?;
         // Replay derives this same canonical projection from the committed evidence.
         // Protect display copies of the journal command without changing that authority.
         report.comparison = serde_json::from_value(self.protect_output(
@@ -2479,8 +2492,10 @@ impl<S: Storage> Journal for Store<S> {
         } else {
             Event::JobObservation(evidence.clone())
         };
-        self.commit(&event).await?;
-        self.dispatch = next;
+        let number = self.commit(&event).await?;
+        self.dispatch
+            .job_evidence(number, evidence.clone(), terminal)
+            .expect("validated job evidence applies after commit");
         Ok(report)
     }
 }

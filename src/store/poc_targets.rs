@@ -132,7 +132,7 @@ impl<S: Storage> Store<S> {
         }
         if let Some(old) = self.poc_targets.get(&record.target.machine) {
             return if old == record {
-                Ok((self.dispatch.clone(), self.allocation().clone()))
+                Ok((self.measured_dispatch_copy(), self.allocation().clone()))
             } else {
                 Err("stored target is immutable; use a fresh store and a new machine name".into())
             };
@@ -147,7 +147,7 @@ impl<S: Storage> Store<S> {
             {
                 return Err("purchase handoff identity conflicts".into());
             }
-            return Ok((self.dispatch.clone(), self.allocation().clone()));
+            return Ok((self.measured_dispatch_copy(), self.allocation().clone()));
         }
         if !self.dispatch.approved_entries.is_empty() || !self.poc_targets.is_empty() {
             return Err(
@@ -174,7 +174,7 @@ impl<S: Storage> Store<S> {
             return Err("machine name already has unrelated command history".into());
         }
         let mut allocation = self.allocation().clone();
-        let mut dispatch = self.dispatch.clone();
+        let mut dispatch = self.measured_dispatch_copy();
         // These facts describe an already owned machine; zero is no new procurement charge.
         let approved = ApprovedEntry {
             entry: MachineEntry {

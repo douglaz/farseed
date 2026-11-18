@@ -1097,7 +1097,7 @@ impl<S: Storage> Store<S> {
                 identity: p.identity.clone(),
                 access: Some(Access::ad_hoc()),
             };
-            let mut dispatch = self.dispatch.clone();
+            let mut dispatch = self.measured_dispatch_copy();
             let mut allocation = self.allocation().clone();
             if matches!(record, Record::Approved(_)) {
                 dispatch.apply_poc_purchase(&mut allocation, approved, p.class_answer)?;

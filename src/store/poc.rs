@@ -636,7 +636,7 @@ impl<S: Storage> Store<S> {
             Err(crate::poc::wait::TASK_BOUNDARY.into())
         }
     }
-    fn measured_dispatch_copy(&self) -> crate::dispatch::Dispatch {
+    pub(super) fn measured_dispatch_copy(&self) -> crate::dispatch::Dispatch {
         let timing = super::unlock_marks::Timer::new(super::unlock_marks::Mark::DispatchCopy);
         timing.count(super::unlock_marks::Counter::DispatchCopies, 1);
         timing.count(
@@ -1217,10 +1217,12 @@ impl<S: Storage> Store<S> {
             call,
             job: fence.prepared.job.clone(),
         };
-        let mut next = self.dispatch.clone();
-        next.launch_attempt(&attempt, false)?;
-        self.commit(&Event::LaunchTransmission(attempt)).await?;
-        self.dispatch = next;
+        self.dispatch.check_launch_attempt(&attempt, false)?;
+        self.commit(&Event::LaunchTransmission(attempt.clone()))
+            .await?;
+        self.dispatch
+            .launch_attempt(&attempt, false)
+            .expect("validated launch reservation applies after commit");
         Ok(())
     }
 
@@ -1303,19 +1305,14 @@ impl<S: Storage> Store<S> {
             return Err(storage("prepared launch bytes differ".into()));
         }
         self.check_signature(&machine, &command).await?;
-        // Check the usual admission on a projection that exempts exactly this call's
-        // hold. The authoritative call remains unresolved throughout.
-        let mut admission = self.dispatch.clone();
-        admission
-            .calls
-            .get_mut(&call)
-            .ok_or_else(|| storage("unknown launch call".into()))?
-            .state = crate::dispatch::CallState::NoEffect;
-        admission
-            .check_command(&machine)
+        // Exempt exactly this call's hold. Its authoritative state stays unresolved.
+        self.dispatch
+            .check_command_except(&machine, Some(call))
             .map_err(AppendRefusal::Policy)?;
         if !preparing {
-            admission.check_installation(&machine).map_err(storage)?;
+            self.dispatch
+                .check_installation(&machine)
+                .map_err(storage)?;
         }
         if self.pending_machine(&machine) {
             return Err(storage("proposal approval pending".into()));
@@ -1324,19 +1321,34 @@ impl<S: Storage> Store<S> {
             call,
             job: job.into(),
         };
-        let mut next = self.dispatch.clone();
-        next.launch_attempt(&attempt, true).map_err(storage)?;
-        self.commit(&Event::Resend(attempt))
+        self.dispatch
+            .check_launch_attempt(&attempt, true)
+            .map_err(storage)?;
+        self.commit(&Event::Resend(attempt.clone()))
             .await
             .map_err(storage)?;
-        self.dispatch = next;
+        self.dispatch
+            .launch_attempt(&attempt, true)
+            .expect("validated resend reservation applies after commit");
         Ok(Some(sent))
     }
     pub(super) fn apply_poc(&mut self, number: u64, record: &Record) -> Result<(), String> {
         // Validate the new record, not previously committed transcript bytes. Settle
         // protects its derived outcome separately before checkpointing it.
         self.poc_record_safe(record)?;
-        let task = self.project_poc(number, record)?;
+        let task = match record {
+            Record::Create { .. } | Record::Start { .. } => self.project_poc(number, record)?,
+            Record::Change { id, .. }
+            | Record::Command {
+                binding: Binding { task: id, .. },
+                ..
+            } => {
+                // Replay refuses the store on error; it does not need a rollback copy.
+                // Live callers have already projected successfully before committing.
+                let task = self.poc.remove(id).ok_or(crate::poc::wait::UNKNOWN_TASK)?;
+                self.project_poc_task(number, record, task)?
+            }
+        };
         self.apply_poc_key_class(record, &task);
         if let Record::Command { intent, launch, .. } = record {
             self.apply_intent(number, intent.clone())?;
@@ -1442,13 +1454,13 @@ impl<S: Storage> Store<S> {
                 block_origins: BTreeMap::new(),
             });
         }
-        let (id, expected) = match record {
-            Record::Change { id, expected, .. } => (id, *expected),
-            Record::Command { binding, .. } => (&binding.task, binding.revision),
+        let id = match record {
+            Record::Change { id, .. } => id,
+            Record::Command { binding, .. } => &binding.task,
             _ => unreachable!(),
         };
         let task = self.poc.get(id).ok_or(crate::poc::wait::UNKNOWN_TASK)?;
-        let mut task = {
+        let task = {
             let timing = super::unlock_marks::Timer::new(super::unlock_marks::Mark::TaskCopy);
             timing.count(super::unlock_marks::Counter::TaskCopies, 1);
             timing.count(
@@ -1456,6 +1468,20 @@ impl<S: Storage> Store<S> {
                 task.completed.len() as u64,
             );
             task.clone()
+        };
+        self.project_poc_task(number, record, task)
+    }
+
+    fn project_poc_task(
+        &self,
+        number: u64,
+        record: &Record,
+        mut task: Task,
+    ) -> Result<Task, String> {
+        let expected = match record {
+            Record::Change { expected, .. } => *expected,
+            Record::Command { binding, .. } => binding.revision,
+            _ => unreachable!(),
         };
         if task.revision != expected || task.ended() {
             return Err(crate::poc::wait::STALE_TASK.into());
@@ -1525,10 +1551,9 @@ impl<S: Storage> Store<S> {
                     .as_ref()
                     .ok_or("task command requires job identity")?
                     .clone();
-                let mut dispatch = self.measured_dispatch_copy();
-                dispatch.intent(number, intent.clone())?;
+                self.dispatch.check_intent(number, intent)?;
                 if let Some(prepared) = launch {
-                    dispatch.prepare_launch(prepared.clone())?;
+                    self.dispatch.check_new_launch(intent, prepared)?;
                 }
                 task.pending = Some(Pending {
                     call: number,
@@ -2330,7 +2355,10 @@ impl<S: Storage> Store<S> {
                             return Err(crate::poc::wait::UNTRUSTWORTHY.into());
                         }
                         let before_setup = task.preparing_read();
-                        let proposal = task.proposal.take().ok_or(crate::poc::wait::NO_PROPOSAL)?;
+                        let proposal = task
+                            .proposal
+                            .as_ref()
+                            .ok_or(crate::poc::wait::NO_PROPOSAL)?;
                         let exit = report.exit_status;
                         let background = report.state == crate::jobs::State::Background;
                         if !background && exit.is_none() && !proposal.check_batch() {
@@ -2340,15 +2368,13 @@ impl<S: Storage> Store<S> {
                             if background {
                                 return Err("AI key write is still running; inspect the recorded job before Resume".into());
                             }
-                            self.ai_key_outcome(
-                                self.poc.get(&task.id).ok_or("AI key task missing")?,
-                                exit,
-                            )?
+                            self.ai_key_outcome(&task, exit)?
                         } else if background {
                             report.background_outcome()
                         } else {
                             json!({"call":pending.call,"job":pending.job,"exit_status":exit,"stdout":report.stdout,"stderr":report.stderr})
                         };
+                        let proposal = task.proposal.take().expect("checked proposal");
                         // The checkpoint derives from already committed, protected evidence. Do not
                         // make its bytes depend on credentials that disappear at worker restart.
                         if self.protect_output(&outcome)? != outcome {

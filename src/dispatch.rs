@@ -254,6 +254,34 @@ impl Dispatch {
 
     pub fn prepare_launch(&mut self, prepared: PreparedLaunch) -> Result<(), String> {
         self.launch_call(prepared.call, &prepared.job)?;
+        self.check_launch_preparation(&prepared)?;
+        self.launches.insert(
+            prepared.call,
+            LaunchFence {
+                prepared,
+                attempted: false,
+                resent: false,
+            },
+        );
+        Ok(())
+    }
+
+    /// Check preparation against the intent that will be inserted at this record.
+    pub(crate) fn check_new_launch(
+        &self,
+        intent: &Intent,
+        prepared: &PreparedLaunch,
+    ) -> Result<(), String> {
+        if prepared.call != intent.call {
+            return Err("unknown launch call".into());
+        }
+        if intent.approval.is_none() || intent.job.as_deref() != Some(prepared.job.as_str()) {
+            return Err("launch call is terminal or job differs".into());
+        }
+        self.check_launch_preparation(prepared)
+    }
+
+    fn check_launch_preparation(&self, prepared: &PreparedLaunch) -> Result<(), String> {
         // Validate the recorded digest without depending on this build's scripts.
         // A later bundle may change the wrapper; replay still works, but sending
         // must reconcile against this original digest and will then refuse.
@@ -266,18 +294,25 @@ impl Dispatch {
         {
             return Err("launch preparation differs or already exists".into());
         }
-        self.launches.insert(
-            prepared.call,
-            LaunchFence {
-                prepared,
-                attempted: false,
-                resent: false,
-            },
-        );
         Ok(())
     }
 
     pub fn launch_attempt(&mut self, attempt: &LaunchAttempt, resend: bool) -> Result<(), String> {
+        self.check_launch_attempt(attempt, resend)?;
+        let fence = self
+            .launches
+            .get_mut(&attempt.call)
+            .expect("checked launch");
+        fence.attempted = true;
+        fence.resent = resend;
+        Ok(())
+    }
+
+    pub(crate) fn check_launch_attempt(
+        &self,
+        attempt: &LaunchAttempt,
+        resend: bool,
+    ) -> Result<(), String> {
         self.launch_call(attempt.call, &attempt.job)?;
         if resend
             && (self
@@ -298,24 +333,31 @@ impl Dispatch {
         }
         let fence = self
             .launches
-            .get_mut(&attempt.call)
+            .get(&attempt.call)
             .ok_or("launch is not prepared")?;
         if fence.attempted || fence.resent || fence.prepared.job != attempt.job {
             return Err("launch transmission already reserved".into());
         }
-        fence.attempted = true;
-        fence.resent = resend;
         Ok(())
     }
 
     pub fn check_command(&self, machine: &str) -> Result<(), DispatchRefusal> {
+        self.check_command_except(machine, None)
+    }
+
+    /// A resend exempts only its own unresolved command from admission barriers.
+    pub(crate) fn check_command_except(
+        &self,
+        machine: &str,
+        except: Option<u64>,
+    ) -> Result<(), DispatchRefusal> {
         if !self.approved_entries.contains_key(machine) {
             return Err(DispatchRefusal::NoEntry {
                 machine: machine.into(),
             });
         }
         let resource = Resource::Entry(machine.into());
-        match self.check_operation(&resource, Operation::Exec, Requester::Session) {
+        match self.check_operation_except(&resource, Operation::Exec, Requester::Session, except) {
             Ok(()) => Ok(()),
             Err(RequestRefusal::Barrier { calls }) => {
                 let running: Vec<_> = calls
@@ -347,6 +389,21 @@ impl Dispatch {
     }
 
     pub fn intent(&mut self, number: u64, intent: Intent) -> Result<(), String> {
+        self.check_intent(number, &intent)?;
+        let state = if intent.approval.is_some() {
+            CallState::Unresolved
+        } else {
+            CallState::Cancelled
+        };
+        self.calls.insert(number, Call { intent, state });
+        self.intent_order.push(number);
+        self.current_installations
+            .entry(self.calls[&number].intent.machine.clone())
+            .or_default();
+        Ok(())
+    }
+
+    pub(crate) fn check_intent(&self, number: u64, intent: &Intent) -> Result<(), String> {
         if intent.call != number || self.call_state(number).is_some() {
             return Err("intent identity is not its unique record number".into());
         }
@@ -363,34 +420,12 @@ impl Dispatch {
         {
             return Err("intent job identity is invalid or reused".into());
         }
-        let state = if intent.approval.is_some() {
-            CallState::Unresolved
-        } else {
-            CallState::Cancelled
-        };
-        self.calls.insert(number, Call { intent, state });
-        self.intent_order.push(number);
-        self.current_installations
-            .entry(self.calls[&number].intent.machine.clone())
-            .or_default();
         Ok(())
     }
 
     pub fn terminal(&mut self, number: u64, terminal: Terminal) -> Result<(), String> {
-        match self.call_operation(terminal.call) {
-            None => return Err("terminal names no call".into()),
-            Some(Operation::Exec) => {}
-            Some(_) => return Err("terminal names no box-plane call".into()),
-        }
-        let state = self
-            .call_state_mut(terminal.call)
-            .expect("recorded command");
-        if matches!(
-            state,
-            CallState::Cancelled | CallState::Finished { .. } | CallState::Background { .. }
-        ) {
-            return Err("terminal names a cancelled or already finished call".into());
-        }
+        self.check_terminal(&terminal)?;
+        let state = self.call_state_mut(terminal.call).expect("checked command");
         if matches!(state, CallState::Unresolved) {
             *state = CallState::Finished {
                 terminal: number,
@@ -399,6 +434,22 @@ impl Dispatch {
         }
         // Later evidence is shown but cannot reopen a disposed call or remove its disposition.
         self.terminals.push(TerminalRecord { number, terminal });
+        Ok(())
+    }
+
+    pub(crate) fn check_terminal(&self, terminal: &Terminal) -> Result<(), String> {
+        match self.call_operation(terminal.call) {
+            None => return Err("terminal names no call".into()),
+            Some(Operation::Exec) => {}
+            Some(_) => return Err("terminal names no box-plane call".into()),
+        }
+        let state = self.call_state(terminal.call).expect("recorded command");
+        if matches!(
+            state,
+            CallState::Cancelled | CallState::Finished { .. } | CallState::Background { .. }
+        ) {
+            return Err("terminal names a cancelled or already finished call".into());
+        }
         Ok(())
     }
 
@@ -426,6 +477,32 @@ impl Dispatch {
         evidence: crate::jobs::Evidence,
         terminal: bool,
     ) -> Result<crate::jobs::Report, String> {
+        let report = self.check_job_evidence(number, &evidence, terminal)?;
+        let unresolved = self.call_state(evidence.call) == Some(&CallState::Unresolved);
+        if terminal {
+            self.terminal(
+                number,
+                Terminal {
+                    call: evidence.call,
+                    exit_status: report.exit_status.expect("finished record"),
+                },
+            )?;
+        }
+        if report.state == crate::jobs::State::Background && unresolved {
+            *self.call_state_mut(evidence.call).expect("recorded call") = CallState::Background {
+                observation: number,
+            };
+        }
+        self.jobs.push(report.clone());
+        Ok(report)
+    }
+
+    pub(crate) fn check_job_evidence(
+        &self,
+        number: u64,
+        evidence: &crate::jobs::Evidence,
+        terminal: bool,
+    ) -> Result<crate::jobs::Report, String> {
         use crate::jobs::State;
         evidence.record.validate()?;
         let call = self
@@ -446,25 +523,15 @@ impl Dispatch {
             return Err("job evidence identity differs from the intent".into());
         }
         let report = evidence.report(number, &call.intent.machine, &call.intent.command);
-        let unresolved = matches!(call.state, CallState::Unresolved);
         if terminal != (report.state == State::Finished) || report.state == State::Running {
             return Err("job evidence kind differs from what the record establishes".into());
         }
         if terminal {
-            self.terminal(
-                number,
-                Terminal {
-                    call: evidence.call,
-                    exit_status: report.exit_status.expect("finished record"),
-                },
-            )?;
+            self.check_terminal(&Terminal {
+                call: evidence.call,
+                exit_status: report.exit_status.expect("finished record"),
+            })?;
         }
-        if report.state == State::Background && unresolved {
-            *self.call_state_mut(evidence.call).expect("recorded call") = CallState::Background {
-                observation: number,
-            };
-        }
-        self.jobs.push(report.clone());
         Ok(report)
     }
 

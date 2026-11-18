@@ -316,7 +316,7 @@ impl<S: Storage> Store<S> {
     async fn reinstall_record(&mut self, record: Record) -> Result<(), String> {
         let mut next = self.reinstall.clone();
         next.apply(self.next, &record)?;
-        let mut dispatch = self.dispatch.clone();
+        let mut dispatch = self.measured_dispatch_copy();
         if let Record::Dispatch { intent, .. } = &record {
             dispatch.operation_intent(self.next, intent.as_ref().clone())?;
         }

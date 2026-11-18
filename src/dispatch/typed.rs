@@ -270,22 +270,40 @@ pub enum RequestRefusal {
 }
 
 impl Dispatch {
+    /// Returns true for an already-mapped legacy association (an accepted no-op).
+    pub(crate) fn check_associate_stored(
+        &self,
+        number: u64,
+        association: &StoredAssociation,
+    ) -> Result<bool, String> {
+        self.validate_association(number, association)?;
+        let entry = self.association_entry(association)?.to_owned();
+        if association.admitted() {
+            return self.association_duplicate(&Association {
+                target: association.target().ok_or("mapped target missing")?.clone(),
+                entry,
+            });
+        }
+        Ok(false)
+    }
+
     /// Apply only validated canonical evidence. Quarantine never enters the map.
     pub(crate) fn associate_stored(
         &mut self,
         number: u64,
         association: StoredAssociation,
     ) -> Result<(), String> {
-        self.validate_association(number, &association)?;
-        let entry = self.association_entry(&association)?.to_owned();
+        if self.check_associate_stored(number, &association)? {
+            return Ok(());
+        }
         if association.admitted() {
             let raw = Association {
-                target: association.target().ok_or("mapped target missing")?.clone(),
-                entry,
+                target: association.target().expect("checked mapped target").clone(),
+                entry: self
+                    .association_entry(&association)
+                    .expect("checked entry")
+                    .to_owned(),
             };
-            if self.association_duplicate(&raw)? {
-                return Ok(());
-            }
             self.associations.push(raw);
         }
         self.association_records.push(AssociationRecord {
@@ -475,6 +493,16 @@ impl Dispatch {
         operation: Operation,
         requester: Requester,
     ) -> Result<(), RequestRefusal> {
+        self.check_operation_except(resource, operation, requester, None)
+    }
+
+    pub(super) fn check_operation_except(
+        &self,
+        resource: &Resource,
+        operation: Operation,
+        requester: Requester,
+        except: Option<u64>,
+    ) -> Result<(), RequestRefusal> {
         if matches!(operation, Operation::Read | Operation::Inference) {
             return Ok(());
         }
@@ -489,6 +517,7 @@ impl Dispatch {
         let calls: Vec<_> = self
             .unresolved(resource)
             .into_iter()
+            .filter(|id| Some(*id) != except)
             .filter(|id| {
                 let old = self.call_operation(*id).expect("recorded call");
                 operation.mutation()
@@ -637,13 +666,7 @@ impl Dispatch {
     }
 
     pub fn observe(&mut self, number: u64, observation: Observation) -> Result<Vec<u64>, String> {
-        for id in &observation.calls {
-            if self.call_resource(*id).as_ref() != Some(&observation.resource)
-                || self.call_operation(*id) != Some(observation.operation)
-            {
-                return Err("observation names no matching call".into());
-            }
-        }
+        self.check_observation(&observation)?;
         let mut settled = Vec::new();
         if observation.reports == Reports::Confirmed && observation.operation.mutation() {
             for id in &observation.calls {
@@ -661,5 +684,16 @@ impl Dispatch {
             settled: settled.clone(),
         });
         Ok(settled)
+    }
+
+    pub(crate) fn check_observation(&self, observation: &Observation) -> Result<(), String> {
+        for id in &observation.calls {
+            if self.call_resource(*id).as_ref() != Some(&observation.resource)
+                || self.call_operation(*id) != Some(observation.operation)
+            {
+                return Err("observation names no matching call".into());
+            }
+        }
+        Ok(())
     }
 }
