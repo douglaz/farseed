@@ -7,6 +7,13 @@ Provider and deployment relay keys are checked as their canonical lowercase hex 
 that has been discarded has no retained output filter. Values that merely look like credentials
 receive no special treatment.
 
+Operator email addresses entered for provider verification also join the held exact-byte values,
+including replaced addresses, rebuilt from encrypted journal custody on unlock. Only the email
+field contents of an `email_entered` record are exempt from journal public-byte scanning. Account
+responses remain private worker input: their address is compared byte for byte and never added to
+reports, task views or inference requests. The page receives only verification status and whether
+an address was entered; it never receives the stored address.
+
 Row 23 is removed from this PoC. There is no scan-reference inventory, loader, reload,
 readiness barrier, synthetic producer or keyed window scanner. It returns with `place_secret`
 in twr-ggw.23; a placed secret added then joins the held-credential check. Today a discarded

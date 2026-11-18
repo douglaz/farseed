@@ -48,6 +48,10 @@ struct Fixture {
     history_response: Option<Value>,
     read_errors: std::collections::BTreeMap<String, protocol::ReadError>,
     read_values: std::collections::BTreeMap<String, Value>,
+    email_account: Option<Value>,
+    email_channels: Option<Value>,
+    email_updates: Vec<Value>,
+    order_response: Option<(u16, Vec<u8>)>,
     status: u16,
     lose_create: bool,
     lose_invoice: bool,
@@ -84,6 +88,10 @@ impl Fixture {
             history_response: None,
             read_errors: Default::default(),
             read_values: Default::default(),
+            email_account: None,
+            email_channels: None,
+            email_updates: Vec::new(),
+            order_response: None,
             status: 200,
             lose_create: false,
             lose_invoice: false,
@@ -167,7 +175,7 @@ impl Api for Fixture {
         &mut self,
         method: &str,
         path: &str,
-        _body: Option<Value>,
+        body: Option<Value>,
     ) -> Result<Value, protocol::ReadError> {
         self.urls.push(path.into());
         if self.record_signatures {
@@ -190,6 +198,20 @@ impl Api for Fixture {
             Ok(value)
         } else {
             let result: Result<Value, String> = match (method, path.as_str()) {
+                ("GET", "/api/v1/account") => self
+                    .email_account
+                    .clone()
+                    .ok_or_else(|| "account unavailable".into()),
+                ("PATCH", "/api/v1/account") => {
+                    self.email_updates.push(body.unwrap());
+                    self.email_account
+                        .clone()
+                        .ok_or_else(|| "account unavailable".into())
+                }
+                ("GET", "/api/v1/notification/channels") => self
+                    .email_channels
+                    .clone()
+                    .ok_or_else(|| "channels unavailable".into()),
                 ("GET", "/api/v1/vm/templates") => {
                     if self.fail_catalogue {
                         return Err("catalogue unavailable".into());
@@ -222,6 +244,16 @@ impl Api for Fixture {
                 }
                 ("GET", "/api/v1/vm") => Ok(json!(self.machines)),
                 ("POST", "/api/v1/vm" | "/api/v1/vm/custom-template") => {
+                    if let Some((status, body)) = self.order_response.take() {
+                        self.status = status;
+                        return Err(
+                            if protocol::decoded_email_required(method, &path, status, &body) {
+                                protocol::ReadError::EmailRequired
+                            } else {
+                                protocol::ReadError::Refused("Provider mutation outcome unknown or browser access unavailable; the saved intent is retained. Use read-only Refresh/Resume to reconcile or remain paused; never retry the mutation.".into())
+                            },
+                        );
+                    }
                     self.clock += self.advance_before_create;
                     self.advance_before_create = 0;
                     let mut vm = fixtures::vm(&self.current_selection, 11);
@@ -2625,6 +2657,473 @@ fn purchase_events(s: &Store<MemoryStorage>) -> Vec<Event> {
         })
         .collect()
 }
+
+const I49_EMAIL: &str = "operator.i49@example.invalid";
+
+fn i49_account(verified: bool, email: &str) -> Value {
+    json!({
+        "email_verified": verified, "email": email,
+        "contact_nip17": true, "contact_email": false,
+        "contact_telegram": true, "contact_whatsapp": false,
+        "billing_address": "must not be copied"
+    })
+}
+
+fn i49_email_records(s: &Store<MemoryStorage>) -> Vec<Value> {
+    purchase_events(s)
+        .into_iter()
+        .filter_map(|event| match &event {
+            Event::Procurement(
+                record @ (Record::EmailRequired
+                | Record::EmailEntered { .. }
+                | Record::EmailVerified
+                | Record::CreateEmailRefused),
+            ) => Some(serde_json::to_value(record).unwrap()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn i49_assert_ordered(s: &Store<MemoryStorage>, api: &Fixture) {
+    assert!(!s.procurement_email.required);
+    assert!(!s.procurement_email_eligible());
+    assert_eq!(api.machines.len(), 1);
+    assert_eq!(
+        s.procurement.as_ref().unwrap().vm,
+        Some(api.machines[0].clone())
+    );
+    let route = if api.custom {
+        "POST /api/v1/vm/custom-template"
+    } else {
+        "POST /api/v1/vm"
+    };
+    assert_eq!(api.count(route), 1);
+    assert_ne!(s.procurement_view()["phase"], "email_verification");
+    assert!(s.procurement_view().get("email_entered").is_none());
+}
+
+fn i49_assert_replay(s: &Store<MemoryStorage>) -> Store<MemoryStorage> {
+    let loaded = reopen(s);
+    assert_eq!(loaded.procurement, s.procurement);
+    assert_eq!(loaded.procurement_view(), s.procurement_view());
+    assert_eq!(
+        loaded.procurement_email.required,
+        s.procurement_email.required
+    );
+    assert_eq!(
+        loaded.procurement_email.expected,
+        s.procurement_email.expected
+    );
+    assert_eq!(loaded.provider_emails, s.provider_emails);
+    loaded
+}
+
+#[test]
+fn provisioning_i49_verified_account_orders_without_gate() {
+    for custom in [false, true] {
+        let mut s = ready();
+        let mut api = Fixture::new(custom);
+        api.email_account = Some(i49_account(true, "provider-only@example.invalid"));
+        approve(&mut s, &mut api);
+        // Creation completes; the existing invoice approval remains a separate step.
+        let why = block_on(s.procurement_resume(&mut api, false)).unwrap_err();
+        assert!(
+            why.contains("Review the current initial Lightning quote"),
+            "{why}"
+        );
+        i49_assert_ordered(&s, &api);
+        assert_eq!(api.count("GET /api/v1/account"), 1);
+        assert_eq!(api.count("GET /api/v1/notification/channels"), 0);
+        assert_eq!(api.count("PATCH /api/v1/account"), 0);
+        assert!(i49_email_records(&s).is_empty());
+        assert!(s.provider_emails.is_empty());
+    }
+}
+
+#[test]
+fn provisioning_i49_email_disabled_orders_without_gate() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    api.email_account = Some(i49_account(false, ""));
+    api.email_channels = Some(json!({"email":false}));
+    approve(&mut s, &mut api);
+    let why = block_on(s.procurement_resume(&mut api, false)).unwrap_err();
+    assert!(
+        why.contains("Review the current initial Lightning quote"),
+        "{why}"
+    );
+    i49_assert_ordered(&s, &api);
+    assert_eq!(api.count("GET /api/v1/notification/channels"), 1);
+    assert_eq!(api.count("PATCH /api/v1/account"), 0);
+    assert!(i49_email_records(&s).is_empty());
+}
+
+#[test]
+fn provisioning_i49_unreadable_optional_reads_order_without_gate() {
+    for route in ["/api/v1/account", "/api/v1/notification/channels"] {
+        for reply in [
+            None,
+            Some(Value::Null),
+            Some(json!([])),
+            Some(json!({})),
+            Some(json!({"email_verified":null,"email":null})),
+            Some(json!({"email_verified":"false","email":"true"})),
+            Some(json!({"email_verified":0,"email":1})),
+        ] {
+            let mut s = ready();
+            let mut api = Fixture::new(false);
+            api.email_account = Some(i49_account(false, ""));
+            api.email_channels = Some(json!({"email":true}));
+            match reply {
+                Some(value) => {
+                    api.read_values.insert(route.into(), value);
+                }
+                None => {
+                    api.read_errors.insert(
+                        route.into(),
+                        protocol::ReadError::Refused("read failed".into()),
+                    );
+                }
+            }
+            approve(&mut s, &mut api);
+            let why = block_on(s.procurement_resume(&mut api, false)).unwrap_err();
+            assert!(
+                why.contains("Review the current initial Lightning quote"),
+                "{route}: {why}"
+            );
+            i49_assert_ordered(&s, &api);
+            assert!(i49_email_records(&s).is_empty(), "{route}");
+            assert_eq!(api.count("PATCH /api/v1/account"), 0);
+        }
+    }
+}
+
+#[test]
+fn provisioning_i49_gate_records_address_preserves_flags_and_requires_exact_match() {
+    // Exercise the same admission predicate used before the browser signs and fetches.
+    let origin = "https://provider.invalid:8443";
+    let account = format!("{origin}/api/v1/account");
+    assert!(protocol::request_method_allowed(origin, "PATCH", &account));
+    for url in [
+        "https://other.invalid:8443/api/v1/account",
+        "https://provider.invalid/api/v1/account",
+        "https://provider.invalid:8443/api/v1/account/",
+        "https://provider.invalid:8443/api/v1/account?email=value",
+        "https://provider.invalid:8443/api/v1/account#fragment",
+        "https://provider.invalid:8443/api/v1/account/verify-email",
+        "https://provider.invalid:8443/api/v1/vm",
+        "https://provider.invalid:8443/api/v1/../api/v1/account",
+        "https://provider.invalid:8443/api/v1/%61ccount",
+    ] {
+        assert!(!protocol::request_method_allowed(origin, "PATCH", url));
+        for method in ["GET", "POST"] {
+            assert!(protocol::request_method_allowed(origin, method, url));
+        }
+    }
+    for method in ["PUT", "DELETE", "OPTIONS", "patch"] {
+        assert!(!protocol::request_method_allowed(origin, method, &account));
+    }
+    for custom in [false, true] {
+        for interruption in ["terms", "read"] {
+            let mut s = ready();
+            let mut api = Fixture::new(custom);
+            api.email_account = Some(i49_account(false, "provider-only@example.invalid"));
+            api.email_channels = Some(json!({"email":true}));
+            approve(&mut s, &mut api);
+            block_on(s.procurement_resume(&mut api, false)).unwrap();
+            assert!(s.procurement_email_eligible());
+            assert_eq!(s.procurement_view()["phase"], "email_verification");
+            assert_eq!(s.procurement_view()["email_entered"], false);
+            assert_eq!(i49_email_records(&s), vec![json!("email_required")]);
+            assert!(api.machines.is_empty());
+            assert_eq!(api.count("POST /api/v1/ssh-key"), 0);
+            s = i49_assert_replay(&s);
+
+            block_on(s.procurement_email_send(&mut api, Some(I49_EMAIL.into()))).unwrap();
+            assert_eq!(
+                s.procurement_email.expected.as_deref().map(String::as_str),
+                Some(I49_EMAIL)
+            );
+            assert_eq!(s.procurement_view()["email_entered"], true);
+            assert_eq!(
+                api.email_updates,
+                vec![json!({
+                    "email":I49_EMAIL, "contact_nip17":true, "contact_email":false,
+                    "contact_telegram":true, "contact_whatsapp":false
+                })]
+            );
+            assert_eq!(
+                i49_email_records(&s),
+                vec![
+                    json!("email_required"),
+                    json!({"email_entered":{"email":I49_EMAIL}})
+                ]
+            );
+            assert!(api.machines.is_empty());
+            s = i49_assert_replay(&s);
+
+            // A verified account with any other address cannot release the saved expectation.
+            api.email_account = Some(i49_account(true, "Operator.i49@example.invalid"));
+            block_on(s.procurement_resume(&mut api, false)).unwrap();
+            assert!(s.procurement_email_eligible());
+            assert!(api.machines.is_empty());
+            assert_eq!(i49_email_records(&s).len(), 2);
+            s = i49_assert_replay(&s);
+
+            // An unreadable read after entry also keeps the existing gate.
+            api.read_errors
+                .insert("/api/v1/account".into(), "read failed".into());
+            assert_eq!(
+                block_on(s.procurement_resume(&mut api, false)).unwrap_err(),
+                "Could not read the provider account. Check again; no new order was sent."
+            );
+            assert!(s.procurement_email_eligible());
+            assert!(api.machines.is_empty());
+
+            // Verification can be followed by a pause before CreateSent. Its expectation
+            // must survive both replay and a subsequent approval of changed terms.
+            api.email_account = Some(i49_account(true, I49_EMAIL));
+            if interruption == "terms" {
+                api.current_selection.charge.amount *= 2;
+                if !custom {
+                    api.current_selection.offer["cost_plan"]["amount"] =
+                        api.current_selection.charge.amount.into();
+                }
+            } else {
+                api.fail_catalogue = true;
+            }
+            let why = block_on(s.procurement_resume(&mut api, false)).unwrap_err();
+            assert!(
+                why.contains(if interruption == "terms" {
+                    "review and approve"
+                } else {
+                    "catalogue unavailable"
+                }),
+                "{why}"
+            );
+            assert!(!s.procurement_email.required);
+            assert_eq!(i49_email_records(&s).last(), Some(&json!("email_verified")));
+            assert!(s.procurement.as_ref().unwrap().create.is_none());
+            assert!(api.machines.is_empty());
+            s = i49_assert_replay(&s);
+            if interruption == "terms" {
+                block_on(s.procurement_approve(&mut api, approval())).unwrap();
+            } else {
+                api.fail_catalogue = false;
+            }
+            s = i49_assert_replay(&s);
+
+            let email_records = i49_email_records(&s);
+            let channel_reads = api.count("GET /api/v1/notification/channels");
+            // Disabled channels cannot waive an already recorded address expectation.
+            api.email_channels = Some(json!({"email":false}));
+            for reply in [
+                None,
+                Some(Value::Null),
+                Some(json!([])),
+                Some(json!({})),
+                Some(json!({"email_verified":null,"email":I49_EMAIL})),
+                Some(json!({"email_verified":"true","email":I49_EMAIL})),
+                Some(json!({"email_verified":true,"email":null})),
+            ] {
+                match reply {
+                    Some(value) => {
+                        api.read_values.insert("/api/v1/account".into(), value);
+                    }
+                    None => {
+                        api.read_errors
+                            .insert("/api/v1/account".into(), "read failed".into());
+                    }
+                }
+                assert_eq!(
+                    block_on(s.procurement_resume(&mut api, false)).unwrap_err(),
+                    "Could not read the provider account. Check again; no new order was sent."
+                );
+                assert_eq!(i49_email_records(&s), email_records);
+                assert!(s.procurement.as_ref().unwrap().create.is_none());
+                assert!(api.machines.is_empty());
+                s = i49_assert_replay(&s);
+            }
+            api.email_account = Some(i49_account(true, "Operator.i49@example.invalid"));
+            block_on(s.procurement_resume(&mut api, false)).unwrap();
+            assert!(s.procurement_email_eligible());
+            assert_eq!(s.procurement_view()["phase"], "email_verification");
+            assert_eq!(i49_email_records(&s).last(), Some(&json!("email_required")));
+            assert_eq!(
+                api.count("GET /api/v1/notification/channels"),
+                channel_reads
+            );
+            assert!(s.procurement.as_ref().unwrap().create.is_none());
+            assert!(api.machines.is_empty());
+            s = i49_assert_replay(&s);
+
+            api.email_account = Some(i49_account(true, I49_EMAIL));
+            let why = block_on(s.procurement_resume(&mut api, false)).unwrap_err();
+            assert!(
+                why.contains("Review the current initial Lightning quote"),
+                "{why}"
+            );
+            i49_assert_ordered(&s, &api);
+            assert_eq!(i49_email_records(&s).last(), Some(&json!("email_verified")));
+            assert_eq!(api.count("PATCH /api/v1/account"), 1);
+            i49_assert_replay(&s);
+        }
+    }
+}
+
+#[test]
+fn provisioning_i49_order_403_exact_refusal_clears_intent_other_text_stays_uncertain() {
+    for custom in [false, true] {
+        for error in [
+            protocol::EMAIL_REQUIRED,
+            "Forbidden",
+            "Email verification is required before creating a VM ",
+        ] {
+            let mut s = ready();
+            let mut api = Fixture::new(custom);
+            api.order_response = Some((403, serde_json::to_vec(&json!({"error":error})).unwrap()));
+            approve(&mut s, &mut api);
+            let result = block_on(s.procurement_resume(&mut api, false));
+            let exact = error == protocol::EMAIL_REQUIRED;
+            if exact {
+                result.unwrap();
+                assert!(s.procurement.as_ref().unwrap().create.is_none());
+                assert!(s.procurement_email_eligible());
+                assert_eq!(s.procurement_view()["phase"], "email_verification");
+                assert_eq!(i49_email_records(&s), vec![json!("create_email_refused")]);
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("Provider mutation outcome unknown")
+                );
+                assert!(s.procurement.as_ref().unwrap().create.is_some());
+                assert!(!s.procurement_email_eligible());
+                assert_eq!(s.procurement_view()["phase"], "create_uncertain");
+                assert!(i49_email_records(&s).is_empty());
+            }
+            assert!(s.procurement.as_ref().unwrap().vm.is_none());
+            assert!(api.machines.is_empty());
+            let mut loaded = i49_assert_replay(&s);
+            api.status = 200;
+            // An unavailable account cannot clear a recorded refusal; uncertain orders
+            // instead reconcile inventory and never send another order.
+            let result = block_on(loaded.procurement_resume(&mut api, false));
+            if exact {
+                result.unwrap();
+                assert!(loaded.procurement_email_eligible());
+            } else {
+                assert!(result.unwrap_err().contains("Create outcome unknown"));
+                assert_eq!(loaded.procurement, s.procurement);
+            }
+            assert_eq!(
+                api.count(if custom {
+                    "POST /api/v1/vm/custom-template"
+                } else {
+                    "POST /api/v1/vm"
+                }),
+                1
+            );
+            i49_assert_replay(&loaded);
+        }
+    }
+    // The production classifier must reject other statuses/routes and incomplete bodies.
+    let body = serde_json::to_vec(&json!({"error":protocol::EMAIL_REQUIRED})).unwrap();
+    for (method, path, status, body) in [
+        ("GET", "/api/v1/vm", 403, body.as_slice()),
+        ("POST", "/api/v1/ssh-key", 403, body.as_slice()),
+        (
+            "POST",
+            "/api/v1/vm/custom-template/price",
+            403,
+            body.as_slice(),
+        ),
+        ("POST", "/api/v1/vm", 500, body.as_slice()),
+        ("POST", "/api/v1/vm", 403, &body[..body.len() - 1]),
+        ("POST", "/api/v1/vm", 403, b"{\"error\":true}".as_slice()),
+    ] {
+        assert!(!protocol::decoded_email_required(
+            method, path, status, body
+        ));
+    }
+}
+
+#[test]
+fn provisioning_i49_old_journal_without_email_records_replays_unchanged() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    assert!(i49_email_records(&s).is_empty());
+    s = i49_assert_replay(&s);
+    let why = block_on(s.procurement_resume(&mut api, false)).unwrap_err();
+    assert!(
+        why.contains("Review the current initial Lightning quote"),
+        "{why}"
+    );
+    assert!(i49_email_records(&s).is_empty());
+    i49_assert_ordered(&s, &api);
+    let mut loaded = i49_assert_replay(&s);
+    let why = block_on(loaded.procurement_resume(&mut api, false)).unwrap_err();
+    assert!(
+        why.contains("Review the current initial Lightning quote"),
+        "{why}"
+    );
+    assert_eq!(api.count("POST /api/v1/vm"), 1);
+    assert_eq!(loaded.procurement, s.procurement);
+    assert!(i49_email_records(&loaded).is_empty());
+}
+
+#[test]
+fn provisioning_i49_entered_address_absent_from_encoded_page_report() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    api.email_account = Some(i49_account(false, ""));
+    api.email_channels = Some(json!({"email":true}));
+    approve(&mut s, &mut api);
+    block_on(s.procurement_resume(&mut api, false)).unwrap();
+    block_on(s.procurement_email_send(&mut api, Some(I49_EMAIL.into()))).unwrap();
+    let mut local = Local::new(s.storage.clone(), Fixed);
+    block_on(local.open());
+    block_on(local.unlock(pass()));
+    for address in [I49_EMAIL, "changed.i49@example.invalid"] {
+        if address != I49_EMAIL {
+            block_on(
+                local
+                    .store()
+                    .unwrap()
+                    .procurement_email_send(&mut api, Some(address.into())),
+            )
+            .unwrap();
+        }
+        let report = local.report(None);
+        assert_eq!(report["state"], "unlocked");
+        assert_eq!(report["procurement"]["phase"], "email_verification");
+        assert_eq!(report["procurement"]["email_entered"], true);
+        let encoded = local.encode_report(report);
+        assert!(!encoded.is_empty());
+        assert!(!encoded.contains(I49_EMAIL));
+        assert!(!encoded.contains(address));
+        let store = local.store().unwrap();
+        assert!(store.check_output_bytes(address.as_bytes()).is_err());
+        assert!(!store.procurement_view().to_string().contains(address));
+        assert!(
+            store
+                .provider_emails
+                .iter()
+                .any(|email| email.as_str() == I49_EMAIL)
+        );
+        // Publication protection must also catch addresses inserted by a report caller.
+        let mut injected = local.report(None);
+        injected["progress"] = json!({"message":format!("{I49_EMAIL} {address}")});
+        let encoded = local.encode_report(injected);
+        assert!(!encoded.contains(I49_EMAIL));
+        assert!(!encoded.contains(address));
+    }
+    let store = local.store().unwrap();
+    assert_eq!(store.provider_emails.len(), 2);
+    i49_assert_replay(store);
+}
+
 fn associated_purchase() -> (Store<MemoryStorage>, Fixture) {
     let mut s = ready();
     let mut api = Fixture::new(false);

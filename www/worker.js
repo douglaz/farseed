@@ -6,6 +6,7 @@ import { credit_request, retry_ended_credit } from './pkg/tau_web.js';
 import { deployment_configure, provider_configure, provider_key_is_set, provider_visibility, provider_action_delay, provider_request } from './pkg/tau_web.js';
 
 const clearInput = request => {
+  if (request?.provider_request && Object.hasOwn(request.provider_request, 'email')) delete request.provider_request.email;
   for (const field of ['create','unlock','seed_backup_redisplay','seed_backup_reentry']) {
     if (request?.[field] instanceof Uint8Array) request[field].fill(0);
   }
@@ -159,6 +160,30 @@ const scheduleReadiness = () => {
   armReadiness(p, JSON.stringify(p.identity) === readinessIdentity ? p.readiness_poll_seconds * 1000 : 1000);
 };
 const stopReadiness = () => { clearTimeout(readinessTimer); readinessTimer = null; };
+let emailTimer = null;
+let emailBusy = false;
+const emailPurchase = () => paymentsEligible() && provider_key_is_set() &&
+  lastReport?.procurement?.phase === 'email_verification' && lastReport.procurement.email_entered
+  ? lastReport.procurement : null;
+const stopEmail = () => { clearTimeout(emailTimer); emailTimer = null; };
+const scheduleEmail = () => {
+  const purchase = emailPurchase();
+  if (!purchase) { stopEmail(); return; }
+  if (emailTimer || emailBusy) return;
+  const identity = JSON.stringify(purchase.identity);
+  emailTimer = setTimeout(async () => {
+    emailTimer = null;
+    if (!emailPurchase() || JSON.stringify(emailPurchase().identity) !== identity) { scheduleEmail(); return; }
+    emailBusy = true;
+    const generation = publication_generation();
+    try {
+      await reportStore(await provider_request(JSON.stringify({action:'email_check'})), generation, '', 'machine', true);
+    } finally {
+      emailBusy = false;
+      scheduleEmail();
+    }
+  }, 20000);
+};
 const refreshPayments = async (wake = {reads:readinessReads, lifecycle:readinessLifecycle,
   generation:publication_generation(), identity:JSON.stringify(lastReport?.procurement?.identity)}) => {
   if (retirementRequested || !pageVisible || lastReport?.state !== 'unlocked') return;
@@ -188,6 +213,7 @@ const reportStore = (report, generation = publication_generation(), session = ''
   lastReport = value;
   schedulePayments();
   scheduleReadiness();
+  scheduleEmail();
   value.poc_configuration = { key_set: poc_key_is_set() };
   value.provider_configuration = { key_set: provider_key_is_set() };
   if (paymentTimerReport) value.payment_timer = true;
@@ -238,13 +264,13 @@ onmessage = async ({ data: envelope }) => {
   if (data.retire_runtime === true) {
     retirementRequested = true;
     clearTimeout(paymentTimer); paymentTimer = null;
-    stopReadiness(); provider_visibility(false);
+    stopReadiness(); stopEmail(); provider_visibility(false);
     await retire_runtime();
     postMessage({ runtime_retired: true });
     return;
   }
   if (typeof data.lifecycle === 'string') {
-    if (data.lifecycle === 'hidden' || data.lifecycle === 'freeze') { readinessLifecycle++; pageVisible = false; clearTimeout(paymentTimer); paymentTimer = null; stopReadiness(); provider_visibility(false); }
+    if (data.lifecycle === 'hidden' || data.lifecycle === 'freeze') { readinessLifecycle++; pageVisible = false; clearTimeout(paymentTimer); paymentTimer = null; stopReadiness(); stopEmail(); provider_visibility(false); }
     if (data.lifecycle === 'visible' || data.lifecycle === 'resume') { pageVisible = true; provider_visibility(true); }
     const report = await lifecycle_transition(data.lifecycle);
     Object.assign(wake, {generation:publication_generation(), identity:JSON.stringify(JSON.parse(report).procurement?.identity)});
@@ -336,9 +362,11 @@ onmessage = async ({ data: envelope }) => {
     }
   }
   else if (data.provider_request && typeof data.provider_request === 'object') {
-    const value = JSON.parse(await provider_request(JSON.stringify(data.provider_request)));
-    if (data.provider_request.action === 'select' && !value.error) value.provider_selection_reviewed = true;
-    report = JSON.stringify(value);
+    try {
+      const value = JSON.parse(await provider_request(JSON.stringify(data.provider_request)));
+      if (data.provider_request.action === 'select' && !value.error) value.provider_selection_reviewed = true;
+      report = JSON.stringify(value);
+    } finally { delete data.provider_request.email; }
   }
   else if (data.poc_enroll !== undefined) {
     if (exactMembers(data.poc_enroll, ['target', 'approve_existing', 'class_answer', 'approve_maintained_access']) &&

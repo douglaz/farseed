@@ -9,6 +9,7 @@ use zeroize::Zeroizing;
 pub const ORIGIN: &str = "https://api.lnvps.net";
 pub const REFUSED: &str = "Provider response refused; saved identities remain unchanged.";
 pub const INCOMPLETE: &str = "Provider request incomplete or browser access unavailable; unlock and Refresh the saved purchase. Uncertain operations are never resent.";
+pub(crate) const EMAIL_REQUIRED: &str = "Email verification is required before creating a VM";
 pub const BODY_LIMIT: usize = 256 * 1024;
 
 /// Strict origin grammar, checked before any URL parser can repair forbidden input.
@@ -105,6 +106,13 @@ pub(crate) fn request_url(origin: &str, path: &str) -> Result<String, String> {
         return Err(REFUSED.into());
     }
     Ok(format!("{origin}{path}"))
+}
+
+/// Only the recorded provider's exact account URL admits an additional mutation method.
+pub(crate) fn request_method_allowed(origin: &str, method: &str, url: &str) -> bool {
+    matches!(method, "GET" | "POST")
+        || method == "PATCH"
+            && request_url(origin, "/api/v1/account").is_ok_and(|account| url == account)
 }
 
 /// One encrypted provider identity for this store.
@@ -209,6 +217,7 @@ pub(crate) const READ_REFUSED: &str =
 pub(crate) enum ReadError {
     Refused(String),
     NotFound,
+    EmailRequired,
 }
 impl From<String> for ReadError {
     fn from(value: String) -> Self {
@@ -225,6 +234,7 @@ impl ReadError {
         match self {
             Self::Refused(message) => message,
             Self::NotFound => READ_REFUSED.into(),
+            Self::EmailRequired => EMAIL_REQUIRED.into(),
         }
     }
 }
@@ -255,6 +265,16 @@ pub(crate) fn decoded_missing(method: &str, url: &str, status: u16, body: &[u8])
         && serde_json::from_slice::<Value>(body)
             .ok()
             .is_some_and(|v| v.is_object() && v.get("error").is_some_and(Value::is_string))
+}
+
+/// Only a complete, exact refusal from an order establishes that no VM was created.
+pub(crate) fn decoded_email_required(method: &str, url: &str, status: u16, body: &[u8]) -> bool {
+    status == 403
+        && method == "POST"
+        && (url.ends_with("/api/v1/vm") || url.ends_with("/api/v1/vm/custom-template"))
+        && serde_json::from_slice::<Value>(body)
+            .ok()
+            .is_some_and(|value| value["error"].as_str() == Some(EMAIL_REQUIRED))
 }
 
 #[allow(async_fn_in_trait)]

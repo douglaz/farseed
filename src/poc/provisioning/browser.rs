@@ -178,6 +178,11 @@ enum Action {
     Resume,
     PaymentCheck,
     ReadinessCheck,
+    EmailCheck,
+    EmailSend {
+        email: String,
+    },
+    EmailReissue,
     Close,
     InitialInvoice {
         billing: crate::store::provisioning::Billing,
@@ -186,6 +191,7 @@ enum Action {
 
 #[wasm_bindgen]
 pub async fn provider_request(request: String) -> String {
+    let request = Zeroizing::new(request);
     let result = async {
         let _active = Active::acquire()?;
         if crate::poc::inference::response_pending() {
@@ -216,14 +222,20 @@ pub async fn provider_request(request: String) -> String {
             return Err("Unlock before provisioning.".into());
         }
         let store = local.store().ok_or("Unlock before provisioning.")?;
-        let automatic = matches!(action, Action::ReadinessCheck);
-        if automatic && (!VISIBLE.get() || !key_is_set() || !store.procurement_readiness_eligible()) {
+        let automatic = matches!(action, Action::ReadinessCheck | Action::EmailCheck);
+        let eligible = if matches!(action, Action::EmailCheck) {
+            store.procurement_email_eligible()
+        } else {
+            store.procurement_readiness_eligible()
+        };
+        if automatic && (!VISIBLE.get() || !key_is_set() || !eligible) {
             return Ok(None);
         }
         if !automatic { store.provider_generate().await?; }
         continuation.check()?;
         restore(store.provider_account());
         let mut api = Browser {
+            origin: store.procurement_origin().into(),
             account: store.provider_account().ok_or("Provider account unavailable.")?.copy(),
             continuation,
             automatic_visibility: automatic.then(|| VISIBILITY.get()),
@@ -247,6 +259,9 @@ pub async fn provider_request(request: String) -> String {
                 store.procurement_approve(&mut api, approval).await.map(|_| None)
             }
             Action::ReadinessCheck => store.procurement_readiness_check(&mut api).await.map(|_| None),
+            Action::EmailCheck => store.procurement_resume(&mut api, false).await.map(|_| None),
+            Action::EmailSend { email } => store.procurement_email_send(&mut api, Some(email)).await.map(|_| None),
+            Action::EmailReissue => store.procurement_email_send(&mut api, None).await.map(|_| None),
             Action::PaymentCheck => store.procurement_payment_check(&mut api).await.map(|_| None),
             Action::Close => store.procurement_close(&mut api).await.map(|_| None),
             Action::Resume => store
@@ -303,6 +318,7 @@ impl Drop for Wait {
 }
 
 struct Browser {
+    origin: String,
     automatic_visibility: Option<u64>,
     account: Account,
     continuation: crate::lifecycle::Continuation,
@@ -363,7 +379,7 @@ impl Api for Browser {
         if self.requests > 16 {
             return Err("Provider work paused at the local read bound; Refresh later.".into());
         }
-        if !matches!(method, "GET" | "POST") {
+        if !request_method_allowed(&self.origin, method, url) {
             return Err(REFUSED.into());
         }
         let pending = Rc::new(Pending {
@@ -428,8 +444,11 @@ impl Api for Browser {
             web_sys::Request::new_with_str_and_init(url, &init).map_err(|_| INCOMPLETE)?;
         let _ = headers.delete("Authorization");
         self.current()?;
-        let mutation = method == "POST" && !url.ends_with("/api/v1/vm/custom-template/price")
+        let mutation = method == "PATCH"
+            || method == "POST" && !url.ends_with("/api/v1/vm/custom-template/price")
             || url.contains("/renew?");
+        let email_refusal = method == "POST"
+            && (url.ends_with("/api/v1/vm") || url.ends_with("/api/v1/vm/custom-template"));
         let exchange = async {
             let response: web_sys::Response = JsFuture::from(worker.fetch_with_request(&request))
                 .await
@@ -448,6 +467,7 @@ impl Api for Browser {
             };
             if !(200..300).contains(&status)
                 && !(status == 404 && missing_read(method, url) && !mutation)
+                && !(status == 403 && email_refusal)
             {
                 return Err(refused());
             }
@@ -497,6 +517,13 @@ impl Api for Browser {
                     refused()
                 });
             }
+            if status == 403 {
+                return Err(if decoded_email_required(method, url, status, &output) {
+                    ReadError::EmailRequired
+                } else {
+                    refused()
+                });
+            }
             let value: Value = serde_json::from_slice(&output).map_err(|_| REFUSED)?;
             let data = value.get("data").ok_or(REFUSED)?.clone();
             self.current()?;
@@ -509,7 +536,7 @@ impl Api for Browser {
             };
         drop(registration);
         result.map_err(|error| {
-            if mutation {
+            if mutation && error != ReadError::EmailRequired {
                 UNKNOWN_MUTATION.into()
             } else if self.response_status == 404
                 && missing_read(method, url)

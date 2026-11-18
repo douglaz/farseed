@@ -41,6 +41,22 @@ fn default_purchase_user() -> String {
     "arch".into()
 }
 
+// Only EmailEntered carries personal data, in encrypted journal custody. This projection
+// publishes booleans only; historical addresses remain held against every output boundary.
+#[derive(Default)]
+pub(super) struct EmailState {
+    required: bool,
+    expected: Option<Zeroizing<String>>,
+}
+
+fn valid_email(email: &str) -> bool {
+    !email.is_empty()
+        && email.len() <= 254
+        && email.contains('@')
+        && email.contains('.')
+        && !email.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Purchase {
@@ -107,6 +123,12 @@ pub enum Record {
     RegistrationSent,
     Registered(Value),
     CreateSent(Create),
+    EmailRequired,
+    EmailEntered {
+        email: String,
+    },
+    EmailVerified,
+    CreateEmailRefused,
     Associated(Value),
     BillingQuoted(Billing),
     InvoiceSent(Invoice),
@@ -219,6 +241,132 @@ impl<S: Storage> Store<S> {
             Err(error) => Err(error.message()),
         }
     }
+    // Account replies are private: compare email in worker memory and discard every other
+    // field. The ordinary provider_read boundary would reject our own held address.
+    async fn private_account(
+        &mut self,
+        api: &mut impl Api,
+        body: Option<Value>,
+    ) -> Result<Value, String> {
+        self.check_api(api)?;
+        let url = protocol::request_url(self.procurement_origin(), "/api/v1/account")?;
+        let method = if body.is_some() { "PATCH" } else { "GET" };
+        let result = api.request(method, &url, body).await;
+        self.check_api(api)?;
+        // Never forward provider errors or account fields to any publication boundary.
+        let account = result.map_err(|_| if method == "PATCH" {
+            "The email update could not be confirmed. Open the link if it arrived, then Check again. Sending again requires your explicit request."
+        } else {
+            "Could not read the provider account. Check again; no new order was sent."
+        })?;
+        if !(200..300).contains(&api.response_status()) || !account.is_object() {
+            return Err(
+                "Could not read the provider account. Check again; no new order was sent.".into(),
+            );
+        }
+        Ok(account)
+    }
+    pub(crate) fn procurement_email_eligible(&self) -> bool {
+        self.procurement_email.required
+            && self.procurement.as_ref().is_some_and(|p| {
+                p.create.is_none() && p.vm.is_none() && p.pending_selection.is_none()
+            })
+    }
+    async fn procurement_check_email(&mut self, api: &mut impl Api) -> Result<bool, String> {
+        let account = match self.private_account(api, None).await {
+            Ok(account) => account,
+            // A saved address remains binding after EmailVerified and across interruptions.
+            Err(error) if self.procurement_email.expected.is_some() => return Err(error),
+            // An optional preflight cannot establish a provider requirement on failure.
+            // A previously recorded gate still needs its matching verified account.
+            Err(_) => return Ok(!self.procurement_email.required),
+        };
+        let verified = account["email_verified"].as_bool();
+        let matches = self
+            .procurement_email
+            .expected
+            .as_ref()
+            .is_none_or(|email| account["email"].as_str() == Some(email.as_str()));
+        if verified == Some(true) && matches {
+            if self.procurement_email.required {
+                self.procurement_commit(Record::EmailVerified).await?;
+            }
+            return Ok(true);
+        }
+        if self.procurement_email.expected.is_some()
+            && (verified.is_none() || account["email"].as_str().is_none())
+        {
+            return Err(
+                "Could not read the provider account. Check again; no new order was sent.".into(),
+            );
+        }
+        if self.procurement_email.expected.is_none() {
+            if verified != Some(false) {
+                return Ok(!self.procurement_email.required);
+            }
+            let channels = match self
+                .provider_response(api, "GET", "/api/v1/notification/channels", None)
+                .await
+            {
+                Ok((status, channels)) if (200..300).contains(&status) => channels,
+                _ => return Ok(!self.procurement_email.required),
+            };
+            match channels["email"].as_bool() {
+                Some(false) => {
+                    if self.procurement_email.required {
+                        self.procurement_commit(Record::EmailVerified).await?;
+                    }
+                    return Ok(true);
+                }
+                Some(true) => (),
+                None => return Ok(!self.procurement_email.required),
+            }
+        }
+        if !self.procurement_email.required {
+            self.procurement_commit(Record::EmailRequired).await?;
+        }
+        Ok(false)
+    }
+    pub(crate) async fn procurement_email_send(
+        &mut self,
+        api: &mut impl Api,
+        entered: Option<String>,
+    ) -> Result<(), String> {
+        self.check_api(api)?;
+        if !self.procurement_email_eligible() {
+            return Err("Email entry is only available before the machine order.".into());
+        }
+        let email = entered
+            .or_else(|| {
+                self.procurement_email
+                    .expected
+                    .as_ref()
+                    .map(|email| email.to_string())
+            })
+            .ok_or("Enter your email address first.")?;
+        if !valid_email(&email) {
+            return Err("Enter a valid email address.".into());
+        }
+        let account = self.private_account(api, None).await?;
+        let mut body = json!({"email":email});
+        // This provider requires the first two flags and overwrites the other two even
+        // when omitted. Preserve all four; never copy billing or read-only account fields.
+        for field in [
+            "contact_nip17",
+            "contact_email",
+            "contact_telegram",
+            "contact_whatsapp",
+        ] {
+            body[field] = json!(account[field].as_bool().ok_or(
+                "Provider notification settings are unavailable; the email update was not sent."
+            )?);
+        }
+        self.procurement_commit(Record::EmailEntered { email })
+            .await?;
+        // A lost PATCH response cannot verify anything and is never automatically resent.
+        self.private_account(api, Some(body)).await?;
+        self.procurement_resume(api, false).await
+    }
     /// Fresh absence evidence is usable only by this explicit action.
     pub(crate) async fn procurement_close(&mut self, api: &mut impl Api) -> Result<(), String> {
         self.check_api(api)?;
@@ -322,6 +470,8 @@ impl<S: Storage> Store<S> {
             "initial_invoice"
         } else if p.create.is_some() {
             "create_uncertain"
+        } else if self.procurement_email.required {
+            "email_verification"
         } else if p.ssh_key.is_some() {
             "registered"
         } else if p.registration_sent {
@@ -334,7 +484,11 @@ impl<S: Storage> Store<S> {
         } else {
             Some(p.pending_selection.as_ref().unwrap_or(&p.selected))
         };
-        json!({"origin":p.origin,"phase":phase,"machine":p.machine,"account":p.account,"selection":selection,"approved_selection":p.selected,"relay":p.relay,"class_answer":p.class_answer,"identity":p.identity,"ssh_key_id":p.ssh_key.as_ref().map(|k|&k["id"]),"vm_id":p.vm.as_ref().map(|vm|&vm["id"]),"billing":p.billing,"payment":p.payment,"paid_at":p.paid_at,"readiness_poll_seconds":protocol::readiness_poll_seconds(),"readiness_wait_seconds":protocol::readiness_wait_seconds(),"readiness_state":p.vm.as_ref().map(|vm|&vm["status"]["state"]),"auto_renewal_enabled":p.vm.as_ref().and_then(|vm|vm.get("auto_renewal_enabled")),"target":p.target,"publication":p.publication,"public_keys":self.poc_identity_public_keys(&p.machine,&p.identity).ok()})
+        let mut view = json!({"origin":p.origin,"phase":phase,"machine":p.machine,"account":p.account,"selection":selection,"approved_selection":p.selected,"relay":p.relay,"class_answer":p.class_answer,"identity":p.identity,"ssh_key_id":p.ssh_key.as_ref().map(|k|&k["id"]),"vm_id":p.vm.as_ref().map(|vm|&vm["id"]),"billing":p.billing,"payment":p.payment,"paid_at":p.paid_at,"readiness_poll_seconds":protocol::readiness_poll_seconds(),"readiness_wait_seconds":protocol::readiness_wait_seconds(),"readiness_state":p.vm.as_ref().map(|vm|&vm["status"]["state"]),"auto_renewal_enabled":p.vm.as_ref().and_then(|vm|vm.get("auto_renewal_enabled")),"target":p.target,"publication":p.publication,"public_keys":self.poc_identity_public_keys(&p.machine,&p.identity).ok()});
+        if phase == "email_verification" {
+            view["email_entered"] = json!(self.procurement_email.expected.is_some());
+        }
+        view
     }
     pub(crate) async fn procurement_catalogue(
         &mut self,
@@ -663,6 +817,27 @@ impl<S: Storage> Store<S> {
         }
         match record {
             Record::Approved(_) => unreachable!(),
+            Record::EmailRequired | Record::EmailEntered { .. } | Record::EmailVerified => {
+                if p.create.is_some() || p.vm.is_some() || p.target.is_some() {
+                    return Err(REFUSED.into());
+                }
+                match record {
+                    Record::EmailEntered { email } if !valid_email(email) => {
+                        return Err("Enter a valid email address.".into());
+                    }
+                    Record::EmailVerified if !self.procurement_email.required => {
+                        return Err(REFUSED.into());
+                    }
+                    _ => (),
+                }
+            }
+            Record::CreateEmailRefused => {
+                if p.create.is_none() || p.vm.is_some() || p.target.is_some() {
+                    return Err(REFUSED.into());
+                }
+                // Only the exact decoded order-time refusal establishes no creation.
+                p.create = None;
+            }
             Record::Closed {
                 vm_id,
                 inventory_status,
@@ -721,6 +896,7 @@ impl<S: Storage> Store<S> {
             }
             Record::CreateSent(intent) => {
                 if p.pending_selection.is_some()
+                    || self.procurement_email.required
                     || p.ssh_key.is_none()
                     || p.create.is_some()
                     || p.vm.is_some()
@@ -866,6 +1042,7 @@ impl<S: Storage> Store<S> {
         p: Purchase,
     ) -> Result<(), String> {
         if matches!(record, Record::Closed { .. }) {
+            self.procurement_email = Default::default();
             self.dispatch.approved_entries.remove(&p.machine);
             self.dispatch.associations.retain(|a| a.entry != p.machine);
             self.dispatch.current_installations.remove(&p.machine);
@@ -876,6 +1053,21 @@ impl<S: Storage> Store<S> {
             self.procurement_selection = None;
             self.closed_purchases.push(p);
             return Ok(());
+        }
+        match record {
+            Record::Approved(_) => self.procurement_email = Default::default(),
+            Record::EmailRequired | Record::CreateEmailRefused => {
+                self.procurement_email.required = true;
+            }
+            Record::EmailEntered { email } => {
+                self.procurement_email.required = true;
+                self.procurement_email.expected = Some(Zeroizing::new(email.clone()));
+                if !self.provider_emails.iter().any(|old| old.as_str() == email) {
+                    self.provider_emails.push(Zeroizing::new(email.clone()));
+                }
+            }
+            Record::EmailVerified => self.procurement_email.required = false,
+            _ => (),
         }
         if matches!(record, Record::Approved(_) | Record::Reapproved { .. }) {
             let charge = &p.selected.charge;
@@ -1124,6 +1316,9 @@ impl<S: Storage> Store<S> {
                     .into(),
             );
         }
+        if p.create.is_none() && p.vm.is_none() && !self.procurement_check_email(api).await? {
+            return Ok(());
+        }
         if p.paid_at.is_some() {
             self.readiness_current(api, &p)?;
         }
@@ -1168,7 +1363,13 @@ impl<S: Storage> Store<S> {
                 crate::testonly::session_point("procurement_create_intent").await;
                 self.check_api(api)?;
                 let (path, body) = p.selected.create(id(p.ssh_key.as_ref().ok_or(REFUSED)?)?);
-                let vm = self.provider_read(api, "POST", path, Some(body)).await?;
+                let vm = match self.provider_read(api, "POST", path, Some(body)).await {
+                    Err(why) if why == protocol::EMAIL_REQUIRED => {
+                        self.procurement_commit(Record::CreateEmailRefused).await?;
+                        return Ok(());
+                    }
+                    result => result?,
+                };
                 self.procurement_commit(Record::Associated(vm)).await?;
             } else {
                 let intent = p.create.as_ref().ok_or(REFUSED)?;

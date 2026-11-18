@@ -28,6 +28,9 @@ pub(super) fn public_bytes<'a>(event: &'a Event, bytes: &[u8]) -> Result<PublicB
             ("default_key", &account.default_key.0),
         ],
         Event::PocProviderAccount(account) => vec![("key", &account.key.0)],
+        Event::Procurement(provisioning::Record::EmailEntered { email }) => {
+            vec![("email", email)]
+        }
         Event::PocAiKey(ai_keys::Record::Held { key, .. }) => vec![("key", &key.0)],
         _ => Vec::new(),
     };

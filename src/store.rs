@@ -406,6 +406,9 @@ pub struct Store<S> {
     reinstall: reinstall::State,
     poc_targets: std::collections::BTreeMap<String, poc_targets::Record>,
     procurement: Option<provisioning::Purchase>,
+    procurement_email: provisioning::EmailState,
+    // Rebuilt from encrypted custody records, including addresses replaced by the operator.
+    provider_emails: Vec<Zeroizing<String>>,
     closed_purchases: Vec<provisioning::Purchase>,
     completed_purchases: Vec<provisioning::Purchase>,
     procurement_selection: Option<crate::poc::provisioning::Selection>,
@@ -578,6 +581,8 @@ impl<S: Storage> Store<S> {
             reinstall: Default::default(),
             poc_targets: Default::default(),
             procurement: None,
+            procurement_email: Default::default(),
+            provider_emails: Vec::new(),
             closed_purchases: Vec::new(),
             completed_purchases: Vec::new(),
             procurement_selection: None,
@@ -1517,6 +1522,9 @@ impl<S: Storage> Store<S> {
         if let Some(account) = &self.provider_account {
             derived.push(Derived::Text(Zeroizing::new(hex::encode(account.bytes()))));
         }
+        for email in &self.provider_emails {
+            borrowed.push(email.as_bytes());
+        }
         for session in &self.sessions {
             let given = session.given.borrow();
             for holding in given.iter() {
@@ -2208,6 +2216,7 @@ impl<S: Storage> Store<S> {
                 Event::Seed { .. }
                 | Event::InferenceAccount { .. }
                 | Event::PocCreditAccount(_) => Value::Null,
+                Event::Procurement(provisioning::Record::EmailEntered { .. }) => Value::Null,
                 Event::PocProviderAccount(account) => {
                     json!({"origin":account.origin,"source":account.source})
                 }
@@ -2804,7 +2813,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
     }
 
     /// Protect fields and the final bytes after a caller adds report members.
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(test, target_arch = "wasm32"))]
     pub(crate) fn encode_report(&self, report: Value) -> String {
         let encoded = self.protect_report(report).to_string();
         if let State::Unlocked(store) = &self.state

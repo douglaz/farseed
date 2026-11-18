@@ -169,6 +169,19 @@ section section { min-width: 0; }
 <p><label><input id="tau-provider-approve-access" type="checkbox" required>Approve maintained, ad-hoc access, the image's login user and whole-script sudo -n.</label></p>
 <button type="submit">Approve these exact purchase terms</button>
 </form>
+<section id="tau-provider-email" hidden aria-label="Verify your email with the machine provider">
+<p>The machine provider requires a verified email address before it creates a machine. Your address goes to the provider only; tau-web uses it for nothing else. It is kept encrypted in this browser so the page can check that the provider verified the address you entered.</p>
+<form id="tau-provider-email-form">
+<label>Your email address <input id="tau-provider-email-address" type="email" maxlength="254" required autocomplete="off" spellcheck="false" autocapitalize="none"></label>
+<button type="submit">Send verification link / Change address</button>
+</form>
+<div id="tau-provider-email-wait" hidden>
+<p>Open the link the provider sent to the address you entered. It is valid for about 24 hours. The page checks every 20 seconds while visible and continues your approved purchase when that exact address is verified.</p>
+<p>If the link expired, open the original link first so the provider can clear it, then request a new link below. Sending again while a token still exists does not send another link. If the original link is unavailable or clearing fails, seek help from the provider; automatic resend is unavailable. To use a different address, enter it above yourself.</p>
+<button id="tau-provider-email-reissue" type="button">Request a new link for the saved address</button>
+</div>
+<button id="tau-provider-email-check" type="button">Check again</button>
+</section>
 <button id="tau-provider-resume" type="button">Create approved machine / Refresh saved purchase</button>
 <button id="tau-provider-close" type="button" hidden>Close purchase</button>
 <button id="tau-provider-invoice" type="button">Issue initial Lightning invoice for one approved period</button>

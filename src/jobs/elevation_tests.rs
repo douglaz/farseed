@@ -202,6 +202,7 @@ fn poc_sudo_refusal_never_downgrades_or_becomes_missing() {
             stderr: output.stderr,
             status: output.status.code().map(|n| n as u32),
             closed: true,
+            ..Default::default()
         };
         let why = delivered.record().unwrap_err();
         assert!(why.contains("sudo -n elevation"), "{why}");

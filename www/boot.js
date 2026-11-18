@@ -207,6 +207,7 @@ const renderSteps = store => {
   emphasize('credit', [$('credit-invoice'), $('credit-check'), $('credit-configure'), $('poc-inference-form').querySelector('button')]);
   const purchase = store.procurement;
   const machineAction = !store.provider_configuration?.key_set ? $('provider-catalogue')
+    : purchase?.phase === 'email_verification' ? (purchase.email_entered ? $('provider-email-check') : $('provider-email-form').querySelector('button'))
     : purchase?.phase === 'initial_invoice' ? $('provider-invoice')
     : purchase?.phase && !['terms_changed', 'handed_off'].includes(purchase.phase) ? $('provider-resume')
     : purchase?.selection ? $('provider-approval-form').querySelector('button')
@@ -401,6 +402,7 @@ const purchaseStatus = purchase => ({
   registration_uncertain: 'Waiting to confirm that the provider saved the access key. The page will check before continuing.',
   registered: 'Access key saved; preparing the machine order.',
   create_uncertain: 'Waiting to confirm the machine order. The page will check before continuing.',
+  email_verification: 'Waiting for your email to be verified by the machine provider.',
   initial_invoice: 'Machine ordered; review the invoice before paying.',
   invoice_uncertain: 'Waiting to confirm the invoice. The page will check before continuing.',
   payment_readiness: purchase.payment?.is_paid ? 'Payment received; the provider is starting the machine.' : 'Waiting for payment of the machine invoice.',
@@ -1487,6 +1489,13 @@ const renderProvider = (store, enabled) => {
     : 'After enrollment, configure inference, then press Start session for the displayed model and machine. Copy its public keys. Install the SSH line and enroll the separate relay public key with the relay operator.';
   $('relay-deployment-status').textContent = deployed ? 'The deployment relay key is in use.' : 'No valid deployment relay key is loaded. The seed-derived relay key requires manual enrollment.';
   const purchase = store.procurement ?? {};
+  const emailRequired = purchase.phase === 'email_verification';
+  $('provider-email').hidden = !emailRequired;
+  $('provider-email-wait').hidden = !purchase.email_entered;
+  for (const control of $('provider-email-form').elements) control.disabled = !enabled || !emailRequired;
+  $('provider-email-check').disabled = !enabled || !emailRequired;
+  $('provider-email-reissue').disabled = !enabled || !emailRequired || !purchase.email_entered;
+  if (!emailRequired) $('provider-email-address').value = '';
   const completedMachine = purchase.phase === 'handed_off' ? purchase.machine : purchase.completed?.at(-1)?.machine ?? null;
   if (providerCompletedMachine !== completedMachine) {
     providerCompletedMachine = completedMachine;
@@ -1637,6 +1646,15 @@ $('provider-approval-form').addEventListener('submit', event => {
   providerRequest({action: 'approve', selection: providerDisplayedSelection, approval: {origin: providerDisplayedOrigin, machine: $('provider-machine').value, relay: $('provider-relay').value, class_answer: $('provider-class').value, approve_charge: $('provider-approve-charge').checked, approve_maintained_access: $('provider-approve-access').checked}});
 });
 $('provider-close').addEventListener('click', () => providerRequest({action: 'close'}));
+$('provider-email-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const field = $('provider-email-address');
+  const email = field.value;
+  field.value = '';
+  providerRequest({action:'email_send', email});
+});
+$('provider-email-check').addEventListener('click', () => providerRequest({action:'email_check'}));
+$('provider-email-reissue').addEventListener('click', () => providerRequest({action:'email_reissue'}));
 $('provider-resume').addEventListener('click', () => providerRequest({action: 'resume'}));
 $('provider-invoice').addEventListener('click', () => providerRequest({action: 'initial_invoice', billing: providerDisplayedBilling}));
 const clearPocInputs = () => {
@@ -1651,6 +1669,7 @@ const clearPocInputs = () => {
   $('provider-selection-view').replaceChildren();
   $('provider-progress').replaceChildren();
   $('provider-key').value = '';
+  $('provider-email-address').value = '';
   creditGoalDrafts.clear();
   creditTemplateDrafts.clear();
   goalTemplateDrafts.clear();
