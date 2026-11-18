@@ -355,7 +355,7 @@ impl Template {
             return None;
         }
         Some(format!(
-            "Step {number} is not passed yet. Finish the rest of this step in the order its text gives, following its instructions for the operator's answer (including any ask_operator, request_ai_key or offer_file call it asks for), then run its Check block exactly as written, as one command on its own; go on only when its output shows \"CHECKS {} PASS\".",
+            "Step {number} is not passed yet. Carry on from the last block you ran, following the step's text and that block's output: run the next block the text gives, including the block for the operator's answer and any ask_operator, request_ai_key or offer_file call it asks for; run a block again only when its output, the step's \"If it fails\" or Recovery tells you to, and don't start the step over. Then run its Check block exactly as written, as one command on its own; go on only when its output shows \"CHECKS {} PASS\".",
             step.part
         ))
     }
