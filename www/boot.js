@@ -1797,7 +1797,10 @@ const renderProvider = (store, enabled) => {
   }
   providerCloseState = {purchase, enabled};
   updateProviderClose();
+  $('provider-resume').textContent = ['approved', 'registered'].includes(purchase.phase) ? 'Create the server' : 'Check the order again';
+  $('provider-resume').hidden = !purchase.phase || purchase.phase === 'handed_off';
   $('provider-resume').disabled = !enabled || !purchase.phase;
+  $('provider-invoice').hidden = purchase.phase !== 'initial_invoice';
   $('provider-invoice').disabled = !enabled || purchase.phase !== 'initial_invoice' || !purchase.billing;
 };
 $('provider-key-form').addEventListener('submit', event => {
