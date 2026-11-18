@@ -744,7 +744,8 @@ also choose `Later`: T3 Code still runs here, not linked yet, and the user's fil
    The user opens the link in a browser signed in to their T3 account (or creates the account there: email and
    password, or Google, GitHub, Apple or Microsoft), checks the code and approves.
 3. If the answer is `Approved`, run the Wait block, then the Check. If the answer is `Later`, run the Later block
-   (not the Wait block), then the Check.
+   (not the Wait block). It ends by running the Check itself: the step is done only when its output's last line
+   is `CHECKS connect PASS`.
 
 **Do**
 ```sh
@@ -772,15 +773,16 @@ elif systemctl is-active -q t3-connect; then echo "STILL WAITING for the user's 
 else echo "SIGN-IN ENDED without approval (expired or cancelled): run the Do block again and ask the user again."; fi
 STEP
 ```
-**Later** (when the answer is `Later`; it ends the waiting sign-in and records the choice):
+**Later** (when the answer is `Later`; it ends the waiting sign-in, records the choice and runs the Check):
 ```sh
 sh <<'STEP'
 systemctl stop t3-connect 2>/dev/null || true
 install -m 600 -o root -g root /dev/null /var/lib/control-center/t3-link-later
 echo "LATER: T3 Code: not linked yet. The user's files will say how to link it."
+sh /etc/nixos/cc-check.sh connect
 STEP
 ```
-**Check** (run it alone, exactly as written)
+**Check** (the Later block already ends with it; after the Wait block, or to check again, run it alone, exactly as written)
 ```sh
 sh /etc/nixos/cc-check.sh connect
 ```
