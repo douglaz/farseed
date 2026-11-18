@@ -138,6 +138,12 @@ const snapshotWorker = () => {
   return { postMessage: (data, transfer) => current?.sendAt ? current.sendAt(data, transfer, generation) : current?.postMessage(data, transfer) };
 };
 const readinessWait = store => ({starting:'The provider is starting the machine.',published_key:'The machine’s published host key has not appeared yet.',address:'Waiting for one allocated IPv4 address.',refused:'The machine check could not finish. Open Details to review what happened.',ready:'Saving the machine for setup.',checking:'Checking whether the machine is ready.'}[store.readiness?.kind ?? 'checking'] ?? 'The machine’s status is unavailable.');
+const localTime = value => {
+  const date = new Date(value);
+  return date.toDateString() === new Date().toDateString()
+    ? date.toLocaleTimeString(undefined, {hour: '2-digit', minute: '2-digit', hourCycle: 'h23'})
+    : date.toLocaleString(undefined, {dateStyle: 'short', timeStyle: 'short'});
+};
 const stepNames = ['store', 'credit', 'machine', 'task'];
 const foldChoices = new Map();
 const rawFoldChoices = new Map();
@@ -182,7 +188,7 @@ const renderSteps = store => {
     credit: store.credit_error || store.credit?.balance_text || (!store.credit?.account ? 'No inference credit yet.' : 'Inference credit balance not read yet.'),
     machine: store.readiness?.expired ? 'Published host-key wait expired after three hours. First contact is stopped.'
       : store.readiness?.inactive ? 'Machine checks are paused. Open the machine step for details.'
-      : payReadiness(store.procurement ?? {}) ? `${readinessWait(store)} ${store.readiness?.checked_at ? `Last check: ${new Date(store.readiness.checked_at).toISOString()}.` : 'The machine has not been checked yet.'}`
+      : payReadiness(store.procurement ?? {}) ? `${readinessWait(store)} ${store.readiness?.checked_at ? `Last check: ${localTime(store.readiness.checked_at)}.` : 'The machine has not been checked yet.'}`
       : store.procurement?.phase ? purchaseStatus(store.procurement) : store.poc_targets?.length ? 'Machine saved. Review it before Start session.' : 'Choose a new or existing machine.',
     task: store.tasks?.map(task => `${task.machine}: ${taskStatus(task.status, task)}${task.inference_retry ? ' — waiting to retry the AI connection' : ''}${task.pause_reason ? ' — ' + plainPause(task.pause_reason) : ''}`).join(' ') || (store.lifecycle_state === 'reconciling' ? 'Waiting to revalidate the saved session.' : sessions.length ? 'Session open. Set or continue its goal.' : 'No session started.'),
   };
@@ -1670,6 +1676,8 @@ const renderProvider = (store, enabled) => {
     : 'After enrollment, configure inference, then press Start session for the displayed model and machine. Copy its public keys. Install the SSH line and enroll the separate relay public key with the relay operator.';
   $('relay-deployment-status').textContent = deployed ? 'The deployment relay key is in use.' : 'No valid deployment relay key is loaded. The seed-derived relay key requires manual enrollment.';
   const purchase = store.procurement ?? {};
+  if (store.readiness?.checked_at) $('step-machine-status').title = `${new Date(store.readiness.checked_at).toISOString()} UTC`;
+  else $('step-machine-status').removeAttribute('title');
   const emailRequired = purchase.phase === 'email_verification';
   $('provider-email').hidden = !emailRequired;
   $('provider-email-wait').hidden = !purchase.email_entered;
@@ -1795,7 +1803,14 @@ const renderProvider = (store, enabled) => {
       }
       else {
         paragraph(progress, readinessWait(store));
-        paragraph(progress, readiness?.checked_at ? `Last machine check: ${new Date(readiness.checked_at).toISOString()}.` : 'The machine has not been checked yet.');
+        if (readiness?.checked_at) {
+          const checked = paragraph(progress, 'Last machine check: ');
+          const time = document.createElement('time');
+          time.dateTime = new Date(readiness.checked_at).toISOString();
+          time.title = `${time.dateTime} UTC`;
+          time.textContent = localTime(readiness.checked_at);
+          checked.append(time, '.');
+        } else paragraph(progress, 'The machine has not been checked yet.');
       }
     }
     if (purchase.public_keys) {
