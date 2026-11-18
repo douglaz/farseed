@@ -169,6 +169,7 @@ section section { min-width: 0; }
 <p id="tau-provider-relay-guidance">Registering the machine SSH public key with the provider does not enroll the relay. Before configuration, copy the separate relay public key and ask your relay operator to enroll it. You still need published pins and approvals for the goal, class, access and installation declaration.</p>
 <form id="tau-provider-approval-form">
 <p><label>Machine name <input id="tau-provider-machine" required autocomplete="off"></label></p>
+<p>Use letters, digits, - and _, starting with a letter or digit. You can change it.</p>
 <p><label>Existing v1 relay URL (wss://, ending in /) <input id="tau-provider-relay" type="url" required autocomplete="off"></label></p>
 <p>Will this machine serve people you have never met? If unsure, choose Not sure.</p>
 <p><label>Class answer <select id="tau-provider-class" required><option value="">Choose an answer</option><option value="yes">Yes</option><option value="no">No, only me and people I know</option><option value="not_sure">Not sure</option></select></label></p>

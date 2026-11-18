@@ -1642,6 +1642,8 @@ $('credit-configure').addEventListener('click', () => worker.postMessage({credit
 
 let providerCatalogue = null;
 let providerCompletedMachine = null;
+let providerMachineTyped = false;
+$('provider-machine').addEventListener('input', () => { providerMachineTyped = true; });
 let providerSelectionDirty = true;
 let providerReviewToken = null;
 let providerDisplayedBilling = null;
@@ -1683,7 +1685,23 @@ const renderProvider = (store, enabled) => {
     $('provider-offer').replaceChildren(new Option('Choose a fetched offer', ''));
     $('provider-image').replaceChildren(new Option('Choose a fetched image', ''));
     $('provider-machine').value = '';
+    providerMachineTyped = false;
     $('provider-class').value = '';
+  }
+  if ((!purchase.phase || purchase.phase === 'handed_off') && store.state === 'unlocked' &&
+      !$('provider-machine').value && !providerMachineTyped) {
+    const names = new Set([
+      ...(store.setup ?? []).map(setup => setup.entry?.machine),
+      ...(store.poc_targets ?? []).map(target => target.machine),
+      purchase.machine,
+      ...(purchase.completed ?? []).map(completed => completed.machine),
+      ...(store.sessions ?? []).flatMap(session => session.bound_set ?? []),
+      ...(store.tasks ?? []).map(task => task.machine),
+      ...(store.delivery ?? []).map(delivery => delivery.machine),
+    ]);
+    let number = 1;
+    while (names.has(`server-${number}`)) number += 1;
+    $('provider-machine').value = `server-${number}`;
   }
   if (!$('purchase-review-home')) {
     const home = document.createElement('span'); home.id = 'tau-purchase-review-home';
@@ -1840,6 +1858,7 @@ $('provider-resume').addEventListener('click', () => providerRequest({action: 'r
 $('provider-invoice').addEventListener('click', () => providerRequest({action: 'initial_invoice', billing: providerDisplayedBilling}));
 const clearPocInputs = () => {
   pocKeySubmission = null;
+  providerMachineTyped = false;
   rawFoldChoices.clear();
   // Fold choices of ended sessions hidden inside their closed list live here; reset with the rest.
   endedSessionFolds.clear();
