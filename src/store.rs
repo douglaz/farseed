@@ -1451,49 +1451,44 @@ impl<S: Storage> Store<S> {
     pub(crate) fn held_credentials(&self) -> Result<crate::redaction::Held<'_>, String> {
         use crate::redaction::{Derived, Held};
         let seed = self.seed.as_ref().ok_or(crate::poc::wait::UNLOCKED_SEED)?;
-        let mut held = Held {
-            borrowed: vec![seed.bytes(), &self.key.0],
-            mnemonic: seed.phrase(),
-            derived: Vec::new(),
-            bindings: Vec::new(),
-        };
+        let mut borrowed: Vec<&[u8]> = vec![seed.bytes(), &self.key.0];
+        let mut derived = Vec::new();
+        let mut bindings = Vec::new();
         if let Some(account) = &self.inference.account {
-            held.borrowed.push(&account.0);
+            borrowed.push(&account.0);
         }
         if let Some(account) = &self.credit.account {
-            held.borrowed.push(&account.credit_id.0);
-            held.borrowed.push(&account.default_key.0);
+            borrowed.push(&account.credit_id.0);
+            borrowed.push(&account.default_key.0);
         }
         #[cfg(target_arch = "wasm32")]
         {
             if let Some(key) = crate::poc::inference::held_key() {
-                held.derived.push(Derived::Inference(key));
+                derived.push(Derived::Inference(key));
             }
             if let Some(key) = crate::poc::credit::browser::held_key() {
-                held.derived.push(Derived::Session(key));
+                derived.push(Derived::Session(key));
             }
         }
         for entry in &self.ai_keys {
             if let Some(key) = &entry.key {
-                held.borrowed.push(key.0.as_bytes());
+                borrowed.push(key.0.as_bytes());
             }
         }
         if let Some(key) = &self.deployment_relay {
-            held.derived
-                .push(Derived::Text(Zeroizing::new(hex::encode(key.0))));
+            derived.push(Derived::Text(Zeroizing::new(hex::encode(key.0))));
         }
         if let Some(account) = &self.provider_account {
-            held.derived
-                .push(Derived::Text(Zeroizing::new(hex::encode(account.bytes()))));
+            derived.push(Derived::Text(Zeroizing::new(hex::encode(account.bytes()))));
         }
         for session in &self.sessions {
-            let bindings = session.given.borrow();
-            for holding in bindings.iter() {
+            let given = session.given.borrow();
+            for holding in given.iter() {
                 if holding.credential.response_bytes().is_none() {
                     return Err(crate::poc::wait::CREDENTIAL_SCAN.into());
                 }
             }
-            held.bindings.push(bindings);
+            bindings.push(given);
         }
         for entry in self.allocation().entries() {
             let identity = &entry.identity;
@@ -1501,25 +1496,23 @@ impl<S: Storage> Store<S> {
                 continue;
             }
             let (v, i) = (identity.derivation_version, identity.index);
-            let derived = (|| -> Result<(), crate::seed::DeriveError> {
+            let result = (|| -> Result<(), crate::seed::DeriveError> {
                 match identity.family {
                     Family::Machines => {
-                        held.derived.push(Derived::Ssh(seed.ssh_client_key(v, i)?));
-                        held.derived
-                            .push(Derived::Sender(seed.attest_sender_key(v, i)?));
-                        held.derived
-                            .push(Derived::Recipient(seed.attest_recipient_key(v, i)?));
+                        derived.push(Derived::Ssh(seed.ssh_client_key(v, i)?));
+                        derived.push(Derived::Sender(seed.attest_sender_key(v, i)?));
+                        derived.push(Derived::Recipient(seed.attest_recipient_key(v, i)?));
                     }
-                    Family::Passes => held.derived.push(Derived::Relay(seed.relay_key(v, i)?)),
-                    Family::Handoffs => held
-                        .derived
-                        .push(Derived::Handoff(seed.post_harness_credential(v, i)?)),
+                    Family::Passes => derived.push(Derived::Relay(seed.relay_key(v, i)?)),
+                    Family::Handoffs => {
+                        derived.push(Derived::Handoff(seed.post_harness_credential(v, i)?))
+                    }
                 }
                 Ok(())
             })();
-            derived.map_err(|_| crate::poc::wait::DERIVATION.to_string())?;
+            result.map_err(|_| crate::poc::wait::DERIVATION.to_string())?;
         }
-        Ok(held)
+        Ok(Held::new(borrowed, seed.phrase(), derived, bindings))
     }
 
     pub async fn operation_observation(

@@ -4,8 +4,10 @@ use crate::credential::{
     AttestRecipientKey, AttestSenderKey, PostHarnessCredential, RelayKey, SshClientKey,
 };
 use crate::store::{Storage, Store};
+use std::cell::OnceCell;
+use std::collections::HashMap;
 use std::fmt;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const MARKER: &str = "<redacted>";
 
@@ -46,7 +48,7 @@ impl Redacted {
         credentials: &[&[u8]],
     ) -> Result<Self, String> {
         let mut held = store.held_credentials()?;
-        held.borrowed.extend_from_slice(credentials);
+        held.extend_borrowed(credentials);
         redact(body, &[], &held)
     }
 
@@ -92,10 +94,10 @@ impl fmt::Debug for Redacted {
 /// Transient enumeration: existing holders are borrowed; derived keys and canonical credential
 /// text zeroize on drop. No copy extends the lifetime of its holder.
 pub(crate) struct Held<'a> {
-    pub borrowed: Vec<&'a [u8]>,
-    pub mnemonic: Zeroizing<String>,
-    pub derived: Vec<Derived>,
-    pub bindings: Vec<std::cell::Ref<'a, Vec<crate::binding::Holding>>>,
+    borrowed: Vec<&'a [u8]>,
+    mnemonic: Zeroizing<String>,
+    derived: Vec<Derived>,
+    bindings: Vec<std::cell::Ref<'a, Vec<crate::binding::Holding>>>,
 }
 
 pub(crate) enum Derived {
@@ -109,9 +111,36 @@ pub(crate) enum Derived {
     Session(crate::credential::SessionInferenceKey),
     Handoff(PostHarnessCredential),
     Text(Zeroizing<String>),
+    Matcher(OnceCell<Matcher>),
 }
 
-impl Held<'_> {
+impl<'a> Held<'a> {
+    pub(crate) fn new(
+        borrowed: Vec<&'a [u8]>,
+        mnemonic: Zeroizing<String>,
+        mut derived: Vec<Derived>,
+        bindings: Vec<std::cell::Ref<'a, Vec<crate::binding::Holding>>>,
+    ) -> Self {
+        // Keep the cache with the derived holdings so all credential-derived allocations
+        // share their lifetime. It is not itself a credential value.
+        derived.push(Derived::Matcher(OnceCell::new()));
+        Self {
+            borrowed,
+            mnemonic,
+            derived,
+            bindings,
+        }
+    }
+
+    pub(crate) fn extend_borrowed(&mut self, credentials: &[&'a [u8]]) {
+        for key in &mut self.derived {
+            if let Derived::Matcher(matcher) = key {
+                matcher.take();
+            }
+        }
+        self.borrowed.extend_from_slice(credentials);
+    }
+
     fn values(&self) -> impl Iterator<Item = &[u8]> {
         self.borrowed
             .iter()
@@ -122,19 +151,88 @@ impl Held<'_> {
                     .flat_map(|given| given.iter().filter_map(|h| h.credential.response_bytes())),
             )
             .chain(std::iter::once(self.mnemonic.as_bytes()))
-            .chain(self.derived.iter().map(|key| match key {
-                Derived::Ssh(key) => key.0.as_slice(),
-                Derived::Sender(key) => key.0.as_slice(),
-                Derived::Recipient(key) => key.0.as_slice(),
-                Derived::Relay(key) => key.0.as_slice(),
-                #[cfg(target_arch = "wasm32")]
-                Derived::Inference(key) => key.0.as_slice(),
-                #[cfg(target_arch = "wasm32")]
-                Derived::Session(key) => key.0.as_slice(),
-                Derived::Handoff(key) => key.0.as_slice(),
-                Derived::Text(text) => text.as_bytes(),
+            .chain(self.derived.iter().filter_map(|key| {
+                Some(match key {
+                    Derived::Ssh(key) => key.0.as_slice(),
+                    Derived::Sender(key) => key.0.as_slice(),
+                    Derived::Recipient(key) => key.0.as_slice(),
+                    Derived::Relay(key) => key.0.as_slice(),
+                    #[cfg(target_arch = "wasm32")]
+                    Derived::Inference(key) => key.0.as_slice(),
+                    #[cfg(target_arch = "wasm32")]
+                    Derived::Session(key) => key.0.as_slice(),
+                    Derived::Handoff(key) => key.0.as_slice(),
+                    Derived::Text(text) => text.as_bytes(),
+                    Derived::Matcher(_) => return None,
+                })
             }))
             .filter(|value| !value.is_empty())
+    }
+
+    fn matches(&self, bytes: &[u8], mut found: impl FnMut(usize, usize) -> bool) -> bool {
+        let matcher = self.derived.iter().find_map(|key| match key {
+            Derived::Matcher(matcher) => Some(matcher.get_or_init(|| Matcher::new(self))),
+            _ => None,
+        });
+        if let Some(matcher) = matcher
+            && matcher.matches(bytes, &mut found)
+        {
+            return true;
+        }
+        for needle in self.values() {
+            if (needle.len() < 8 || matcher.is_none())
+                && credential_matches(bytes, needle, |start| found(start, start + needle.len()))
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct Prefix([u8; 8]);
+
+impl Drop for Prefix {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+pub(crate) struct Matcher {
+    prefixes: HashMap<Prefix, Zeroizing<Vec<Zeroizing<Vec<u8>>>>>,
+}
+
+impl Matcher {
+    fn new(held: &Held<'_>) -> Self {
+        // Sized up front so inserting never grows the table: growth would free old buckets
+        // holding prefix copies without zeroizing them.
+        let long = held.values().filter(|value| value.len() >= 8).count();
+        let mut prefixes = HashMap::with_capacity(long);
+        for value in held.values().filter(|value| value.len() >= 8) {
+            prefixes
+                .entry(Prefix(value[..8].try_into().expect("credential prefix")))
+                .or_insert_with(|| Zeroizing::new(Vec::new()))
+                .push(Zeroizing::new(value.to_vec()));
+        }
+        Self { prefixes }
+    }
+
+    fn matches(&self, bytes: &[u8], found: &mut impl FnMut(usize, usize) -> bool) -> bool {
+        if self.prefixes.is_empty() {
+            return false;
+        }
+        for (start, window) in bytes.windows(8).enumerate() {
+            let prefix = Prefix(window.try_into().expect("eight-byte window"));
+            if let Some(candidates) = self.prefixes.get(&prefix) {
+                for value in candidates.iter() {
+                    if bytes[start..].starts_with(value) && found(start, start + value.len()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 }
 
@@ -163,12 +261,10 @@ pub(crate) fn redact(body: &[u8], fields: &[&str], held: &Held<'_>) -> Result<Re
     // Collect before replacing: overlapping copies must produce a single marker, and replacing
     // one needle must not conceal an overlapping needle from another credential.
     let mut ranges = Vec::new();
-    for needle in held.values() {
-        credential_matches(&bytes, needle, |start| {
-            ranges.push((start, start + needle.len()));
-            false
-        });
-    }
+    held.matches(&bytes, |start, end| {
+        ranges.push((start, end));
+        false
+    });
     ranges.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (start, end) in ranges {
@@ -190,10 +286,8 @@ pub(crate) fn redact(body: &[u8], fields: &[&str], held: &Held<'_>) -> Result<Re
     output.extend_from_slice(&bytes[cursor..]);
     // The marker itself (or its junction with preserved bytes) could contain a held value.
     // Refuse instead of claiming that such an output passed.
-    for needle in held.values() {
-        if credential_matches(&output, needle, |_| true) {
-            return Err(crate::poc::wait::REDACTION_MARKER.into());
-        }
+    if held.matches(&output, |_, _| true) {
+        return Err(crate::poc::wait::REDACTION_MARKER.into());
     }
     Ok(Redacted { bytes: output })
 }

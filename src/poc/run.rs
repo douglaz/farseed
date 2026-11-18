@@ -180,9 +180,29 @@ pub async fn resume(
                 }
                 // Show the recorded request (running, one more reply used) while the reply is awaited; otherwise a
                 // resumed task keeps showing its old pause until the reply lands.
-                runtime.progress(&task).await;
                 // The durable request count is consumed even if this future is lost.
-                let next = model.next(&task, session).await;
+                let next = {
+                    let mut request = std::pin::pin!(model.next(&task, session));
+                    let mut progress = std::pin::pin!(runtime.progress(&task));
+                    let mut next = None;
+                    let mut published = false;
+                    std::future::poll_fn(|cx| {
+                        if next.is_none()
+                            && let std::task::Poll::Ready(reply) = request.as_mut().poll(cx)
+                        {
+                            next = Some(reply);
+                        }
+                        if !published {
+                            published = progress.as_mut().poll(cx).is_ready();
+                        }
+                        if published && next.is_some() {
+                            std::task::Poll::Ready(next.take().expect("request completed"))
+                        } else {
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await
+                };
                 if let Err(why) = runtime.authority(id, session).await {
                     return pause_authority(runtime, &task, why).await;
                 }

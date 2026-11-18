@@ -13,7 +13,7 @@ impl<S: Storage> Store<S> {
         credentials: &[&[u8]],
     ) -> Result<Value, String> {
         let mut held = self.held_credentials()?;
-        held.borrowed.extend_from_slice(credentials);
+        held.extend_borrowed(credentials);
         fn text(text: &str, held: &crate::redaction::Held<'_>) -> Result<String, String> {
             let safe = crate::redaction::redact(text.as_bytes(), &[], held)?;
             Ok(String::from_utf8_lossy(safe.as_bytes()).into_owned())
@@ -64,7 +64,7 @@ impl<S: Storage> Store<S> {
         credentials: &[&[u8]],
     ) -> Result<(), String> {
         let mut held = self.held_credentials()?;
-        held.borrowed.extend_from_slice(credentials);
+        held.extend_borrowed(credentials);
         self.check_output_bytes_with(bytes, &held)
     }
 
