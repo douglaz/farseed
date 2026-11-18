@@ -6,6 +6,16 @@
 //! build failure on purpose; none of them has an override.
 
 mod session_gate;
+// The build validates the template; runtime code consumes its parsed fields.
+#[allow(dead_code)]
+#[path = "src/poc/template_blocks.rs"]
+mod template_blocks;
+
+fn control_center_template() {
+    println!("cargo::rerun-if-changed=templates/control-center/playbook.md");
+    println!("cargo::rerun-if-changed=src/poc/template_blocks.rs");
+    template_blocks::parse(include_str!("templates/control-center/playbook.md"));
+}
 
 fn git(args: &[&str]) -> String {
     let out = std::process::Command::new("git")
@@ -81,6 +91,7 @@ fn emit(out: &mut String, root: &str, doc: &str, name: &str, items: &[(String, S
 }
 
 fn main() {
+    control_center_template();
     let pin = pinned_spec_commit();
 
     // Cargo watches this package's own files by default, and the gate reads neither its own

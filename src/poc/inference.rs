@@ -76,6 +76,7 @@ impl PartialEq<&str> for ReplyError {
 fn argument_reason(name: &str, args: &Value) -> String {
     let fields: &[&str] = match name {
         "exec" => &["machine", "command"],
+        "run_step_block" => &["machine", "step", "block"],
         "done" => &["machine", "checks", "urls"],
         "ask_operator" => &["purpose", "link", "choices"],
         "request_ai_key" => &["machine", "application", "purpose"],
@@ -91,6 +92,9 @@ fn argument_reason(name: &str, args: &Value) -> String {
             continue;
         }
         let valid = match *field {
+            "step" => args[*field]
+                .as_u64()
+                .is_some_and(|number| usize::try_from(number).is_ok()),
             "declaration" => object.contains_key(*field),
             "application" | "purpose" => args[*field].as_str().is_some_and(|text| {
                 !text.trim().is_empty()
@@ -484,6 +488,145 @@ fn usable_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
 
+// The request and the by-reference resolver share the source of every public fact.
+fn template_facts<S: Storage>(
+    store: &Store<S>,
+    task: &crate::store::poc::Task,
+) -> Result<std::collections::BTreeMap<&'static str, String>, String> {
+    let target = store
+        .poc_target(&task.machine)
+        .ok_or("template machine target missing")?;
+    let configuration = store.session_configuration(&task.start_session)?;
+    let mut facts = std::collections::BTreeMap::from([
+        ("MACHINE_ADDRESS", target.host.clone()),
+        (
+            "AI_BASE_URL",
+            configuration
+                .endpoint
+                .strip_suffix("/chat/completions")
+                .unwrap_or(&configuration.endpoint)
+                .to_owned(),
+        ),
+        ("AI_MODEL", configuration.model),
+    ]);
+    for (name, value) in super::template::facts(task.options.as_ref()) {
+        facts.insert(name, value.into());
+    }
+    for (name, _) in super::template::INPUTS {
+        facts.insert(
+            name,
+            task.inputs
+                .as_ref()
+                .and_then(|inputs| inputs.get(*name))
+                .cloned()
+                .unwrap_or_default(),
+        );
+    }
+    Ok(facts)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlockCall {
+    machine: String,
+    step: usize,
+    block: String,
+}
+
+fn resolve_block<S: Storage>(
+    store: &Store<S>,
+    task: &crate::store::poc::Task,
+    arguments: &Value,
+    credentials: &[&[u8]],
+) -> Result<Tool, String> {
+    let call: BlockCall = serde_json::from_value(arguments.clone())
+        .map_err(|_| argument_reason("run_step_block", arguments))?;
+    if call.machine != task.machine {
+        return Err("inference tool names a different machine".into());
+    }
+    // The browser holds the writer and checks the request revision at this boundary.
+    // Recheck here too: no snapshot from before the inference exchange can admit a block.
+    store.check_inference_request(task, &task.start_session)?;
+    let source = super::template::CONTROL_CENTER.block(
+        task,
+        store.poc_needs_declaration(&task.machine),
+        call.step,
+        &call.block,
+    )?;
+    let facts = template_facts(store, task)?;
+    let mut substitutions = Vec::new();
+    for (step, name) in [
+        (3, "USER_SSH_KEY"),
+        (4, "AI_KEY_PATH"),
+        (5, "AI_BASE_URL"),
+        (5, "AI_MODEL"),
+        (11, "MACHINE_ADDRESS"),
+    ] {
+        if call.step != step || !source.contains(name) {
+            continue;
+        }
+        let value = if name == "AI_KEY_PATH" {
+            task.completed
+                .iter()
+                .rev()
+                .find_map(|(id, tool, output)| {
+                    if !matches!(tool, Tool::RequestAiKey { machine, .. } if machine == &task.machine)
+                        || output["content"]["status"] != "created"
+                    {
+                        return None;
+                    }
+                    // Use the product's own placement record, never a remote stdout path.
+                    let entry = store.ai_key(&task.id, id)?;
+                    (output["content"]["path"].as_str() == Some(entry.path.as_str()))
+                        .then(|| entry.path.clone())
+                })
+                .ok_or("AI_KEY_PATH is unavailable: request_ai_key has not placed a key for this task")?
+        } else {
+            facts.get(name).cloned().ok_or("playbook fact missing")?
+        };
+        if value.contains(['\'', '"', '\\', '\n', '\r', '\0', '$', '`'])
+            || value.chars().any(char::is_control)
+        {
+            return Err(format!(
+                "{name} cannot be used safely in the playbook block's quoting"
+            ));
+        }
+        // Step 5 feeds these values into a sed replacement. A delimiter or '&'
+        // would change that replacement even though the shell quotes stayed intact.
+        if matches!(name, "AI_BASE_URL" | "AI_MODEL") && value.contains(['|', '&']) {
+            return Err(format!(
+                "{name} cannot be used safely in the playbook block's replacement"
+            ));
+        }
+        substitutions.push((name, value));
+    }
+    // Locate substitutions in the immutable source first. Inserted fact bytes are
+    // never rescanned, so a value containing another placeholder stays that value.
+    let mut spans = Vec::new();
+    for (name, value) in &substitutions {
+        for (start, _) in source.match_indices(name) {
+            spans.push((start, start + name.len(), value.as_str()));
+        }
+    }
+    spans.sort_unstable_by_key(|(start, _, _)| *start);
+    let mut command = String::new();
+    let mut end = 0;
+    for (start, next, value) in spans {
+        command.push_str(&source[end..start]);
+        command.push_str(value);
+        end = next;
+    }
+    command.push_str(&source[end..]);
+    let tool = Tool::Exec {
+        machine: call.machine,
+        command,
+    };
+    if !safe(store, &json!(tool), credentials) {
+        return Err("inference proposal contains protected material".into());
+    }
+    Ok(tool)
+}
+
 pub(crate) fn request_for_task<S: Storage>(
     store: &Store<S>,
     config: &Configuration,
@@ -551,28 +694,8 @@ fn request_context<S: Storage>(
         if let Some(mut facts) = task.and_then(|t| store.poc_inference_facts(t)) {
             if let Some(task) = task.filter(|t| t.template.as_deref() == Some(super::template::ID))
             {
-                let target = store
-                    .poc_target(&task.machine)
-                    .ok_or("template machine target missing")?;
-                let configuration = store.session_configuration(&task.start_session)?;
-                facts["MACHINE_ADDRESS"] = json!(target.host);
-                facts["AI_BASE_URL"] = json!(
-                    configuration
-                        .endpoint
-                        .strip_suffix("/chat/completions")
-                        .unwrap_or(&configuration.endpoint)
-                );
-                facts["AI_MODEL"] = json!(configuration.model);
-                for (name, value) in super::template::facts(task.options.as_ref()) {
+                for (name, value) in template_facts(store, task)? {
                     facts[name] = json!(value);
-                }
-                for (name, _) in super::template::INPUTS {
-                    facts[name] = json!(
-                        task.inputs
-                            .as_ref()
-                            .and_then(|inputs| inputs.get(*name))
-                            .map_or("", String::as_str)
-                    );
                 }
             }
             let facts = store.protect_publication(&facts, credentials)?;
@@ -583,7 +706,7 @@ fn request_context<S: Storage>(
         if let Some(task) = task.filter(|t| t.template.as_deref() == Some(super::template::ID)) {
             let template = &super::template::CONTROL_CENTER;
             let repair = !task.verifying && !task.findings.is_empty();
-            let recovery = repair || template.failed(task);
+            let recovery = template.recovery_needed(task);
             let current = template.current(task, store.poc_needs_declaration(machine));
             include_handover = repair
                 || current.is_some_and(|current| {
@@ -594,7 +717,7 @@ fn request_context<S: Storage>(
                             .any(|step| step.part == "done" && step.text == current)
                 });
             let mut extra = vec![
-                json!({"role":"system","content":format!("{}\n\n{}", template.header, template.facts)}),
+                json!({"role":"system","content":format!("{}\n\n{}\n\nRun the step's own blocks with run_step_block using its step number and exact block label (Do, Wait, Check, Later); Step 1's Do is also its check. For Recovery use step 0 and its block label (R2). Use exec only for reads and for fixes the step's If it fails or Recovery asks for.", template.header, template.facts)}),
             ];
             if let Some(current) = current {
                 extra.push(json!({"role":"user","content":current}));
@@ -804,6 +927,9 @@ fn request_context<S: Storage>(
                     }
                     json!({"type":"function","function":d})
                 }).collect();
+            if control_center {
+                offered.push(json!({"type":"function","function":{"name":"run_step_block","description":"Run one published Control center shell block by reference. Only the current step's blocks are admitted; step 0 names a Recovery block when Recovery has been sent. The product fills its own facts and records the full command as exec.","parameters":{"type":"object","properties":{"machine":{"type":"string"},"step":{"type":"integer","minimum":0,"maximum":super::template::CONTROL_CENTER.steps.len()},"block":{"type":"string","description":"Exact label in the supplied step: Do, Wait, Check, Later; Recovery: R2."}},"required":["machine","step","block"],"additionalProperties":false}}}));
+            }
             offered.push(json!({"type":"function","function":{"name":"request_ai_key","description":"Request an application inference key for an application the operator asked for that needs its own AI access, never for your own use. The operator must approve on a card before creation; the key outlives the session, with a 0.25 USD cap and 30-day expiry.","parameters":{"type":"object","properties":{"machine":{"type":"string"},"application":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[ -~]+$","description":"Short plain name of the operator's application; no secret."},"purpose":{"type":"string","minLength":1,"maxLength":160,"pattern":"^[ -~]+$","description":"One plain line describing why the operator's application needs its own AI access; no secret."}},"required":["machine","application","purpose"],"additionalProperties":false}}}));
             let file = definitions
                 .as_array()
@@ -855,6 +981,7 @@ fn error_detail<S: Storage>(
         .map(|text| excerpt(text, ERROR_BYTES))
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) fn normalize<S: Storage>(
     store: &Store<S>,
     status: u16,
@@ -862,6 +989,18 @@ pub(crate) fn normalize<S: Storage>(
     machine: &str,
     steps: &[Step],
     credentials: &[&[u8]],
+) -> Result<(String, Tool), ReplyError> {
+    normalize_context(store, status, body, machine, steps, credentials, None)
+}
+
+fn normalize_context<S: Storage>(
+    store: &Store<S>,
+    status: u16,
+    body: &[u8],
+    machine: &str,
+    steps: &[Step],
+    credentials: &[&[u8]],
+    task: Option<&crate::store::poc::Task>,
 ) -> Result<(String, Tool), ReplyError> {
     (|| {
         let value = (|| {
@@ -979,10 +1118,13 @@ pub(crate) fn normalize<S: Storage>(
             if !if store.poc_needs_declaration(machine) {
                 name == "propose_declaration"
             } else {
-                matches!(
-                    name,
-                    "exec" | "done" | "request_ai_key" | "offer_file" | "ask_operator"
-                )
+                (name == "run_step_block"
+                    && task
+                        .is_some_and(|task| task.template.as_deref() == Some(super::template::ID)))
+                    || matches!(
+                        name,
+                        "exec" | "done" | "request_ai_key" | "offer_file" | "ask_operator"
+                    )
             } {
                 return Err("inference tool is not offered".into());
             }
@@ -996,7 +1138,16 @@ pub(crate) fn normalize<S: Storage>(
             if !safe(store, &proposal, credentials) {
                 return Err("inference proposal contains protected material".into());
             }
-            let tool = Tool::parse(&proposal).map_err(|_| argument_reason(name, &arguments))?;
+            let tool = if name == "run_step_block" {
+                resolve_block(
+                    store,
+                    task.ok_or("playbook task missing")?,
+                    &arguments,
+                    credentials,
+                )?
+            } else {
+                Tool::parse(&proposal).map_err(|_| argument_reason(name, &arguments))?
+            };
             if !matches!(tool, Tool::AskOperator { .. }) && tool.machine() != machine {
                 return Err("inference tool names a different machine".into());
             }
@@ -1055,6 +1206,7 @@ pub(crate) fn normalize<S: Storage>(
 }
 
 /// Completion boundary shared by the worker exchange and host transport fixtures.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 fn complete_response<S: Storage>(
     store: &Store<S>,
     status: u16,
@@ -1062,6 +1214,18 @@ fn complete_response<S: Storage>(
     machine: &str,
     steps: &[Step],
     credentials: &[&[u8]],
+) -> Result<(String, Tool), ReplyError> {
+    complete_response_context(store, status, body, machine, steps, credentials, None)
+}
+
+fn complete_response_context<S: Storage>(
+    store: &Store<S>,
+    status: u16,
+    body: &[u8],
+    machine: &str,
+    steps: &[Step],
+    credentials: &[&[u8]],
+    task: Option<&crate::store::poc::Task>,
 ) -> Result<(String, Tool), ReplyError> {
     // HTTP failures retain their category even when the provider sends HTML or no body.
     if (200..300).contains(&status) {
@@ -1072,7 +1236,7 @@ fn complete_response<S: Storage>(
         let _: Value =
             serde_json::from_slice(body).map_err(|_| "inference response malformed JSON")?;
     }
-    normalize(store, status, body, machine, steps, credentials)
+    normalize_context(store, status, body, machine, steps, credentials, task)
 }
 
 #[cfg(target_arch = "wasm32")]

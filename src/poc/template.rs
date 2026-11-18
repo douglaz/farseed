@@ -4,6 +4,9 @@ use crate::store::poc::Task;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
+#[path = "template_blocks.rs"]
+mod block_catalogue;
+
 pub const ID: &str = "control-center@1";
 pub const NAME: &str = "Control center";
 pub const USER_TEXT: &str = "Your own private AI machine. It runs NixOS, has an AI agent with a web dashboard, and only you can reach it. It can install more for you later.";
@@ -44,119 +47,9 @@ pub const FINISHED: &str =
     "Every step passed. Call done with every address the user should open in urls.";
 const SOURCE: &str = include_str!("../../templates/control-center/playbook.md");
 
-pub struct Step {
-    pub text: &'static str,
-    pub part: &'static str,
-    pub conditions: Vec<&'static str>,
-}
-pub struct Template {
-    pub header: &'static str,
-    pub facts: &'static str,
-    pub declaration: Option<&'static str>,
-    pub steps: Vec<Step>,
-    pub recovery: &'static str,
-    pub hashes: [&'static str; 2],
-}
+pub use block_catalogue::{Step, Template};
 
-pub static CONTROL_CENTER: LazyLock<Template> = LazyLock::new(|| {
-    let sections: Vec<_> = SOURCE.match_indices("\n## ").map(|(i, _)| i + 1).collect();
-    let mut header = None;
-    let mut facts = None;
-    let mut declaration = None;
-    let mut recovery = None;
-    let mut steps = Vec::new();
-    for (index, start) in sections.iter().enumerate() {
-        let text = SOURCE[*start..sections.get(index + 1).copied().unwrap_or(SOURCE.len())]
-            .trim_end()
-            .trim_end_matches("---")
-            .trim_end();
-        let heading = text.lines().next().expect("template section heading");
-        if heading.starts_with("## Header") {
-            assert!(header.replace(text).is_none(), "duplicate template Header");
-        } else if heading.starts_with("## Facts") {
-            assert!(facts.replace(text).is_none(), "duplicate template Facts");
-        } else if heading == "## Declaration" {
-            assert!(declaration.replace(text).is_none(), "duplicate Declaration");
-        } else if heading == "## Recovery" {
-            assert!(recovery.replace(text).is_none(), "duplicate Recovery");
-        } else if let Some(number) = heading.strip_prefix("## Step ") {
-            let number = number.split([':', ' ']).next().expect("step number");
-            assert_eq!(
-                number.parse::<usize>().expect("numeric template step"),
-                steps.len() + 1
-            );
-            let parts: Vec<_> = text
-                .lines()
-                .filter_map(|line| {
-                    line.strip_prefix("Expect `CHECKS ")?
-                        .split_once(" PASS`")
-                        .map(|(part, _)| part)
-                })
-                .collect();
-            assert_eq!(parts.len(), 1, "one Expect PASS per template step");
-            let part = parts[0];
-            assert!(
-                !part.is_empty()
-                    && part
-                        .bytes()
-                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
-                "template pass part"
-            );
-            assert!(
-                !steps.iter().any(|step: &Step| step.part == part),
-                "duplicate pass part"
-            );
-            steps.push(Step {
-                text,
-                part,
-                conditions: heading
-                    .split("only if `")
-                    .skip(1)
-                    .filter_map(|rest| {
-                        let (name, suffix) = rest.split_once('`')?;
-                        suffix.starts_with(" is `yes`").then_some(name)
-                    })
-                    .collect(),
-            });
-        }
-    }
-    assert!(!steps.is_empty(), "at least one template step");
-    let prefix = "printf '%s  /etc/nixos/cc-rebuild.sh\\n%s  /etc/nixos/cc-check.sh\\n' ";
-    let mut hashes = None;
-    for check in steps
-        .iter()
-        .flat_map(|step| step.text.lines())
-        .filter_map(|line| line.strip_prefix(prefix))
-    {
-        let words: Vec<_> = check.split_whitespace().collect();
-        assert!(
-            words.len() >= 3 && words[2] == "|",
-            "two pinned script hashes"
-        );
-        let pair = [words[0], words[1]];
-        assert!(
-            pair.iter().all(|hash| hash.len() == 64
-                && hash
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
-            "sha256 script hashes"
-        );
-        assert!(
-            hashes.is_none_or(|previous| previous == pair),
-            "consistent script hashes across template steps"
-        );
-        hashes = Some(pair);
-    }
-    let hashes = hashes.expect("template script hash check");
-    Template {
-        header: header.expect("template Header"),
-        facts: facts.expect("template Facts"),
-        declaration,
-        steps,
-        recovery: recovery.expect("template Recovery"),
-        hashes,
-    }
-});
+pub static CONTROL_CENTER: LazyLock<Template> = LazyLock::new(|| block_catalogue::parse(SOURCE));
 
 pub fn valid_options(options: Option<&Options>) -> bool {
     options.is_none_or(|options| {
@@ -298,6 +191,43 @@ fn latest_exec(task: &Task) -> Option<(&str, &str)> {
 }
 
 impl Template {
+    pub fn recovery_needed(&self, task: &Task) -> bool {
+        (!task.verifying && !task.findings.is_empty()) || self.failed(task)
+    }
+
+    /// Admission uses the same history and conditional-step rule as the message.
+    /// Zero names Recovery, whose blocks are available only when Recovery is sent.
+    pub fn block(
+        &self,
+        task: &Task,
+        declaration_needed: bool,
+        number: usize,
+        name: &str,
+    ) -> Result<&'static str, String> {
+        if task.template.as_deref() != Some(ID) {
+            return Err("run_step_block is only available for Control center tasks".into());
+        }
+        if declaration_needed {
+            return Err("approve the declaration before running a playbook block".into());
+        }
+        let catalogue = if number == 0 {
+            if !self.recovery_needed(task) {
+                return Err("Recovery has not been sent for this task".into());
+            }
+            &self.recovery_blocks
+        } else {
+            let step = self.steps.get(number - 1).ok_or("unknown playbook step")?;
+            if self.current(task, declaration_needed) != Some(step.text) {
+                return Err("only the current step's blocks can run".into());
+            }
+            &step.blocks
+        };
+        catalogue
+            .get(name)
+            .copied()
+            .ok_or_else(|| "unknown block label for this playbook step".into())
+    }
+
     pub fn current(&self, task: &Task, declaration_needed: bool) -> Option<&'static str> {
         self.current_through(task, declaration_needed, task.completed.len())
     }
@@ -355,7 +285,7 @@ impl Template {
             return None;
         }
         Some(format!(
-            "Step {number} is not passed yet. Carry on from the last block you ran, following the step's text and that block's output: run the next block the text gives, including the block for the operator's answer and any ask_operator, request_ai_key or offer_file call it asks for; run a block again only when its output, the step's \"If it fails\" or Recovery tells you to, and don't start the step over. Then run its Check block exactly as written, as one command on its own; go on only when its output shows \"CHECKS {} PASS\".",
+            "Step {number} is not passed yet. Carry on from the last block you ran, following the step's text and that block's output: use run_step_block with this step number and the next block's label, including the block for the operator's answer and any ask_operator, request_ai_key or offer_file call it asks for; run a block again only when its output, the step's \"If it fails\" or Recovery tells you to, and don't start the step over. Then run its Check block alone with run_step_block; go on only when its output shows \"CHECKS {} PASS\".",
             step.part
         ))
     }

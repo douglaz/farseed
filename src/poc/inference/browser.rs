@@ -612,7 +612,16 @@ pub(crate) async fn next(
                     }
                     return Ok(Ok(None));
                 }
-                Ok(complete_response(store, status, &bytes, machine, steps, &[key]).map(Some))
+                Ok(complete_response_context(
+                    store,
+                    status,
+                    &bytes,
+                    machine,
+                    steps,
+                    &[key],
+                    Some(task),
+                )
+                .map(Some))
             })?
         };
         let result = match futures_util::future::select(Box::pin(exchange), Box::pin(ready)).await {
