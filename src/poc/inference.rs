@@ -526,14 +526,25 @@ fn request_context<S: Storage>(
             let facts = store.protect_output_with(&facts, credentials)?;
             messages.push(json!({"role":"user","content":facts.to_string()}));
         }
+        let mut template_messages = Vec::new();
+        let mut include_handover = true;
         if let Some(task) = task.filter(|t| t.template.as_deref() == Some(super::template::ID)) {
             let template = &super::template::CONTROL_CENTER;
             let repair = !task.verifying && !task.findings.is_empty();
             let recovery = repair || template.failed(task);
+            let current = template.current(task, store.poc_needs_declaration(machine));
+            include_handover = repair
+                || current.is_some_and(|current| {
+                    current == super::template::FINISHED
+                        || template
+                            .steps
+                            .iter()
+                            .any(|step| step.part == "done" && step.text == current)
+                });
             let mut extra = vec![
                 json!({"role":"system","content":format!("{}\n\n{}", template.header, template.facts)}),
             ];
-            if let Some(current) = template.current(task, store.poc_needs_declaration(machine)) {
+            if let Some(current) = current {
                 extra.push(json!({"role":"user","content":current}));
                 if !recovery && let Some(reason) = template.retry_reason(task, current) {
                     extra.push(json!({"role":"user","content":reason}));
@@ -552,13 +563,13 @@ fn request_context<S: Storage>(
                 extra.push(json!({"role":"user","content":template.recovery}));
             }
             let extra = store.protect_output_with(&json!(extra), credentials)?;
-            messages.extend(
-                extra
-                    .as_array()
-                    .ok_or("template message protection")?
-                    .iter()
-                    .cloned(),
-            );
+            let mut extra = extra
+                .as_array()
+                .ok_or("template message protection")?
+                .iter()
+                .cloned();
+            messages.extend(extra.next());
+            template_messages.extend(extra);
         }
         if let Some(task) = task
             && let Some(malformed) = &task.malformed
@@ -720,7 +731,9 @@ fn request_context<S: Storage>(
             } else {
                 handover.push_str("Before calling done, run these same commands yourself with exec and fix every difference. Differences found after done pause the task as findings.");
             }
-            messages.push(json!({"role":"user", "content":handover}));
+            if include_handover {
+                messages.push(json!({"role":"user", "content":handover}));
+            }
             messages.push(json!({"role":"user", "content":"For an application the operator asked for that needs its own AI access, call request_ai_key with a short plain application name and purpose, never for your own use and never with a secret; after the operator presses Create key on its card, tau-web creates an application inference key capped at 0.25 USD, expiring in 30 days, and saves it on the machine at the path in the reply, which also gives the chat-completions API base URL to configure the application with. The key outlives this session; use the file, never print the key, and never ask the operator for keys."}));
             let mut offered: Vec<_> = definitions.as_array().expect("tool definitions").iter()
                 .filter(|d| matches!(d["name"].as_str(), Some("exec" | "done")))
@@ -742,6 +755,7 @@ fn request_context<S: Storage>(
             offered.push(json!({"type":"function","function":{"name":"ask_operator","description":"Ask the operator to approve a login or choose an option. Never request or include secrets; answers are fixed choice labels, never free text.","parameters":{"type":"object","properties":{"purpose":{"type":"string","minLength":1,"maxLength":160,"pattern":"^[ -~]+$","description":"One plain line explaining why the operator is asked; no secrets."},"link":{"type":"string","minLength":1,"maxLength":2048,"description":"Optional absolute HTTPS URL with a host, no userinfo, whitespace or control bytes; no secrets. The operator may open it; the page never opens it automatically."},"choices":{"type":"array","maxItems":4,"description":"2 to 4 distinct short answer labels; Done and Can't when omitted.","items":{"type":"string","minLength":1,"maxLength":32,"pattern":"^[ -~]+$"}}},"required":["purpose"],"additionalProperties":false}}}));
             offered
         };
+        messages.extend(template_messages);
         let value = protected(
             store,
             &json!({"model":config.model,"max_completion_tokens":COMPLETION_TOKENS,"tool_choice":"auto","parallel_tool_calls":false,"provider":{"zdr":true},"messages":messages,"tools":tools}),
