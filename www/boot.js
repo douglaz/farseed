@@ -1392,6 +1392,7 @@ const renderDelivery = (section, machine, store) => {
   if (Number.isInteger(delivery.reports_count)) {
     const reports = document.createElement('section');
     paragraph(reports, delivery.report_label);
+    if (delivery.report_note) paragraph(reports, delivery.report_note);
     const count = deliveryDetails.commands.get(machine)?.value?.length ?? delivery.reports_count;
     const records = deliveryDetailsButton(reports, machine, 'commands', `commands (${count})`, store);
     for (const [index, report] of (records ?? []).entries()) rawDetails(reports, report, ['delivery', machine, 'report', index]);

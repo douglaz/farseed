@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 pub const FIXTURE_LIMIT: &str = "Fixture measurements and fixed lockdown fixture checks only; no live machine was read. The bundle's lockdown checklist and real observation paths are not implemented.";
 pub const REPORT_LABEL: &str = "Checks the AI wrote — not part of Delivered";
+// The list under REPORT_LABEL holds every command record for the machine, not only checks (SEC-2 keeps the label).
+pub const REPORT_NOTE: &str = "This lists every command recorded for this machine, setup steps included, not only checks; none of it decides Delivered.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

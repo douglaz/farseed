@@ -284,7 +284,7 @@ impl<S: Storage> Store<S> {
                 "verdict_is_historical":!entitled || last.is_some_and(|c|!c.result.complete) || !completed_current || !m.placements_since_check.is_empty(),
                 "placement_eligible":entitled && !m.unknown && current && m.placements_since_check.is_empty() && last.is_some_and(|c|c.result.placement_eligible),
                 "applications":m.applications,"subsequent_placement_sessions":m.placements_since_check,
-                "report_label":delivery::REPORT_LABEL,
+                "report_label":delivery::REPORT_LABEL,"report_note":delivery::REPORT_NOTE,
                 "reports_count":reports_count,"reports_revision":reports_revision})
         };
         // Every string is protected under current holdings before publication.
