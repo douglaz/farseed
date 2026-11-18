@@ -12,8 +12,87 @@ use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, client};
 use serde_json::{Value, json};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use ws_stream_wasm::{WsEvent, WsMessage, WsMeta, WsStream};
+
+type RelayGate = Arc<tokio::sync::Mutex<Option<f64>>>;
+thread_local! {
+    // Destination host only: the relay shares its pace across ports. Worker memory only.
+    static RELAY_GATES: RefCell<BTreeMap<String, RelayGate>> = RefCell::default();
+}
+
+fn relay_now() -> Result<f64, Refusal> {
+    timings::now().ok_or_else(|| Refusal::Failed("relay pacing clock unavailable".into()))
+}
+
+async fn relay_wait(ms: i32, stop: &wait::Stop) -> Result<(), Refusal> {
+    use wasm_bindgen::{JsCast, closure::Closure};
+    struct Wake {
+        worker: web_sys::WorkerGlobalScope,
+        timer: i32,
+        _callback: Closure<dyn FnMut()>,
+    }
+    impl Drop for Wake {
+        fn drop(&mut self) {
+            self.worker.clear_timeout_with_handle(self.timer);
+        }
+    }
+    let worker: web_sys::WorkerGlobalScope = js_sys::global().unchecked_into();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    let mut send = Some(send);
+    let callback = Closure::<dyn FnMut()>::new(move || {
+        if let Some(send) = send.take() {
+            let _ = send.send(());
+        }
+    });
+    let timer = worker
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            callback.as_ref().unchecked_ref(),
+            ms,
+        )
+        .map_err(|_| Refusal::Failed("relay pacing timer unavailable".into()))?;
+    let _wake = Wake {
+        worker,
+        timer,
+        _callback: callback,
+    };
+    stop.until(receive)
+        .await
+        .ok_or_else(|| Refusal::Journal("stale relay continuation".into()))?
+        .map_err(|_| Refusal::Failed("relay pacing timer ended".into()))
+}
+
+async fn relay_slot(
+    host: &str,
+    not_before: f64,
+    stop: &wait::Stop,
+) -> Result<tokio::sync::OwnedMutexGuard<Option<f64>>, Refusal> {
+    let gate = RELAY_GATES.with_borrow_mut(|gates| {
+        gates
+            .entry(host.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
+            .clone()
+    });
+    let mut last = stop
+        .until(gate.lock_owned())
+        .await
+        .ok_or_else(|| Refusal::Journal("stale relay continuation".into()))?;
+    loop {
+        if stop.stopped() {
+            return Err(Refusal::Journal("stale relay continuation".into()));
+        }
+        let now = relay_now()?;
+        let remaining = last.map_or(not_before, |last| not_before.max(last + 1_250.0)) - now;
+        if remaining <= 0.0 {
+            // Keep the host locked through AUTH send, including any yielding sink flush.
+            *last = Some(now);
+            return Ok(last);
+        }
+        relay_wait(remaining.ceil() as i32, stop).await?;
+    }
+}
 
 async fn access(
     target: &Target,
@@ -853,7 +932,7 @@ pub async fn collect_jobs(
 }
 
 /// Click-only synchronous harness job. This deliberately bypasses command evidence:
-/// no intent, terminal, stdout file, report, task mutation, or automatic retry is created.
+/// no intent, terminal, stdout file, report, task mutation, or command retry is created.
 /// Connection admission, configuring account, elevation and pinned SSH are shared.
 pub(crate) async fn download_file(
     pins: &impl PinSource,
@@ -1136,74 +1215,106 @@ async fn connect(
         .map_err(|e| Refusal::Failed(format!("ssh client key: {e}")))?
     };
 
-    journal.current(session).await.map_err(Refusal::Journal)?;
     let url = target.contact_url(Some(&pinned)).map_err(Refusal::Failed)?;
     let cycle = journal.command_cycle();
-    let websocket_timing = Timer::new(cycle, Mark::WebsocketOpen);
-    let (mut meta, mut ws) = WsMeta::connect(&url, None)
-        .await
-        .map_err(|e| Refusal::Failed(format!("relay websocket: {e}")))?;
-    drop(websocket_timing);
-    let relay_timing = Timer::new(cycle, Mark::RelayVerdict);
-    journal.current(session).await.map_err(Refusal::Journal)?;
-    let socket = stop.socket(meta.wrapped().clone());
-    let mut events = meta
-        .observe(ObserveConfig::default())
-        .await
-        .map_err(|e| Refusal::Failed(format!("relay events: {e}")))?;
-
-    // WIR-4 (paid-tcp-relay 844e834): the challenge.
-    let challenge = text_frame(&mut ws).await.map_err(failed("challenge"))?;
-    let challenge = challenge["challenge"]
-        .as_str()
-        .ok_or_else(|| Refusal::Failed(format!("challenge: {challenge}")))?;
-
-    // WIR-5 (paid-tcp-relay 844e834): the AUTH, signed by the relay key.
-    let mut aux = [0u8; 32];
-    getrandom::fill(&mut aux).map_err(|e| Refusal::Failed(format!("getrandom: {e}")))?;
-    let created_at = (js_sys::Date::now() / 1000.0) as u64;
-    #[cfg_attr(not(feature = "tracer"), allow(unused_mut))]
-    let mut auth = crate::relay_auth::auth_event(
-        &relay_key.0,
-        &target.relay,
-        challenge,
-        &target.host,
-        target.port,
-        created_at,
-        &aux,
-    )
-    .map_err(Refusal::Failed)?;
-    #[cfg(feature = "tracer")]
-    if tamper_auth {
-        // The signature's first hex digit, so up to four of its bits: the event keeps its shape,
-        // so only check 2 of paid-tcp-relay's `WIR-6` (844e834) fails.
-        let sig = auth["sig"].as_str().expect("signed").to_string();
-        let flipped = if sig.starts_with('0') { "1" } else { "0" };
-        auth["sig"] = format!("{flipped}{}", &sig[1..]).into();
-    }
-    journal.current(session).await.map_err(Refusal::Journal)?;
-    if stop.stopped() {
-        return Err(Refusal::Journal("stale relay continuation".into()));
-    }
-    ws.send(WsMessage::Text(auth.to_string()))
-        .await
-        .map_err(|e| Refusal::Failed(format!("AUTH: {e}")))?;
-
-    // WIR-7 (paid-tcp-relay 844e834): `{"ok": true}` once the relay has dialed; anything else
-    // ends the attempt.
-    let verdict = text_frame(&mut ws).await.map_err(failed("relay verdict"))?;
-    drop(relay_timing);
-    if verdict["ok"] != json!(true) {
-        let reason = verdict["reason"].as_str().unwrap_or_default().to_string();
-        let mut close_code = None;
-        while let Some(event) = events.next().await {
-            if let WsEvent::Closed(close) = event {
-                close_code = Some(close.code);
-                break;
-            }
+    let mut retries = 0;
+    let mut not_before = 0.0;
+    let (ws, socket) = loop {
+        journal.current(session).await.map_err(Refusal::Journal)?;
+        if stop.stopped() {
+            return Err(Refusal::Journal("stale relay continuation".into()));
         }
-        return Err(Refusal::Relay { reason, close_code });
-    }
+        // A retry's back-off is waited out before the new websocket opens, without the host gate.
+        let back_off = (not_before - relay_now()?).ceil();
+        if back_off > 0.0 {
+            relay_wait(back_off as i32, stop).await?;
+        }
+        let websocket_timing = Timer::new(cycle, Mark::WebsocketOpen);
+        let (mut meta, mut ws) = WsMeta::connect(&url, None)
+            .await
+            .map_err(|e| Refusal::Failed(format!("relay websocket: {e}")))?;
+        drop(websocket_timing);
+        let relay_timing = Timer::new(cycle, Mark::RelayVerdict);
+        journal.current(session).await.map_err(Refusal::Journal)?;
+        let socket = stop.socket(meta.wrapped().clone());
+        let mut events = meta
+            .observe(ObserveConfig::default())
+            .await
+            .map_err(|e| Refusal::Failed(format!("relay events: {e}")))?;
+
+        // WIR-4 (paid-tcp-relay 844e834): the challenge.
+        let challenge = text_frame(&mut ws).await.map_err(failed("challenge"))?;
+        let challenge = challenge["challenge"]
+            .as_str()
+            .ok_or_else(|| Refusal::Failed(format!("challenge: {challenge}")))?;
+
+        // WIR-5 (paid-tcp-relay 844e834): the AUTH, signed by the relay key.
+        let mut aux = [0u8; 32];
+        getrandom::fill(&mut aux).map_err(|e| Refusal::Failed(format!("getrandom: {e}")))?;
+        let created_at = (js_sys::Date::now() / 1000.0) as u64;
+        #[cfg_attr(not(feature = "tracer"), allow(unused_mut))]
+        let mut auth = crate::relay_auth::auth_event(
+            &relay_key.0,
+            &target.relay,
+            challenge,
+            &target.host,
+            target.port,
+            created_at,
+            &aux,
+        )
+        .map_err(Refusal::Failed)?;
+        #[cfg(feature = "tracer")]
+        if tamper_auth {
+            // The signature's first hex digit, so up to four of its bits: the event keeps its shape,
+            // so only check 2 of paid-tcp-relay's `WIR-6` (844e834) fails.
+            let sig = auth["sig"].as_str().expect("signed").to_string();
+            let flipped = if sig.starts_with('0') { "1" } else { "0" };
+            auth["sig"] = format!("{flipped}{}", &sig[1..]).into();
+        }
+        // The host gate covers only the spacing wait and the AUTH send: a connection that stalls
+        // before its challenge never holds up other dials to the same host.
+        let mut slot = relay_slot(&target.host, 0.0, stop).await?;
+        journal.current(session).await.map_err(Refusal::Journal)?;
+        if stop.stopped() {
+            return Err(Refusal::Journal("stale relay continuation".into()));
+        }
+        *slot = Some(relay_now()?);
+        ws.send(WsMessage::Text(auth.to_string()))
+            .await
+            .map_err(|e| Refusal::Failed(format!("AUTH: {e}")))?;
+        // Completion is conservative: even a delayed flush cannot bunch two AUTHs together.
+        *slot = Some(relay_now()?);
+        drop(slot);
+
+        // WIR-7 (paid-tcp-relay 844e834): `{"ok": true}` once the relay has dialed; anything else
+        // ends the attempt.
+        let verdict = text_frame(&mut ws).await.map_err(failed("relay verdict"))?;
+        drop(relay_timing);
+        if verdict["ok"] != json!(true) {
+            let reason = verdict["reason"].as_str().unwrap_or_default().to_string();
+            let mut close_code = None;
+            while let Some(event) = events.next().await {
+                if let WsEvent::Closed(close) = event {
+                    close_code = Some(close.code);
+                    break;
+                }
+            }
+            if reason == "pace" && retries < 3 {
+                // The refused socket is closed before another attempt. No TCP bytes, SSH or
+                // command intent exist here. Back off 1.25, 2.5, then 5 seconds, without
+                // replacing the caller's stop or extending its existing deadline.
+                let _ = meta.wrapped().close();
+                drop(ws);
+                drop(meta);
+                drop(socket);
+                not_before = relay_now()? + f64::from(1_250 << retries);
+                retries += 1;
+                continue;
+            }
+            return Err(Refusal::Relay { reason, close_code });
+        }
+        break (ws, socket);
+    };
 
     // WIR-8 (paid-tcp-relay 844e834): from here on, binary frames carry the TCP bytes; SSH runs
     // over them.
