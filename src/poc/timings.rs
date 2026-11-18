@@ -392,6 +392,7 @@ impl Launch {
 pub(crate) fn change_label(change: &Change) -> &'static str {
     match change {
         Change::Request => "Request",
+        Change::RecoverRequest => "RecoverRequest",
         Change::PrepareRead => "PrepareRead",
         Change::SkipRead(_) => "SkipRead",
         Change::Malformed { .. } => "Malformed",

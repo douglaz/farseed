@@ -56,6 +56,31 @@ pub struct Terminal {
     pub exit_status: u32,
 }
 
+/// A replayable pre-transmission fence. Only a prepared, never-attempted launch may
+/// recover automatically: arbitrary root commands can remove their own job records.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedLaunch {
+    pub call: u64,
+    pub job: String,
+    pub elevation: crate::jobs::Elevation,
+    pub wrapper_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LaunchAttempt {
+    pub call: u64,
+    pub job: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct LaunchFence {
+    pub prepared: PreparedLaunch,
+    pub attempted: bool,
+    pub resent: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Continuation {
@@ -199,6 +224,7 @@ pub enum DispatchRefusal {
 /// All projections come from committed records applied in journal order.
 #[derive(Clone, Debug, Default)]
 pub struct Dispatch {
+    pub launches: BTreeMap<u64, LaunchFence>,
     pub approved_entries: BTreeMap<String, ApprovedMachine>,
     pub setup_approval: Option<u64>,
     pub(crate) purchase_approvals: BTreeMap<String, u64>,
@@ -218,6 +244,70 @@ pub struct Dispatch {
 }
 
 impl Dispatch {
+    fn launch_call(&self, call: u64, job: &str) -> Result<&Intent, String> {
+        let call = self.calls.get(&call).ok_or("unknown launch call")?;
+        if !matches!(call.state, CallState::Unresolved) || call.intent.job.as_deref() != Some(job) {
+            return Err("launch call is terminal or job differs".into());
+        }
+        Ok(&call.intent)
+    }
+
+    pub fn prepare_launch(&mut self, prepared: PreparedLaunch) -> Result<(), String> {
+        self.launch_call(prepared.call, &prepared.job)?;
+        // Validate the recorded digest without depending on this build's scripts.
+        // A later bundle may change the wrapper; replay still works, but sending
+        // must reconcile against this original digest and will then refuse.
+        if self.launches.contains_key(&prepared.call)
+            || prepared.wrapper_sha256.len() != 64
+            || !prepared
+                .wrapper_sha256
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("launch preparation differs or already exists".into());
+        }
+        self.launches.insert(
+            prepared.call,
+            LaunchFence {
+                prepared,
+                attempted: false,
+                resent: false,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn launch_attempt(&mut self, attempt: &LaunchAttempt, resend: bool) -> Result<(), String> {
+        self.launch_call(attempt.call, &attempt.job)?;
+        if resend
+            && (self
+                .jobs
+                .iter()
+                .rev()
+                .find(|r| r.evidence.call == attempt.call)
+                .is_none_or(|r| {
+                    r.number.is_none()
+                        || r.evidence.job != attempt.job
+                        || r.state != crate::jobs::State::Missing
+                })
+                || self.jobs.iter().any(|r| {
+                    r.evidence.call == attempt.call && r.state != crate::jobs::State::Missing
+                }))
+        {
+            return Err("resend requires committed missing evidence only".into());
+        }
+        let fence = self
+            .launches
+            .get_mut(&attempt.call)
+            .ok_or("launch is not prepared")?;
+        if fence.attempted || fence.resent || fence.prepared.job != attempt.job {
+            return Err("launch transmission already reserved".into());
+        }
+        fence.attempted = true;
+        fence.resent = resend;
+        Ok(())
+    }
+
     pub fn check_command(&self, machine: &str) -> Result<(), DispatchRefusal> {
         if !self.approved_entries.contains_key(machine) {
             return Err(DispatchRefusal::NoEntry {

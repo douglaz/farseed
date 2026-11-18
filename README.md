@@ -186,10 +186,42 @@ does not parse, has zero tool calls or has more than one tool call. The older pa
 loop never retries or resumes a turn. The served PoC permits only up to five re-sends after
 waits of 1, 2, 4, 8 and 16 seconds when a complete successful HTTP reply has no choices array
 and reports error code 502 with error type `provider_unavailable`. Each re-send is validated
-like a first send and stays within the same counted Request. Lost, aborted or timed-out
-replies are never retried. The served BYO task runner restores
-eligible work in the original session after unlock and credential resupply, with a new counted
-Request for an interrupted inference turn and collection of pending jobs first.
+like a first send and stays within the same counted Request. Provider errors, authentication
+refusals, limits, malformed replies and configuration changes keep their own pauses. A live
+exchange lost to a rejected fetch, status 0, dropped connection or transport abort uses the
+same recovery as a page close: an unfinished AI request with no journaled reply is retired,
+and a new counted Request is made automatically from the committed history. Recovery waits
+until the page is visible and online; visibility changes, online and pageshow wake it, with
+a one-second backoff between lost exchanges and no retry loop while hidden or offline. The
+interrupted request stays counted; its possible spend is neither refunded nor declared zero.
+No journaled reply is requested again: recording a proposal (including questions, file offers
+and done) consumes the request and records its next action in the same append. Recovery waits
+for the original session, authority, approvals, key, endpoint and model just like any next
+request. Ended tasks and sessions do not continue. A recovered credit-backed request with no
+session AI key pauses for one Resume press to create the key, then carries on by itself;
+reopening that pause still needs the press. Recovery with a held session key or an
+operator-supplied key needs no extra press. Five consecutive interrupted requests can
+be recovered automatically; that count survives reopen and reduces the busy-reply retry
+allowance on the replacement request. A committed reply resets it. Reaching the interruption
+bound pauses with a connection message; an explicit Resume starts a new bounded attempt.
+Normal request/step limits and the inference provider's existing spending limits still apply.
+Pending machine jobs are collected first; they keep their recorded identity and never become
+a second run because of an AI recovery. A connection dropped while awaiting a transmitted
+command's record, or during a collection read, leaves inspection active. Once visible and
+online, the page reconnects and collects the same call and job automatically, with a one-second
+backoff after transport loss. Both collection and initial connection setup stop after five
+consecutive transport failures observed while visible and online; failures observed while
+hidden or offline and time spent waiting for return do not count or reset the count. At the
+bound, the page pauses with a connection message and Resume starts a new bounded attempt.
+During initial setup, a transport failure can repeat dispatch only while the same revision
+and committed proposal have no pending intent, so the command has never been sent. Each
+attempt passes normal admission again. Once an intent exists, the page collects instead.
+Reload or close retains that inspection for continuation after unlock. A consumed
+transmission reservation forbids resend, even if the next read is missing.
+Only committed, validated evidence can settle the call. Foreign, incomplete, missing,
+mismatched or malformed records and nontransport refusals keep their existing pauses; a
+normally closed read without an exit status also pauses, even if SSH reports an exit signal.
+A known-running verification record still needs Resume under the existing collection rules.
 
 | Tool | Arguments and dispatch |
 |---|---|
@@ -853,11 +885,16 @@ renames it to `exit`. It never waits for background descendants. No standard
 input is written to disk; no command takes input yet. A connected exec reads these files as soon
 as the command ends, including when a background process retains stdout (`STA-20a`).
 
-An existing job directory is refused without changing its record. This is an implementation
-reading stricter than `STA-20` for an installed system, carried over from the rescue rule;
-normal operation never resends a wrapper. A wrapper refusal or setup failure leaves the call
-unresolved and never becomes a command exit code. The reason includes up to 2048 bytes of
-wrapper stderr, decoded lossily; a nonzero wrapper status never becomes a command exit code.
+An existing job directory is refused without changing its record. The page can send a prepared,
+untransmitted command automatically after unlock, once a complete `missing` read on the pinned
+machine has committed. It sends the identical wrapper under the same job id and call, with the same approval
+and hold, and records `resend {call, job}` before transmission. Exclusive `mkdir` admits only
+one send while the reservation remains present. A wrapper refusal or setup failure leaves the call
+unresolved and never becomes a command exit code. A complete, validated record returned by
+the recovery wrapper goes directly through evidence, checkpoint and settlement, just like
+the first dispatch; only a wrapper without a usable record needs a separate read. The reason
+includes up to 2048 bytes of wrapper stderr, decoded lossily; a nonzero wrapper status never
+becomes a command exit code.
 
 `collect_jobs` takes the same target fields as `run_command`, without a command. It is refused
 while locked, and without a host-key pin before contact. It reads every unresolved call's job
@@ -868,8 +905,11 @@ no intent, writes nothing on the machine and bypasses the command disposition ch
 code. Each call is independent: a read, parse, validation or append failure reports
 `{"call":1,"job":"…","failed":true,"why":"…"}` and collection proceeds to the next call.
 An append failure also retains the read evidence in `job_record` with `number:null`.
-Nothing is retried. If the connection ends, earlier outcomes remain in the response and the
-unreached calls are listed with `not_read:true`. Evidence is durably appended before the
+Ordinary collection never retries. The page's pending-task adapter alone retries interrupted
+collection reads when visible and online, and can reserve the one recovery send described
+above; its collection exec still contains only read text. If the connection ends, earlier
+outcomes remain in the response and unreached calls are listed with `not_read:true`.
+Evidence is durably appended before the
 projection changes (`STA-3`).
 
 Waiting runs on the machine with shell sleeps and no browser or Tokio timer. An existing
@@ -896,8 +936,26 @@ never presented as empty output. Collection reports that failed read and continu
 next call.
 
 A changed boot or a gone command without an exit code likewise establishes `ended`, outcome
-unknown: **no terminal is written**. A missing record stays `missing`, unresolved, and is never
-proof of death. An interrupted launch can leave an `incomplete` record: any received machine
+unknown: **no terminal is written**. A missing record stays `missing` and unresolved. It proves
+that no command has run so far only if no earlier reservation could have been erased. Arbitrary
+root shell can erase its job directory; reinstall or volatile `/var/lib` can erase it too.
+The page therefore includes an optional `launch` preparation (wrapper digest and elevation)
+in the existing page command-intent record for new commands without standard input, then
+records a `launch_transmission` reservation before any launch
+bytes can leave. A prepared call without either a transmission or resend reservation is known
+not to have been sent by this page. Only that case may be sent automatically once after the
+missing read. Both reservations consume the attempt even when a later stop prevents sending.
+Calls that may have been transmitted, old calls without a preparation fence, standard-input
+jobs and delivery reboot retain collection and pause. Missing alone never authorizes their
+resend. Admission is repeated except for the pending call's own hold; no new intent or approval
+is created. Journal v4 remains v4; replay refuses unknown, terminal or repeated resend records.
+The preparation and intent commit together. Normal launch adds only the transmission
+reservation: two pre-send appends in total, versus round 1's three and the original one.
+Historical intents without preparation remain collect-only; replay also accepts round 1's
+separate `launch_prepared` record. SSH login precedes the intent. If the page closes during
+login, the saved proposal continues after unlock without another AI request. If it closes
+after the intent but before the reservation, the guarded missing-record continuation applies.
+An interrupted launch can leave an `incomplete` record: any received machine
 and command bytes are retained as evidence, but it establishes no end or outcome. A record
 with no command PID and no exit code is also incomplete. Another machine's record settles
 nothing. Ended, missing and incomplete calls remain eligible for later collection. No timer

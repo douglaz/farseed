@@ -6,6 +6,7 @@ use std::cell::Cell;
 #[derive(Default)]
 pub(super) struct Read {
     sent: Cell<bool>,
+    interrupted: Cell<bool>,
 }
 
 impl Read {
@@ -18,10 +19,17 @@ impl Read {
         self.sent.get()
     }
 
+    pub fn mark_interrupted(&self) {
+        self.interrupted.set(true);
+    }
+
     pub fn failure(&self, call: u64, job: Option<&str>, ending: bool, why: &str) -> Value {
         let mut report = json!({"call":call});
         if let Some(job) = job {
             report["job"] = json!(job);
+        }
+        if self.interrupted.get() && !ending && job.is_some() {
+            report["connection_lost"] = json!(true);
         }
         if !self.sent() && ending {
             report["not_read"] = json!(true);

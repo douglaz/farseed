@@ -142,6 +142,24 @@ pub fn valid_request(request: &serde_json::Value) -> bool {
 /// Live connection admission is above the dispatch core used by the formal comparison.
 #[allow(async_fn_in_trait, reason = "single worker")]
 pub trait BoundJournal: Journal {
+    fn recovers_missing(&self) -> bool {
+        false
+    }
+    /// Page recovery is opt-in; ordinary collection remains read-only.
+    async fn resend_launch(
+        &mut self,
+        _session: &crate::binding::Session,
+        _call: u64,
+        _job: &str,
+        _elevation: crate::jobs::Elevation,
+        _pinned: &str,
+    ) -> Result<Option<Vec<u8>>, AppendRefusal> {
+        Ok(None)
+    }
+    /// Reserve possible transmission before enqueuing any command bytes.
+    async fn launch_transmission(&mut self, _call: u64, _sent: &[u8]) -> Result<(), String> {
+        Ok(())
+    }
     /// Opaque, memory-only worker measurement; ordinary harness calls have no task cycle.
     #[cfg(target_arch = "wasm32")]
     fn command_cycle(&self) -> Option<u64> {

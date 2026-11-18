@@ -1,7 +1,8 @@
 //! One configured chat-completions endpoint. No provisioning retries.
 //! Only a fast provider-unavailable answer permits up to five re-sends after waits of
-//! 1–16 seconds, each validated like a first send. Lost, aborted or timed-out replies
-//! are never retried.
+//! 1–16 seconds, each validated like a first send. A transport interruption without
+//! a committed reply may be recovered as a new counted Request within the retry
+//! bound, once the page is visible and online again.
 //!
 //! Bounds: 8 KiB per outcome excerpt, 128 KiB serialized request, 2 MiB response,
 //! 512 bytes per provider error excerpt; each exchange, including response reading,
@@ -35,8 +36,11 @@ const SHORT_EXCERPT_BYTES: usize = 768;
 const RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const RESPONSE_TOO_LARGE: &str = "inference response exceeds the local size bound";
 const ERROR_BYTES: usize = 512;
+pub(crate) const MAX_RETRIES: u32 = 5;
 pub(crate) const INCOMPLETE: &str =
-    "inference request incomplete; resume when the connection and session are ready";
+    "The AI request was interrupted. Check the connection, then Resume to ask again.";
+pub(crate) const TRANSPORT_INTERRUPTED: &str =
+    "The AI connection was interrupted; waiting for the page and connection to return.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplyError {

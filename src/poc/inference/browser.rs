@@ -42,7 +42,7 @@ impl Drop for CommandResponse {
 struct Pending {
     session: String,
     task: String,
-    retry: Cell<Option<u32>>,
+    retry: Cell<Option<(u32, u32)>>,
     controller: web_sys::AbortController,
     stopped: Cell<bool>,
     ready: Notify,
@@ -74,13 +74,14 @@ pub(crate) fn retry_progress(report: &mut Value) {
     };
     REQUESTS.with_borrow(|requests| {
         for pending in requests.iter().filter_map(std::rc::Weak::upgrade) {
-            if let Some(retry) = pending.retry.get()
+            if let Some((retry, limit)) = pending.retry.get()
                 && !pending.stopped.get()
                 && let Some(task) = tasks.iter_mut().find(|task| {
                     task["id"] == pending.task && task["start_session"] == pending.session
                 })
             {
-                task["inference_retry"] = format!("Provider busy, retrying ({retry} of 5).").into();
+                task["inference_retry"] =
+                    format!("Provider busy, retrying ({retry} of {limit}).").into();
             }
         }
     });
@@ -240,9 +241,9 @@ struct Registration {
     _callback: Closure<dyn FnMut()>,
 }
 impl Registration {
-    async fn retry_wait(&mut self, retry: u32) -> Result<(), String> {
+    async fn retry_wait(&mut self, retry: u32, limit: u32) -> Result<(), String> {
         self.worker.clear_timeout_with_handle(self.timer);
-        self.pending.retry.set(Some(retry));
+        self.pending.retry.set(Some((retry, limit)));
         let result = async {
             let (send, receive) = tokio::sync::oneshot::channel();
             let mut send = Some(send);
@@ -370,10 +371,26 @@ async fn body(
     Ok(output)
 }
 
-/// Only a fast provider-unavailable answer permits up to five re-sends after waits of
-/// 1–16 seconds, each validated like a first send. Lost, aborted or timed-out replies
-/// are never retried. Completed steps remain owned by the durable caller.
+/// Keep transport loss distinct from provider, configuration and admission pauses.
+/// The durable caller alone retires an interrupted Request and counts its replacement.
 pub(crate) async fn next(
+    task: &crate::store::poc::Task,
+    session: &str,
+) -> Result<(String, crate::goals::Tool), ReplyError> {
+    let revision = REVISION.get();
+    let continuation = crate::lifecycle::owner().continuation()?;
+    match exchange(task, session).await {
+        Err(why) if why == INCOMPLETE && revision != REVISION.get() => Err(
+            "inference configuration changed; review the endpoint and model before Resume".into(),
+        ),
+        Err(why) if why == INCOMPLETE && continuation.check().is_ok() => {
+            Err(TRANSPORT_INTERRUPTED.into())
+        }
+        result => result,
+    }
+}
+
+async fn exchange(
     task: &crate::store::poc::Task,
     session: &str,
 ) -> Result<(String, crate::goals::Tool), ReplyError> {
@@ -394,7 +411,8 @@ pub(crate) async fn next(
     // Five fast busy replies, 1+2+4+8+16 seconds of waits, then one full exchange.
     // This timer also bounds admission and progress waits across all re-sends.
     let total_deadline = monotonic_ms()? + f64::from(5 * BUSY_WINDOW_MS + 31_000 + deadline_ms);
-    for retries in 0..=5 {
+    let retry_limit = MAX_RETRIES.saturating_sub(task.request_recoveries);
+    for retries in 0..=retry_limit {
         continuation.check().map_err(|_| INCOMPLETE)?;
         if revision != REVISION.get() {
             return Err(INCOMPLETE.into());
@@ -441,30 +459,33 @@ pub(crate) async fn next(
         );
         REQUESTS.with_borrow_mut(|requests| requests.push(Rc::downgrade(&pending)));
 
-        let admission_error = |why: String| if retries == 0 { why } else { INCOMPLETE.into() };
-        let (promise, is_credit, sent_at) = {
+        let (promise, is_credit, sent_at) = loop {
+            if task.request_recoveries > 0 {
+                pending
+                    .until(crate::poc::web::wait_for_page(&continuation))
+                    .await??;
+            }
             let mut local = pending.until(local.lock()).await?;
-            continuation.check().map_err(admission_error)?;
+            continuation.check()?;
+            // Recheck under the writer: acquiring it can yield to a hide/offline
+            // event. Drop it before waiting, then admit the same counted Request.
+            if task.request_recoveries > 0 && !crate::poc::web::page_ready() {
+                continue;
+            }
             if revision != REVISION.get() {
                 return Err(INCOMPLETE.into());
             }
             if let Some(why) = local.dispatch_refusal() {
-                return Err(admission_error(why.into()).into());
+                return Err(why.into());
             }
-            let store = local
-                .store()
-                .ok_or_else(|| admission_error("locked".into()))?;
-            store
-                .check_inference_request(task, session)
-                .map_err(admission_error)?;
-            store
-                .check_inference_request(task, session)
-                .map_err(admission_error)?;
-            continuation.check().map_err(admission_error)?;
+            let store = local.store().ok_or("locked")?;
+            store.check_inference_request(task, session)?;
+            store.check_inference_request(task, session)?;
+            continuation.check()?;
             if revision != REVISION.get() || pending.stopped.get() {
                 return Err(INCOMPLETE.into());
             }
-            with_request_key(session, store.credit_session(session), |key| {
+            break with_request_key(session, store.credit_session(session), |key| {
                 let body = request_for_task(store, &config, task, &[key])?;
                 let init = web_sys::RequestInit::new();
                 init.set_method("POST");
@@ -491,10 +512,8 @@ pub(crate) async fn next(
                     .map_err(|_| INCOMPLETE)?;
                 body.fill(0, 0, body.length());
                 let _ = headers.delete("Authorization");
-                continuation.check().map_err(admission_error)?;
-                store
-                    .check_inference_request(task, session)
-                    .map_err(admission_error)?;
+                continuation.check()?;
+                store.check_inference_request(task, session)?;
                 let sent_at = monotonic_ms()?;
                 if sent_at >= total_deadline {
                     return Err(INCOMPLETE.into());
@@ -504,7 +523,7 @@ pub(crate) async fn next(
                     store.credit_session(session),
                     sent_at,
                 ))
-            })?
+            })?;
         };
 
         let ready = pending.ready.notified();
@@ -578,15 +597,13 @@ pub(crate) async fn next(
                 return Err(INCOMPLETE.into());
             }
             let store = local.store().ok_or(INCOMPLETE)?;
-            store
-                .check_inference_request(task, session)
-                .map_err(|why| if retries == 0 { why } else { INCOMPLETE.into() })?;
+            store.check_inference_request(task, session)?;
             let reply_at = monotonic_ms()?;
             if reply_at >= total_deadline {
                 return Err(INCOMPLETE.into());
             }
             with_request_key(session, is_credit, |key| {
-                if retries < 5
+                if retries < retry_limit
                     && (0.0..=f64::from(BUSY_WINDOW_MS)).contains(&(reply_at - sent_at))
                     && (200..300).contains(&status)
                     && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
@@ -629,7 +646,7 @@ pub(crate) async fn next(
             futures_util::future::Either::Right(_) => Err(INCOMPLETE.into()),
         };
         if matches!(result, Ok(None)) {
-            registration.retry_wait(retries + 1).await?;
+            registration.retry_wait(retries + 1, retry_limit).await?;
             continuation.check().map_err(|_| INCOMPLETE)?;
             if revision != REVISION.get() || pending.stopped.get() {
                 return Err(INCOMPLETE.into());

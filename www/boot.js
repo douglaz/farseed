@@ -450,6 +450,7 @@ const plainPause = reason => {
   if (pauseMessages.has(reason)) return pauseMessages.get(reason);
   if (/^collection returned no outcome for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return 'The earlier command’s result is not available yet. Resume checks it again without running it twice.';
   if (/^collection record identity mismatch for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return 'The returned result does not match the earlier command. Review Details before Resume; the command will not be run twice.';
+  if (/^collection (?:recorded no record found|could not confirm whether the command reached the machine; Resume will check again without running it twice) for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return 'The page could not confirm whether the command reached the machine. Resume will check again without running it twice.';
   if (/^collection (?:failed for pending call|failed for pending call \d+ job|.* for pending call) /.test(reason)) return 'The page could not establish the earlier command’s result. Review Details and check the connection before Resume; the command will not be run twice.';
   return reason;
 };
@@ -1891,7 +1892,7 @@ const start = () => {
     if (worker !== current) return;
     deploymentMaterial = material;
     const key = new TextEncoder().encode(material.relay_key ?? '');
-    try { nativePost({initialize: incarnation, deployment: {origin: material.provider_origin, key, public_fields: JSON.stringify(material.fields ?? {})}}, [key.buffer]); }
+    try { nativePost({initialize: incarnation, presence: {visible: document.visibilityState === 'visible', online: navigator.onLine}, deployment: {origin: material.provider_origin, key, public_fields: JSON.stringify(material.fields ?? {})}}, [key.buffer]); }
     finally { if (key.byteLength) key.fill(0); }
   });
   worker.onmessage = ({ data }) => {
@@ -1986,7 +1987,11 @@ const lock = () => {
   });
   previous.postMessage({retire_runtime: true});
 };
+const updateTaskPresence = () => worker?.postMessage({task_presence: {
+  visible: document.visibilityState === 'visible', online: navigator.onLine,
+}});
 document.addEventListener('visibilitychange', () => {
+  updateTaskPresence();
   const hidden = document.visibilityState === 'hidden';
   if (hidden) interruptFileDownloads();
   if (hidden && (taskDetails.size || deliveryDetails.entry.size || deliveryDetails.commands.size)) { clearDetails(); render(taskDetailsStore, true); }
@@ -1994,6 +1999,7 @@ document.addEventListener('visibilitychange', () => {
   worker?.postMessage({ lifecycle: hidden ? 'hidden' : 'visible' });
 });
 document.addEventListener('freeze', () => {
+  worker?.postMessage({task_presence: {visible: false, online: navigator.onLine}});
   interruptFileDownloads();
   if (taskDetails.size || deliveryDetails.entry.size || deliveryDetails.commands.size) { clearDetails(); render(taskDetailsStore, true); }
   if (ceremony) { lock(); return; }
@@ -2001,11 +2007,15 @@ document.addEventListener('freeze', () => {
   worker?.postMessage({ lifecycle: 'freeze' });
 });
 document.addEventListener('resume', () => {
+  updateTaskPresence();
   if (suspended) { suspended = false; worker?.postMessage({ lifecycle: 'resume' }); }
 });
 addEventListener('pagehide', lock);
+addEventListener('online', updateTaskPresence);
+addEventListener('offline', updateTaskPresence);
 addEventListener('pageshow', (event) => {
   if (event.persisted) lock();
+  updateTaskPresence();
 });
 $('lock').addEventListener('click', lock);
 

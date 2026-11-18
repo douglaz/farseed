@@ -12,6 +12,8 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 pub(crate) type Response = Rc<RefCell<Option<crate::poc::inference::CommandResponse>>>;
 
+const TRANSPORT_FAILURE_LIMIT: u8 = 5;
+
 #[derive(PartialEq, Eq)]
 struct Progress {
     generation: u64,
@@ -27,6 +29,73 @@ thread_local! {
     static WAKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static WAKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static LAST_PROGRESS: RefCell<BTreeMap<String, Progress>> = const { RefCell::new(BTreeMap::new()) };
+    static PAGE_READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PAGE_CHANGED: Rc<tokio::sync::Notify> = Rc::new(tokio::sync::Notify::new());
+}
+
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub fn task_presence(visible: bool, online: bool) {
+    PAGE_READY.set(visible && online);
+    PAGE_CHANGED.with(|changed| changed.notify_waiters());
+    if visible && online {
+        wake();
+    }
+}
+
+/// Back off a lost transport, then wait without polling while hidden or offline.
+/// The wait holds no store writer and grants no transmission authority.
+async fn wait_for_return(continuation: &crate::lifecycle::Continuation) -> Result<(), String> {
+    use wasm_bindgen::closure::Closure;
+    struct Delay {
+        worker: web_sys::WorkerGlobalScope,
+        timer: i32,
+        _callback: Closure<dyn FnMut()>,
+    }
+    impl Drop for Delay {
+        fn drop(&mut self) {
+            self.worker.clear_timeout_with_handle(self.timer);
+        }
+    }
+    continuation.check()?;
+    let worker: web_sys::WorkerGlobalScope = js_sys::global().unchecked_into();
+    let (send, receive) = tokio::sync::oneshot::channel();
+    let mut send = Some(send);
+    let callback = Closure::<dyn FnMut()>::new(move || {
+        if let Some(send) = send.take() {
+            let _ = send.send(());
+        }
+    });
+    let timer = worker
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            callback.as_ref().unchecked_ref(),
+            1_000,
+        )
+        .map_err(|_| "could not wait for the connection to return")?;
+    let _delay = Delay {
+        worker,
+        timer,
+        _callback: callback,
+    };
+    receive.await.map_err(|_| "connection wait interrupted")?;
+    wait_for_page(continuation).await
+}
+
+pub(crate) fn page_ready() -> bool {
+    PAGE_READY.get()
+}
+
+pub(crate) async fn wait_for_page(
+    continuation: &crate::lifecycle::Continuation,
+) -> Result<(), String> {
+    let changed = PAGE_CHANGED.with(Rc::clone);
+    loop {
+        let notified = changed.notified();
+        continuation.check()?;
+        if PAGE_READY.get() {
+            return Ok(());
+        }
+        notified.await;
+    }
 }
 
 #[wasm_bindgen::prelude::wasm_bindgen]
@@ -322,27 +391,66 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             collecting: false,
             continuation: self.continuation.clone(),
         };
-        let result = crate::harness::run_command_input(
-            self.pins,
-            &mut journal,
-            self.target,
-            command.as_bytes(),
-            input.as_deref().map(Vec::as_slice),
-            Some(&origin),
+        let mut transport_failures = 0;
+        loop {
+            {
+                let local = local();
+                let mut writer = local.lock().await;
+                self.continuation.check()?;
+                if let Some(why) = writer.dispatch_refusal() {
+                    return Err(why.into());
+                }
+                let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
+                let current = store.poc_task(&task.id)?;
+                // A committed intent changes the revision and installs pending atomically.
+                // Return to the driver's collection path instead of issuing it again.
+                if current.pending.is_some()
+                    || current.revision != task.revision
+                    || current.proposal != task.proposal
+                {
+                    return Err("stale task execution".into());
+                }
+                store.poc_prepare_execution(&current, &journal.binding.session)?;
+            }
+            let result = crate::harness::run_command_input(
+                self.pins,
+                &mut journal,
+                self.target,
+                command.as_bytes(),
+                input.as_deref().map(Vec::as_slice),
+                Some(&origin),
+                #[cfg(feature = "tracer")]
+                false,
+            )
+            .await;
             #[cfg(feature = "tracer")]
-            false,
-        )
-        .await;
-        #[cfg(feature = "tracer")]
-        crate::testonly::session_point("poc_execution_return").await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(why) => Err(local()
-                .lock()
-                .await
-                .store()
-                .ok_or(crate::poc::wait::LOCKED)?
-                .poc_refusal(&why.to_json())),
+            crate::testonly::session_point("poc_execution_return").await;
+            let why = match result {
+                Ok(_) => return Ok(()),
+                Err(why) => why,
+            };
+            {
+                let local = local();
+                let mut writer = local.lock().await;
+                self.continuation.check()?;
+                let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
+                let current = store.poc_task(&task.id)?;
+                if !matches!(&why, crate::harness::Refusal::Transport(_))
+                    || current.pending.is_some()
+                    || current.revision != task.revision
+                    || current.proposal != task.proposal
+                {
+                    return Err(store.poc_refusal(&why.to_json()));
+                }
+            }
+            // Hidden/offline failures and the wait consume no visible attempt.
+            if PAGE_READY.get() {
+                transport_failures += 1;
+            }
+            if transport_failures >= TRANSPORT_FAILURE_LIMIT {
+                return Err("The machine or connection could not be reached. The command has not been sent; Resume will try connecting again.".into());
+            }
+            wait_for_return(&self.continuation).await?;
         }
     }
     async fn observe(&mut self, task: &Task, session: &str) -> Result<Observation, String> {
@@ -384,40 +492,77 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             collecting: true,
             continuation: self.continuation.clone(),
         };
-        publish_cycle_progress(session, super::timings::active(&task.id)).await;
-        let collect_timing = super::timings::Timer::new(
-            super::timings::active(&task.id),
-            super::timings::Mark::Collect,
-        );
-        let result = crate::harness::collect_jobs(
-            self.pins,
-            &mut journal,
-            self.target,
-            #[cfg(feature = "tracer")]
-            false,
-        )
-        .await;
-        drop(collect_timing);
-        if let Some(observation) = committed(task, &self.continuation).await? {
-            return Ok(observation);
-        }
-        let local = local();
-        let mut writer = local.lock().await;
-        let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
         let pending = task
             .pending
             .as_ref()
             .ok_or(crate::poc::wait::MISSING_PENDING_JOB)?;
-        let call = pending.call;
-        match result {
-            Ok(reports) => Ok(Observation::Unknown(
-                store.poc_collection_reason(pending, &reports),
-            )),
-            Err(why) => Err(crate::poc::wait::COLLECTION_FAILED.render(
-                call,
-                "",
-                &store.poc_refusal(&why.to_json()),
-            )),
+        let mut transport_failures = 0;
+        loop {
+            if !PAGE_READY.get() {
+                wait_for_return(&self.continuation).await?;
+            }
+            self.authority(&task.id, session).await?;
+            // A completed append stands even when its network response was lost.
+            if let Some(observation) = committed(task, &self.continuation).await? {
+                return Ok(observation);
+            }
+            publish_cycle_progress(session, super::timings::active(&task.id)).await;
+            let collect_timing = super::timings::Timer::new(
+                super::timings::active(&task.id),
+                super::timings::Mark::Collect,
+            );
+            let result = crate::harness::collect_jobs(
+                self.pins,
+                &mut journal,
+                self.target,
+                #[cfg(feature = "tracer")]
+                false,
+            )
+            .await;
+            drop(collect_timing);
+            if let Some(observation) = committed(task, &self.continuation).await? {
+                return Ok(observation);
+            }
+            let interrupted = match &result {
+                Ok(reports) => reports.iter().any(|report| {
+                    report["call"].as_u64() == Some(pending.call)
+                        && report["job"].as_str() == Some(pending.job.as_str())
+                        && report["connection_lost"] == true
+                }),
+                Err(crate::harness::Refusal::Transport(_)) => true,
+                _ => false,
+            };
+            if interrupted {
+                if PAGE_READY.get() {
+                    transport_failures += 1;
+                }
+                if transport_failures >= TRANSPORT_FAILURE_LIMIT {
+                    let why = "The machine or connection could not be reached. Resume will check again without running the command twice.";
+                    return match result {
+                        Ok(_) => Ok(Observation::Unknown(why.into())),
+                        Err(_) => {
+                            Err(crate::poc::wait::COLLECTION_FAILED.render(pending.call, "", why))
+                        }
+                    };
+                }
+                // Inspect is already durable and retains this exact call/job.
+                // A consumed transmission reservation forbids any later resend.
+                wait_for_return(&self.continuation).await?;
+                continue;
+            }
+            let local = local();
+            let mut writer = local.lock().await;
+            let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
+            return match result {
+                Ok(reports) => Ok(Observation::Unknown(
+                    store.poc_collection_reason(pending, &reports),
+                )),
+                Err(why) => Err(crate::poc::wait::COLLECTION_FAILED.render(
+                    pending.call,
+                    "",
+                    &store.poc_refusal(&why.to_json()),
+                )),
+            };
         }
     }
 }
@@ -549,6 +694,48 @@ impl Journal for ScopedJournal {
     }
 }
 impl BoundJournal for ScopedJournal {
+    fn recovers_missing(&self) -> bool {
+        self.collecting
+    }
+    async fn launch_transmission(&mut self, call: u64, sent: &[u8]) -> Result<(), String> {
+        self.current(&self.origin).await?;
+        let local = local();
+        let mut writer = local.lock().await;
+        self.continuation.check()?;
+        if let Some(why) = writer.dispatch_refusal() {
+            return Err(why.into());
+        }
+        let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
+        store.check_current_session(&self.origin)?;
+        store.poc_binding_current(&self.binding)?;
+        store.poc_launch_transmission(call, sent).await
+    }
+    async fn resend_launch(
+        &mut self,
+        session: &Session,
+        call: u64,
+        job: &str,
+        elevation: crate::jobs::Elevation,
+        pinned: &str,
+    ) -> Result<Option<Vec<u8>>, AppendRefusal> {
+        self.current(session)
+            .await
+            .map_err(AppendRefusal::Storage)?;
+        if !self.collecting {
+            return Ok(None);
+        }
+        let local = local();
+        let mut writer = local.lock().await;
+        self.continuation.check().map_err(AppendRefusal::Storage)?;
+        if let Some(why) = writer.dispatch_refusal() {
+            return Err(AppendRefusal::Storage(why.into()));
+        }
+        writer
+            .store()
+            .ok_or_else(|| AppendRefusal::Storage(crate::poc::wait::LOCKED.into()))?
+            .poc_resend(&self.binding, session, call, job, elevation, pinned)
+            .await
+    }
     fn command_cycle(&self) -> Option<u64> {
         super::timings::active(&self.binding.task)
     }
@@ -909,11 +1096,17 @@ impl run::Model for Configured {
             return Ok(());
         }
         self.continuation.check()?;
+        if task.request_recoveries > 0 {
+            wait_for_return(&self.continuation).await?;
+        }
         let credit = {
             let local = local();
             let mut writer = local.lock().await;
             self.continuation.check()?;
-            writer.store().ok_or("locked")?.credit_session(session)
+            let store = writer.store().ok_or("locked")?;
+            store.check_task_session(task, session)?;
+            store.poc_authority(&task.id, session)?;
+            store.credit_session(session)
         };
         if credit && (task.steps >= task.limits.steps || task.requests >= task.limits.requests) {
             // Let the runner record its budget pause without requesting another allowance.
@@ -922,7 +1115,27 @@ impl run::Model for Configured {
         if credit && !crate::poc::credit::browser::has_key(session) {
             self.response.borrow_mut().take();
         }
-        crate::poc::credit::browser::ensure(session, &self.continuation).await?;
+        // RecoverRequest's durable counter survives Pause and replay. An explicit
+        // Resume enters with automatic=false; a later live transport loss sets it
+        // true again, so that new recovery cannot mint on its own either.
+        let allow_mint = !self.automatic || task.request_recoveries == 0;
+        let ready =
+            crate::poc::credit::browser::ensure(session, &self.continuation, allow_mint).await;
+        if matches!(&ready, Err(why) if why == crate::poc::credit::RECOVERY_KEY_PRESS) {
+            let local = local();
+            let mut writer = local.lock().await;
+            self.continuation.check()?;
+            let store = writer.store().ok_or("locked")?;
+            store.check_task_session(task, session)?;
+            store
+                .poc_change(
+                    &task.id,
+                    task.revision,
+                    Change::Pause(crate::poc::credit::RECOVERY_KEY_PRESS.into()),
+                )
+                .await?;
+        }
+        ready?;
         if !crate::poc::inference::key_is_set() {
             return Err("waiting for the admitted inference key; no request consumed".into());
         }
@@ -961,6 +1174,10 @@ impl run::Model for Configured {
             return Ok(next);
         }
         let next = crate::poc::inference::next(task, session).await;
+        if matches!(&next, Err(crate::poc::inference::ReplyError::Pause(why)) if why == crate::poc::inference::TRANSPORT_INTERRUPTED)
+        {
+            self.automatic = true;
+        }
         // A failed request has no new command result to release. In particular, let
         // the operator configure an endpoint/key while its pause is being recorded.
         if next.is_ok() {

@@ -216,6 +216,9 @@ pub(crate) enum Event {
         command: String,
     },
     Intent(Intent),
+    LaunchPrepared(crate::dispatch::PreparedLaunch),
+    LaunchTransmission(crate::dispatch::LaunchAttempt),
+    Resend(crate::dispatch::LaunchAttempt),
     OperationIntent(crate::dispatch::OperationIntent),
     OperationObservation(crate::dispatch::Observation),
     OperationReceipt(crate::dispatch::StoredReceipt),
@@ -1801,6 +1804,14 @@ impl<S: Storage> Store<S> {
                 (_, Event::Intent(intent)) => self
                     .apply_intent(number, intent.clone())
                     .map_err(|e| format!("record {number}: {e}; replay stopped"))?,
+                (_, Event::LaunchPrepared(prepared)) => self
+                    .dispatch
+                    .prepare_launch(prepared.clone())
+                    .map_err(|e| format!("record {number}: {e}; replay stopped"))?,
+                (_, Event::LaunchTransmission(attempt) | Event::Resend(attempt)) => self
+                    .dispatch
+                    .launch_attempt(attempt, matches!(&event, Event::Resend(_)))
+                    .map_err(|e| format!("record {number}: {e}; replay stopped"))?,
                 (_, Event::OperationIntent(intent)) => {
                     if !intent.operation.mutation()
                         && intent.operation != crate::dispatch::Operation::Read
@@ -2530,10 +2541,10 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         self.state = match unlock(self.storage.clone(), &self.kdf, passphrase).await {
             Ok(mut store) => {
                 self.restore_deployment(&mut store);
-                // A new worker has no live request future. Persist uncertainty before
-                // exposing the replayed tasks to the page's automatic wake.
+                // A new worker has no live request future. Retire it durably before
+                // exposing the task to the page's automatic, counted continuation.
                 #[cfg(target_arch = "wasm32")]
-                store.poc_pause_interrupted_requests().await;
+                store.poc_recover_interrupted_requests().await;
                 if store.allocation().seed_backup_owed() {
                     self.seed_backup = BackupStage::Display;
                 }

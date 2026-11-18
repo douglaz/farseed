@@ -779,6 +779,7 @@ async fn cleanup_mints(session: &str, ended: bool, retry: bool) -> Result<(), St
 pub(crate) async fn ensure(
     session: &str,
     continuation: &crate::lifecycle::Continuation,
+    allow_mint: bool,
 ) -> Result<(), String> {
     let fence = Fence {
         continuation: continuation.clone(),
@@ -794,6 +795,11 @@ pub(crate) async fn ensure(
     };
     if !is_credit || has_key(session) {
         return Ok(());
+    }
+    // Recovery can use a held key, but only an explicit Resume may create one.
+    // Check here too: a key seen by the caller may be lost while taking the writer.
+    if !allow_mint {
+        return Err(RECOVERY_KEY_PRESS.into());
     }
     let _active = Active::wait().await;
     fence.check()?;

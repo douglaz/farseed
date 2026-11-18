@@ -13,6 +13,8 @@ pub const INVOICE_FAILED: &str = "No invoice was received. Try again.";
 pub const INVOICE_INVALID: &str = "The credit service sent an invoice this page can't use.";
 pub const UNKNOWN: &str = "Payment status unknown.";
 pub const MINT_FAILED: &str = "Couldn't create this session's inference key.";
+#[cfg(target_arch = "wasm32")]
+pub(crate) const RECOVERY_KEY_PRESS: &str = "This session needs a new AI key before the interrupted request can continue. Press Resume to create it; the task then carries on by itself.";
 pub const REFUSED: &str = "The credit service refused this request.";
 pub const DISCLOSURE: &str = "Inference uses a key capped at 1 USD of your credit and valid 24 hours (requested limits, per key). A new key with the same limits is made after each Unlock or New key press, so a session can use more than 1 USD in total; your credit balance is the overall limit.";
 

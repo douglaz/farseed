@@ -133,6 +133,9 @@ pub struct Task {
     pub verdict: Option<String>,
     pub verifying: bool,
     pub requesting: bool,
+    /// Consecutive interrupted requests for this turn; survives worker loss.
+    #[serde(default)]
+    pub request_recoveries: u32,
     pub malformed: Option<Malformed>,
     #[serde(default = "initial_completion_tokens")]
     pub completion_tokens: u32,
@@ -307,6 +310,7 @@ pub struct Binding {
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum Change {
     Request,
+    RecoverRequest,
     PrepareRead,
     SkipRead(String),
     Malformed {
@@ -394,6 +398,9 @@ pub(crate) enum Record {
     Command {
         binding: Binding,
         intent: Intent,
+        // Part of the existing page intent append, absent in historical journals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        launch: Option<crate::dispatch::PreparedLaunch>,
     },
 }
 
@@ -503,10 +510,10 @@ impl<S: Storage> Store<S> {
             "unresolved_commands":self.dispatch.calls.values().filter(|c| c.intent.machine == machine && matches!(c.state, crate::dispatch::CallState::Unresolved)).map(|c| json!({"call":c.intent.call,"job":c.intent.job})).collect::<Vec<_>>()
         }))
     }
-    /// Recovery only closes uncertain requests; it grants no session or dispatch authority.
+    /// Recovery retires uncertain requests; it grants no session or dispatch authority.
     /// Failed transitions remain requesting and are reported without blocking other tasks.
     #[cfg(target_arch = "wasm32")]
-    pub(crate) async fn poc_pause_interrupted_requests(&mut self) {
+    pub(crate) async fn poc_recover_interrupted_requests(&mut self) {
         self.poc_reconciliation_failures.clear();
         let interrupted: Vec<_> = self
             .poc
@@ -522,17 +529,11 @@ impl<S: Storage> Store<S> {
             return;
         }
         for (id, revision) in interrupted {
-            let result = self
-                .poc_change(
-                    &id,
-                    revision,
-                    Change::Pause(crate::poc::inference::INCOMPLETE.into()),
-                )
-                .await;
+            let result = self.poc_change(&id, revision, Change::RecoverRequest).await;
             if let Err(why) = result {
                 self.poc_reconciliation_failures.insert(
                     id,
-                    (revision, format!("Could not pause the interrupted request: {why}. Automatic retry is blocked.")),
+                    (revision, format!("Could not record recovery of the interrupted AI request: {why}. Work is paused so the request cannot be applied twice.")),
                 );
             }
         }
@@ -1100,6 +1101,7 @@ impl<S: Storage> Store<S> {
             .proposal
             .as_ref()
             .ok_or_else(|| AppendRefusal::Storage("missing task proposal".into()))?;
+        let replayable = matches!(proposal.tool, Tool::Exec { .. });
         if !task.preparing_read() {
             self.poc_tool(&binding.task, &binding.session, &proposal.tool)
                 .map_err(AppendRefusal::Storage)?;
@@ -1121,9 +1123,32 @@ impl<S: Storage> Store<S> {
             job: Some(hex::encode(random::<24>().map_err(AppendRefusal::Storage)?)),
             provenance: entry.provenance.clone(),
         };
+        // Standard input is deliberately absent from the journal. Only ordinary
+        // command wrappers can carry an exact, replayable launch preparation.
+        let prepared = if replayable {
+            let elevation = self
+                .poc_target(&entry.machine)
+                .ok_or_else(|| AppendRefusal::Storage("stored target missing".into()))?
+                .elevation;
+            let wrapper = crate::jobs::launch_with_elevation(
+                intent.job.as_deref().expect("new job"),
+                &entry.machine,
+                &entry.command,
+                elevation,
+            );
+            Some(crate::dispatch::PreparedLaunch {
+                call: intent.call,
+                job: intent.job.clone().expect("new job"),
+                elevation,
+                wrapper_sha256: hex::encode(Sha256::digest(wrapper.as_bytes())),
+            })
+        } else {
+            None
+        };
         let record = Record::Command {
             binding: binding.clone(),
             intent,
+            launch: prepared,
         };
         self.project_poc(self.next, &record)
             .map_err(AppendRefusal::Storage)?;
@@ -1137,14 +1162,150 @@ impl<S: Storage> Store<S> {
             .expect("validated task intent applies after commit");
         Ok(number)
     }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn poc_launch_transmission(
+        &mut self,
+        call: u64,
+        sent: &[u8],
+    ) -> Result<(), String> {
+        let Some(fence) = self.dispatch.launches.get(&call) else {
+            // Historical calls and standard-input jobs retain the original dispatch path.
+            return Ok(());
+        };
+        if hex::encode(Sha256::digest(sent)) != fence.prepared.wrapper_sha256 {
+            return Err("prepared launch bytes differ".into());
+        }
+        let attempt = crate::dispatch::LaunchAttempt {
+            call,
+            job: fence.prepared.job.clone(),
+        };
+        let mut next = self.dispatch.clone();
+        next.launch_attempt(&attempt, false)?;
+        self.commit(&Event::LaunchTransmission(attempt)).await?;
+        self.dispatch = next;
+        Ok(())
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn poc_resend(
+        &mut self,
+        binding: &Binding,
+        session: &Session,
+        call: u64,
+        job: &str,
+        elevation: crate::jobs::Elevation,
+        pinned: &str,
+    ) -> Result<Option<Vec<u8>>, AppendRefusal> {
+        let storage = AppendRefusal::Storage;
+        self.poc_authority(&binding.task, &binding.session)
+            .map_err(storage)?;
+        self.check_current_session(session).map_err(storage)?;
+        let task = self.poc_task(&binding.task).map_err(storage)?;
+        if task.revision != binding.revision
+            || task.pending.as_ref()
+                != Some(&Pending {
+                    call,
+                    job: job.into(),
+                })
+        {
+            return Err(storage("stale task collection".into()));
+        }
+        let Some(fence) = self.dispatch.launches.get(&call) else {
+            return Ok(None);
+        };
+        if fence.attempted || fence.resent {
+            return Ok(None);
+        }
+        let intent = self
+            .dispatch
+            .calls
+            .get(&call)
+            .ok_or_else(|| storage("unknown launch call".into()))?
+            .intent
+            .clone();
+        if fence.prepared.job != job
+            || fence.prepared.elevation != elevation
+            || intent.machine != task.machine
+            || intent.provenance.as_ref().is_none_or(|p| {
+                p.session.as_deref() != Some(&binding.session)
+                    || p.target != crate::dispatch::Target::Entry(task.machine.clone())
+                    || p.requester != crate::dispatch::Requester::Session
+            })
+        {
+            return Err(storage("prepared launch authority differs".into()));
+        }
+        if intent.approval
+            != Some(Approval::HarnessPin {
+                machine: task.machine.clone(),
+                fingerprint: pinned.into(),
+            })
+        {
+            return Err(storage("prepared launch approval differs".into()));
+        }
+        let proposal = task
+            .proposal
+            .as_ref()
+            .ok_or_else(|| storage("missing task proposal".into()))?;
+        if !matches!(&proposal.tool, Tool::Exec { machine, command }
+            if machine == &intent.machine && hex::encode(command.as_bytes()) == intent.command)
+        {
+            return Ok(None);
+        }
+        let preparing = task.preparing_read();
+        let machine = task.machine.clone();
+        if !preparing {
+            self.poc_tool(&binding.task, &binding.session, &proposal.tool)
+                .map_err(storage)?;
+        }
+        let command =
+            hex::decode(&intent.command).map_err(|_| storage("launch command hex".into()))?;
+        let sent =
+            crate::jobs::launch_with_elevation(job, &machine, &command, elevation).into_bytes();
+        if hex::encode(Sha256::digest(&sent)) != fence.prepared.wrapper_sha256 {
+            return Err(storage("prepared launch bytes differ".into()));
+        }
+        self.check_signature(&machine, &command).await?;
+        // Check the usual admission on a projection that exempts exactly this call's
+        // hold. The authoritative call remains unresolved throughout.
+        let mut admission = self.dispatch.clone();
+        admission
+            .calls
+            .get_mut(&call)
+            .ok_or_else(|| storage("unknown launch call".into()))?
+            .state = crate::dispatch::CallState::NoEffect;
+        admission
+            .check_command(&machine)
+            .map_err(AppendRefusal::Policy)?;
+        if !preparing {
+            admission.check_installation(&machine).map_err(storage)?;
+        }
+        if self.pending_machine(&machine) {
+            return Err(storage("proposal approval pending".into()));
+        }
+        let attempt = crate::dispatch::LaunchAttempt {
+            call,
+            job: job.into(),
+        };
+        let mut next = self.dispatch.clone();
+        next.launch_attempt(&attempt, true).map_err(storage)?;
+        self.commit(&Event::Resend(attempt))
+            .await
+            .map_err(storage)?;
+        self.dispatch = next;
+        Ok(Some(sent))
+    }
     pub(super) fn apply_poc(&mut self, number: u64, record: &Record) -> Result<(), String> {
         // Validate the new record, not previously committed transcript bytes. Settle
         // protects its derived outcome separately before checkpointing it.
         self.poc_record_safe(record)?;
         let task = self.project_poc(number, record)?;
         self.apply_poc_key_class(record, &task);
-        if let Record::Command { intent, .. } = record {
+        if let Record::Command { intent, launch, .. } = record {
             self.apply_intent(number, intent.clone())?;
+            if let Some(prepared) = launch {
+                self.dispatch.prepare_launch(prepared.clone())?;
+            }
         }
         if let Record::Start { session, .. } = record
             && let Some(acceptance) = self.poc_new_acceptance(session)?
@@ -1235,6 +1396,7 @@ impl<S: Storage> Store<S> {
                 verification: vec![],
                 verifying: false,
                 requesting: false,
+                request_recoveries: 0,
                 malformed: None,
                 completion_tokens: initial_completion_tokens(),
                 before_setup: None,
@@ -1267,8 +1429,19 @@ impl<S: Storage> Store<S> {
             return Err("task session ended".into());
         }
         match record {
-            Record::Command { binding, intent } => {
+            Record::Command {
+                binding,
+                intent,
+                launch,
+            } => {
                 let proposal = task.proposal.as_ref().ok_or("missing task proposal")?;
+                if let Some(prepared) = launch
+                    && (!matches!(proposal.tool, Tool::Exec { .. })
+                        || prepared.call != intent.call
+                        || intent.job.as_deref() != Some(prepared.job.as_str()))
+                {
+                    return Err("launch preparation differs from task intent".into());
+                }
                 let (machine, command) = match &proposal.tool {
                     Tool::Exec { machine, command } => (machine, command.clone()),
                     Tool::RequestAiKey { machine, .. } => {
@@ -1311,6 +1484,9 @@ impl<S: Storage> Store<S> {
                     .clone();
                 let mut dispatch = self.dispatch.clone();
                 dispatch.intent(number, intent.clone())?;
+                if let Some(prepared) = launch {
+                    dispatch.prepare_launch(prepared.clone())?;
+                }
                 task.pending = Some(Pending {
                     call: number,
                     job: job.clone(),
@@ -1424,6 +1600,24 @@ impl<S: Storage> Store<S> {
                         }
                         task.limits = limits.clone();
                     }
+                    Change::RecoverRequest => {
+                        if !task.requesting
+                            || task.pending.is_some()
+                            || task.proposal.is_some()
+                            || task.verifying
+                        {
+                            return Err("no interrupted task request".into());
+                        }
+                        // Keep the consumed Request and all committed history. A fresh
+                        // Request passes normal readiness and limits before any fetch.
+                        task.requesting = false;
+                        if task.request_recoveries >= crate::poc::inference::MAX_RETRIES {
+                            task.pause("The AI connection was interrupted repeatedly. Check the connection, then Resume to try again.");
+                        } else {
+                            task.request_recoveries += 1;
+                            task.active();
+                        }
+                    }
                     Change::Request => {
                         if task.pending.is_some() || task.proposal.is_some() || task.verifying {
                             return Err("task has a next action already".into());
@@ -1434,6 +1628,10 @@ impl<S: Storage> Store<S> {
                         } else if task.requests >= task.limits.requests {
                             task.pause("request limit reached; raise limits and Resume");
                         } else {
+                            if task.status == Status::Paused {
+                                // Only an explicit Resume reaches a paused task.
+                                task.request_recoveries = 0;
+                            }
                             if task.status == Status::Paused
                                 && task.malformed.as_ref().is_some_and(|m| m.count >= 3)
                             {
@@ -1478,6 +1676,7 @@ impl<S: Storage> Store<S> {
                             return Err("malformed-reply bound exhausted".into());
                         }
                         task.requesting = false;
+                        task.request_recoveries = 0;
                         task.malformed = Some(Malformed {
                             count,
                             reason: reason.clone(),
@@ -1532,6 +1731,7 @@ impl<S: Storage> Store<S> {
                             return Err("no current task request".into());
                         }
                         task.requesting = false;
+                        task.request_recoveries = 0;
                         task.malformed = None;
                         task.completion_tokens = initial_completion_tokens();
                         task.ai_key_approved = false;

@@ -308,6 +308,11 @@ async fn resume_with_progress(
                         };
                         return runtime.change(&task, change).await;
                     }
+                    Err(super::inference::ReplyError::Pause(why))
+                        if why == super::inference::TRANSPORT_INTERRUPTED =>
+                    {
+                        return runtime.change(&task, Change::RecoverRequest).await;
+                    }
                     Err(super::inference::ReplyError::Pause(why)) => {
                         return runtime
                             .change(&task, Change::Pause(concrete_pause(why)))

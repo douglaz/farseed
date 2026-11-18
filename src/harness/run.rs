@@ -165,6 +165,8 @@ pub enum Refusal {
     },
     /// Anything else: the transport, the protocol, authentication.
     Failed(String),
+    /// The socket or channel ended before a usable record could be read.
+    Transport(String),
 }
 
 impl Refusal {
@@ -206,6 +208,9 @@ impl Refusal {
                 "terminal":evidence.number,"why":why,"job_record":evidence,
             }),
             Refusal::Failed(why) => json!({ "refused": "failed", "why": why }),
+            Refusal::Transport(why) => {
+                json!({ "refused": "failed", "why": why, "connection_lost": true })
+            }
         }
     }
 }
@@ -248,7 +253,13 @@ fn append_refusal(refusal: AppendRefusal) -> Refusal {
 }
 
 fn failed(context: &str) -> impl Fn(String) -> Refusal + '_ {
-    move |e| Refusal::Failed(format!("{context}: {e}"))
+    move |e| {
+        if e == "the relay closed the connection" {
+            Refusal::Transport(format!("{context}: {e}"))
+        } else {
+            Refusal::Failed(format!("{context}: {e}"))
+        }
+    }
 }
 
 /// The host-key check, inside the SSH key exchange and before authentication. `false` makes
@@ -413,7 +424,13 @@ pub(crate) async fn run_command_input(
         .until(ssh.channel_open_session())
         .await
         .ok_or_else(|| Refusal::Journal("sessions ended".into()))?
-        .map_err(|e| Refusal::Failed(format!("session channel: {e}")))?;
+        .map_err(|e| {
+            if ssh.is_closed() {
+                Refusal::Transport(format!("session channel: {e}"))
+            } else {
+                Refusal::Failed(format!("session channel: {e}"))
+            }
+        })?;
 
     // ARC-8, STA-4: the record is appended immediately before the bytes leave, and a failed
     // append means they do not (STA-3).
@@ -497,6 +514,21 @@ pub(crate) async fn run_command_input(
             input.is_some(),
         )
         .into_bytes();
+        journal
+            .launch_transmission(seq, &sent)
+            .await
+            .map_err(|why| Refusal::Unresolved {
+                call: seq,
+                why,
+                evidence: None,
+            })?;
+        if stop.stopped() || ssh.is_closed() || journal.current(&session).await.is_err() {
+            return Err(Refusal::Unresolved {
+                call: seq,
+                why: "sessions ended before command transmission".into(),
+                evidence: None,
+            });
+        }
         let progress = super::job_read::Read::default();
         let result = stop
             .until(exec_record(
@@ -732,7 +764,9 @@ async fn held(
                 Some(Ok((ssh, _, _, socket))) => connection = Some((ssh, socket)),
                 Some(Err(why)) => {
                     let reason = match why {
-                        Refusal::Failed(why) => json!({"connection":"unavailable","why":why}),
+                        Refusal::Failed(why) | Refusal::Transport(why) => {
+                            json!({"connection":"unavailable","why":why})
+                        }
                         other => other.to_json(),
                     };
                     let why = json!({"unreachable":reason});
@@ -803,7 +837,8 @@ async fn held(
     super::held_report(&target.machine, reports, hold.disposition.as_ref())
 }
 
-/// Collecting is a read. It neither consults command dispositions nor appends an intent.
+/// Collection execs are reads. The page adapter may reserve one recovery transmission
+/// after a committed missing read; ordinary adapters do not opt in.
 /// Calls whose own dispatch awaits its record are reported as not read here.
 pub async fn collect_jobs(
     pins: &impl PinSource,
@@ -847,7 +882,7 @@ pub async fn collect_jobs(
             tamper_auth,
         ))
         .await;
-    let (ssh, _, _, _socket) = match connection {
+    let (ssh, pinned, _, _socket) = match connection {
         Some(result) => result?,
         None => {
             reports.extend(calls.into_iter().map(|intent| {
@@ -866,7 +901,7 @@ pub async fn collect_jobs(
         }
         if ssh.is_closed() {
             reports.push(
-                json!({"call":intent.call,"job":job,"not_read":true,"why":"connection lost"}),
+                json!({"call":intent.call,"job":job,"not_read":true,"why":"connection lost","connection_lost":true}),
             );
             continue;
         }
@@ -883,6 +918,9 @@ pub async fn collect_jobs(
         let record = match stop.until(read).await {
             Some(Ok(record)) => record,
             Some(Err(why)) => {
+                if ssh.is_closed() {
+                    progress.mark_interrupted();
+                }
                 reports.push(progress.failure(
                     intent.call,
                     Some(&job),
@@ -910,6 +948,18 @@ pub async fn collect_jobs(
         ssh_point(&ssh, "session_evidence").await;
         match journal.job_evidence_unless_stopped(&received, &stop).await {
             Some(Ok(report)) => {
+                if report.state == jobs::State::Missing && journal.recovers_missing() {
+                    match resend_missing(journal, &session, target, &ssh, &stop, &pinned, &report).await {
+                        Ok(Some(value)) => { reports.push(value); continue; }
+                        Ok(None) => {}
+                        Err(why) if ssh.is_closed() && !stop.stopped() => {
+                            reports.push(json!({"call":intent.call,"job":received.job,
+                                "failed":true,"connection_lost":true,"why":why.to_json()}));
+                            continue;
+                        }
+                        Err(why) => return Err(why),
+                    }
+                }
                 reports.push(evidence_result(journal, &session, &stop, report).await)
             }
             result => reports.push(json!({
@@ -929,6 +979,159 @@ pub async fn collect_jobs(
             .await;
     }
     Ok(reports)
+}
+
+async fn resend_missing(
+    journal: &mut impl BoundJournal,
+    session: &Session,
+    target: &Target,
+    ssh: &client::Handle<PinCheck>,
+    stop: &std::rc::Rc<wait::Stop>,
+    pinned: &str,
+    report: &jobs::Report,
+) -> Result<Option<Value>, Refusal> {
+    if stop.stopped() || super::inference::ending() {
+        return Err(Refusal::Journal(
+            "sessions ended before command transmission".into(),
+        ));
+    }
+    if ssh.is_closed() {
+        return Err(Refusal::Transport(
+            "connection lost before command transmission".into(),
+        ));
+    }
+    journal.current(session).await.map_err(Refusal::Journal)?;
+    let (_, elevation, _) = access(target).await.map_err(Refusal::Failed)?;
+    let Some(sent) = journal
+        .resend_launch(
+            session,
+            report.evidence.call,
+            &report.evidence.job,
+            elevation,
+            pinned,
+        )
+        .await
+        .map_err(|refusal| match refusal {
+            AppendRefusal::Policy(DispatchRefusal::Held(hold)) => {
+                Refusal::Held(super::held_report(
+                    &target.machine,
+                    hold.calls
+                        .iter()
+                        .map(|intent| {
+                            serde_json::json!({"call":intent.call,"not_read":true,
+                    "why":"another unresolved command holds this machine"})
+                        })
+                        .collect(),
+                    hold.disposition.as_ref(),
+                ))
+            }
+            other => append_refusal(other),
+        })?
+    else {
+        return Ok(None);
+    };
+    // The durable resend reservation has consumed the single attempt, even if a
+    // stop or connection loss fences transmission at this final boundary.
+    if stop.stopped() || super::inference::ending() {
+        return Err(Refusal::Journal(
+            "sessions ended before command transmission".into(),
+        ));
+    }
+    if ssh.is_closed() {
+        return Err(Refusal::Transport(
+            "connection lost before command transmission".into(),
+        ));
+    }
+    journal.current(session).await.map_err(Refusal::Journal)?;
+    let mut channel = stop
+        .until(ssh.channel_open_session())
+        .await
+        .ok_or_else(|| Refusal::Journal("sessions ended".into()))?
+        .map_err(|e| Refusal::Failed(format!("session channel: {e}")))?;
+    if stop.stopped() || super::inference::ending() {
+        return Err(Refusal::Journal(
+            "sessions ended before command transmission".into(),
+        ));
+    }
+    if ssh.is_closed() {
+        return Err(Refusal::Transport(
+            "connection lost before command transmission".into(),
+        ));
+    }
+    journal.current(session).await.map_err(Refusal::Journal)?;
+    let progress = super::job_read::Read::default();
+    let record = match stop
+        .until(exec_record(
+            &mut channel,
+            &sent,
+            Some(&progress),
+            None,
+            None,
+        ))
+        .await
+    {
+        // exec_record accepts only a complete, validated record on a normally
+        // closed channel. Commit that evidence exactly as for the first launch.
+        Some(Ok(record)) => record,
+        _ => {
+            // A wrapper refusal or SSH status is never a command outcome. Only
+            // when no usable record arrived do we need a separate read.
+            if stop.stopped() || ssh.is_closed() || super::inference::ending() {
+                if ssh.is_closed() && !stop.stopped() && !super::inference::ending() {
+                    progress.mark_interrupted();
+                    return Ok(Some(progress.failure(
+                        report.evidence.call,
+                        Some(&report.evidence.job),
+                        false,
+                        "connection lost while awaiting job record",
+                    )));
+                }
+                return Ok(None);
+            }
+            journal.current(session).await.map_err(Refusal::Journal)?;
+            let mut channel = stop
+                .until(ssh.channel_open_session())
+                .await
+                .ok_or_else(|| Refusal::Journal("sessions ended".into()))?
+                .map_err(|e| Refusal::Failed(format!("session channel: {e}")))?;
+            let progress = super::job_read::Read::default();
+            let read = async {
+                journal.current(session).await?;
+                read_job_record(&mut channel, &report.evidence.job, &progress, target).await
+            };
+            match stop.until(read).await {
+                Some(Ok(record)) => record,
+                result => {
+                    if ssh.is_closed() {
+                        progress.mark_interrupted();
+                    }
+                    return Ok(Some(progress.failure(
+                        report.evidence.call,
+                        Some(&report.evidence.job),
+                        super::inference::ending(),
+                        &match result {
+                            Some(Err(why)) => why,
+                            _ => "stopped while reading record".into(),
+                        },
+                    )));
+                }
+            }
+        }
+    };
+    let received = Evidence {
+        call: report.evidence.call,
+        job: report.evidence.job.clone(),
+        record,
+    };
+    match journal.job_evidence_unless_stopped(&received, stop).await {
+        Some(Ok(report)) => Ok(Some(evidence_result(journal, session, stop, report).await)),
+        result => Ok(Some(
+            json!({"call":received.call,"job":received.job,"failed":true,
+            "why":match result { Some(Err(why)) => format!("job evidence append: {why}"), _ => "wait stopped before journaling job evidence".into() },
+            "job_record":journal.uncommitted(&received, &target.machine,
+                &journal.intent(received.call).await.map_or(String::new(), |i| i.command)).await.ok()}),
+        )),
+    }
 }
 
 /// Click-only synchronous harness job. This deliberately bypasses command evidence:
@@ -1128,10 +1331,12 @@ async fn exec_record(
     if let Some(progress) = progress {
         progress.mark_sent();
     }
-    channel
-        .exec(true, bytes)
-        .await
-        .map_err(|e| format!("exec: {e}"))?;
+    if let Err(why) = channel.exec(true, bytes).await {
+        if let Some(progress) = progress {
+            progress.mark_interrupted();
+        }
+        return Err(format!("exec: {why}"));
+    }
     if let Some(input) = input {
         channel
             .data(input)
@@ -1143,6 +1348,7 @@ async fn exec_record(
             .map_err(|_| "AI key stdin transmission interrupted")?;
     }
     let mut delivered = jobs::ReadDelivery::default();
+    let mut refused = false;
     while let Some(message) = channel.wait().await {
         if matches!(&message, ChannelMsg::Success | ChannelMsg::Failure)
             && let Some(timing) = launch_timing
@@ -1150,6 +1356,7 @@ async fn exec_record(
             timing.observing();
         }
         match message {
+            ChannelMsg::Failure => refused = true,
             ChannelMsg::Data { data } => delivered.stdout.extend_from_slice(&data),
             ChannelMsg::ExtendedData { data, .. } => delivered.extended_data(&data),
             ChannelMsg::ExitStatus { exit_status } => delivered.status = Some(exit_status),
@@ -1166,6 +1373,14 @@ async fn exec_record(
         let store = local.store().ok_or("locked before output scan")?;
         let safe = crate::redaction::Redacted::for_store(store, &delivered.stderr, &[])?;
         delivered.stderr = safe.as_bytes().to_vec();
+    }
+    // A normal Close without ExitStatus (including ExitSignal) is a read failure.
+    // The collector separately checks whether the SSH connection itself closed.
+    if !refused
+        && !delivered.closed
+        && let Some(progress) = progress
+    {
+        progress.mark_interrupted();
     }
     delivered.record()
 }
@@ -1219,7 +1434,7 @@ async fn connect(
     let cycle = journal.command_cycle();
     let mut retries = 0;
     let mut not_before = 0.0;
-    let (ws, socket) = loop {
+    let (ws, socket, websocket) = loop {
         journal.current(session).await.map_err(Refusal::Journal)?;
         if stop.stopped() {
             return Err(Refusal::Journal("stale relay continuation".into()));
@@ -1232,7 +1447,7 @@ async fn connect(
         let websocket_timing = Timer::new(cycle, Mark::WebsocketOpen);
         let (mut meta, mut ws) = WsMeta::connect(&url, None)
             .await
-            .map_err(|e| Refusal::Failed(format!("relay websocket: {e}")))?;
+            .map_err(|e| Refusal::Transport(format!("relay websocket: {e}")))?;
         drop(websocket_timing);
         let relay_timing = Timer::new(cycle, Mark::RelayVerdict);
         journal.current(session).await.map_err(Refusal::Journal)?;
@@ -1240,7 +1455,7 @@ async fn connect(
         let mut events = meta
             .observe(ObserveConfig::default())
             .await
-            .map_err(|e| Refusal::Failed(format!("relay events: {e}")))?;
+            .map_err(|e| Refusal::Transport(format!("relay events: {e}")))?;
 
         // WIR-4 (paid-tcp-relay 844e834): the challenge.
         let challenge = text_frame(&mut ws).await.map_err(failed("challenge"))?;
@@ -1281,7 +1496,7 @@ async fn connect(
         *slot = Some(relay_now()?);
         ws.send(WsMessage::Text(auth.to_string()))
             .await
-            .map_err(|e| Refusal::Failed(format!("AUTH: {e}")))?;
+            .map_err(|e| Refusal::Transport(format!("AUTH: {e}")))?;
         // Completion is conservative: even a delayed flush cannot bunch two AUTHs together.
         *slot = Some(relay_now()?);
         drop(slot);
@@ -1313,7 +1528,7 @@ async fn connect(
             }
             return Err(Refusal::Relay { reason, close_code });
         }
-        break (ws, socket);
+        break (ws, socket, meta.wrapped().clone());
     };
 
     // WIR-8 (paid-tcp-relay 844e834): from here on, binary frames carry the TCP bytes; SSH runs
@@ -1345,6 +1560,9 @@ async fn connect(
                     Some(presented) if presented != pinned => {
                         Refusal::HostKey { pinned, presented }
                     }
+                    _ if websocket.ready_state() >= web_sys::WebSocket::CLOSING => {
+                        Refusal::Transport(format!("ssh: {e}"))
+                    }
                     _ => Refusal::Failed(format!("ssh: {e}")),
                 });
             }
@@ -1363,7 +1581,13 @@ async fn connect(
             PrivateKeyWithHashAlg::new(Arc::new(ssh_key), None),
         )
         .await
-        .map_err(|e| Refusal::Failed(format!("authentication: {e}")))?;
+        .map_err(|e| {
+            if ssh.is_closed() || websocket.ready_state() >= web_sys::WebSocket::CLOSING {
+                Refusal::Transport(format!("authentication: {e}"))
+            } else {
+                Refusal::Failed(format!("authentication: {e}"))
+            }
+        })?;
     drop(login_timing);
     if !auth.success() {
         return Err(Refusal::Failed(format!("authentication refused: {auth:?}")));

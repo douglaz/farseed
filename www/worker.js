@@ -1,7 +1,7 @@
 // The harness worker alone holds the seed and keys. Only the dedicated seed-backup display
 // carries words to the page; re-entry and passphrase buffers are zero-filled by the module.
 import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, accept_page_goal, TaskPublication, requirements_answer, delivery_request, retire_runtime, sweep_inference, lifecycle_transition, publication_generation, publish_report, verify_inference_clock, withdraw_reinstall } from './pkg/tau_web.js';
-import { identify_execution, wake_tasks, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_download, publish_task_details, publish_delivery_details } from './pkg/tau_web.js';
+import { identify_execution, wake_tasks, task_presence, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_download, publish_task_details, publish_delivery_details } from './pkg/tau_web.js';
 import { credit_request, retry_ended_credit } from './pkg/tau_web.js';
 import { deployment_configure, provider_configure, provider_key_is_set, provider_visibility, provider_action_delay, provider_request } from './pkg/tau_web.js';
 
@@ -17,6 +17,7 @@ const clearInput = request => {
 // A fresh page worker gets one execution identity before it can receive authority.
 let incarnation;
 let deployment;
+let initialPresence;
 let retirementRequested = false;
 const lockWait = new AbortController();
 // Fetch and compile while the page prepares its deployment initialization.
@@ -55,9 +56,14 @@ const wasmReady = (async () => {
 });
 await new Promise(resolve => {
   onmessage = ({data}) => {
-    if (!incarnation && data && Object.keys(data).every(k => ['initialize','deployment'].includes(k)) && typeof data.initialize === 'string') {
+    if (incarnation && data?.incarnation === incarnation && data.request?.task_presence) {
+      initialPresence = data.request.task_presence;
+      return;
+    }
+    if (!incarnation && data && Object.keys(data).every(k => ['initialize','deployment','presence'].includes(k)) && typeof data.initialize === 'string') {
       incarnation = data.initialize;
       deployment = data.deployment;
+      initialPresence = data.presence;
       resolve();
     } else {
       // Retirement can arrive while the page is still reading deployment defaults.
@@ -80,6 +86,7 @@ try {
   const result = await wasmReady;
   if (result.error) throw result.error;
   identify_execution(incarnation);
+  task_presence(initialPresence?.visible === true, initialPresence?.online === true);
   try {
     const accepted = await deployment_configure(typeof deployment?.origin === 'string' ? deployment.origin : undefined,
       deployment?.key instanceof Uint8Array ? deployment.key : new Uint8Array(),
@@ -289,7 +296,7 @@ const publishTask = async (request, generation, session, step, automatic = false
 onmessage = async ({ data: envelope }) => {
   if (!envelope || envelope.incarnation !== incarnation || typeof envelope.generation !== 'string') { clearInput(envelope?.request ?? envelope); return; }
   const data = envelope.request;
-  if (envelope.generation !== publication_generation().toString() && data?.retire_runtime !== true && typeof data?.lifecycle !== 'string') { clearInput(data); return; }
+  if (envelope.generation !== publication_generation().toString() && data?.retire_runtime !== true && typeof data?.lifecycle !== 'string' && !data?.task_presence) { clearInput(data); return; }
   try {
   if (!data || typeof data !== 'object' || Object.keys(data).length !== 1) {
     clearInput(data);
@@ -311,6 +318,11 @@ onmessage = async ({ data: envelope }) => {
     Object.assign(wake, {generation:publication_generation(), identity:JSON.stringify(JSON.parse(report).procurement?.identity)});
     await reportStore(report);
     if (data.lifecycle === 'visible' || data.lifecycle === 'resume') await refreshPayments(wake);
+    return;
+  }
+  if (data.task_presence && exactMembers(data.task_presence, ['visible', 'online']) &&
+      typeof data.task_presence.visible === 'boolean' && typeof data.task_presence.online === 'boolean') {
+    task_presence(data.task_presence.visible, data.task_presence.online);
     return;
   }
   if (data.task_details) {
@@ -505,4 +517,5 @@ onmessage = async ({ data: envelope }) => {
         Object.keys(data).some(name => name.startsWith('seed_backup_')))) wake_tasks();
   }
 };
+task_presence(initialPresence?.visible === true, initialPresence?.online === true);
 await reportStore(await open());
