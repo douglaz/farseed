@@ -166,6 +166,7 @@ pub(crate) async fn configure(
     endpoint: String,
     model: String,
     key: Zeroizing<Vec<u8>>,
+    expected_sessions: Vec<String>,
 ) -> Result<(), String> {
     let continuation = crate::lifecycle::owner().continuation()?;
     let local = crate::worker::local();
@@ -173,6 +174,24 @@ pub(crate) async fn configure(
     continuation.check()?;
     if let Some(why) = local.dispatch_refusal() {
         return Err(why.into());
+    }
+    let store = local.store().ok_or("locked")?;
+    let sessions = store.sessions();
+    let mut current_sessions = sessions
+        .iter()
+        .filter(|session| session["session_state"] != "ended")
+        .map(|session| {
+            session["identity"]
+                .as_str()
+                .map(str::to_owned)
+                .ok_or("session identity")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    current_sessions.sort();
+    // End and Start hold this same writer. No session can change between this
+    // comparison and installing the key below, even if admission waited on it.
+    if current_sessions != expected_sessions {
+        return Err("inference configuration refused: session changed; enter the key again".into());
     }
     if response_pending() {
         return Err(
@@ -182,13 +201,8 @@ pub(crate) async fn configure(
     }
     let config = Configuration::new(endpoint, model)?;
     valid_key(&key)?;
-    let store = local.store().ok_or("locked")?;
     store.poc_configuration_ready()?;
-    for session in store
-        .sessions()
-        .iter()
-        .filter(|s| s["session_state"] != "ended")
-    {
+    for session in sessions.iter().filter(|s| s["session_state"] != "ended") {
         if store
             .session_configuration(session["identity"].as_str().ok_or("session identity")?)?
             .model

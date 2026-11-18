@@ -127,6 +127,9 @@ if (retirementRequested) {
 let paymentTimer = null;
 let pageVisible = true;
 let lastReport = null;
+// The newest session list from either a store report or a task publication (End publishes only through the latter),
+// so a fresh key submitted after End is compared with the sessions the page shows, not with a stale store report.
+let latestSessions = null;
 const paymentsEligible = () => !retirementRequested && pageVisible && lastReport?.state === 'unlocked' && !['suspended','reconciling','ended'].includes(lastReport?.lifecycle_state);
 const pendingCredit = () => {
   const invoice = lastReport?.credit?.invoices?.at(-1);
@@ -253,6 +256,8 @@ const reportStore = (report, generation = publication_generation(), session = ''
   report = presentationReport(report, step);
   const value = JSON.parse(report);
   lastReport = value;
+  if (Array.isArray(value.sessions)) latestSessions = value.sessions;
+  discardStalePocConfiguration(value);
   schedulePayments();
   scheduleReadiness();
   scheduleEmail();
@@ -268,6 +273,107 @@ const startFields = value => typeof value.goal === 'string' && (value.document_s
 const startMembers = (value, required) => startFields(value) &&
   required.every(name => Object.hasOwn(value, name)) &&
   Object.keys(value).every(name => [...required, 'template', 'options', 'inputs'].includes(name));
+const validPocConfiguration = config => exactMembers(config, ['endpoint', 'model', 'key', 'sessions']) &&
+  typeof config.endpoint === 'string' && typeof config.model === 'string' &&
+  config.key instanceof Uint8Array && Array.isArray(config.sessions) && config.sessions.every(session => typeof session === 'string');
+
+// Custody outlives a temporary recovery refusal. Attempts are serialized and only
+// refusals retry; a successful configure is never applied a second time.
+let pendingPocConfiguration = null;
+let pocConfigurationWork = Promise.resolve();
+let pocConfigurationTimer = null;
+let pocConfigurationEpoch = 0;
+let pocConfigurationLifecycle = 0;
+let pocConfigurationRevalidating = false;
+const recoveryConfigurationRefusals = new Set([
+  'inference configuration refused: command response pending; retry after it completes',
+  'inference configuration refused: recorded task result awaits recovery; Resume collection in the original session before configuring; then retry configuration',
+]);
+const clearPendingPocConfiguration = () => {
+  clearTimeout(pocConfigurationTimer); pocConfigurationTimer = null;
+  clearInput({poc_configure: pendingPocConfiguration?.config});
+  pendingPocConfiguration = null;
+};
+const pocSessions = sessions => (sessions ?? []).filter(session => session.session_state !== 'ended').map(session => session.identity).sort();
+const discardStalePocConfiguration = (report = lastReport) => {
+  const pending = pendingPocConfiguration;
+  if (!pending) return;
+  const sessions = report === lastReport && latestSessions ? latestSessions : report?.sessions;
+  if (retirementRequested || pending.generation !== publication_generation().toString() ||
+      report?.state !== 'unlocked' || report.lifecycle_state === 'ended' ||
+      (Array.isArray(sessions) && JSON.stringify(pending.config.sessions) !== JSON.stringify(pocSessions(sessions)))) {
+    clearPendingPocConfiguration();
+    if (!retirementRequested) postMessage({poc_configure_status: 'rejected'});
+  }
+};
+const configurePoc = (config, generation, retry = null) => {
+  const epoch = pocConfigurationEpoch;
+  const work = pocConfigurationWork.then(async () => {
+    if (retirementRequested || epoch !== pocConfigurationEpoch) { clearInput({poc_configure: config}); return; }
+    if (retry && pendingPocConfiguration !== retry) return;
+    if (config) {
+      if (!config.key.length) {
+        if (pendingPocConfiguration) {
+          postMessage({poc_configure_status: 'waiting'});
+          return;
+        }
+        postMessage({poc_configure_status: 'cancelled'});
+        const current = JSON.parse(await open());
+        current.error = 'inference key missing';
+        await reportStore(JSON.stringify(current), publication_generation(), '', 'credit');
+        return;
+      }
+      clearPendingPocConfiguration();
+      pendingPocConfiguration = {config, generation, refusal: null, retryStep: 0};
+    }
+    discardStalePocConfiguration();
+    const pending = pendingPocConfiguration;
+    if (!pending) return;
+    clearTimeout(pocConfigurationTimer); pocConfigurationTimer = null;
+    if (!paymentsEligible() || pocConfigurationRevalidating || !Array.isArray(lastReport?.sessions)) {
+      postMessage({poc_configure_status: 'waiting'});
+      return;
+    }
+    // The wasm entry point zeroes its argument even on refusal. Keep custody of
+    // the original until acceptance; the temporary copy never leaves this worker.
+    const key = pending.config.key.slice();
+    let report;
+    try { report = await poc_configure(pending.config.endpoint, pending.config.model, key, JSON.stringify(pending.config.sessions)); }
+    finally { key.fill(0); }
+    if (retirementRequested || epoch !== pocConfigurationEpoch || pendingPocConfiguration !== pending) return;
+    const result = JSON.parse(report);
+    if (!result.error) {
+      clearPendingPocConfiguration();
+      postMessage({poc_configure_status: 'applied'});
+      wake_tasks();
+    } else if (recoveryConfigurationRefusals.has(result.error)) {
+      const repeatedRefusal = pending.refusal === result.error;
+      pending.refusal = result.error;
+      if (!repeatedRefusal) postMessage({poc_configure_status: 'waiting'});
+      const delay = [100, 250, 500, 1000][pending.retryStep];
+      pending.retryStep = Math.min(pending.retryStep + 1, 3);
+      if (paymentsEligible() && !pocConfigurationRevalidating) {
+        pocConfigurationTimer = setTimeout(() => {
+          pocConfigurationTimer = null;
+          void configurePoc(null, pending.generation, pending);
+        }, delay);
+      }
+      if (repeatedRefusal) return;
+    } else {
+      clearPendingPocConfiguration();
+      postMessage({poc_configure_status: 'rejected'});
+    }
+    await reportStore(report, publication_generation(), '', 'credit');
+  });
+  // Unexpected failures end custody and require a fresh submission.
+  pocConfigurationWork = work.catch(() => {
+    if (pendingPocConfiguration) {
+      clearPendingPocConfiguration();
+      if (!retirementRequested) postMessage({poc_configure_status: 'rejected'});
+    }
+  });
+  return pocConfigurationWork;
+};
 
 const startGoal = async (report, inputs, machine) => {
   let current = JSON.parse(report);
@@ -288,6 +394,9 @@ const publishTask = async (request, generation, session, step, automatic = false
   const publication = new TaskPublication();
   try {
     let report = automatic ? await publication.continue_task(request.id, session) : await publication.request(JSON.stringify(request));
+    const published = JSON.parse(report);
+    if (Array.isArray(published.sessions)) latestSessions = published.sessions;
+    discardStalePocConfiguration(published);
     report = presentationReport(report, step);
     await publication.publish(generation, session, report);
   } finally { publication.free(); }
@@ -296,7 +405,17 @@ const publishTask = async (request, generation, session, step, automatic = false
 onmessage = async ({ data: envelope }) => {
   if (!envelope || envelope.incarnation !== incarnation || typeof envelope.generation !== 'string') { clearInput(envelope?.request ?? envelope); return; }
   const data = envelope.request;
-  if (envelope.generation !== publication_generation().toString() && data?.retire_runtime !== true && typeof data?.lifecycle !== 'string' && !data?.task_presence) { clearInput(data); return; }
+  const emptyPocSubmission = exactMembers(data, ['poc_configure']) && validPocConfiguration(data.poc_configure) && !data.poc_configure.key.length;
+  if (emptyPocSubmission && pendingPocConfiguration) {
+    // An empty retry acknowledges existing custody without consulting wasm or
+    // changing the original submission, its timer, or its session binding.
+    postMessage({poc_configure_status: 'waiting'});
+    clearInput(data);
+    return;
+  }
+  // Stale keys reach configurePoc only to be wiped with a plain rejection. Keep
+  // the lifecycle and presence exceptions required by recovery.
+  if (envelope.generation !== publication_generation().toString() && !data?.poc_configure && data?.retire_runtime !== true && typeof data?.lifecycle !== 'string' && !data?.task_presence) { clearInput(data); return; }
   try {
   if (!data || typeof data !== 'object' || Object.keys(data).length !== 1) {
     clearInput(data);
@@ -305,6 +424,7 @@ onmessage = async ({ data: envelope }) => {
   const wake = {reads:readinessReads, lifecycle:readinessLifecycle};
   if (data.retire_runtime === true) {
     retirementRequested = true;
+    clearPendingPocConfiguration();
     clearTimeout(paymentTimer); paymentTimer = null;
     stopReadiness(); stopEmail(); provider_visibility(false);
     await retire_runtime();
@@ -312,11 +432,18 @@ onmessage = async ({ data: envelope }) => {
     return;
   }
   if (typeof data.lifecycle === 'string') {
+    const configurationLifecycle = ++pocConfigurationLifecycle;
+    pocConfigurationRevalidating = true;
+    clearTimeout(pocConfigurationTimer); pocConfigurationTimer = null;
     if (data.lifecycle === 'hidden' || data.lifecycle === 'freeze') { readinessLifecycle++; pageVisible = false; clearTimeout(paymentTimer); paymentTimer = null; stopReadiness(); stopEmail(); provider_visibility(false); }
     if (data.lifecycle === 'visible' || data.lifecycle === 'resume') { pageVisible = true; provider_visibility(true); }
     const report = await lifecycle_transition(data.lifecycle);
     Object.assign(wake, {generation:publication_generation(), identity:JSON.stringify(JSON.parse(report).procurement?.identity)});
     await reportStore(report);
+    if ((data.lifecycle === 'visible' || data.lifecycle === 'resume') && configurationLifecycle === pocConfigurationLifecycle) {
+      pocConfigurationRevalidating = false;
+      if (pendingPocConfiguration) void configurePoc(null, pendingPocConfiguration.generation, pendingPocConfiguration);
+    }
     if (data.lifecycle === 'visible' || data.lifecycle === 'resume') await refreshPayments(wake);
     return;
   }
@@ -379,10 +506,12 @@ onmessage = async ({ data: envelope }) => {
   else if (data.poc_configure && typeof data.poc_configure === 'object') {
     const config = data.poc_configure;
     try {
-      if (exactMembers(config, ['endpoint', 'model', 'key']) &&
-          typeof config.endpoint === 'string' && typeof config.model === 'string' &&
-          config.key instanceof Uint8Array) {
-        report = await poc_configure(config.endpoint, config.model, config.key);
+      if (validPocConfiguration(config)) {
+        // Transfer ownership out of the request's finally cleanup.
+        const retained = {endpoint: config.endpoint, model: config.model, key: config.key, sessions: [...config.sessions].sort()};
+        delete config.key;
+        await configurePoc(retained, envelope.generation);
+        return;
       } else {
         const current = JSON.parse(await open());
         current.error = 'Invalid inference configuration.';
@@ -394,6 +523,12 @@ onmessage = async ({ data: envelope }) => {
     }
   }
   else if (data.credit_request && typeof data.credit_request === 'object') {
+    if (['configure', 'start', 'new_key'].includes(data.credit_request.action)) {
+      // A newer explicit credit choice supersedes queued operator configuration.
+      pocConfigurationEpoch++;
+      clearPendingPocConfiguration();
+      postMessage({poc_configure_status: 'cancelled'});
+    }
     const value = JSON.parse(await credit_request(JSON.stringify(data.credit_request)));
     if (data.credit_request.action === 'start' && !value.credit_error) value.credit_started_machine = data.credit_request.machine;
     report = JSON.stringify(value);
@@ -513,7 +648,7 @@ onmessage = async ({ data: envelope }) => {
   if (display) postMessage(display);
   } finally {
     // Prerequisite changes wake interrupted work; task controls retain their explicit workflow.
-    if (data && (data.unlock instanceof Uint8Array || data.poc_configure || data.credit_request || data.lifecycle === 'resume' ||
+    if (data && (data.unlock instanceof Uint8Array || (data.poc_configure && !emptyPocSubmission) || data.credit_request || data.lifecycle === 'resume' ||
         Object.keys(data).some(name => name.startsWith('seed_backup_')))) wake_tasks();
   }
 };

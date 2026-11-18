@@ -122,6 +122,14 @@ const setupDrafts = new Map();
 const startDrafts = new Map();
 const taskLimitDrafts = new Map();
 let pocKeyRefusal = '';
+let pocKeySubmission = null;
+const renderPocKeyStatus = store => {
+  $('poc-key-status').textContent = pocKeySubmission === 'submitting' ? 'Setting key…'
+    : pocKeySubmission === 'waiting' ? 'Key retained in worker memory. Waiting for task recovery before applying it automatically.'
+    : pocKeySubmission === 'rejected' ? 'The key was not set: see the message above, then enter the key again.'
+    : store.poc_configuration?.key_set === true ? 'Key set.'
+    : store.poc_configuration?.key_set === false ? 'Key unset.' : 'Key status unavailable.';
+};
 const snapshotWorker = () => {
   const current = worker;
   const generation = current?.generation;
@@ -1662,6 +1670,7 @@ $('provider-email-reissue').addEventListener('click', () => providerRequest({act
 $('provider-resume').addEventListener('click', () => providerRequest({action: 'resume'}));
 $('provider-invoice').addEventListener('click', () => providerRequest({action: 'initial_invoice', billing: providerDisplayedBilling}));
 const clearPocInputs = () => {
+  pocKeySubmission = null;
   rawFoldChoices.clear();
   providerCatalogue = null;
   providerCompletedMachine = null;
@@ -1763,8 +1772,8 @@ const renderPoc = (store) => {
   renderCredit(store, enabled);
   const restored = (store.sessions ?? []).find(s => s.session_state !== 'ended')?.inference_configuration;
   if (restored && store.poc_configuration?.key_set !== true) { $('poc-endpoint').value = restored.endpoint; $('poc-model').value = restored.model; }
-  $('poc-key-status').textContent = store.poc_configuration?.key_set === true ? 'Key set.' : store.poc_configuration?.key_set === false ? 'Key unset.' : 'Key status unavailable.';
   if (['locked', 'none', 'refused', 'lost', 'starting'].includes(store.state) || store.lifecycle_state === 'ended') clearPocInputs();
+  renderPocKeyStatus(store);
   const targets = $('poc-targets');
   targets.replaceChildren();
   for (const target of store.poc_targets ?? []) {
@@ -1841,14 +1850,23 @@ const renderPoc = (store) => {
 $('poc-inference-form').addEventListener('submit', event => {
   event.preventDefault();
   const field = $('poc-key');
+  if (!worker || $('store').dataset.state !== 'unlocked') {
+    $('poc-key-status').textContent = 'Unlock the store before setting the key. Your entry has been kept.';
+    return;
+  }
   const bytes = new TextEncoder().encode(field.value);
-  field.value = '';
   try {
     worker.postMessage({ poc_configure: {
       endpoint: $('poc-endpoint').value,
       model: $('poc-model').value,
       key: bytes,
+      sessions: (taskDetailsStore.sessions ?? []).filter(session => session.session_state !== 'ended').map(session => session.identity).sort(),
     } }, [bytes.buffer]);
+    field.value = '';
+    pocKeySubmission = 'submitting';
+    renderPocKeyStatus(taskDetailsStore);
+  } catch {
+    $('poc-key-status').textContent = 'The worker could not receive the key. Your entry has been kept; unlock again before retrying.';
   } finally {
     if (bytes.byteLength) bytes.fill(0);
   }
@@ -1903,6 +1921,11 @@ const start = () => {
     if (data.delivery_details) { receiveDeliveryDetails(data.delivery_details, current); return; }
     if (typeof data.delivery_details_unavailable === 'string') { receiveDeliveryDetails({request: data.delivery_details_unavailable, error: true}, current); return; }
     if (worker !== current) return;
+    if (['waiting', 'rejected', 'applied', 'cancelled'].includes(data.poc_configure_status)) {
+      pocKeySubmission = ['applied', 'cancelled'].includes(data.poc_configure_status) ? null : data.poc_configure_status;
+      renderPocKeyStatus(data.poc_configure_status === 'applied' ? {poc_configuration: {key_set: true}} : taskDetailsStore);
+      return;
+    }
     if (data.app_load_failed === true) {
       current.onerror({message: 'the app did not load'});
       return;

@@ -158,10 +158,20 @@ mod worker {
     }
 
     #[wasm_bindgen]
-    pub async fn poc_configure(endpoint: String, model: String, key: Uint8Array) -> String {
+    pub async fn poc_configure(
+        endpoint: String,
+        model: String,
+        key: Uint8Array,
+        sessions: String,
+    ) -> String {
         let secret = zeroize::Zeroizing::new(key.to_vec());
         key.fill(0, 0, key.length());
-        let result = crate::poc::inference::configure(endpoint, model, secret).await;
+        let result = match serde_json::from_str::<Vec<String>>(&sessions) {
+            Ok(sessions) => {
+                crate::poc::inference::configure(endpoint, model, secret, sessions).await
+            }
+            Err(_) => Err("invalid inference session context".into()),
+        };
         local()
             .lock()
             .await
