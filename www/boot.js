@@ -204,6 +204,8 @@ const renderSteps = store => {
     const button = offered.find(button => !button.disabled) ?? offered[0];
     if (!button) return;
     button.classList.add('main-action');
+    // Keep this decision beside the uncertainty the operator is accepting.
+    if (button.hasAttribute('data-pending-retry')) return;
     // Move the existing form intact when its action is inside optional settings.
     // Controls already beside their required facts keep their original container.
     const node = button.form ?? button;
@@ -229,6 +231,7 @@ const renderSteps = store => {
     ...taskControls('[data-verify-clock]'),
     ...taskControls('[data-requirements-decision="approve"]'),
     ...(needsDeclaration ? taskControls('[data-poc-propose]') : []),
+    ...taskControls('[data-pending-retry]'),
     ...taskControls('[data-task] button').filter(button => button.textContent === 'Resume'),
     ...taskControls('[data-start-accepted-goal], [data-goal-enter], [data-bind]'),
     ...taskControls('#tau-poc-targets button').filter(button => button.textContent.startsWith('Start session ') &&
@@ -456,6 +459,8 @@ const plainPause = reason => {
     return pauseMessages.get(cause) ?? 'The browser could not safely save the result. Reopen and unlock this page before Resume; the earlier command will be checked without running it twice.';
   }
   if (pauseMessages.has(reason)) return pauseMessages.get(reason);
+  const machineCheck = reason.match(/^Checked the machine at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z): it has no record of this command\. /);
+  if (machineCheck) return `Checked the machine at ${new Date(machineCheck[1]).toLocaleString()}: it has no record of this command.`;
   if (/^collection returned no outcome for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return 'The earlier command’s result is not available yet. Resume checks it again without running it twice.';
   if (/^collection record identity mismatch for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return 'The returned result does not match the earlier command. Review Details before Resume; the command will not be run twice.';
   if (/^collection (?:recorded no record found|could not confirm whether the command reached the machine; Resume will check again without running it twice) for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return 'The page could not confirm whether the command reached the machine. Resume will check again without running it twice.';
@@ -1075,6 +1080,9 @@ const renderTasks = (store) => {
   for (const entry of store.tasks ?? []) {
     const opened = entry.summary ? taskDetails.get(entry.id) : undefined;
     const task = opened?.task ?? entry;
+    const missingRecord = task.status === 'paused' && task.disposition_offer?.read === 'missing' &&
+      task.proposal?.tool.name === 'exec' && task.proposal.check == null && task.proposal.report == null &&
+      !task.proposal.call_id.startsWith('$');
     const card = document.createElement('section');
     card.dataset.task = task.id;
     card.dataset.cycleTimings = JSON.stringify(task.cycle_timings ?? []);
@@ -1229,11 +1237,11 @@ const renderTasks = (store) => {
           requestCard.append(button);
         }
         card.append(requestCard);
-      } else paragraph(card, task.proposal.call_id.startsWith('$before:') ? 'Next: read the listening ports before setup.' : task.proposal.call_id.startsWith('$verify:') || task.proposal.call_id.startsWith('$verify-batch') ? 'Next: check the machine setup.' : task.proposal.tool.name === 'exec' ? `Next: ${commandSummary(task.proposal.tool.arguments.command)}` : task.proposal.tool.name === 'propose_declaration' ? 'Next: a requirements proposal from the AI.' : task.proposal.tool.name === 'done' ? 'Next: the handover from the AI.' : task.proposal.tool.name === 'request_ai_key' ? `Creating an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} and saving it on the machine.` : 'Next: a step.');
+      } else if (!missingRecord) paragraph(card, task.proposal.call_id.startsWith('$before:') ? 'Next: read the listening ports before setup.' : task.proposal.call_id.startsWith('$verify:') || task.proposal.call_id.startsWith('$verify-batch') ? 'Next: check the machine setup.' : task.proposal.tool.name === 'exec' ? `Next: ${commandSummary(task.proposal.tool.arguments.command)}` : task.proposal.tool.name === 'propose_declaration' ? 'Next: a requirements proposal from the AI.' : task.proposal.tool.name === 'done' ? 'Next: the handover from the AI.' : task.proposal.tool.name === 'request_ai_key' ? `Creating an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} and saving it on the machine.` : 'Next: a step.');
       rawDetails(card, task.proposal.tool, ['task', task.id, 'proposal', task.proposal.call_id]);
     }
     if (task.pending && task.proposal?.report == null) {
-      paragraph(card, 'Waiting for the earlier command. Resume checks its result without running it twice.');
+      if (!missingRecord) paragraph(card, 'Waiting for the earlier command. Resume checks its result without running it twice.');
       rawDetails(card, task.pending, ['task', task.id, 'pending']);
     }
     if (task.pause_reason) {
@@ -1295,44 +1303,69 @@ const renderTasks = (store) => {
     }
     if (session && store.lifecycle_state !== 'ended' && task.disposition_offer) {
       const offer = task.disposition_offer;
-      const labels = {as_if_not_done: "Carry on as if it didn't run", as_if_done: 'Carry on as if it ran'};
-      const confirmation = document.createElement('section');
-      confirmation.dataset.pendingConfirmation = task.id;
-      const showConfirmation = () => {
-        confirmation.replaceChildren();
-        const draft = taskDispositionDrafts.get(task.id);
-        if (!draft) return;
-        const snapshot = draft.confirmation;
-        paragraph(confirmation, `The earlier command on ${snapshot.machine} still has no confirmed result.`);
-        rawDetails(confirmation, snapshot, ['task', task.id, 'confirmation']);
-        paragraph(confirmation, `The result stays unknown. Your choice: ${labels[draft.continuation]}.`);
-        paragraph(confirmation, 'The AI may then run the same command again.');
-        paragraph(confirmation, 'If the earlier command arrives or runs late, it can overlap later commands and the page will never show it.');
-        if (snapshot.read === 'incomplete') paragraph(confirmation, 'The incomplete command may still be running.');
-        if (snapshot.remaining.length) paragraph(confirmation, 'Other commands still have unknown results. This choice does not clear them; the machine stays paused for them.');
-        if (snapshot.standing) {
-          paragraph(confirmation, 'This replaces your earlier choice for this command. Other commands covered by that choice keep their unknown results.');
+      if (missingRecord) {
+        taskDispositionDrafts.delete(task.id);
+        const decision = document.createElement('section');
+        decision.dataset.missingRecord = '';
+        paragraph(decision, 'The page sent the command, but the machine has no record of it. Most likely it never arrived.');
+        paragraph(decision, 'Running it again is the usual choice. If it did arrive, running it again repeats its changes. This is your decision.');
+        paragraph(decision, 'Either choice lets the AI carry on, with the result still unknown. The earlier command may arrive or run late, overlap later commands, and its late result will not appear here.');
+        if (offer.remaining.length) paragraph(decision, 'Other commands still have unknown results. This choice does not clear them; the machine stays paused for them.');
+        if (offer.standing) paragraph(decision, 'This replaces your earlier choice for this command. Other commands covered by that choice keep their unknown results.');
+        let chosen = false;
+        for (const [continuation, label] of [['as_if_not_done', 'Run it again'], ['as_if_done', 'It already ran']]) {
+          const choose = document.createElement('button'); choose.type = 'button'; choose.textContent = label;
+          choose.dataset.pendingAssumption = continuation;
+          if (continuation === 'as_if_not_done') choose.dataset.pendingRetry = '';
+          choose.addEventListener('click', () => {
+            if (chosen || choose.disabled) return;
+            chosen = true;
+            for (const control of decision.querySelectorAll('button')) control.disabled = true;
+            worker.postMessage({task: {action: 'dispose-pending', id: task.id, session: task.start_session, confirmation: structuredClone(offer), continuation}});
+          });
+          decision.append(choose);
         }
-        const confirm = document.createElement('button'); confirm.type = 'button'; confirm.textContent = 'Confirm unknown outcome';
-        confirm.addEventListener('click', () => {
-          confirm.disabled = true;
-          taskDispositionDrafts.delete(task.id);
-          worker.postMessage({task: {action: 'dispose-pending', id: task.id, session: task.start_session, ...draft}});
-        });
-        const cancel = document.createElement('button'); cancel.type = 'button'; cancel.textContent = 'Cancel assumption';
-        cancel.addEventListener('click', () => { taskDispositionDrafts.delete(task.id); showConfirmation(); });
-        confirmation.append(confirm, cancel);
-      };
-      for (const [continuation, label] of Object.entries(labels)) {
-        const choose = document.createElement('button'); choose.type = 'button'; choose.textContent = label;
-        choose.dataset.pendingAssumption = continuation;
-        choose.addEventListener('click', () => {
-          taskDispositionDrafts.set(task.id, {confirmation: structuredClone(offer), continuation});
-          showConfirmation();
-        });
-        card.append(choose);
+        card.append(decision);
+      } else {
+        const labels = {as_if_not_done: "Carry on as if it didn't run", as_if_done: 'Carry on as if it ran'};
+        const confirmation = document.createElement('section');
+        confirmation.dataset.pendingConfirmation = task.id;
+        const showConfirmation = () => {
+          confirmation.replaceChildren();
+          const draft = taskDispositionDrafts.get(task.id);
+          if (!draft) return;
+          const snapshot = draft.confirmation;
+          paragraph(confirmation, `The earlier command on ${snapshot.machine} still has no confirmed result.`);
+          rawDetails(confirmation, snapshot, ['task', task.id, 'confirmation']);
+          paragraph(confirmation, `The result stays unknown. Your choice: ${labels[draft.continuation]}.`);
+          paragraph(confirmation, 'The AI may then run the same command again.');
+          paragraph(confirmation, 'If the earlier command arrives or runs late, it can overlap later commands and the page will never show it.');
+          if (snapshot.read === 'incomplete') paragraph(confirmation, 'The incomplete command may still be running.');
+          if (snapshot.remaining.length) paragraph(confirmation, 'Other commands still have unknown results. This choice does not clear them; the machine stays paused for them.');
+          if (snapshot.standing) {
+            paragraph(confirmation, 'This replaces your earlier choice for this command. Other commands covered by that choice keep their unknown results.');
+          }
+          const confirm = document.createElement('button'); confirm.type = 'button'; confirm.textContent = 'Confirm unknown outcome';
+          confirm.addEventListener('click', () => {
+            confirm.disabled = true;
+            taskDispositionDrafts.delete(task.id);
+            worker.postMessage({task: {action: 'dispose-pending', id: task.id, session: task.start_session, ...draft}});
+          });
+          const cancel = document.createElement('button'); cancel.type = 'button'; cancel.textContent = 'Cancel assumption';
+          cancel.addEventListener('click', () => { taskDispositionDrafts.delete(task.id); showConfirmation(); });
+          confirmation.append(confirm, cancel);
+        };
+        for (const [continuation, label] of Object.entries(labels)) {
+          const choose = document.createElement('button'); choose.type = 'button'; choose.textContent = label;
+          choose.dataset.pendingAssumption = continuation;
+          choose.addEventListener('click', () => {
+            taskDispositionDrafts.set(task.id, {confirmation: structuredClone(offer), continuation});
+            showConfirmation();
+          });
+          card.append(choose);
+        }
+        card.append(confirmation); showConfirmation();
       }
-      card.append(confirmation); showConfirmation();
     } else if (task.disposition_refusal) {
       paragraph(card, 'The page cannot accept a choice about the unknown result yet. Review Details before continuing.');
       rawDetails(card, {reason: task.disposition_refusal}, ['task', task.id, 'choice-refused']);

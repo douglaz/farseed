@@ -557,9 +557,24 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             let mut writer = local.lock().await;
             let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
             return match result {
-                Ok(reports) => Ok(Observation::Unknown(
-                    store.poc_collection_reason(pending, &reports),
-                )),
+                Ok(reports) => {
+                    let mut why = store.poc_collection_reason(pending, &reports);
+                    // Only a fresh committed read may claim that we checked the machine.
+                    // Keep the collection diagnostic and identity in the durable pause.
+                    if store.poc_committed(pending).is_some_and(|report| {
+                        report.state == crate::jobs::State::Missing
+                            && report.number > task.inspection_record
+                    }) {
+                        let checked_at = js_sys::Date::new_0()
+                            .to_iso_string()
+                            .as_string()
+                            .ok_or("machine check time unavailable")?;
+                        why = format!(
+                            "Checked the machine at {checked_at}: it has no record of this command. {why}"
+                        );
+                    }
+                    Ok(Observation::Unknown(why))
+                }
                 Err(why) => Err(crate::poc::wait::COLLECTION_FAILED.render(
                     pending.call,
                     "",
