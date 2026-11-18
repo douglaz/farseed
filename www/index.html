@@ -175,8 +175,8 @@ section section { min-width: 0; }
 <p><label>Existing v1 relay URL (wss://, ending in /) <input id="tau-provider-relay" type="url" required autocomplete="off"></label></p>
 <p>Will this machine serve people you have never met? If unsure, choose Not sure.</p>
 <p><label>Class answer <select id="tau-provider-class" required><option value="">Choose an answer</option><option value="yes">Yes</option><option value="no">No, only me and people I know</option><option value="not_sure">Not sure</option></select></label></p>
-<p><label><input id="tau-provider-approve-charge" type="checkbox" required>Approve the exact displayed machine configuration, region, image, resources and recurring charge terms.</label></p>
-<p><label><input id="tau-provider-approve-access" type="checkbox" required>Approve maintained, ad-hoc access, the image's login user and whole-script sudo -n.</label></p>
+<p><label><input id="tau-provider-approve-charge" type="checkbox" required>I approve buying this machine exactly as shown above: its offer, region, system image, resources and recurring charge.</label></p>
+<p><label><input id="tau-provider-approve-access" type="checkbox" required>I let tau-web's AI log in to this machine whenever it needs to, now and later, as the image's login user, and run whole scripts on it as administrator without a password (sudo -n).</label></p>
 <button type="submit">Approve these exact purchase terms</button>
 </form>
 <section id="tau-provider-email" hidden aria-label="Verify your email with the machine provider">
