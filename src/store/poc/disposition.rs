@@ -333,18 +333,34 @@ impl<S: Storage> Store<S> {
                 return Err(crate::poc::wait::CHECKPOINT_PROTECTION.into());
             }
             if let Some(index) = proposal.check {
-                let check = task
-                    .verification
-                    .get_mut(index)
-                    .ok_or("pending disposition verification absent")?;
-                if check.job != pending.job
-                    || check.exit_status.is_some()
-                    || task.checks.get(index) != Some(&check.command)
-                    || !matches!(&proposal.tool, Tool::Exec {command, ..} if command == &check.command)
+                let batch = proposal.check_batch();
+                let end = if batch {
+                    proposal.check_batch_end(task.checks.len())
+                } else {
+                    index + 1
+                };
+                if batch
+                    && !matches!(&proposal.tool, Tool::Exec {command, ..}
+                    if command == &crate::poc::check_batch::command(&task.checks[..end], index))
                 {
                     return Err("pending disposition verification differs".into());
                 }
-                check.excerpt = "Outcome unknown; owner recorded a continuing assumption.".into();
+                for index in index..end {
+                    let check = task
+                        .verification
+                        .get_mut(index)
+                        .ok_or("pending disposition verification absent")?;
+                    if check.job != pending.job
+                        || check.exit_status.is_some()
+                        || task.checks.get(index) != Some(&check.command)
+                        || (!batch
+                            && !matches!(&proposal.tool, Tool::Exec {command, ..} if command == &check.command))
+                    {
+                        return Err("pending disposition verification differs".into());
+                    }
+                    check.excerpt =
+                        "Outcome unknown; owner recorded a continuing assumption.".into();
+                }
             }
             if let Some(index) = proposal.report {
                 task.reports[index].status = "outcome unknown".into();

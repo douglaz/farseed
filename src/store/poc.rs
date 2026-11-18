@@ -37,6 +37,28 @@ pub struct Proposal {
     pub check: Option<usize>,
     pub report: Option<usize>,
 }
+impl Proposal {
+    pub(crate) fn check_batch(&self) -> bool {
+        self.check.is_some()
+            && (self.call_id.starts_with("$verify-batch:")
+                || self.call_id.starts_with("$verify-batch-to:"))
+    }
+    pub(crate) fn check_batch_end(&self, checks: usize) -> usize {
+        // Historical batches cover every remaining read. New batches record their
+        // exclusive end so dispatch, collection and replay use the same range.
+        self.call_id
+            .strip_prefix("$verify-batch-to:")
+            .map(|suffix| {
+                suffix
+                    .split(':')
+                    .next()
+                    .expect("batch end")
+                    .parse()
+                    .expect("batch end index")
+            })
+            .unwrap_or(checks)
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pending {
@@ -237,6 +259,11 @@ pub enum Change {
         refusal: Option<String>,
     },
     PrepareCheck,
+    // New attempts batch harness reads; PrepareCheck keeps its historical replay meaning.
+    PrepareCheckBatch,
+    // Keep both historical preparation changes unchanged when replaying journals.
+    PrepareCheckJobs,
+    SkipCheckBatch(String),
     RetryChecks,
     RepairFindings,
     SkipReport(String),
@@ -1161,13 +1188,19 @@ impl<S: Storage> Store<S> {
                     if index != task.verification.len() {
                         return Err("verification order".into());
                     }
-                    task.verification.push(Verification {
-                        command: command.clone(),
-                        job: job.clone(),
-                        exit_status: None,
-                        excerpt: String::new(),
-                        observation: None,
-                    });
+                    let commands = if proposal.check_batch() {
+                        task.checks[index..proposal.check_batch_end(task.checks.len())].to_vec()
+                    } else {
+                        vec![command.clone()]
+                    };
+                    task.verification
+                        .extend(commands.into_iter().map(|command| Verification {
+                            command,
+                            job: job.clone(),
+                            exit_status: None,
+                            excerpt: String::new(),
+                            observation: None,
+                        }));
                 }
                 if let Some(index) = proposal.report {
                     let report = task
@@ -1707,7 +1740,35 @@ impl<S: Storage> Store<S> {
                         task.verdict = None;
                         task.active();
                     }
-                    Change::PrepareCheck => {
+                    Change::SkipCheckBatch(why) => {
+                        let proposal = task.proposal.as_ref().ok_or("no check batch")?;
+                        if !proposal.check_batch() || task.pending.is_some() {
+                            return Err("check batch cannot be skipped".into());
+                        }
+                        let index = proposal.check.expect("batch start");
+                        let end = proposal.check_batch_end(task.checks.len());
+                        if index != task.verification.len() {
+                            return Err("verification order".into());
+                        }
+                        task.verification
+                            .extend(task.checks[index..end].iter().map(|command| Verification {
+                                command: command.clone(),
+                                job: String::new(),
+                                exit_status: None,
+                                excerpt: String::new(),
+                                observation: None,
+                            }));
+                        let proposal = task.proposal.take().expect("batch");
+                        task.completed.push((
+                            proposal.call_id,
+                            proposal.tool,
+                            crate::goals::untrusted("tool_output", json!({"refused":why})),
+                        ));
+                        task.active();
+                    }
+                    Change::PrepareCheck | Change::PrepareCheckBatch | Change::PrepareCheckJobs => {
+                        let split = matches!(change, Change::PrepareCheckJobs);
+                        let batch = split || matches!(change, Change::PrepareCheckBatch);
                         if !task.verifying || task.proposal.is_some() || task.pending.is_some() {
                             return Err("verification not ready".into());
                         }
@@ -1727,8 +1788,24 @@ impl<S: Storage> Store<S> {
                             .iter()
                             .position(|report| report.status == "queued")
                         {
-                            let reserved =
+                            let remaining =
                                 task.checks.len().saturating_sub(task.verification.len());
+                            let reserved = if split {
+                                let control_centers = task.read_plan[task.verification.len()..]
+                                    .iter()
+                                    .filter(|read| {
+                                        matches!(
+                                            read,
+                                            crate::poc::completion::Read::ControlCenter { .. }
+                                        )
+                                    })
+                                    .count();
+                                control_centers + usize::from(remaining > control_centers)
+                            } else if batch {
+                                usize::from(remaining > 0)
+                            } else {
+                                remaining
+                            };
                             if (task.limits.steps.saturating_sub(task.steps) as usize) <= reserved {
                                 task.reports[index].status = "not run".into();
                                 task.reports[index].excerpt =
@@ -1748,7 +1825,8 @@ impl<S: Storage> Store<S> {
                                 });
                                 task.active();
                             }
-                        } else if task.verification.iter().any(|v| v.observation.is_none())
+                        } else if (!split
+                            && task.verification.iter().any(|v| v.observation.is_none()))
                             || task.verification.len() == task.checks.len()
                         {
                             let observations = task
@@ -1805,12 +1883,40 @@ impl<S: Storage> Store<S> {
                             );
                         } else {
                             let index = task.verification.len();
+                            let end = if split {
+                                task.read_plan
+                                    .iter()
+                                    .enumerate()
+                                    .skip(index)
+                                    .find(|(_, read)| {
+                                        matches!(
+                                            read,
+                                            crate::poc::completion::Read::ControlCenter { .. }
+                                        )
+                                    })
+                                    .map(|(index, _)| index)
+                                    .unwrap_or(task.checks.len())
+                            } else {
+                                task.checks.len()
+                            };
+                            // A control-center read has the full job window to itself.
+                            let batch = batch && end > index;
                             task.steps += 1;
                             task.proposal = Some(Proposal {
-                                call_id: format!("$verify:{index}:{}", task.steps),
+                                call_id: if batch && split {
+                                    format!("$verify-batch-to:{end}:{index}:{}", task.steps)
+                                } else if batch {
+                                    format!("$verify-batch:{index}:{}", task.steps)
+                                } else {
+                                    format!("$verify:{index}:{}", task.steps)
+                                },
                                 tool: Tool::Exec {
                                     machine: task.machine.clone(),
-                                    command: task.checks[index].clone(),
+                                    command: if batch {
+                                        crate::poc::check_batch::command(&task.checks[..end], index)
+                                    } else {
+                                        task.checks[index].clone()
+                                    },
                                 },
                                 check: Some(index),
                                 report: None,
@@ -1840,7 +1946,7 @@ impl<S: Storage> Store<S> {
                         let proposal = task.proposal.take().ok_or(crate::poc::wait::NO_PROPOSAL)?;
                         let exit = report.exit_status;
                         let background = report.state == crate::jobs::State::Background;
-                        if !background && exit.is_none() {
+                        if !background && exit.is_none() && !proposal.check_batch() {
                             return Err(crate::poc::wait::NO_EXIT.into());
                         }
                         let outcome = if matches!(proposal.tool, Tool::RequestAiKey { .. }) {
@@ -1869,7 +1975,49 @@ impl<S: Storage> Store<S> {
                                     .observe(exit, &report.stdout)
                             });
                         }
-                        if let Some(index) = proposal.check {
+                        if proposal.check_batch() {
+                            let start = proposal.check.expect("batch start");
+                            let end = proposal.check_batch_end(task.checks.len());
+                            let stdout = match &report.evidence.record {
+                                crate::jobs::Record::Present { stdout, .. }
+                                    if !background && exit == Some(0) =>
+                                {
+                                    hex::decode(stdout).ok()
+                                }
+                                _ => None,
+                            };
+                            let reads = stdout
+                                .as_deref()
+                                .map(|bytes| crate::poc::check_batch::parse(bytes, start, end))
+                                .unwrap_or_default();
+                            for index in start..end {
+                                let check = task
+                                    .verification
+                                    .get_mut(index)
+                                    .ok_or(crate::poc::wait::NO_VERIFICATION)?;
+                                if check.job != pending.job || check.exit_status.is_some() {
+                                    return Err(crate::poc::wait::VERIFICATION_MISMATCH.into());
+                                }
+                                if let Some((exit, bytes)) = reads.get(index - start) {
+                                    let stdout = String::from_utf8_lossy(bytes);
+                                    if self.protect_output(&json!(stdout))? != json!(stdout) {
+                                        return Err(crate::poc::wait::CHECKPOINT_PROTECTION.into());
+                                    }
+                                    // The standalone supervisor treats statuses above 128
+                                    // as signal-or-high-exit evidence, without an exit record.
+                                    check.exit_status = (*exit <= 128).then_some(*exit);
+                                    check.observation = check
+                                        .exit_status
+                                        .map(|exit| task.read_plan[index].observe(exit, &stdout));
+                                    check.excerpt = stdout.chars().take(1024).collect();
+                                    if self.protect_output(&json!(check.excerpt))?
+                                        != json!(check.excerpt)
+                                    {
+                                        return Err(crate::poc::wait::EXCERPT_PROTECTION.into());
+                                    }
+                                }
+                            }
+                        } else if let Some(index) = proposal.check {
                             let check = task
                                 .verification
                                 .get_mut(index)

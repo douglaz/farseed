@@ -205,6 +205,19 @@ impl<S: Storage> Store<S> {
         &self,
         mut report: crate::jobs::Report,
     ) -> Result<crate::jobs::Report, String> {
+        let batch = self.poc.values().find_map(|task| {
+            let pending = task.pending.as_ref()?;
+            let proposal = task.proposal.as_ref()?;
+            (pending.call == report.evidence.call
+                && pending.job == report.evidence.job
+                && proposal.check_batch())
+            .then(|| {
+                (
+                    proposal.check.expect("batch start"),
+                    proposal.check_batch_end(task.checks.len()),
+                )
+            })
+        });
         // Reports duplicate the same output as raw hex and lossy text. Protect the full
         // bytes once, then derive both copies; scan every other field independently.
         let output = if let crate::jobs::Record::Present { stdout, stderr, .. }
@@ -226,13 +239,47 @@ impl<S: Storage> Store<S> {
             | crate::jobs::Record::Background { stdout, stderr, .. } =
                 &mut report.evidence.record
         {
-            for (raw, encoded, decoded) in [
+            for (channel, (raw, encoded, decoded)) in [
                 (&output[0], stdout, &mut report.stdout),
                 (&output[1], stderr, &mut report.stderr),
-            ] {
-                let bytes =
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut bytes =
                     Zeroizing::new(hex::decode(raw).map_err(|_| crate::poc::wait::JOB_OUTPUT_HEX)?);
+                if channel == 0
+                    && let Some((start, end)) = batch
+                {
+                    // Parse original bytes before redaction or lossy decoding can shift a
+                    // boundary. Protect each read as a standalone output, then reframe it.
+                    let mut framed = Zeroizing::new(Vec::new());
+                    for (offset, (exit, stdout)) in
+                        crate::poc::check_batch::parse(&bytes, start, end)
+                            .into_iter()
+                            .enumerate()
+                    {
+                        let safe = crate::redaction::Redacted::for_store(self, stdout, &[])?;
+                        crate::poc::check_batch::frame(
+                            &mut framed,
+                            start + offset,
+                            exit,
+                            safe.as_bytes(),
+                        );
+                    }
+                    bytes = framed;
+                }
                 let safe = crate::redaction::Redacted::for_store(self, &bytes, &[])?;
+                if channel == 0 && batch.is_some() && safe.as_bytes() != bytes.as_slice() {
+                    // A whole-stream substitution could turn read data into a header.
+                    // Withhold all observations rather than parse shifted framing.
+                    bytes.clear();
+                }
+                let safe = if channel == 0 && batch.is_some() && bytes.is_empty() {
+                    crate::redaction::Redacted::for_store(self, &[], &[])?
+                } else {
+                    safe
+                };
                 *encoded = hex::encode(safe.as_bytes());
                 *decoded = String::from_utf8_lossy(safe.as_bytes()).into_owned();
                 // Encoding or lossy decoding can itself create another credential's

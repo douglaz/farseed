@@ -1,3 +1,4 @@
+pub(crate) mod check_batch;
 pub mod completion;
 pub mod files;
 #[cfg_attr(

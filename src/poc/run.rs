@@ -167,7 +167,7 @@ pub async fn resume(
     }
     if task.proposal.is_none() {
         if task.verifying {
-            task = runtime.change(&task, Change::PrepareCheck).await?;
+            task = runtime.change(&task, Change::PrepareCheckJobs).await?;
         } else {
             model.ready(&task, session).await?;
             task = runtime.prepare(&task, session).await?;
@@ -263,6 +263,12 @@ pub async fn resume(
                     .is_some_and(|p| p.report.is_some())
                 {
                     Change::SkipReport(
+                        result.err().unwrap_or_else(|| {
+                            "command returned without a durable task intent".into()
+                        }),
+                    )
+                } else if current.proposal.as_ref().is_some_and(|p| p.check_batch()) {
+                    Change::SkipCheckBatch(
                         result.err().unwrap_or_else(|| {
                             "command returned without a durable task intent".into()
                         }),
