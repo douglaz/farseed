@@ -402,6 +402,7 @@ pub struct Store<S> {
     seed: Option<Seed>,
     /// The allocation metadata, from the seed record on.
     allocation: Option<Metadata>,
+    seed_keys: std::cell::RefCell<Option<crate::redaction::SeedKeyCache>>,
     commands: Vec<(u64, Entry)>,
     dispatch: Dispatch,
     delivery: delivery::State,
@@ -583,6 +584,7 @@ impl<S: Storage> Store<S> {
             previous: Address([0; 32]),
             seed: None,
             allocation: None,
+            seed_keys: std::cell::RefCell::new(None),
             commands: Vec::new(),
             dispatch: Dispatch::default(),
             delivery: delivery::State::default(),
@@ -1508,7 +1510,7 @@ impl<S: Storage> Store<S> {
     }
 
     pub(crate) fn held_credentials(&self) -> Result<crate::redaction::Held<'_>, String> {
-        use crate::redaction::{Derived, Held};
+        use crate::redaction::{CheckValue, Held, SeedKeyCache, SeedKeys};
         let timing = unlock_marks::Timer::new(unlock_marks::Mark::HeldCredentials);
         timing.count(unlock_marks::Counter::HeldCredentials, 1);
         let seed = self.seed.as_ref().ok_or(crate::poc::wait::UNLOCKED_SEED)?;
@@ -1525,10 +1527,10 @@ impl<S: Storage> Store<S> {
         #[cfg(target_arch = "wasm32")]
         {
             if let Some(key) = crate::poc::inference::held_key() {
-                derived.push(Derived::Inference(key));
+                derived.push(CheckValue::Inference(key));
             }
             if let Some(key) = crate::poc::credit::browser::held_key() {
-                derived.push(Derived::Session(key));
+                derived.push(CheckValue::Session(key));
             }
         }
         for entry in &self.ai_keys {
@@ -1537,10 +1539,12 @@ impl<S: Storage> Store<S> {
             }
         }
         if let Some(key) = &self.deployment_relay {
-            derived.push(Derived::Text(Zeroizing::new(hex::encode(key.0))));
+            derived.push(CheckValue::Text(Zeroizing::new(hex::encode(key.0))));
         }
         if let Some(account) = &self.provider_account {
-            derived.push(Derived::Text(Zeroizing::new(hex::encode(account.bytes()))));
+            derived.push(CheckValue::Text(Zeroizing::new(hex::encode(
+                account.bytes(),
+            ))));
         }
         for email in &self.provider_emails {
             borrowed.push(email.as_bytes());
@@ -1554,36 +1558,44 @@ impl<S: Storage> Store<S> {
             }
             bindings.push(given);
         }
-        for entry in self.allocation().entries() {
-            let identity = &entry.identity;
-            if identity.seed != seed.id() {
-                continue;
+        let cached = self.seed_keys.try_borrow().ok().and_then(|cache| {
+            if cache
+                .as_ref()
+                .is_some_and(|cache| cache.is_current(seed, self.allocation()))
+            {
+                std::cell::Ref::filter_map(cache, Option::as_ref).ok()
+            } else {
+                None
             }
-            let (v, i) = (identity.derivation_version, identity.index);
-            let result = (|| -> Result<(), crate::seed::DeriveError> {
-                match identity.family {
-                    Family::Machines => {
-                        timing.count(unlock_marks::Counter::DerivedKeys, 1);
-                        derived.push(Derived::Ssh(seed.ssh_client_key(v, i)?));
-                        timing.count(unlock_marks::Counter::DerivedKeys, 1);
-                        derived.push(Derived::Sender(seed.attest_sender_key(v, i)?));
-                        timing.count(unlock_marks::Counter::DerivedKeys, 1);
-                        derived.push(Derived::Recipient(seed.attest_recipient_key(v, i)?));
-                    }
-                    Family::Passes => {
-                        timing.count(unlock_marks::Counter::DerivedKeys, 1);
-                        derived.push(Derived::Relay(seed.relay_key(v, i)?));
-                    }
-                    Family::Handoffs => {
-                        timing.count(unlock_marks::Counter::DerivedKeys, 1);
-                        derived.push(Derived::Handoff(seed.post_harness_credential(v, i)?))
-                    }
-                }
-                Ok(())
-            })();
-            result.map_err(|_| crate::poc::wait::DERIVATION.to_string())?;
-        }
-        Ok(Held::new(borrowed, seed.phrase(), derived, bindings))
+        });
+        let cached = if cached.is_some() {
+            cached
+        } else if let Ok(mut cache) = self.seed_keys.try_borrow_mut() {
+            SeedKeyCache::synchronize(&mut cache, seed, self.allocation(), &timing)?;
+            drop(cache);
+            self.seed_keys
+                .try_borrow()
+                .ok()
+                .and_then(|cache| std::cell::Ref::filter_map(cache, Option::as_ref).ok())
+        } else {
+            None
+        };
+        let seed_keys = if let Some(cache) = cached {
+            SeedKeys::Borrowed(cache)
+        } else {
+            // A nested protection call can already hold a cache borrow. Derive a fresh
+            // per-call set rather than panic or accept an unverified cached set.
+            let mut fresh = None;
+            SeedKeyCache::synchronize(&mut fresh, seed, self.allocation(), &timing)?;
+            SeedKeys::Owned(Box::new(fresh.expect("fresh seed keys")))
+        };
+        Ok(Held::new(
+            borrowed,
+            seed.phrase(),
+            derived,
+            bindings,
+            seed_keys,
+        ))
     }
 
     pub async fn operation_observation(

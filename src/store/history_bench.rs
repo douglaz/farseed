@@ -13,7 +13,13 @@ type Sample = BTreeMap<&'static str, f64>;
 type BenchResult<T> = Result<T, &'static str>;
 const REPEATS: usize = 3;
 const STEPS: usize = 40;
-const BUDGET: Duration = Duration::from_secs(14 * 60);
+/// 14 minutes unless `TAU_HISTORY_BENCH_BUDGET_SECONDS` names another whole number of seconds.
+fn budget() -> Duration {
+    std::env::var("TAU_HISTORY_BENCH_BUDGET_SECONDS")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .map_or(Duration::from_secs(14 * 60), Duration::from_secs)
+}
 const MACHINE: &str = "fixture";
 const FIXTURE_SECONDS: u64 = 100;
 const COMMAND_BYTES: [usize; 6] = [800, 12000, 4000, 1000, 1500, 2500];
@@ -241,7 +247,7 @@ fn history_task(store: &mut Store<MemoryStorage>, started: Instant) -> BenchResu
     let requested = change(store, &task, Change::Request)?;
     task = change(store, &requested, Change::RecoverRequest)?;
     for step in 0..STEPS {
-        if started.elapsed() >= BUDGET {
+        if started.elapsed() >= budget() {
             return Err("runtime_budget_exceeded");
         }
         task = exec_step(store, &task, step)?;
@@ -600,7 +606,7 @@ fn header() {
     println!("crypto_backend runtime_dispatch_unless_forced_soft");
     println!("phone wasm32 software_AES_GCM_SHA256 single_thread slower_CPU WebCrypto_PBKDF2");
     println!("median_repeats {REPEATS}");
-    println!("budget_seconds {}", BUDGET.as_secs());
+    println!("budget_seconds {}", budget().as_secs());
 }
 
 /// One generation pass, snapshots at the requested sizes, three independent unlocks
@@ -620,15 +626,26 @@ pub fn run(meter: MemoryMeter) -> BenchResult<()> {
     let mut generation_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut cutoff = 0;
     for size in sizes {
-        // Reserve a conservative quadratic projection from the most recent measured
-        // generation and replay. Keep 1, 10 and 50; omit an over-budget larger column.
+        // Project the next column with the growth measured between the last two columns
+        // (between linear and quadratic; quadratic with one column), with a margin for the
+        // measurement repeats. Keep 1, 10 and 50; omit an over-budget larger column.
         if size > 50
             && let Some((previous, sample)) = columns.last()
         {
-            let scale = (size as f64 / *previous as f64).powi(2);
+            let exponent = match columns.len() {
+                n if n >= 2 => {
+                    let (earlier, older) = &columns[n - 2];
+                    let size_ratio = *previous as f64 / *earlier as f64;
+                    let time_ratio = sample["generation_ms"] / older["generation_ms"];
+                    (time_ratio.ln() / size_ratio.ln()).clamp(1.0, 2.0)
+                }
+                _ => 2.0,
+            };
+            let scale = (size as f64 / *previous as f64).powf(exponent);
             let projected =
                 generation_ms * (scale - 1.0) + sample["measurement_wall_ms"] * scale * 2.0;
-            if started.elapsed().as_secs_f64() * 1000.0 + projected > BUDGET.as_secs_f64() * 1000.0
+            if started.elapsed().as_secs_f64() * 1000.0 + projected
+                > budget().as_secs_f64() * 1000.0
             {
                 cutoff = 1;
                 break;
@@ -636,7 +653,7 @@ pub fn run(meter: MemoryMeter) -> BenchResult<()> {
         }
         let generation = Instant::now();
         while generated < size {
-            if started.elapsed() >= BUDGET {
+            if started.elapsed() >= budget() {
                 return Err("runtime_budget_exceeded");
             }
             let id = history_task(&mut store, started)?;
@@ -648,7 +665,7 @@ pub fn run(meter: MemoryMeter) -> BenchResult<()> {
         let wall = Instant::now();
         let mut samples = Vec::new();
         for _ in 0..REPEATS {
-            if started.elapsed() >= BUDGET {
+            if started.elapsed() >= budget() {
                 return Err("runtime_budget_exceeded");
             }
             samples.push(measure(
@@ -714,6 +731,119 @@ pub fn run(meter: MemoryMeter) -> BenchResult<()> {
             -1.0
         };
         println!(" {ratio:>16.3}");
+    }
+    held_set()
+}
+
+/// Extra machines (created, then destroyed) and relay passes per held-set column, on top of one
+/// finished task: the held set, not the task count, sizes the protection matcher.
+const HELD_SET_SIZES: [usize; 4] = [0, 100, 400, 1600];
+const HELD_SET_REPEATS: usize = 101;
+
+fn median_of(mut values: Vec<f64>) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
+
+/// Plain fixture text split into strings, as a task view holds it; about `bytes` long.
+fn held_set_value(bytes: usize) -> Value {
+    let mut lines = Vec::new();
+    let mut total = 0;
+    while total < bytes {
+        let text = format!("fixture output line {} with ordinary words", lines.len());
+        total += text.len();
+        lines.push(Value::String(text));
+    }
+    json!({"task": {"completed": lines}})
+}
+
+/// One machine, created and destroyed, and one relay pass, created, through the allocation journal.
+fn add_machine_and_pass(store: &mut Store<MemoryStorage>) -> BenchResult<()> {
+    let machine =
+        block_on(store.allocate(Family::Machines)).map_err(|_| "held_set_allocation_failed")?;
+    block_on(store.observe(allocation::Event::Created(machine.clone())))
+        .map_err(|_| "held_set_created_failed")?;
+    block_on(store.observe(allocation::Event::Destroyed(machine)))
+        .map_err(|_| "held_set_destroyed_failed")?;
+    let relay =
+        block_on(store.allocate(Family::Passes)).map_err(|_| "held_set_allocation_failed")?;
+    block_on(store.observe(allocation::Event::Created(relay)))
+        .map_err(|_| "held_set_created_failed")?;
+    Ok(())
+}
+
+/// Per-check protection cost against the held set: a small history (one finished task) with
+/// 0, 100, 400 and 1,600 extra machines and passes. Prints its own fixed table.
+fn held_set() -> BenchResult<()> {
+    let started = Instant::now();
+    let mut store = ready()?;
+    history_task(&mut store, started)?;
+    let check = held_set_value(8 * 1024);
+    let page = held_set_value(200 * 1024);
+    let mut added = 0;
+    let mut columns: Vec<(usize, Sample)> = Vec::new();
+    for target in HELD_SET_SIZES {
+        while added < target {
+            add_machine_and_pass(&mut store)?;
+            added += 1;
+        }
+        let mut sample = Sample::new();
+        sample.insert(
+            "held_set_allocation_entries",
+            store.allocation().entries().len() as f64,
+        );
+        let (mut helds, mut checks, mut pages) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..HELD_SET_REPEATS {
+            let start = Instant::now();
+            drop(
+                store
+                    .held_credentials()
+                    .map_err(|_| "held_set_held_failed")?,
+            );
+            helds.push(start.elapsed().as_secs_f64() * 1000.0);
+            let start = Instant::now();
+            store
+                .protect_output(&check)
+                .map_err(|_| "held_set_check_failed")?;
+            checks.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        for _ in 0..11 {
+            let start = Instant::now();
+            store
+                .protect_page_publication(&page)
+                .map_err(|_| "held_set_page_failed")?;
+            pages.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        sample.insert("held_set_held_credentials_ms", median_of(helds));
+        sample.insert("held_set_check_8k_ms", median_of(checks));
+        sample.insert("held_set_page_200k_ms", median_of(pages));
+        let files = store.storage.files();
+        timed(&mut sample, "held_set_unlock_ms", || {
+            block_on(unlock(MemoryStorage::with_files(files), &Pbkdf2, pass()))
+        })
+        .map_err(|_| "held_set_unlock_failed")?;
+        // Adding one more machine and pass after the measurements: five journal appends, whose
+        // own protection checks derive the new keys and rebuild the seed matcher. The next
+        // column adds the rest of its count.
+        timed(&mut sample, "held_set_extend_ms", || {
+            add_machine_and_pass(&mut store)
+        })?;
+        added += 1;
+        columns.push((target, sample));
+    }
+    print!("{:<40}", "held_set_extra_machines_and_passes");
+    for (size, _) in &columns {
+        print!(" {size:>16}");
+    }
+    println!(" {:>16}", "largest_over_0");
+    for name in columns[0].1.keys() {
+        print!("{name:<40}");
+        for (_, sample) in &columns {
+            print!(" {:>16.3}", sample[name]);
+        }
+        let first = columns[0].1[name];
+        let last = columns[columns.len() - 1].1[name];
+        println!(" {:>16.3}", if first > 0.0 { last / first } else { -1.0 });
     }
     Ok(())
 }

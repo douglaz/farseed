@@ -1,10 +1,12 @@
 //! The credential-redaction boundary for adapter responses.
 
+use crate::allocation::{Family, Identity, Metadata};
 use crate::credential::{
     AttestRecipientKey, AttestSenderKey, PostHarnessCredential, RelayKey, SshClientKey,
 };
-use crate::store::{Storage, Store};
-use std::cell::OnceCell;
+use crate::seed::Seed;
+use crate::store::{Storage, Store, unlock_marks};
+use std::cell::{OnceCell, Ref};
 use std::collections::HashMap;
 use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
@@ -96,12 +98,13 @@ impl fmt::Debug for Redacted {
     }
 }
 
-/// Transient enumeration: existing holders are borrowed; derived keys and canonical credential
-/// text zeroize on drop. No copy extends the lifetime of its holder.
+/// Seed-derived keys and their matcher stay in the unlocked store; other holders are borrowed
+/// per check, with canonical text and browser-key copies scoped to this enumeration. Seed keys
+/// are wiped at lock or drop on a best-effort basis (STA-23).
 pub(crate) struct Held<'a> {
     borrowed: Vec<&'a [u8]>,
     mnemonic: Zeroizing<String>,
-    derived: Vec<Derived>,
+    derived: Vec<CheckValue<'a>>,
     bindings: Vec<std::cell::Ref<'a, Vec<crate::binding::Holding>>>,
 }
 
@@ -110,25 +113,181 @@ pub(crate) enum Derived {
     Sender(AttestSenderKey),
     Recipient(AttestRecipientKey),
     Relay(RelayKey),
+    Handoff(PostHarnessCredential),
+}
+
+impl Derived {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Ssh(key) => &key.0,
+            Self::Sender(key) => &key.0,
+            Self::Recipient(key) => &key.0,
+            Self::Relay(key) => &key.0,
+            Self::Handoff(key) => &key.0,
+        }
+    }
+}
+
+pub(crate) enum CheckValue<'a> {
     #[cfg(target_arch = "wasm32")]
     Inference(crate::credential::InferenceAccountCredential),
     #[cfg(target_arch = "wasm32")]
     Session(crate::credential::SessionInferenceKey),
-    Handoff(PostHarnessCredential),
     Text(Zeroizing<String>),
-    Matcher(OnceCell<Matcher>),
+    Matcher {
+        seed: SeedKeys<'a>,
+        combined: OnceCell<Matcher>,
+    },
+}
+
+pub(crate) enum SeedKeys<'a> {
+    Borrowed(Ref<'a, SeedKeyCache>),
+    Owned(Box<SeedKeyCache>),
+}
+
+impl SeedKeys<'_> {
+    fn matcher(&self) -> &Matcher {
+        match self {
+            Self::Borrowed(cache) => &cache.matcher,
+            Self::Owned(cache) => &cache.matcher,
+        }
+    }
+}
+
+/// Only seed-derived secrets belong here. Boxes keep key bytes stationary when extending.
+pub(crate) struct SeedKeyCache {
+    seed: String,
+    allocation_seed: String,
+    derivation_version: u32,
+    identities: Vec<Identity>,
+    #[allow(
+        clippy::vec_box,
+        reason = "key bytes must not move during cache extension"
+    )]
+    keys: Vec<Box<Derived>>,
+    matcher: Matcher,
+}
+
+impl SeedKeyCache {
+    pub(crate) fn is_current(&self, seed: &Seed, allocation: &Metadata) -> bool {
+        let seed_id = seed.id();
+        self.seed == seed_id
+            && self.allocation_seed == allocation.seed()
+            && self.derivation_version == allocation.derivation_version()
+            && allocation
+                .entries()
+                .iter()
+                .map(|entry| &entry.identity)
+                .filter(|identity| identity.seed == seed_id)
+                .eq(self.identities.iter())
+    }
+
+    pub(crate) fn synchronize(
+        slot: &mut Option<Self>,
+        seed: &Seed,
+        allocation: &Metadata,
+        timing: &unlock_marks::Timer,
+    ) -> Result<(), String> {
+        let seed_id = seed.id();
+        let identities = || {
+            allocation
+                .entries()
+                .iter()
+                .map(|entry| &entry.identity)
+                .filter(|identity| identity.seed == seed_id)
+        };
+        let same_seed = slot.as_ref().is_some_and(|cache| {
+            cache.seed == seed_id
+                && cache.allocation_seed == allocation.seed()
+                && cache.derivation_version == allocation.derivation_version()
+        });
+        // Compare actual identities, including their seed and version, before every use.
+        // Status changes do not remove tombstoned keys from protection.
+        if same_seed
+            && slot
+                .as_ref()
+                .is_some_and(|cache| identities().eq(cache.identities.iter()))
+        {
+            return Ok(());
+        }
+        let extends = same_seed
+            && slot.as_ref().is_some_and(|cache| {
+                identities()
+                    .take(cache.identities.len())
+                    .eq(cache.identities.iter())
+            });
+        let key_count = identities()
+            .map(|identity| match identity.family {
+                Family::Machines => 3,
+                Family::Passes | Family::Handoffs => 1,
+            })
+            .sum();
+        let mut keys = Vec::with_capacity(key_count);
+        let old = slot.take();
+        let start = if extends {
+            let old = old.expect("extension has a cache");
+            // Drop secret-bearing map buckets before building their replacement. Moving
+            // boxes into the precisely sized vector moves pointers, never key bytes.
+            drop(old.matcher);
+            keys.extend(old.keys);
+            old.identities.len()
+        } else {
+            // A changed seed/version, reordered list or removal invalidates everything.
+            drop(old);
+            0
+        };
+        for identity in identities().skip(start) {
+            let (v, i) = (identity.derivation_version, identity.index);
+            let mut derive = |result: Result<Derived, crate::seed::DeriveError>| {
+                result
+                    .map(|key| {
+                        timing.count(unlock_marks::Counter::DerivedKeys, 1);
+                        keys.push(Box::new(key));
+                    })
+                    .map_err(|_| crate::poc::wait::DERIVATION.to_string())
+            };
+            match identity.family {
+                Family::Machines => {
+                    derive(seed.ssh_client_key(v, i).map(Derived::Ssh))?;
+                    derive(seed.attest_sender_key(v, i).map(Derived::Sender))?;
+                    derive(seed.attest_recipient_key(v, i).map(Derived::Recipient))?;
+                }
+                Family::Passes => {
+                    derive(seed.relay_key(v, i).map(Derived::Relay))?;
+                }
+                Family::Handoffs => {
+                    derive(seed.post_harness_credential(v, i).map(Derived::Handoff))?;
+                }
+            }
+        }
+        let matcher = Matcher::new(|| keys.iter().map(|key| key.bytes()));
+        let mut current_identities = Vec::with_capacity(identities().count());
+        current_identities.extend(identities().cloned());
+        *slot = Some(Self {
+            seed: seed_id.clone(),
+            allocation_seed: allocation.seed().into(),
+            derivation_version: allocation.derivation_version(),
+            identities: current_identities,
+            keys,
+            matcher,
+        });
+        Ok(())
+    }
 }
 
 impl<'a> Held<'a> {
     pub(crate) fn new(
         borrowed: Vec<&'a [u8]>,
         mnemonic: Zeroizing<String>,
-        mut derived: Vec<Derived>,
+        mut derived: Vec<CheckValue<'a>>,
         bindings: Vec<std::cell::Ref<'a, Vec<crate::binding::Holding>>>,
+        seed: SeedKeys<'a>,
     ) -> Self {
-        // Keep the cache with the derived holdings so all credential-derived allocations
-        // share their lifetime. It is not itself a credential value.
-        derived.push(Derived::Matcher(OnceCell::new()));
+        // The final slot gives constant-time access without walking cached key material.
+        derived.push(CheckValue::Matcher {
+            seed,
+            combined: OnceCell::new(),
+        });
         Self {
             borrowed,
             mnemonic,
@@ -138,10 +297,8 @@ impl<'a> Held<'a> {
     }
 
     pub(crate) fn extend_borrowed(&mut self, credentials: &[&'a [u8]]) {
-        for key in &mut self.derived {
-            if let Derived::Matcher(matcher) = key {
-                matcher.take();
-            }
+        if let Some(CheckValue::Matcher { combined, .. }) = self.derived.last_mut() {
+            combined.take();
         }
         self.borrowed.extend_from_slice(credentials);
     }
@@ -158,17 +315,12 @@ impl<'a> Held<'a> {
             .chain(std::iter::once(self.mnemonic.as_bytes()))
             .chain(self.derived.iter().filter_map(|key| {
                 Some(match key {
-                    Derived::Ssh(key) => key.0.as_slice(),
-                    Derived::Sender(key) => key.0.as_slice(),
-                    Derived::Recipient(key) => key.0.as_slice(),
-                    Derived::Relay(key) => key.0.as_slice(),
                     #[cfg(target_arch = "wasm32")]
-                    Derived::Inference(key) => key.0.as_slice(),
+                    CheckValue::Inference(key) => key.0.as_slice(),
                     #[cfg(target_arch = "wasm32")]
-                    Derived::Session(key) => key.0.as_slice(),
-                    Derived::Handoff(key) => key.0.as_slice(),
-                    Derived::Text(text) => text.as_bytes(),
-                    Derived::Matcher(_) => return None,
+                    CheckValue::Session(key) => key.0.as_slice(),
+                    CheckValue::Text(text) => text.as_bytes(),
+                    CheckValue::Matcher { .. } => return None,
                 })
             }))
             .filter(|value| !value.is_empty())
@@ -184,17 +336,18 @@ impl<'a> Held<'a> {
         publication: bool,
         mut found: impl FnMut(usize, usize) -> bool,
     ) -> bool {
-        let matcher = self.derived.iter().find_map(|key| match key {
-            Derived::Matcher(matcher) => Some(matcher.get_or_init(|| Matcher::new(self))),
-            _ => None,
-        });
-        if let Some(matcher) = matcher
-            && matcher.matches(bytes, publication, &mut found)
-        {
-            return true;
-        }
+        let indexed = if let Some(CheckValue::Matcher { seed, combined }) = self.derived.last() {
+            let seed = seed.matcher();
+            let matcher = combined.get_or_init(|| Matcher::with_seed(|| self.values(), Some(seed)));
+            if matcher.matches(seed, bytes, publication, &mut found) {
+                return true;
+            }
+            true
+        } else {
+            false
+        };
         for needle in self.values() {
-            if (needle.len() < 8 || matcher.is_none())
+            if (needle.len() < 8 || !indexed)
                 && credential_matches(bytes, needle, |start| found(start, start + needle.len()))
             {
                 return true;
@@ -214,47 +367,104 @@ impl Drop for Prefix {
 }
 
 pub(crate) struct Matcher {
-    prefixes: HashMap<Prefix, Zeroizing<Vec<Zeroizing<Vec<u8>>>>>,
-    suffixes: HashMap<Prefix, Zeroizing<Vec<Zeroizing<Vec<u8>>>>>,
+    index: HashMap<Prefix, Candidates>,
+    values: Vec<MatchValue>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Candidates {
+    prefix: Option<usize>,
+    suffix: Option<usize>,
+}
+
+struct MatchValue {
+    value: Zeroizing<Vec<u8>>,
+    prefix_next: Option<usize>,
+    suffix_next: Option<usize>,
 }
 
 impl Matcher {
-    fn new(held: &Held<'_>) -> Self {
-        // Sized up front so inserting never grows the table: growth would free old buckets
-        // holding prefix copies without zeroizing them.
-        let long = held.values().filter(|value| value.len() >= 8).count();
-        let mut prefixes = HashMap::with_capacity(long);
-        let mut suffixes = HashMap::with_capacity(long);
-        for value in held.values().filter(|value| value.len() >= 8) {
-            prefixes
+    fn new<'a, I: Iterator<Item = &'a [u8]>>(values: impl Fn() -> I) -> Self {
+        Self::with_seed(values, None)
+    }
+
+    fn with_seed<'a, I: Iterator<Item = &'a [u8]>>(
+        values: impl Fn() -> I,
+        seed: Option<&Self>,
+    ) -> Self {
+        // Size every secret-bearing collection before inserting. Linked candidate indices
+        // avoid growing bucket vectors, even when many values share a prefix or suffix.
+        let long = values().filter(|value| value.len() >= 8).count();
+        let seed_len = seed.map_or(0, |seed| seed.values.len());
+        let mut index = HashMap::with_capacity(seed.map_or(0, |seed| seed.index.len()) + 2 * long);
+        if let Some(seed) = seed {
+            // Copy only cached eight-byte index keys and candidate indices, never full seed
+            // values. This O(cached keys) copy is paid once per Held, not once per scan.
+            for (prefix, candidates) in &seed.index {
+                index.insert(Prefix(prefix.0), *candidates);
+            }
+        }
+        let mut entries = Vec::with_capacity(long);
+        for value in values().filter(|value| value.len() >= 8) {
+            // Cached candidates address seed.values; appended candidates address this
+            // Held's overlay values after that range. Chains can cross into the seed list.
+            let candidate = seed_len + entries.len();
+            let prefix_next = index
                 .entry(Prefix(value[..8].try_into().expect("credential prefix")))
-                .or_insert_with(|| Zeroizing::new(Vec::new()))
-                .push(Zeroizing::new(value.to_vec()));
-            suffixes
+                .or_default()
+                .prefix
+                .replace(candidate);
+            let suffix_next = index
                 .entry(Prefix(
                     value[value.len() - 8..]
                         .try_into()
                         .expect("credential suffix"),
                 ))
-                .or_insert_with(|| Zeroizing::new(Vec::new()))
-                .push(Zeroizing::new(value.to_vec()));
+                .or_default()
+                .suffix
+                .replace(candidate);
+            entries.push(MatchValue {
+                value: Zeroizing::new(value.to_vec()),
+                prefix_next,
+                suffix_next,
+            });
         }
-        Self { prefixes, suffixes }
+        Self {
+            index,
+            values: entries,
+        }
+    }
+
+    fn candidate<'a>(&'a self, seed: &'a Self, index: usize) -> &'a MatchValue {
+        if index < seed.values.len() {
+            &seed.values[index]
+        } else {
+            &self.values[index - seed.values.len()]
+        }
     }
 
     fn matches(
         &self,
+        seed: &Self,
         bytes: &[u8],
         publication: bool,
         found: &mut impl FnMut(usize, usize) -> bool,
     ) -> bool {
-        if self.prefixes.is_empty() {
+        if self.index.is_empty() {
             return false;
         }
         for (start, window) in bytes.windows(8).enumerate() {
             let prefix = Prefix(window.try_into().expect("eight-byte window"));
-            if let Some(candidates) = self.prefixes.get(&prefix) {
-                for value in candidates.iter() {
+            // Prefix and publication-suffix chains share one standard keyed hash lookup.
+            let Some(candidates) = self.index.get(&prefix) else {
+                continue;
+            };
+            if let Some(candidate) = candidates.prefix {
+                let mut next = Some(candidate);
+                while let Some(candidate) = next {
+                    let entry = self.candidate(seed, candidate);
+                    next = entry.prefix_next;
+                    let value = &entry.value;
                     if publication {
                         let remaining = &bytes[start..];
                         let matched = value
@@ -287,9 +497,13 @@ impl Matcher {
                     }
                 }
             }
-            if publication && let Some(candidates) = self.suffixes.get(&prefix) {
+            if publication && let Some(candidate) = candidates.suffix {
                 let end = start + 8;
-                for value in candidates.iter() {
+                let mut next = Some(candidate);
+                while let Some(candidate) = next {
+                    let entry = self.candidate(seed, candidate);
+                    next = entry.suffix_next;
+                    let value = &entry.value;
                     if end < value.len()
                         && (end < bytes.len() || bytes.len() >= SHORT_WHOLE)
                         && value.ends_with(&bytes[..end])
