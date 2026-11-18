@@ -1540,17 +1540,20 @@ const renderDelivery = (section, machine, store) => {
   const entry = (store.delivery ?? []).find(d => d.machine === machine);
   if (!entry) return;
   const delivery = deliveryDetails.entry.get(machine)?.value ?? entry;
+  const isLive = !delivery.summary && (store.poc_targets ?? []).some(target => target.machine === machine);
+  const fixtureBreak = isLive ? (delivery.fixture_limit ?? '').indexOf('. ') : -1;
   const card = document.createElement('section');
   card.dataset.deliveryCard = machine;
   const heading = document.createElement('h3');
   heading.textContent = `Delivery for ${machine}`;
   card.append(heading);
-  if (delivery.fixture_limit) paragraph(card, delivery.fixture_limit);
+  if (delivery.fixture_limit) paragraph(card, fixtureBreak === -1 ? delivery.fixture_limit : delivery.fixture_limit.slice(0, fixtureBreak + 1));
   const verdict = document.createElement('p');
   verdict.dataset.deliveryVerdict = machine;
   verdict.textContent = delivery.verdict;
   if (delivery.verdict_is_historical && delivery.last_completed_check) paragraph(card, 'The last completed result is historical; a final demonstration is still needed.');
   card.append(verdict);
+  if (isLive) paragraph(card, 'Not checked here: this version has no machine-wide delivery check (the lockdown checklist). The checks the setup runs, and their result, are on its task card.');
   if (entry.summary) deliveryDetailsButton(card, machine, 'entry', 'delivery details', store);
   if (delivery.summary) {
     paragraph(card, `${delivery.findings_count} findings recorded.`);
@@ -1561,7 +1564,15 @@ const renderDelivery = (section, machine, store) => {
   // has a verdict; otherwise each task's own card shows its addresses.
   const verdictTasks = (store.tasks ?? []).filter(task => task.machine === machine && task.verdict);
   if (verdictTasks.length === 1) renderDeliveredUrls(card, taskDeliveredUrls(verdictTasks[0]));
-  paragraph(card, 'Delivered covers the declared machine state and the fixed lockdown checks.');
+  if (isLive) {
+    const about = document.createElement('details');
+    about.dataset.foldKey = JSON.stringify(['delivery-about', machine]);
+    const summary = document.createElement('summary'); summary.textContent = 'About this card';
+    about.append(summary);
+    if (fixtureBreak !== -1) paragraph(about, delivery.fixture_limit.slice(fixtureBreak + 2));
+    paragraph(about, 'Delivered covers the declared machine state and the fixed lockdown checks.');
+    card.append(about);
+  } else paragraph(card, 'Delivered covers the declared machine state and the fixed lockdown checks.');
   if (delivery.last_completed_check) {
     paragraph(card, 'Last recorded check against its journaled declaration:');
     paragraph(card, delivery.verdict_is_historical ? 'Last completed check (historical result):' : 'Last completed check:');
@@ -1597,7 +1608,7 @@ const renderDelivery = (section, machine, store) => {
     card.append(reports);
   }
   const session = (store.sessions ?? []).find(s => s.session_state !== 'ended' && s.bound_set.includes(machine));
-  if (session && session.inference_limits?.state !== 'clock-withheld') {
+  if (!isLive && session && session.inference_limits?.state !== 'clock-withheld') {
     const button = document.createElement('button');
     button.type = 'button';
     button.dataset.deliveryCheck = machine;
