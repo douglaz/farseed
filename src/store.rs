@@ -1729,7 +1729,6 @@ impl<S: Storage> Store<S> {
             }
         }
         numbers.sort_unstable();
-        let mut records = Vec::new();
         for (expected, number) in (FIRST..).zip(numbers) {
             if number != expected {
                 return Err(format!(
@@ -1741,17 +1740,12 @@ impl<S: Storage> Store<S> {
             let bytes = self.storage.read(&number.to_string()).await?;
             read_timing.count(unlock_marks::Counter::RecordBytes, bytes.len() as u64);
             drop(read_timing);
-            let (event, plaintext) = self
+            let (event, _plaintext) = self
                 .open_record(number, &bytes)
                 .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
-            self.previous = unlock_marks::measure(unlock_marks::Mark::Hash, || {
-                Address(Sha256::digest(&bytes).into())
-            });
-            records.push((number, bytes, event, plaintext));
-        }
-        self.previous = Address([0; 32]);
-        let apply_timing = unlock_marks::Timer::new(unlock_marks::Mark::Apply);
-        for (number, bytes, event, _plaintext) in records {
+            // Release this record's buffers before reading the next one. With multiple faults,
+            // an earlier apply refusal precedes a later missing/read/open refusal.
+            let apply_timing = unlock_marks::Timer::new(unlock_marks::Mark::Apply);
             match (number, &event) {
                 (FIRST, Event::Seed { mnemonic }) => {
                     let seed = Seed::import(mnemonic).map_err(|e| {
@@ -1968,12 +1962,12 @@ impl<S: Storage> Store<S> {
                     ));
                 }
             }
+            drop(apply_timing);
             self.next = number + 1;
             self.previous = unlock_marks::measure(unlock_marks::Mark::Hash, || {
                 Address(Sha256::digest(&bytes).into())
             });
         }
-        drop(apply_timing);
         let _restore_timing = unlock_marks::Timer::new(unlock_marks::Mark::Restore);
         self.restore_sessions()?;
         Ok(())
