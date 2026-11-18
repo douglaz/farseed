@@ -32,15 +32,22 @@ let initialPresence;
 let retirementRequested = false;
 const lockWait = new AbortController();
 // Fetch and compile while the page prepares its deployment initialization.
-// Count decoded bytes. Content-Length describes encoded bytes when compressed,
-// so only advertise a total for an unencoded response.
+// Count bytes only for an unencoded response with a known total. Otherwise keep
+// the fetched Response intact: Chromium's streaming wasm code cache needs its URL
+// and HTTP cache metadata, which a synthetic Response would discard. With the
+// application/wasm MIME type and cacheable no-cache/ETag headers, later loads can
+// revalidate and reuse compiled code; eligibility does not guarantee a cache hit.
 const wasmReady = (async () => {
   const response = await fetch(new URL('./pkg/tau_web_bg.wasm', import.meta.url));
   if (!response.ok) throw Error('The app download failed.');
   const length = Number(response.headers.get('Content-Length'));
-  const encoding = response.headers.get('Content-Encoding');
-  const total = (!encoding || encoding === 'identity') && Number.isSafeInteger(length) && length > 0 ? length : null;
-  if (!response.body) return init({module_or_path: response});
+  const total = !response.headers.has('Content-Encoding') && Number.isSafeInteger(length) && length > 0 ? length : null;
+  if (total === null || !response.body) {
+    // No byte estimate or polling: the page keeps its static "Loading the app…".
+    await init({module_or_path: response});
+    postMessage({app_loading: {loaded: 0, total: null, complete: true}});
+    return;
+  }
   const reader = response.body.getReader();
   let loaded = 0, lastUpdate = -Infinity;
   const body = new ReadableStream({
@@ -49,7 +56,7 @@ const wasmReady = (async () => {
         const {done, value} = await reader.read();
         if (!done) loaded += value.byteLength;
         const now = performance.now();
-        if (done || now - lastUpdate >= 100) {
+        if (done || now - lastUpdate >= 500) {
           postMessage({app_loading: {loaded, total, complete: done}});
           lastUpdate = now;
         }

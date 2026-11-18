@@ -2013,14 +2013,17 @@ $('poc-target-form').addEventListener('submit', event => {
 });
 let worker;
 let firstStart = true;
+const setLoadingText = text => {
+  const line = $('loading-text');
+  if (line.textContent !== text) line.textContent = text;
+};
 
 const start = () => {
   unlockPageMarks = null;
   worker = firstStart ? firstWorker : new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
   firstStart = false;
   $('loading').hidden = false;
-  $('loading').querySelector('progress').hidden = false;
-  $('loading-text').textContent = 'Loading the app…';
+  setLoadingText('Loading the app…');
   $('store').inert = $('poc').inert = true;
   goalOutcomes.clear();
   show('starting', 'Starting the harness…');
@@ -2067,9 +2070,9 @@ const start = () => {
     }
     if (data.app_loading) {
       const {loaded, total, complete} = data.app_loading;
-      $('loading-text').textContent = total
+      setLoadingText(total
         ? `Loading the app: ${(loaded / 1000000).toFixed(1)} of ${(total / 1000000).toFixed(1)} MB${complete ? ' — preparing the app…' : ''}`
-        : 'Loading the app…';
+        : 'Loading the app…');
       return;
     }
     if (typeof data.deployment_ready === 'boolean') {
@@ -2129,8 +2132,7 @@ const start = () => {
     $('passphrase').value = $('confirm').value = '';
     render({ state: 'lost' });
     $('loading').hidden = false;
-    $('loading').querySelector('progress').hidden = true;
-    $('loading-text').textContent = 'The app could not load. Reload this page to retry.';
+    setLoadingText('The app could not load. Reload this page to retry.');
     show('failed', `Harness lost: ${event.message ?? 'the worker did not load'}. Reload to reopen locked.`);
   };
 };
