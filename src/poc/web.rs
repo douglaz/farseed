@@ -3,17 +3,30 @@ use super::run::{self, Observation, Runtime};
 use crate::binding::Session;
 use crate::dispatch::{Approval, Intent, Terminal};
 use crate::harness::{AppendRefusal, BoundJournal, Entry, Journal, PinSource, Target};
-use crate::store::poc::{Binding, Change, Task};
+use crate::store::poc::{Binding, Change, Status, Task};
 use crate::worker::{StoreJournal, local};
 use serde_json::Value;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 pub(crate) type Response = Rc<RefCell<Option<crate::poc::inference::CommandResponse>>>;
 
+#[derive(PartialEq, Eq)]
+struct Progress {
+    generation: u64,
+    session: String,
+    revision: u64,
+    status: Status,
+    pending: bool,
+    proposal: bool,
+    requesting: bool,
+}
+
 thread_local! {
     static WAKING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static WAKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LAST_PROGRESS: RefCell<BTreeMap<String, Progress>> = const { RefCell::new(BTreeMap::new()) };
 }
 
 #[wasm_bindgen::prelude::wasm_bindgen]
@@ -102,10 +115,9 @@ pub(crate) fn wake() {
 
 pub(crate) async fn publish_progress(session: &str) {
     let generation = crate::harness::inference::publication_generation();
-    let report = local().lock().await.report(None).to_string();
     #[cfg(feature = "tracer")]
     crate::testonly::session_point("poc_progress_publication").await;
-    crate::harness::inference::publish_report(generation, session.into(), report).await;
+    crate::harness::inference::publish_report(generation, session.into(), "{}".into()).await;
 }
 
 async fn publish_cycle_progress(session: &str, cycle: Option<u64>) {
@@ -158,7 +170,23 @@ impl<P: PinSource> Runtime for Web<'_, P> {
                 .borrow_mut()
                 .get_or_insert_with(crate::poc::inference::CommandResponse::reserve);
         }
+        let progress = Progress {
+            generation: crate::harness::inference::publication_generation(),
+            session: self.session.into(),
+            revision: task.revision,
+            status: task.status,
+            pending: task.pending.is_some(),
+            proposal: task.proposal.is_some(),
+            requesting: task.requesting,
+        };
+        if LAST_PROGRESS.with_borrow(|last| last.get(&task.id) == Some(&progress)) {
+            return;
+        }
         publish_cycle_progress(self.session, super::timings::recording(&task.id)).await;
+        // Worker-local only; other publication paths never populate this memory.
+        if self.continuation.check().is_ok() {
+            LAST_PROGRESS.with_borrow_mut(|last| last.insert(task.id.clone(), progress));
+        }
     }
     async fn load(&mut self, id: &str) -> Result<Task, String> {
         local()

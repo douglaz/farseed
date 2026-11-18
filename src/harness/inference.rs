@@ -100,7 +100,12 @@ async fn publication(generation: u64, session: String, report: String, post: boo
             } else if value.get("goal_outcome").is_some() {
                 return Err("publication has no affected session".into());
             }
-            let safe = store.protect_output(&value)?;
+            let safe = if value.as_object().is_some_and(|fields| fields.is_empty()) {
+                // No incoming fields to release; report() protects the current store view.
+                value
+            } else {
+                store.protect_output(&value)?
+            };
             let mut current = local.report(None);
             if safe["payment_timer"] == true {
                 current["payment_timer"] = true.into();
