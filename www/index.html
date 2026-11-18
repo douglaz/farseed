@@ -11,6 +11,7 @@
 :root { color-scheme: light; font: 17px/1.5 system-ui, sans-serif; color: #172b36; background: #f1f5f5; }
 * { box-sizing: border-box; }
 body { max-width: 860px; margin: auto; padding: 16px; overflow-wrap: anywhere; }
+body > * { max-width: 100%; }
 h1 { font-size: 1.6rem; margin: 0 0 12px; }
 h2 { font-size: 1.2rem; margin: 0; }
 h3 { font-size: 1.05rem; }
@@ -23,13 +24,13 @@ p { margin: 12px 0; }
 summary { cursor: pointer; min-height: 48px; padding: 10px 0; font-weight: 600; }
 details { min-width: 0; margin: 10px 0; }
 label { display: block; margin: 12px 0; }
-label:has(input[type="checkbox"]) { min-height: 48px; min-width: 48px; cursor: pointer; }
+label:has(input[type="checkbox"]) { display: flex; align-items: center; gap: 10px; min-height: 48px; min-width: 48px; cursor: pointer; }
 input, select, textarea, button { font: inherit; max-width: 100%; }
 input:not([type="checkbox"]), select, textarea { display: block; width: 100%; min-width: 0; padding: 10px; border: 1px solid #8299a2; border-radius: 6px; background: white; color: inherit; }
-select { min-height: 48px; }
+input:not([type="checkbox"]), select { min-height: 48px; }
 textarea { min-height: 110px; }
-input[type="checkbox"] { width: 22px; height: 22px; vertical-align: middle; margin: 13px 8px 13px 0; }
-button, a[href^="lightning:"], a[data-operator-link], a[data-delivered-url] { display: inline-block; min-height: 44px; padding: 10px 14px; border: 1px solid #718c96; border-radius: 8px; background: #f5f8f9; color: #173d4a; margin: 5px 6px 5px 0; cursor: pointer; }
+input[type="checkbox"] { width: 48px; height: 48px; flex: none; margin: 0; accent-color: #175b5b; }
+button, a[href^="lightning:"], a[data-operator-link], a[data-delivered-url] { display: inline-block; min-width: 48px; min-height: 48px; max-width: calc(100% - 6px); white-space: normal; overflow-wrap: anywhere; padding: 10px 14px; border: 1px solid #718c96; border-radius: 8px; background: #f5f8f9; color: #173d4a; margin: 5px 6px 5px 0; cursor: pointer; }
 a[data-operator-link], a[data-delivered-url] { display: block; width: 100%; min-width: 48px; min-height: 48px; margin-right: 0; white-space: normal; overflow-wrap: anywhere; }
 [data-invoice-expires] { display: block; white-space: nowrap; }
 button.main-action { background: #175b5b; border-color: #175b5b; color: white; font-weight: 700; }
