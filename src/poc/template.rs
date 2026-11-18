@@ -272,8 +272,42 @@ pub fn last_line(text: &str) -> &str {
         .unwrap_or_default()
 }
 
+fn markers(text: &str) -> impl DoubleEndedIterator<Item = (&str, bool)> {
+    text.lines().filter_map(|line| {
+        let (part, result) = line.trim().strip_prefix("CHECKS ")?.split_once(' ')?;
+        let passed = match result.split(' ').next()? {
+            "PASS" => true,
+            "FAIL" => false,
+            _ => return None,
+        };
+        (!part.is_empty()).then_some((part, passed))
+    })
+}
+
+fn latest_exec(task: &Task) -> Option<(&str, &str)> {
+    task.completed.iter().rev().find_map(|(_, tool, output)| {
+        if let Tool::Exec { command, .. } = tool {
+            Some((
+                command.as_str(),
+                output["content"]["stdout"].as_str().unwrap_or_default(),
+            ))
+        } else {
+            None
+        }
+    })
+}
+
 impl Template {
     pub fn current(&self, task: &Task, declaration_needed: bool) -> Option<&'static str> {
+        self.current_through(task, declaration_needed, task.completed.len())
+    }
+
+    fn current_through(
+        &self,
+        task: &Task,
+        declaration_needed: bool,
+        completed: usize,
+    ) -> Option<&'static str> {
         if declaration_needed {
             return self.declaration;
         }
@@ -286,10 +320,13 @@ impl Template {
                         .all(|name| fact(name, task.options.as_ref()) == "yes")
                 })
                 .find(|step| {
-                    !task.completed.iter().any(|(_, tool, output)| {
+                    !task.completed[..completed].iter().any(|(_, tool, output)| {
                         matches!(tool, Tool::Exec { .. })
                             && output["content"]["stdout"].as_str().is_some_and(|text| {
-                                last_line(text).starts_with(&format!("CHECKS {} PASS", step.part))
+                                markers(text)
+                                    .rev()
+                                    .find(|(part, _)| *part == step.part)
+                                    .is_some_and(|(_, passed)| passed)
                             })
                     })
                 })
@@ -298,15 +335,27 @@ impl Template {
     }
 
     pub fn failed(&self, task: &Task) -> bool {
-        task.completed
+        latest_exec(task).is_some_and(|(_, text)| {
+            markers(text)
+                .rev()
+                .find(|(part, _)| self.steps.iter().any(|step| step.part == *part))
+                .is_some_and(|(_, passed)| !passed)
+        })
+    }
+
+    pub fn retry_reason(&self, task: &Task, current: &str) -> Option<String> {
+        let step = self.steps.iter().find(|step| step.text == current)?;
+        let number = current.strip_prefix("## Step ")?.split([':', ' ']).next()?;
+        let latest = task
+            .completed
             .iter()
-            .rev()
-            .find(|(_, tool, _)| matches!(tool, Tool::Exec { .. }))
-            .and_then(|(_, _, output)| output["content"]["stdout"].as_str())
-            .is_some_and(|text| {
-                self.steps
-                    .iter()
-                    .any(|step| last_line(text).starts_with(&format!("CHECKS {} FAIL", step.part)))
-            })
+            .rposition(|(_, tool, _)| matches!(tool, Tool::Exec { .. }))?;
+        if self.current_through(task, false, latest) != Some(current) {
+            return None;
+        }
+        let (command, text) = latest_exec(task)?;
+        (command.contains("cc-check.sh") || markers(text).next().is_some()).then(|| {
+            format!("Step {number} is not passed yet: your last command's output had no line \"CHECKS {} PASS\". Run this step's Check block exactly as written, as one command on its own, and go on only when its output shows that line.", step.part)
+        })
     }
 }

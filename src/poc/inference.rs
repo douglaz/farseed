@@ -528,13 +528,17 @@ fn request_context<S: Storage>(
         }
         if let Some(task) = task.filter(|t| t.template.as_deref() == Some(super::template::ID)) {
             let template = &super::template::CONTROL_CENTER;
+            let repair = !task.verifying && !task.findings.is_empty();
+            let recovery = repair || template.failed(task);
             let mut extra = vec![
                 json!({"role":"system","content":format!("{}\n\n{}", template.header, template.facts)}),
             ];
             if let Some(current) = template.current(task, store.poc_needs_declaration(machine)) {
                 extra.push(json!({"role":"user","content":current}));
+                if !recovery && let Some(reason) = template.retry_reason(task, current) {
+                    extra.push(json!({"role":"user","content":reason}));
+                }
             }
-            let repair = !task.verifying && !task.findings.is_empty();
             if repair {
                 let details = task
                     .findings
@@ -544,7 +548,7 @@ fn request_context<S: Storage>(
                     .join(" | ");
                 extra.push(json!({"role":"user","content":format!("The checks after done found: {details} Follow Recovery, fix them, then call done again.")}));
             }
-            if repair || template.failed(task) {
+            if recovery {
                 extra.push(json!({"role":"user","content":template.recovery}));
             }
             let extra = store.protect_output_with(&json!(extra), credentials)?;
