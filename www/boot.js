@@ -983,7 +983,12 @@ const renderTasks = (store) => {
     }
     paragraph(card, `${task.requests} of ${task.limits.requests} AI replies used; ${task.steps} of ${task.limits.steps} steps used.`);
     for (const [id, tool, outcome] of task.completed.filter(([id]) => !id.startsWith('$report:'))) {
-      if (id.startsWith('$verify:') || tool.name === 'offer_file' && outcome.content?.status === 'offered') continue;
+      if (id.startsWith('$verify-batch') && typeof outcome?.content?.refused === 'string') {
+        paragraph(card, `The machine setup check could not start: ${outcome.content.refused}`);
+        rawDetails(card, {outcome}, ['task', task.id, 'completed', id]);
+        continue;
+      }
+      if (id.startsWith('$verify:') || id.startsWith('$verify-batch') || tool.name === 'offer_file' && outcome.content?.status === 'offered') continue;
       if (tool.name === 'ask_operator') {
         const answered = typeof outcome.answer === 'string';
         paragraph(card, answered ? `Answered: ${outcome.answer}.` : outcome.content?.refused ?? 'The question could not be asked.');
@@ -1086,7 +1091,7 @@ const renderTasks = (store) => {
           requestCard.append(button);
         }
         card.append(requestCard);
-      } else paragraph(card, task.proposal.call_id.startsWith('$before:') ? 'Next: read the listening ports before setup.' : task.proposal.call_id.startsWith('$verify:') ? 'Next: check the machine setup.' : task.proposal.tool.name === 'exec' ? `Next: ${commandSummary(task.proposal.tool.arguments.command)}` : task.proposal.tool.name === 'propose_declaration' ? 'Next: a requirements proposal from the AI.' : task.proposal.tool.name === 'done' ? 'Next: the handover from the AI.' : task.proposal.tool.name === 'request_ai_key' ? `Creating an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} and saving it on the machine.` : 'Next: a step.');
+      } else paragraph(card, task.proposal.call_id.startsWith('$before:') ? 'Next: read the listening ports before setup.' : task.proposal.call_id.startsWith('$verify:') || task.proposal.call_id.startsWith('$verify-batch') ? 'Next: check the machine setup.' : task.proposal.tool.name === 'exec' ? `Next: ${commandSummary(task.proposal.tool.arguments.command)}` : task.proposal.tool.name === 'propose_declaration' ? 'Next: a requirements proposal from the AI.' : task.proposal.tool.name === 'done' ? 'Next: the handover from the AI.' : task.proposal.tool.name === 'request_ai_key' ? `Creating an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} and saving it on the machine.` : 'Next: a step.');
       rawDetails(card, task.proposal.tool, ['task', task.id, 'proposal', task.proposal.call_id]);
     }
     if (task.pending && task.proposal?.report == null) {
