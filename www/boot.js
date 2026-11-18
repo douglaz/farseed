@@ -199,7 +199,7 @@ const renderSteps = store => {
     $(name === 'credit' ? 'credit-status' : `step-${name}-status`).textContent = messages[name];
     const errors = [name === (store.page_error_step ?? 'store') ? store.error : '', name === 'task' ? pocKeyRefusal : ''];
     $(`step-${name}-error`).textContent = [...new Set(errors.filter(Boolean))].join(' ');
-    $(`step-${name}-fold`).open = foldChoices.get(name) ?? current === name;
+    $(`step-${name}-fold`).open = foldChoices.get(name) ?? false;
     step.querySelectorAll('.main-action').forEach(button => { button.classList.remove('main-action'); if (!button.className) button.removeAttribute('class'); });
   }
   const retained = new Set();
