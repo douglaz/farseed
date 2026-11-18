@@ -877,6 +877,10 @@ impl<S: Storage> Store<S> {
         expected: u64,
         mut change: Change,
     ) -> Result<Task, String> {
+        #[cfg(target_arch = "wasm32")]
+        let timing_started = crate::poc::timings::now();
+        #[cfg(target_arch = "wasm32")]
+        let timing_label = crate::poc::timings::change_label(&change);
         match &mut change {
             Change::Malformed { reason, .. }
             | Change::CutOff { reason }
@@ -911,9 +915,43 @@ impl<S: Storage> Store<S> {
         };
         self.poc_record_safe(&record)?;
         let task = self.project_poc(self.next, &record)?;
+        #[cfg(target_arch = "wasm32")]
+        let timing = {
+            use crate::poc::timings::{self, Mark, Timer};
+            timings::proposal(&task, &record, timing_started);
+            Timer::since(
+                timings::recording(id),
+                Mark::Journal(timing_label),
+                timing_started,
+            )
+        };
         self.commit(&Event::Poc(record.clone())).await?;
         self.apply_poc_key_class(&record, &task);
         self.poc.insert(id.into(), task.clone());
+        #[cfg(target_arch = "wasm32")]
+        {
+            drop(timing);
+            if matches!(
+                &record,
+                Record::Change {
+                    change: Change::Settle,
+                    ..
+                }
+            ) {
+                crate::poc::timings::finish(id);
+            }
+            if matches!(
+                &record,
+                Record::Change {
+                    change: Change::Request,
+                    ..
+                }
+            ) || matches!(task.status, Status::Paused | Status::Waiting)
+                || task.ended()
+            {
+                crate::poc::timings::close_after_settle(id, crate::poc::timings::now());
+            }
+        }
         Ok(task)
     }
     /// A terminal awaiting its task checkpoint still needs a full current-inventory

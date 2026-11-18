@@ -13,6 +13,8 @@ thread_local! {
 struct Active(String);
 impl Drop for Active {
     fn drop(&mut self) {
+        #[cfg(target_arch = "wasm32")]
+        super::timings::close_after_settle(&self.0, super::timings::now());
         ACTIVE.with_borrow_mut(|set| set.remove(&self.0));
         if WAKE_PENDING.with_borrow_mut(|set| set.remove(&self.0)) {
             #[cfg(target_arch = "wasm32")]

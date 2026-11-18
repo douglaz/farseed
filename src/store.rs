@@ -2093,6 +2093,73 @@ impl<S: Storage> Store<S> {
     /// Encrypts `event` as the record numbered `next` and commits it: written whole under the
     /// staging name, then moved onto its own name. The caller applies it only once this returns.
     async fn commit(&mut self, event: &Event) -> Result<u64, String> {
+        // Change calls measure their entire protection/project/commit path in poc_change.
+        // Other command records measure this append, including protection and encryption.
+        #[cfg(target_arch = "wasm32")]
+        let _cycle_timing = {
+            use crate::poc::timings::{self, Mark, Timer};
+            let bindings = match event {
+                Event::Poc(poc::Record::Command { binding, .. }) => {
+                    vec![(binding.task.as_str(), "Command")]
+                }
+                Event::JobTerminal(evidence) | Event::JobObservation(evidence) => self
+                    .poc
+                    .values()
+                    .find(|task| {
+                        task.pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.call == evidence.call)
+                    })
+                    .map(|task| {
+                        (
+                            task.id.as_str(),
+                            if matches!(event, Event::JobTerminal(_)) {
+                                "JobTerminal"
+                            } else {
+                                "JobObservation"
+                            },
+                        )
+                    })
+                    .into_iter()
+                    .collect(),
+                Event::Terminal(terminal) => self
+                    .poc
+                    .values()
+                    .filter(|task| {
+                        task.pending
+                            .as_ref()
+                            .is_some_and(|p| p.call == terminal.call)
+                    })
+                    .map(|task| (task.id.as_str(), "Terminal"))
+                    .collect(),
+                Event::SignatureRefusal(refusal) => self
+                    .poc
+                    .values()
+                    .filter(|task| task.machine == refusal.machine)
+                    .map(|task| (task.id.as_str(), "SignatureRefusal"))
+                    .collect(),
+                Event::ConnectionRefusal(refusal) => self
+                    .poc
+                    .values()
+                    .filter(|task| task.machine == refusal.machine)
+                    .map(|task| (task.id.as_str(), "ConnectionRefusal"))
+                    .collect(),
+                Event::End(end) => self
+                    .poc
+                    .values()
+                    .filter(|task| task.start_session == end.session)
+                    .map(|task| (task.id.as_str(), "End"))
+                    .collect(),
+                _ => Vec::new(),
+            };
+            bindings
+                .into_iter()
+                .filter_map(|(id, label)| {
+                    let cycle = timings::recording(id)?;
+                    Some(Timer::new(Some(cycle), Mark::Journal(label)))
+                })
+                .collect::<Vec<_>>()
+        };
         if let Some(why) = &self.failed {
             return Err(crate::poc::wait::EARLIER_APPEND.render(0, "", why));
         }
@@ -2174,6 +2241,18 @@ impl<S: Storage> Store<S> {
         }
         self.next = number + 1;
         self.previous = Address(Sha256::digest(&bytes).into());
+        #[cfg(target_arch = "wasm32")]
+        if let Event::End(end) = event {
+            drop(_cycle_timing);
+            let ended = crate::poc::timings::now();
+            for task in self
+                .poc
+                .values()
+                .filter(|task| task.start_session == end.session)
+            {
+                crate::poc::timings::close_after_settle(&task.id, ended);
+            }
+        }
         Ok(number)
     }
 }
@@ -2657,6 +2736,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                             #[cfg(target_arch = "wasm32")]
                             let value = {
                                 let mut value = value;
+                                value["cycle_timings"] = crate::poc::timings::view(&task.id);
                                 if task.requesting
                                     && !task.ended()
                                     && !store.ended_sessions.contains(&task.start_session)

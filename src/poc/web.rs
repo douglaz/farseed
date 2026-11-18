@@ -108,6 +108,11 @@ pub(crate) async fn publish_progress(session: &str) {
     crate::harness::inference::publish_report(generation, session.into(), report).await;
 }
 
+async fn publish_cycle_progress(session: &str, cycle: Option<u64>) {
+    let _timing = super::timings::Timer::new(cycle, super::timings::Mark::Progress);
+    publish_progress(session).await;
+}
+
 pub(crate) async fn resume_with(
     task: &Task,
     session: &str,
@@ -153,7 +158,7 @@ impl<P: PinSource> Runtime for Web<'_, P> {
                 .borrow_mut()
                 .get_or_insert_with(crate::poc::inference::CommandResponse::reserve);
         }
-        publish_progress(self.session).await;
+        publish_cycle_progress(self.session, super::timings::recording(&task.id)).await;
     }
     async fn load(&mut self, id: &str) -> Result<Task, String> {
         local()
@@ -177,6 +182,9 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             .map(|_| ())
     }
     async fn change(&mut self, task: &Task, change: Change) -> Result<Task, String> {
+        if task.pending.is_some() {
+            super::timings::resume(task);
+        }
         let local = local();
         let mut writer = local.lock().await;
         self.continuation.check()?;
@@ -212,6 +220,7 @@ impl<P: PinSource> Runtime for Web<'_, P> {
     }
 
     async fn execute(&mut self, binding: Binding, task: &Task) -> Result<(), String> {
+        super::timings::resume(task);
         self.response
             .borrow_mut()
             .get_or_insert_with(crate::poc::inference::CommandResponse::reserve);
@@ -337,7 +346,11 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             collecting: true,
             continuation: self.continuation.clone(),
         };
-        publish_progress(session).await;
+        publish_cycle_progress(session, super::timings::active(&task.id)).await;
+        let collect_timing = super::timings::Timer::new(
+            super::timings::active(&task.id),
+            super::timings::Mark::Collect,
+        );
         let result = crate::harness::collect_jobs(
             self.pins,
             &mut journal,
@@ -346,6 +359,7 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             false,
         )
         .await;
+        drop(collect_timing);
         if let Some(observation) = committed(task, &self.continuation).await? {
             return Ok(observation);
         }
@@ -497,6 +511,9 @@ impl Journal for ScopedJournal {
     }
 }
 impl BoundJournal for ScopedJournal {
+    fn command_cycle(&self) -> Option<u64> {
+        super::timings::active(&self.binding.task)
+    }
     async fn append_bound(
         &mut self,
         session: &Session,
@@ -525,7 +542,7 @@ impl BoundJournal for ScopedJournal {
                 }
                 store.poc_append(&self.binding, entry, approval).await
             },
-            publish_progress(&self.binding.session),
+            publish_cycle_progress(&self.binding.session, self.command_cycle()),
         )
         .await
     }

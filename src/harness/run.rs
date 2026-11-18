@@ -5,6 +5,7 @@ use super::{AppendRefusal, BoundJournal, Done, Entry, PinSource, Target};
 use crate::binding::{AdmissionRefusal, Session};
 use crate::dispatch::{Approval, CommandHold, DestructiveDisposition, DispatchRefusal};
 use crate::jobs::{self, Evidence, Record};
+use crate::poc::timings::{self, Mark, Timer};
 use futures_util::{SinkExt, StreamExt};
 use pharos::{Observable, ObserveConfig};
 use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
@@ -179,6 +180,8 @@ struct PinCheck {
     presented: Arc<Mutex<Option<String>>>,
     generation: u64,
     session: String,
+    cycle: Option<u64>,
+    handshake_started: Option<f64>,
 }
 
 impl PinCheck {
@@ -241,7 +244,15 @@ impl client::Handler for PinCheck {
         .to_string();
         let matches = presented == self.pinned;
         *self.presented.lock().expect("pin check lock") = Some(presented);
-        Ok(matches && self.current().await)
+        let accepted = matches && self.current().await;
+        if accepted {
+            drop(Timer::since(
+                self.cycle,
+                Mark::SshHandshake,
+                self.handshake_started.take(),
+            ));
+        }
+        Ok(accepted)
     }
 }
 
@@ -318,6 +329,7 @@ pub(crate) async fn run_command_input(
         .await
         .ok_or_else(|| Refusal::Journal("sessions ended".into()))??;
     journal.current(&session).await.map_err(Refusal::Journal)?;
+    let launch_timing = timings::Launch::new(journal.command_cycle());
     let mut channel = stop
         .until(ssh.channel_open_session())
         .await
@@ -408,7 +420,13 @@ pub(crate) async fn run_command_input(
         .into_bytes();
         let progress = super::job_read::Read::default();
         let result = stop
-            .until(exec_record(&mut channel, &sent, Some(&progress), input))
+            .until(exec_record(
+                &mut channel,
+                &sent,
+                Some(&progress),
+                input,
+                Some(&launch_timing),
+            ))
             .await
             .unwrap_or_else(|| {
                 Err(if progress.sent() {
@@ -1012,6 +1030,7 @@ async fn read_job_record(
         jobs::collect_with_elevation(job, elevation).as_bytes(),
         Some(progress),
         None,
+        None,
     )
     .await
 }
@@ -1023,6 +1042,7 @@ async fn exec_record(
     bytes: &[u8],
     progress: Option<&super::job_read::Read>,
     input: Option<&[u8]>,
+    launch_timing: Option<&timings::Launch>,
 ) -> Result<Record, String> {
     // Beginning the channel send can enqueue bytes before its future resolves. From here
     // cancellation must conservatively retain possible transmission.
@@ -1045,6 +1065,11 @@ async fn exec_record(
     }
     let mut delivered = jobs::ReadDelivery::default();
     while let Some(message) = channel.wait().await {
+        if matches!(&message, ChannelMsg::Success | ChannelMsg::Failure)
+            && let Some(timing) = launch_timing
+        {
+            timing.observing();
+        }
         match message {
             ChannelMsg::Data { data } => delivered.stdout.extend_from_slice(&data),
             ChannelMsg::ExtendedData { data, .. } => delivered.extended_data(&data),
@@ -1113,9 +1138,13 @@ async fn connect(
 
     journal.current(session).await.map_err(Refusal::Journal)?;
     let url = target.contact_url(Some(&pinned)).map_err(Refusal::Failed)?;
+    let cycle = journal.command_cycle();
+    let websocket_timing = Timer::new(cycle, Mark::WebsocketOpen);
     let (mut meta, mut ws) = WsMeta::connect(&url, None)
         .await
         .map_err(|e| Refusal::Failed(format!("relay websocket: {e}")))?;
+    drop(websocket_timing);
+    let relay_timing = Timer::new(cycle, Mark::RelayVerdict);
     journal.current(session).await.map_err(Refusal::Journal)?;
     let socket = stop.socket(meta.wrapped().clone());
     let mut events = meta
@@ -1163,6 +1192,7 @@ async fn connect(
     // WIR-7 (paid-tcp-relay 844e834): `{"ok": true}` once the relay has dialed; anything else
     // ends the attempt.
     let verdict = text_frame(&mut ws).await.map_err(failed("relay verdict"))?;
+    drop(relay_timing);
     if verdict["ok"] != json!(true) {
         let reason = verdict["reason"].as_str().unwrap_or_default().to_string();
         let mut close_code = None;
@@ -1183,11 +1213,17 @@ async fn connect(
         presented: presented.clone(),
         generation: crate::lifecycle::owner().generation(),
         session: session.identity.clone(),
+        cycle,
+        handshake_started: None,
     };
     // ADR-0024: no keepalive and no inactivity timeout, which need a tokio timer the browser
     // does not have.
     let config = Arc::new(client::Config::default());
     journal.current(session).await.map_err(Refusal::Journal)?;
+    let handler = PinCheck {
+        handshake_started: cycle.and_then(|_| timings::now()),
+        ..handler
+    };
     let mut ssh =
         match client::connect_stream(config, super::relay_io::RelayIo(ws.into_io()), handler).await
         {
@@ -1209,6 +1245,7 @@ async fn connect(
         .unwrap_or_default();
 
     journal.current(session).await.map_err(Refusal::Journal)?;
+    let login_timing = Timer::new(cycle, Mark::Login);
     let auth = ssh
         .authenticate_publickey(
             target.user.clone(),
@@ -1216,6 +1253,7 @@ async fn connect(
         )
         .await
         .map_err(|e| Refusal::Failed(format!("authentication: {e}")))?;
+    drop(login_timing);
     if !auth.success() {
         return Err(Refusal::Failed(format!("authentication refused: {auth:?}")));
     }

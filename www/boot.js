@@ -969,6 +969,7 @@ const renderTasks = (store) => {
   for (const task of store.tasks ?? []) {
     const card = document.createElement('section');
     card.dataset.task = task.id;
+    card.dataset.cycleTimings = JSON.stringify(task.cycle_timings ?? []);
     const session = (store.sessions ?? []).find(s => s.identity === task.start_session && s.session_state !== 'ended' && s.bound_set.length === 1 && s.bound_set[0] === task.machine);
     paragraph(card, `Setting up ${task.machine}: ${taskStatus(task.status, task)}.`);
     if (task.goal.length <= 120) paragraph(card, task.goal);

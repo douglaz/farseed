@@ -142,6 +142,11 @@ pub fn valid_request(request: &serde_json::Value) -> bool {
 /// Live connection admission is above the dispatch core used by the formal comparison.
 #[allow(async_fn_in_trait, reason = "single worker")]
 pub trait BoundJournal: Journal {
+    /// Opaque, memory-only worker measurement; ordinary harness calls have no task cycle.
+    #[cfg(target_arch = "wasm32")]
+    fn command_cycle(&self) -> Option<u64> {
+        None
+    }
     async fn append_bound(
         &mut self,
         session: &crate::binding::Session,
