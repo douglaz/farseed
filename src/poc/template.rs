@@ -353,9 +353,9 @@ impl Template {
         if self.current_through(task, false, latest) != Some(current) {
             return None;
         }
-        let (command, text) = latest_exec(task)?;
-        (command.contains("cc-check.sh") || markers(text).next().is_some()).then(|| {
-            format!("Step {number} is not passed yet: your last command's output had no line \"CHECKS {} PASS\". Run this step's Check block exactly as written, as one command on its own, and go on only when its output shows that line.", step.part)
-        })
+        Some(format!(
+            "Step {number} is not passed yet. Finish the rest of this step in the order its text gives, following its instructions for the operator's answer (including any ask_operator, request_ai_key or offer_file call it asks for), then run its Check block exactly as written, as one command on its own; go on only when its output shows \"CHECKS {} PASS\".",
+            step.part
+        ))
     }
 }
