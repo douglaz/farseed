@@ -228,12 +228,16 @@ const renderSteps = store => {
   const purchase = store.procurement;
   const choiceNeeded = providerChoiceNeeded(purchase);
   // After a refusal the page offers no purchase action: the way on is a new machine.
-  const machineAction = purchase?.phase && providerWait(purchase)?.kind === 'refused' ? null
+  const machineAction = purchase && providerWait(purchase)?.kind === 'refused' ? null
     : choiceNeeded ? null
     : vpsbgTokenFormShowing(purchase) ? $('vpsbg-token-form').querySelector('button[type="submit"]')
-    : !store.provider_configuration?.key_set ? $('provider-catalogue')
+    // The LNVPS account key gates only LNVPS: a VPSBG purchase's prerequisite is its token (checked above).
+    : !vpsbgInUse(purchase) && !store.provider_configuration?.key_set ? $('provider-catalogue')
+    : vpsbgApprovalShowing(purchase) && purchase.selection ? (vpsbgPaymentPlan(purchase) ? $('provider-approval-form').querySelector('button[type="submit"]') : null)
+    : vpsbgNewTopupAllowed(purchase) ? document.querySelector('[data-vpsbg-new-topup]')
+    : vpsbgPause(purchase)?.kind === 'unpaid_order' && purchase.pause.pay_allowed === true ? document.querySelector('[data-vpsbg-pay-order]')
     : purchase?.phase === 'email_verification' ? (purchase.email_entered ? $('provider-email-check') : $('provider-email-form').querySelector('button'))
-    : purchase?.phase === 'initial_invoice' ? $('provider-invoice')
+    : purchase?.phase === 'initial_invoice' && !vpsbgHeld(purchase) ? $('provider-invoice')
     : purchase?.phase && !['terms_changed', 'handed_off'].includes(purchase.phase) ? $('provider-resume')
     : purchase?.selection ? $('provider-approval-form').querySelector('button')
     : providerCatalogue ? $('provider-selection-form').querySelector('button') : $('provider-catalogue');
@@ -1786,6 +1790,8 @@ const updateProviderClose = () => {
   $('provider-close').disabled = !enabled || !closeEligible;
 };
 setInterval(() => {
+  for (const node of document.querySelectorAll('[data-vpsbg-invoice-expires]')) node.hidden = Date.now() / 1000 >= Number(node.dataset.vpsbgInvoiceExpires);
+  for (const node of document.querySelectorAll('[data-vpsbg-invoice-expired]')) node.hidden = Date.now() / 1000 < Number(node.dataset.vpsbgInvoiceExpired);
   for (const node of document.querySelectorAll('[data-invoice-expires]')) node.textContent = `${Math.max(0, Math.ceil((Number(node.dataset.invoiceExpires) - Date.now() / 1000) / 60))} minutes left`;
   for (const node of document.querySelectorAll('#tau-provider-wait[data-wait="identity"][data-deadline]')) node.firstChild.textContent = providerIdentityWait(Number(node.dataset.deadline));
   updateProviderClose();
@@ -1837,7 +1843,12 @@ const providerChoiceOpen = purchase => purchase?.vendor_choice_open === true &&
 // Anything other than a known vendor id counts as no choice yet.
 const providerChoice = purchase => ['vpsbg', 'lnvps'].includes(purchase?.vendor_choice) ? purchase.vendor_choice : null;
 const providerChoiceNeeded = purchase => providerChoiceOpen(purchase) && providerChoice(purchase) === null;
-const vpsbgInUse = purchase => providerChoice(purchase) === 'vpsbg' || purchase?.vendor?.id === 'vpsbg';
+// The held purchase's lines follow its own vendor. The review and approval of a new purchase (no phase, or after
+// handoff) follow the draft choice when one is known. Account-level lines (token, balance, pauses) show for either.
+const vpsbgHeld = purchase => purchase?.vendor?.id === 'vpsbg';
+const vpsbgDraft = purchase => (!purchase?.phase || purchase.phase === 'handed_off') && providerChoice(purchase) !== null
+  ? providerChoice(purchase) === 'vpsbg' : vpsbgHeld(purchase);
+const vpsbgInUse = purchase => vpsbgDraft(purchase) || vpsbgHeld(purchase);
 const vpsbgAccount = purchase => vpsbgInUse(purchase) && purchase?.vendor_account?.vendor === 'vpsbg' ? purchase.vendor_account : null;
 let vpsbgReplacingToken = false;
 let vpsbgTokenCheck;
@@ -1847,7 +1858,143 @@ const vpsbgTokenFormShowing = purchase => {
 };
 const vpsbgBalance = purchase => {
   const balance = purchase?.balance;
-  return vpsbgInUse(purchase) && Number.isSafeInteger(balance?.amount) && typeof balance.currency === 'string' && balance.currency.length > 0 ? balance : null;
+  // VPSBG figures are euro cents; any other currency is not shown rather than reinterpreted.
+  return vpsbgInUse(purchase) && Number.isSafeInteger(balance?.amount) && balance.amount >= 0 && balance.currency === 'EUR' ? balance : null;
+};
+const vpsbgPaymentPlan = purchase => {
+  const plan = purchase?.payment_plan;
+  return vpsbgDraft(purchase) && plan &&
+    ['balance', 'price', 'minimum', 'top_up', 'first_period', 'left_as_credit'].every(field => Number.isSafeInteger(plan[field]) && plan[field] >= 0) &&
+    plan.currency === 'EUR' ? plan : null;
+};
+const vpsbgDeposit = purchase => vpsbgHeld(purchase) && ['asking', 'open', 'expired', 'settled', 'unknown'].includes(purchase?.deposit?.state) ? purchase.deposit : null;
+const vpsbgPause = purchase => vpsbgInUse(purchase) && ['another_writer', 'balance_short', 'unpaid_order', 'image_list_full'].includes(purchase?.pause?.kind) ? purchase.pause : null;
+const vpsbgNewTopupAllowed = purchase => ['expired', 'unknown'].includes(vpsbgDeposit(purchase)?.state) && purchase.deposit.new_top_up_allowed === true;
+let vpsbgReviewNewTopup = false;
+const vpsbgApprovalShowing = purchase => vpsbgDraft(purchase) &&
+  ((!purchase.phase && !vpsbgDeposit(purchase)) || ['terms_changed', 'handed_off'].includes(purchase.phase) ||
+    ['another_writer', 'balance_short'].includes(vpsbgPause(purchase)?.kind) ||
+    (vpsbgReviewNewTopup && vpsbgNewTopupAllowed(purchase)));
+const vpsbgMoney = (amount, currency) => readableMoney(amount, currency).replace(/^(.+) EUR \(([0-9]+) EUR cents\)$/, '€$1 ($2 cents)');
+const vpsbgTopupWarnings = parent => {
+  paragraph(parent, 'Asking for a top-up cancels any other unpaid VPSBG top-up invoice.');
+  paragraph(parent, 'Pay only the newest invoice shown here.');
+};
+const vpsbgExpiredText = "The top-up invoice expired. Don't pay it. This page keeps checking whether it was paid.";
+const renderVpsbgTopup = (progress, purchase, enabled, refused) => {
+  const deposit = vpsbgDeposit(purchase);
+  if (!deposit) return;
+  const section = document.createElement('section'); section.id = 'tau-vpsbg-topup'; section.dataset.deposit = deposit.state;
+  progress.append(section);
+  const plan = vpsbgPaymentPlan(purchase);
+  if (deposit.state === 'asking') paragraph(section, 'Asking VPSBG for a top-up invoice.');
+  else if (deposit.state === 'open') {
+    const expires = epochSeconds(deposit.expires);
+    if (deposit.covered_from_elsewhere === true) {
+      // Until the invoice's expiry only; after it the expired line takes over.
+      const covered = document.createElement('div');
+      paragraph(covered, "Your VPSBG balance now covers the first period without this top-up. Don't pay this invoice.");
+      paragraph(covered, 'This page orders the machine from your balance. If you pay the invoice anyway, the payment stays in your balance as credit.');
+      section.append(covered);
+      if (expires !== undefined && expires >= 0) {
+        covered.dataset.vpsbgInvoiceExpires = String(expires);
+        covered.hidden = Date.now() / 1000 >= expires;
+        const expired = paragraph(section, vpsbgExpiredText);
+        expired.dataset.vpsbgInvoiceExpired = String(expires);
+        expired.hidden = Date.now() / 1000 < expires;
+      }
+    } else {
+      if (expires !== undefined && expires >= 0) {
+        const expired = paragraph(section, vpsbgExpiredText);
+        expired.dataset.vpsbgInvoiceExpired = String(expires);
+        expired.hidden = Date.now() / 1000 < expires;
+        // Never offered next to a re-approval: approving asks for a new top-up, which cancels this one.
+        if (!refused && !vpsbgApprovalShowing(purchase) && plan && plan.top_up > 0 && Date.now() / 1000 < expires) {
+          const payable = document.createElement('div'); payable.dataset.vpsbgInvoiceExpires = String(expires);
+          paragraph(payable, `Pay the top-up: ${vpsbgMoney(plan.top_up, plan.currency)}.`);
+          const amount = bolt11AmountTenths(deposit.bolt11);
+          if (amount !== null && amount > 0n) invoiceControls(payable, deposit.bolt11, expires, null);
+          paragraph(payable, 'When the payment shows in your VPSBG account, this page orders the machine by itself.');
+          vpsbgTopupWarnings(payable);
+          section.append(payable);
+        }
+      }
+    }
+  } else if (deposit.state === 'expired') paragraph(section, vpsbgExpiredText);
+  else if (deposit.state === 'unknown') paragraph(section, "VPSBG's answer to the top-up request was lost. This page never sends another on its own.");
+  else if (deposit.state === 'settled') {
+    const balance = vpsbgBalance(purchase);
+    if (balance) paragraph(section, `Payment received. Balance: ${vpsbgMoney(balance.amount, balance.currency)}. Ordering the machine…`);
+  }
+  if (!refused && vpsbgNewTopupAllowed(purchase) && !vpsbgReviewNewTopup) {
+    const button = document.createElement('button'); button.type = 'button'; button.dataset.vpsbgNewTopup = '';
+    button.textContent = 'Approve a new top-up'; button.disabled = !enabled;
+    button.addEventListener('click', () => {
+      if (button.disabled) return;
+      vpsbgReviewNewTopup = true;
+      renderProvider(renderedReport, enabled);
+      renderSteps(renderedReport);
+    });
+    section.append(button);
+  }
+};
+const renderVpsbgPause = (progress, purchase, enabled, refused) => {
+  const pause = vpsbgPause(purchase);
+  if (!pause) return;
+  const order = typeof pause.order === 'string' && pause.order.trim() ? pause.order
+    : Number.isSafeInteger(pause.order) && pause.order >= 0 ? String(pause.order) : null;
+  const text = {
+    another_writer: 'Another browser or the VPSBG console may be ordering on this account. Check at VPSBG before going on.',
+    balance_short: "The balance at VPSBG is lower than this machine's first period; approve again.",
+    unpaid_order: order === null ? null : `VPSBG has an unpaid order for this machine (order ${order}).`,
+    image_list_full: "Your VPSBG account has no room for another system image. Delete an old image in VPSBG's console, then press Check the order again.",
+  }[pause.kind];
+  if (!text) return;
+  const line = paragraph(progress, text); line.id = 'tau-vpsbg-pause'; line.dataset.pause = pause.kind;
+  if (pause.kind === 'unpaid_order') {
+    if (pause.pay_allowed === true && !refused) {
+      const button = document.createElement('button'); button.type = 'button'; button.dataset.vpsbgPayOrder = '';
+      button.textContent = 'Pay that order'; button.disabled = !enabled;
+      button.addEventListener('click', () => {
+        if (button.disabled) return;
+        button.disabled = true;
+        providerRequest({action: 'pay_order'});
+      });
+      progress.append(button);
+    } else if (pause.pay_allowed !== true) paragraph(progress, 'It is too late to pay it safely. Delete it at VPSBG, or wait for the delete button.');
+  }
+};
+const renderVpsbgApproval = (purchase, plan) => {
+  const vpsbg = vpsbgDraft(purchase);
+  const money = $('provider-money'); money.replaceChildren(); money.hidden = !vpsbg;
+  const lines = $('vpsbg-approval-lines'); lines.replaceChildren(); lines.hidden = !vpsbg;
+  $('provider-approval-limits').hidden = vpsbg;
+  $('provider-approval-more').hidden = vpsbg;
+  if (!vpsbg) return;
+  const note = $('provider-approval-note'); note.textContent = '';
+  const submit = $('provider-approval-form').querySelector('button[type="submit"]');
+  submit.textContent = purchase.phase === 'terms_changed' ? 'Approve the new figures' : plan?.top_up > 0 ? 'Approve and top up' : 'Approve and order this machine';
+  if (purchase.phase === 'terms_changed') paragraph(lines, 'The price or your VPSBG balance changed since you approved, so nothing was ordered. Review the new figures and approve again.');
+  if (!plan) paragraph(money, "Waiting for VPSBG's VAT for this plan before showing the price.");
+  else {
+    const moneyLine = (kind, cents, text) => {
+      const line = paragraph(money, text); line.dataset.money = kind; line.dataset.cents = String(cents);
+    };
+    moneyLine('balance', plan.balance, `Balance at VPSBG now: ${vpsbgMoney(plan.balance, plan.currency)}.`);
+    if (plan.top_up > 0) moneyLine('topup', plan.top_up, `Top up ${vpsbgMoney(plan.top_up, plan.currency)}.`);
+    else paragraph(money, 'Your VPSBG balance already covers the first period. Nothing to top up.');
+    moneyLine('first', plan.first_period, `${vpsbgMoney(plan.first_period, plan.currency)} pays for this machine's first period, VAT included.`);
+    if (plan.left_as_credit > 0) moneyLine('credit', plan.left_as_credit, `${vpsbgMoney(plan.left_as_credit, plan.currency)} stays in your VPSBG balance as credit.`);
+    const minimum = document.createElement('small'); minimum.textContent = `VPSBG's smallest top-up is ${vpsbgMoney(plan.minimum, plan.currency).split(' (')[0]}.`;
+    money.append(minimum);
+    note.textContent = plan.top_up > 0
+      ? "Approving first gets the machine's system image ready at VPSBG, then asks VPSBG for a top-up invoice. Nothing is charged until you pay it yourself, in your wallet. Then this page orders the machine from your balance."
+      : `Approving first gets the machine's system image ready at VPSBG, then orders the machine from your balance. That spends ${vpsbgMoney(plan.first_period, plan.currency).split(' (')[0]} of your balance; there is no invoice to pay.`;
+    if (plan.top_up > 0) vpsbgTopupWarnings(lines);
+  }
+  paragraph(lines, "Use this VPSBG token in this browser only: a top-up or order made anywhere else can cancel this page's invoice or be charged separately.");
+  if (purchase.balance?.has_valid_card === true) paragraph(lines, "If this VPSBG account has a saved card or other payment method, VPSBG can charge it when the balance runs short; this page can't stop that.");
+  if (vpsbgDeposit(purchase)?.state === 'expired' && vpsbgNewTopupAllowed(purchase)) paragraph(lines, 'The earlier top-up invoice may still have been paid. If both are paid, the extra stays at VPSBG as credit for later.');
 };
 const renderVpsbgToken = (purchase, enabled) => {
   const section = $('vpsbg-token-section');
@@ -1985,6 +2132,12 @@ const renderProvider = (store, enabled) => {
     : 'After enrollment, configure inference, then press Start session for the displayed model and machine. Copy its public keys. Install the SSH line and enroll the separate relay public key with the relay operator.';
   $('relay-deployment-status').textContent = deployed ? 'The deployment relay key is in use.' : 'No valid deployment relay key is loaded. The seed-derived relay key requires manual enrollment.';
   const purchase = store.procurement ?? {};
+  const vpsbg = vpsbgDraft(purchase);
+  const vpsbgHeldPurchase = vpsbgHeld(purchase);
+  const plan = vpsbgPaymentPlan(purchase);
+  if (!vpsbgNewTopupAllowed(purchase)) vpsbgReviewNewTopup = false;
+  const vpsbgReapproval = vpsbg && (purchase.phase === 'terms_changed' ||
+    ['another_writer', 'balance_short'].includes(vpsbgPause(purchase)?.kind) || vpsbgReviewNewTopup);
   if (store.readiness?.checked_at) $('step-machine-status').title = `${new Date(store.readiness.checked_at).toISOString()} UTC`;
   else $('step-machine-status').removeAttribute('title');
   const emailRequired = purchase.phase === 'email_verification';
@@ -2050,16 +2203,17 @@ const renderProvider = (store, enabled) => {
   providerDisplayedBilling = purchase.billing ? structuredClone(purchase.billing) : null;
   providerDisplayedSelection = purchase.selection ? structuredClone(purchase.selection) : null;
   const renewal = purchase.phase === 'terms_changed';
-  const reviewToken = purchase.selection ? JSON.stringify([purchase.origin, purchase.selection]) : null;
+  const reviewToken = purchase.selection ? JSON.stringify([purchase.origin, purchase.selection,
+    ...(vpsbg ? [plan && ['balance', 'price', 'minimum', 'top_up', 'first_period', 'left_as_credit', 'currency'].map(field => plan[field]), purchase.phase === 'terms_changed', vpsbgPause(purchase)?.kind, vpsbgReviewNewTopup] : [])]) : null;
   if (providerReviewToken !== reviewToken) {
     $('provider-approve-charge').checked = false;
     $('provider-approve-access').checked = false;
     providerReviewToken = reviewToken;
   }
-  if (renewal) {
-    $('provider-machine').value = purchase.machine;
-    $('provider-relay').value = purchase.relay;
-    $('provider-class').value = purchase.class_answer;
+  if (renewal || vpsbgReapproval) {
+    for (const [name, value] of [['provider-machine', purchase.machine], ['provider-relay', purchase.relay], ['provider-class', purchase.class_answer]]) {
+      if (!vpsbg || typeof value === 'string') $(name).value = value;
+    }
   }
   if (store.provider_catalogue) {
     providerCatalogue = store.provider_catalogue;
@@ -2085,12 +2239,12 @@ const renderProvider = (store, enabled) => {
     providerSelectionDirty = true; $('provider-approve-charge').checked = false;
   }
   updateProviderResources();
-  if (store.provider_selection_reviewed || renewal) providerSelectionDirty = false;
+  if (store.provider_selection_reviewed || renewal || (vpsbgReapproval && purchase.selection)) providerSelectionDirty = false;
   const selection = $('provider-selection-view'); selection.replaceChildren();
   if (purchase.selection) {
     paragraph(selection, `Provider origin: ${purchase.origin}`);
     const c = purchase.selection.charge;
-    paragraph(selection, `Recurring charge: ${readableMoney(c.amount, c.currency)} ${readableInterval(c.interval_amount, c.interval_type)}. Tax and processing fee are shown on the initial invoice.`);
+    paragraph(selection, `Recurring charge: ${readableMoney(c.amount, c.currency)} ${readableInterval(c.interval_amount, c.interval_type)}.${vpsbg ? '' : ' Tax and processing fee are shown on the initial invoice.'}`);
     const selected = purchase.selection;
     const resources = selected.resources ?? selected.offer;
     paragraph(selection, `${selected.offer.name}; ${selected.offer.region?.name ?? 'region not stated'}; ${selected.image.distribution} ${selected.image.flavour} ${selected.image.version}.`);
@@ -2098,9 +2252,8 @@ const renderProvider = (store, enabled) => {
     rawDetails(selection, purchase.selection, ['purchase', purchase.origin, purchase.account ?? null]);
   }
   const progress = $('provider-progress'); progress.replaceChildren();
-  const vpsbg = purchase.vendor?.id === 'vpsbg';
   const vendorName = purchase.vendor?.name;
-  if (vpsbg) paragraph(progress, `Provider: ${typeof vendorName === 'string' && vendorName.trim() ? vendorName : 'VPSBG'}.`);
+  if (vpsbgHeldPurchase) paragraph(progress, `Provider: ${typeof vendorName === 'string' && vendorName.trim() ? vendorName : 'VPSBG'}.`);
   const balance = vpsbgBalance(purchase);
   if (balance) {
     const updated = epochSeconds(balance.read_at);
@@ -2122,6 +2275,8 @@ const renderProvider = (store, enabled) => {
       const text = document.createElement('small'); text.textContent = wait.helper; helper.append(text);
     }
   }
+  renderVpsbgTopup(progress, purchase, enabled, refused);
+  renderVpsbgPause(progress, purchase, enabled, refused);
   if (purchase.closed) {
     paragraph(progress, 'The provider no longer has the earlier machine or its payment records, and this purchase recorded no payment. You can approve a new purchase. If you paid, keep your proof of payment; these checks cannot establish whether you paid.');
     rawDetails(progress, {closed: purchase.closed}, ['purchase-closed']);
@@ -2129,20 +2284,20 @@ const renderProvider = (store, enabled) => {
   if (purchase.phase) {
     paragraph(progress, `${purchase.machine}: ${purchaseStatus(purchase)}`);
     rawDetails(progress, purchase, ['purchase-progress', purchase.machine]);
-    if (!vpsbg) paragraph(progress, `Machine provider: ${purchase.origin}`);
-    if (vpsbg) {
+    if (!vpsbgHeldPurchase) paragraph(progress, `Machine provider: ${purchase.origin}`);
+    if (vpsbgHeldPurchase) {
       const paidUntil = epochSeconds(purchase.paid_until);
       if (paidUntil !== undefined) paragraph(progress, `Paid until ${localTime(paidUntil * 1000)}.`);
       paragraph(progress, `Automatic renewal at VPSBG: ${['on', 'off'].includes(purchase.renewal) ? purchase.renewal : 'unknown'}. This page does not change it.`);
     } else paragraph(progress, `Automatic renewal: ${purchase.auto_renewal_enabled === true ? 'on' : purchase.auto_renewal_enabled === false ? 'off' : 'unknown'}. This page does not change it.`);
-    if (purchase.billing) {
+    if (purchase.billing && !vpsbgHeldPurchase) {
       const quote = purchase.billing.terms;
       paragraph(progress, `Price for the first period, before any account credit: ${readableMoney(boundInvoiceTotal(quote), quote.currency)} for ${readableDuration(quote.time)} (${readableMoney(quote.amount, quote.currency)}, tax ${readableMoney(quote.tax, quote.currency)}).`);
       if (quote.processing_fee !== 0) paragraph(progress, `Its processing fee of ${readableMoney(quote.processing_fee, quote.currency)} is not part of the Lightning invoice.`);
       if (purchase.selection && purchase.selection.charge.currency !== quote.currency) paragraph(progress, `This machine is priced in ${purchase.selection.charge.currency}: the provider converted the price into the sat amounts above at its own rate.`);
       paragraph(progress, `Initial Lightning quote: ${quote.amount}, plus tax ${quote.tax} and processing fee ${quote.processing_fee} (${quote.currency === 'BTC' ? 'millisats' : quote.currency + ' cents'}), covering ${quote.time} seconds. Review these terms before requesting the invoice. Refresh may update the quote.`);
     }
-    if (purchase.payment) {
+    if (purchase.payment && !vpsbgHeldPurchase) {
       const pay = purchase.payment;
       paragraph(progress, `Price, before any account credit: ${readableMoney(boundInvoiceTotal(pay), pay.currency)} (amount ${readableMoney(pay.amount, pay.currency)}, tax ${readableMoney(pay.tax, pay.currency)}).`);
       if (pay.processing_fee !== 0) paragraph(progress, `Its processing fee of ${readableMoney(pay.processing_fee, pay.currency)} is not part of the Lightning invoice.`);
@@ -2189,18 +2344,24 @@ const renderProvider = (store, enabled) => {
   const canReview = !purchase.phase || ['approved', 'registered', 'terms_changed', 'handed_off'].includes(purchase.phase);
   $('provider-approval-form').querySelector('button[type="submit"]').textContent = purchase.phase === 'terms_changed' ? 'Approve the new terms' : 'Approve and order this machine';
   $('provider-approval-note').textContent = purchase.phase === 'terms_changed' ? 'This records the new terms only. Then press Create the server to order the machine. With an account this page made for you, nothing is charged until you pay its first invoice yourself, in your wallet.' : 'Approving orders this machine from the provider now. With an account this page made for you, nothing is charged until you pay its first invoice yourself, in your wallet.';
+  renderVpsbgApproval(purchase, plan);
+  $('provider-approval-form').hidden = vpsbg && (refused || !vpsbgApprovalShowing(purchase));
   for (const control of $('provider-selection-form').elements) control.disabled = !enabled || !canReview;
-  for (const control of $('provider-approval-form').elements) control.disabled = !enabled || (Boolean(purchase.phase) && !renewal && purchase.phase !== 'handed_off') || providerSelectionDirty || !purchase.selection;
-  if (renewal) {
-    for (const name of ['provider-machine', 'provider-relay', 'provider-class']) $(name).disabled = true;
+  for (const control of $('provider-approval-form').elements) control.disabled = !enabled ||
+    (vpsbg ? refused || !vpsbgApprovalShowing(purchase) || !plan : Boolean(purchase.phase) && !renewal && purchase.phase !== 'handed_off') ||
+    providerSelectionDirty || !purchase.selection;
+  if (renewal || vpsbgReapproval) {
+    for (const [name, value] of [['provider-machine', purchase.machine], ['provider-relay', purchase.relay], ['provider-class', purchase.class_answer]]) {
+      if (!vpsbg || (typeof value === 'string' && value.length > 0)) $(name).disabled = true;
+    }
   }
   providerCloseState = {purchase, enabled};
   updateProviderClose();
   $('provider-resume').textContent = ['approved', 'registered'].includes(purchase.phase) ? 'Create the server' : 'Check the order again';
-  $('provider-resume').hidden = !purchase.phase || purchase.phase === 'handed_off' || refused;
-  $('provider-resume').disabled = !enabled || !purchase.phase || refused;
-  $('provider-invoice').hidden = purchase.phase !== 'initial_invoice' || refused;
-  $('provider-invoice').disabled = !enabled || purchase.phase !== 'initial_invoice' || !purchase.billing || refused;
+  $('provider-resume').hidden = !purchase.phase || purchase.phase === 'handed_off' || refused || (vpsbg && vpsbgApprovalShowing(purchase));
+  $('provider-resume').disabled = !enabled || !purchase.phase || refused || (vpsbg && vpsbgApprovalShowing(purchase));
+  $('provider-invoice').hidden = purchase.phase !== 'initial_invoice' || refused || vpsbg;
+  $('provider-invoice').disabled = !enabled || purchase.phase !== 'initial_invoice' || !purchase.billing || refused || vpsbg;
 };
 $('vpsbg-token-form').addEventListener('input', () => {
   const form = $('vpsbg-token-form');
@@ -2239,7 +2400,15 @@ $('provider-selection-form').addEventListener('submit', event => {
 });
 $('provider-approval-form').addEventListener('submit', event => {
   event.preventDefault(); if (providerSelectionDirty) return;
+  const purchase = renderedReport?.procurement;
+  if (vpsbgDraft(purchase) && ($('provider-approval-form').hidden ||
+      $('provider-approval-form').querySelector('button[type="submit"]').disabled ||
+      !vpsbgPaymentPlan(purchase) || providerWait(purchase)?.kind === 'refused')) return;
   providerRequest({action: 'approve', selection: providerDisplayedSelection, approval: {origin: providerDisplayedOrigin, machine: $('provider-machine').value, relay: $('provider-relay').value, class_answer: $('provider-class').value, approve_charge: $('provider-approve-charge').checked, approve_maintained_access: $('provider-approve-access').checked}});
+  if (vpsbgDraft(purchase)) {
+    vpsbgReviewNewTopup = false;
+    for (const control of $('provider-approval-form').elements) control.disabled = true;
+  }
 });
 $('provider-close').addEventListener('click', () => providerRequest({action: 'close'}));
 $('provider-email-form').addEventListener('submit', event => {
