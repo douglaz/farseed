@@ -727,7 +727,8 @@ impl<S: Storage> Store<S> {
     }
     pub(crate) fn procurement_view(&self) -> Value {
         let mut view = self.procurement_current_view();
-        view["archive"] = json!(self.closed_purchases.iter().map(|p| json!({"machine":p.machine,"vm_id":p.vm.as_ref().map(|vm|p.vendor.raw_id(vm)),"message":closed_message(p, self.provider_account_entered())})).collect::<Vec<_>>());
+        // VPSBG closures are published below as their own cards, never with an LNVPS-shaped message.
+        view["archive"] = json!(self.closed_purchases.iter().filter(|p| p.vendor != Vendor::Vpsbg).map(|p| json!({"machine":p.machine,"vm_id":p.vm.as_ref().map(|vm|p.vendor.raw_id(vm)),"message":closed_message(p, self.provider_account_entered())})).collect::<Vec<_>>());
         self.vpsbg_view(&mut view);
         let archived_vpsbg: Vec<_> = self.closed_purchases.iter().filter(|p| p.vendor == Vendor::Vpsbg).map(|p| {
             let mut card = json!({"machine":p.machine,"origin":p.origin,"vendor":p.vendor.describe(),"closed":true});
@@ -738,13 +739,14 @@ impl<S: Storage> Store<S> {
             card
         }).collect();
         if !archived_vpsbg.is_empty() {
+            // `closed` stays the string the page reads; the VPSBG card is published beside it.
             if view.get("closed").is_some()
                 && self
                     .closed_purchases
                     .last()
                     .is_some_and(|p| p.vendor == Vendor::Vpsbg)
             {
-                view["closed"] = archived_vpsbg.last().cloned().unwrap_or(Value::Null);
+                view["closed_card"] = archived_vpsbg.last().cloned().unwrap_or(Value::Null);
             }
             if let Some(archive) = view["archive"].as_array_mut() {
                 archive.extend(archived_vpsbg);

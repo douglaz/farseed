@@ -272,7 +272,7 @@ fn vpsbg_expired_delete_reload_fresh_approval() {
                 .any(|c| c["purchase"] == id)
         );
         assert_eq!(
-            s.procurement_view()["closed"]["delete"]["state"],
+            s.procurement_view()["closed_card"]["delete"]["state"],
             "confirmed"
         );
         let new_id = approve_next(&mut s, &mut api);
@@ -450,7 +450,7 @@ fn vpsbg_deleted_machine_publishes_revoke_request() {
     assert!(block_on(s.poc_bind(&probe.machine)).is_err());
     assert!(s.attest_target(&probe.machine).is_none());
     assert!(
-        s.procurement_view()["closed"]["delete"]
+        s.procurement_view()["closed_card"]["delete"]
             .get("refund")
             .is_none()
     );
@@ -458,7 +458,7 @@ fn vpsbg_deleted_machine_publishes_revoke_request() {
         if replay {
             s = money_reopen(&s);
         }
-        let card = &s.procurement_view()["closed"];
+        let card = &s.procurement_view()["closed_card"];
         assert_eq!(card["relay_pass"]["state"], "revoke_requested");
         assert_eq!(card["relay_pass"]["key"], key);
         assert_eq!(card["relay_pass"]["host"], "8.8.8.8");
@@ -705,7 +705,7 @@ fn vpsbg_unpaid_order_closures() {
     api.terminal(&hostname(&s, &id));
     block_on(s.vpsbg_delete_check(api.action(), &id)).unwrap();
     assert_eq!(
-        s.procurement_view()["closed"]["relay_pass"]["state"],
+        s.procurement_view()["closed_card"]["relay_pass"]["state"],
         "revoke_requested"
     );
 }
@@ -921,7 +921,7 @@ fn vpsbg_closed_delete_is_atomic_before_retirement() {
     let mut s = money_reopen(&s);
     assert!(s.vpsbg_purchases[&id].retirement.is_none());
     assert_eq!(
-        s.procurement_view()["closed"]["relay_pass"]["state"],
+        s.procurement_view()["closed_card"]["relay_pass"]["state"],
         "revoke_requested"
     );
     assert!(s.procurement_can_start());
@@ -1103,8 +1103,10 @@ fn vpsbg_closed_cards_preserve_mixed_lnvps_views() {
         let mut api = DeleteApi::new(&s, &id, inner);
         api.terminal(&hostname(&s, &id));
         block_on(s.vpsbg_delete_check(api.action(), &id)).unwrap();
-        let card = s.procurement_view()["closed"].clone();
+        let card = s.procurement_view()["closed_card"].clone();
         assert_eq!(card["purchase"], id);
+        // The page reads `closed` as a string (www/boot.js `purchase.closed.startsWith`).
+        assert!(s.procurement_view()["closed"].is_string());
         let mut base = ready();
         match case {
             "lnvps_current" => {
@@ -1121,16 +1123,25 @@ fn vpsbg_closed_cards_preserve_mixed_lnvps_views() {
             }
         }
         let mut expected = base.procurement_view();
-        // The only allowed mixed-store addition is its VPSBG archive card, plus
-        // replacing the base closed message when VPSBG really was the last closure.
-        expected["archive"] = json!([card.clone()]);
+        // Preserve the base's LNVPS archive entries, then append the VPSBG card. When VPSBG
+        // really was the last closure, `closed` is VPSBG's closed message (still a string) and
+        // the card is published beside it as `closed_card`.
+        expected["archive"]
+            .as_array_mut()
+            .unwrap()
+            .push(card.clone());
         if case == "vpsbg_closed_last" {
-            expected["closed"] = card;
+            expected["closed"] =
+                json!("VPSBG purchase closed. Earlier top-ups may still settle as VPSBG credit.");
+            expected["closed_card"] = card;
         } else if case == "lnvps_current" {
             assert!(expected.get("closed").is_none());
         } else {
             assert!(expected["closed"].is_string());
         }
+        // Whatever the vendors, `closed` is a string whenever it is present.
+        let view = s.procurement_view();
+        assert!(view.get("closed").is_none_or(Value::is_string), "{case}");
         assert_eq!(
             serde_json::to_vec(&s.procurement_view()).unwrap(),
             serde_json::to_vec(&expected).unwrap(),
@@ -1199,7 +1210,7 @@ fn vpsbg_deleted_refund_requires_saved_order_bound_to_server() {
         .transactions(vec![money_row(72, "38.79", "balance", "Refund")]);
     block_on(s.vpsbg_delete_check(api.action(), &id)).unwrap();
     assert!(
-        s.procurement_view()["closed"]["delete"]
+        s.procurement_view()["closed_card"]["delete"]
             .get("refund")
             .is_none()
     );
@@ -1208,13 +1219,13 @@ fn vpsbg_deleted_refund_requires_saved_order_bound_to_server() {
         .transactions(vec![money_row(71, "38.79", "balance", "Refund")]);
     block_on(s.vpsbg_delete_check(api.action(), &id)).unwrap();
     assert_eq!(
-        s.procurement_view()["closed"]["delete"]["refund"],
+        s.procurement_view()["closed_card"]["delete"]["refund"],
         json!({"amount":3879,"currency":"EUR"})
     );
     let mut s = money_reopen(&s);
     block_on(s.vpsbg_delete_check(api.action(), &id)).unwrap();
     assert_eq!(
-        s.procurement_view()["closed"]["delete"]["refund"],
+        s.procurement_view()["closed_card"]["delete"]["refund"],
         json!({"amount":3879,"currency":"EUR"})
     );
     assert_eq!(api.deletes, 0);

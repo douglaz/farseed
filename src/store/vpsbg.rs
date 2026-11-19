@@ -1001,6 +1001,8 @@ impl<S: Storage> Store<S> {
                 paid_at: None,
                 publication: None,
                 target: None,
+                duplicate_orders: Vec::new(),
+                stopped: None,
             };
             self.vpsbg_commit(
                 &id,

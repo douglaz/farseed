@@ -689,12 +689,14 @@ fn vpsbg_ready_allows_real_lnvps_account_and_approval() {
     let card = completed_card(&s, &id);
     s.procurement_choose_vendor(Vendor::Lnvps).unwrap();
     assert_eq!(completed_card(&s, &id), card);
-    let secret = hex::encode([7; 32]);
-    let account = protocol::Account::parse(secret.as_bytes()).unwrap();
+    s.deployment_origin = Some("https://fake-lnvps.invalid".into());
+    block_on(s.provider_generate()).unwrap();
+    let account = s.provider_account().unwrap().copy();
     assert_ne!(account.public(), s.vpsbg_purchase(&id).unwrap().account);
-    block_on(s.procurement_configure(&account, secret.as_bytes(), "https://fake-lnvps.invalid"))
-        .unwrap();
-    assert_eq!(s.provider_account().unwrap().public(), account.public());
+    assert_eq!(
+        money_reopen(&s).provider_account().unwrap().public(),
+        account.public()
+    );
     assert_eq!(completed_card(&s, &id), card);
     let mut api = LnvpsReads {
         account: account.public(),
