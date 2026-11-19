@@ -1479,7 +1479,7 @@ pub async fn poc_download(
             unavailable: false,
         };
         let bytes = crate::harness::download_file(&pins, &mut journal, &target, &file.path).await?;
-        {
+        let name = {
             let local = local();
             let mut writer = local.lock().await;
             continuation.check()?;
@@ -1494,14 +1494,23 @@ pub async fn poc_download(
             {
                 return Err("This file offer is no longer available.".into());
             }
-        }
+            // The name is cut and rewritten from the path, so both must pass the publication check.
+            let unchanged = |text: &str| {
+                matches!(
+                    store.protect_publication(&serde_json::Value::String(text.into()), &[]),
+                    Ok(serde_json::Value::String(protected)) if protected == text
+                )
+            };
+            let name = crate::poc::files::filename(&file.path);
+            if unchanged(&file.path) && unchanged(&name) {
+                name
+            } else {
+                "download".into()
+            }
+        };
         let result = js_sys::Object::new();
-        js_sys::Reflect::set(
-            &result,
-            &"filename".into(),
-            &crate::poc::files::filename(&file.path).into(),
-        )
-        .map_err(|_| "The download could not be prepared. Try again.")?;
+        js_sys::Reflect::set(&result, &"filename".into(), &name.into())
+            .map_err(|_| "The download could not be prepared. Try again.")?;
         let data = js_sys::Uint8Array::from(bytes.as_slice());
         js_sys::Reflect::set(&result, &"bytes".into(), &data)
             .map_err(|_| "The download could not be prepared. Try again.")?;
