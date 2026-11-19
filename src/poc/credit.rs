@@ -4,7 +4,9 @@ use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
 pub const CAP: f64 = 1.0;
-pub const AI_KEY_CAP: f64 = 0.25;
+pub const AI_KEY_CAP: f64 = 1.0;
+// Records minted before the raise keep their recorded cap and still replay.
+pub const LEGACY_AI_KEY_CAP: f64 = 0.25;
 pub const AI_KEY_LIFETIME: u64 = 30 * 86_400;
 pub const LIFETIME: u64 = 86_400;
 pub const POLL_SECONDS: u64 = 5;
@@ -338,6 +340,11 @@ impl Mint {
         cutoff.is_some_and(|cutoff| now_nanos < cutoff)
     }
 }
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn ai_key_request(name: &str, expiry: &str) -> Value {
+    serde_json::json!({"name":name,"usage_limit_usd":AI_KEY_CAP,"expire_at":expiry})
+}
+
 pub fn returned_mint(value: &Value, mint: &Mint) -> Result<(String, String), String> {
     let data = &value["data"];
     let expiry = data["expire_at"].as_str().ok_or(MINT_FAILED)?;

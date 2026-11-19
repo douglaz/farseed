@@ -1045,7 +1045,7 @@ pub(crate) async fn prepare_ai_key(task: &crate::store::poc::Task) -> Result<boo
         "POST",
         "/keys",
         Auth::Account,
-        Some(serde_json::json!({"name":mint.name,"usage_limit_usd":AI_KEY_CAP,"expire_at":expiry})),
+        Some(ai_key_request(&mint.name, &expiry)),
     )
     .await
     .map_err(|_| UNKNOWN)?;

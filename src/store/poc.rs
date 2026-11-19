@@ -201,6 +201,9 @@ impl Task {
         let mut value = serde_json::to_value(self).expect("task serializes");
         value["file_offers"] = serde_json::to_value(self.file_offers()).expect("offers serialize");
         value["pause_reason"] = self.publication_pause_reason();
+        if self.awaiting_ai_key() {
+            value["ai_key_limit_usd"] = json!(crate::poc::credit::AI_KEY_CAP);
+        }
         value
     }
     fn publication_pause_reason(&self) -> Value {

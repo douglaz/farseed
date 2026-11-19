@@ -1,6 +1,6 @@
 //! Application inference key custody is encrypted; the machine owns its revocation metadata.
 use super::*;
-use crate::poc::credit::{AI_KEY_CAP, Mint, SecretText};
+use crate::poc::credit::{AI_KEY_CAP, LEGACY_AI_KEY_CAP, Mint, SecretText};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -85,11 +85,11 @@ impl<S: Storage> Store<S> {
                 .strip_suffix("/chat/completions")
                 .unwrap_or(&configuration.endpoint);
             Ok(
-                json!({"status":"created","path":entry.path,"limit_usd":AI_KEY_CAP,"expires":machine_key.map(|key| &key.expires),"base_url":base_url,"api":"chat-completions","model":configuration.model}),
+                json!({"status":"created","path":entry.path,"limit_usd":entry.mint.requested_cap,"expires":machine_key.map(|key| &key.expires),"base_url":base_url,"api":"chat-completions","model":configuration.model}),
             )
         } else {
             Ok(
-                json!({"status":"failed","reason":"the machine could not save the AI key","path":entry.path,"limit_usd":AI_KEY_CAP}),
+                json!({"status":"failed","reason":"the machine could not save the AI key","path":entry.path,"limit_usd":entry.mint.requested_cap}),
             )
         }
     }
@@ -118,7 +118,7 @@ impl<S: Storage> Store<S> {
                     || self.ai_key(&task.id, call).is_some()
                     || *saved_path != path(&task)
                     || mint.session != task.start_session
-                    || mint.requested_cap != AI_KEY_CAP
+                    || (mint.requested_cap != AI_KEY_CAP && mint.requested_cap != LEGACY_AI_KEY_CAP)
                     || mint.requested_expiry == 0
                     || mint.name.len() != 25
                     || !crate::poc::credit::identifier(&mint.name)

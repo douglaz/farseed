@@ -1306,7 +1306,7 @@ const renderTasks = (store) => {
         const created = outcome?.content?.status === 'created';
         const declined = outcome?.content?.status === 'declined';
         const application = shortLine(tool.arguments.application, 64);
-        const line = paragraph(card, created ? `Created an AI key for ${application} on this machine (limit 0.25 USD, expires in 30 days)` : declined ? `Didn't create an AI key for ${application}.` : `Couldn't create an AI key: ${shortLine(outcome?.content?.reason ?? 'the outcome is unavailable', 160)}.`);
+        const line = paragraph(card, created ? `Created an AI key for ${application} on this machine (limit ${outcome.content.limit_usd} USD, expires in 30 days)` : declined ? `Didn't create an AI key for ${application}.` : `Couldn't create an AI key: ${shortLine(outcome?.content?.reason ?? 'the outcome is unavailable', 160)}.`);
         line.dataset[created ? 'aiKeyCreated' : declined ? 'aiKeyDeclined' : 'aiKeyFailed'] = '';
       } else paragraph(card, id.startsWith('$before:') ? 'Read the listening ports before setup.' : tool.name === 'exec' ? `Ran: ${(!id.startsWith('$rerun:') && playbookCommand(controlCenterOrigin(task, id))) || commandSummary(tool.arguments.command)} (${commandResultWord(outcome)})` : tool.name === 'propose_declaration' ? 'The AI proposed requirements.' : tool.name === 'done' ? 'The AI handed the work over for checks.' : 'Completed a step.');
       const machineKey = tool.name === 'request_ai_key' ? (store.poc_targets ?? []).find(target => target.machine === task.machine)?.application_inference_keys?.find(key => key.path === outcome?.content?.path) : undefined;
@@ -1377,7 +1377,7 @@ const renderTasks = (store) => {
       } else if (awaitingAiKey(task)) {
         const requestCard = document.createElement('section');
         requestCard.dataset.aiKeyRequest = '';
-        paragraph(requestCard, `Create an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} on this machine (limit 0.25 USD, expires in 30 days)?`);
+        paragraph(requestCard, `Create an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} on this machine (limit ${task.ai_key_limit_usd} USD, expires in 30 days)?`);
         paragraph(requestCard, "Paid from your inference balance. It can read the account's usage history. It ends when the machine is destroyed, it expires, or it is revoked.");
         paragraph(requestCard, "This key is for the operator's application and outlives this session. Lock, Stop task and End session do not revoke it.");
         const needsClass = (store.poc_targets ?? []).find(target => target.machine === task.machine)?.ai_key_needs_class_answer !== false;

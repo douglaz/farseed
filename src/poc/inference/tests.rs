@@ -820,3 +820,40 @@ fn correction_tool_parse_reasons_name_the_offending_argument_without_values() {
         matches!(normalize(&store,200,reply.to_string().as_bytes(),"machine-a",&[],&[]),Err(ReplyError::Pause(reason)) if reason == "inference diagnostic contains protected material")
     );
 }
+
+#[test]
+fn poc_ai_key_instruction_and_description_only_change_the_cap() {
+    let body: Value = serde_json::from_slice(
+        &request(
+            &store(),
+            &config(),
+            "install a service",
+            "machine-a",
+            &[],
+            &[],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let instruction = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|message| message["content"].as_str())
+        .find(|text| text.starts_with("For an application the operator asked for"))
+        .unwrap();
+    let description = body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["function"]["name"] == "request_ai_key")
+        .unwrap()["function"]["description"]
+        .as_str()
+        .unwrap();
+    let old_instruction = "For an application the operator asked for that needs its own AI access, call request_ai_key with a short plain application name and purpose, never for your own use and never with a secret; after the operator presses Create key on its card, tau-web creates an application inference key capped at 0.25 USD, expiring in 30 days, and saves it on the machine at the path in the reply, which also gives the chat-completions API base URL to configure the application with. The key outlives this session; use the file, never print the key, and never ask the operator for keys.";
+    let old_description = "Request an application inference key for an application the operator asked for that needs its own AI access, never for your own use. The operator must approve on a card before creation; the key outlives the session, with a 0.25 USD cap and 30-day expiry.";
+    assert!(instruction.contains("1 USD"));
+    assert!(description.contains("1 USD"));
+    assert_eq!(instruction, old_instruction.replace("0.25", "1"));
+    assert_eq!(description, old_description.replace("0.25", "1"));
+}

@@ -3145,3 +3145,90 @@ mod completion_tests;
 mod correction_tests;
 
 mod interruption_tests;
+
+#[test]
+fn poc_ai_key_replay_preserves_legacy_and_new_outcome_caps_and_refuses_other_caps() {
+    use crate::poc::credit::{Mint, SecretText};
+    use crate::store::ai_keys::Record;
+
+    for cap in [0.25, 1.0, 0.5] {
+        let mut s = ready();
+        let task = create_task(&mut s);
+        let task = change(&mut s, &task, Change::Request);
+        let task = change(
+            &mut s,
+            &task,
+            Change::Propose {
+                call_id: "application-key".into(),
+                tool: Tool::RequestAiKey {
+                    machine: task.machine.clone(),
+                    application: "requested service".into(),
+                    purpose: "run the requested service".into(),
+                },
+            },
+        );
+        assert_eq!(s.poc_task_view(&task)["ai_key_limit_usd"], 1.0);
+        let task = change(&mut s, &task, Change::AiKeyDecision { create: true });
+        let expiry = "2026-11-11T00:00:00Z";
+        let name = "k0123456789abcdef01234567";
+        let record = Record::Request {
+            task: task.id.clone(),
+            call: "application-key".into(),
+            path: crate::store::ai_keys::path(&task),
+            mint: Mint {
+                session: task.start_session.clone(),
+                name: name.into(),
+                requested_cap: cap,
+                requested_expiry: crate::poc::provisioning::timestamp(expiry).unwrap(),
+                issuer_id: None,
+                returned_cap: None,
+                returned_expiry: None,
+            },
+            configuration: Some(
+                crate::poc::inference::Configuration::new(
+                    "https://inference.invalid/v1/chat/completions".into(),
+                    "fixture".into(),
+                )
+                .unwrap(),
+            ),
+        };
+        if cap == 0.5 {
+            block_on(s.commit(&Event::PocAiKey(record))).unwrap();
+            let error = block_on(unlock(
+                MemoryStorage::with_files(s.storage.files()),
+                &Fixed,
+                pass(),
+            ))
+            .err()
+            .unwrap();
+            assert!(error.contains("AI key request record refused"), "{error}");
+            continue;
+        }
+        block_on(s.ai_key_commit(record)).unwrap();
+        block_on(s.ai_key_commit(Record::Held {
+            machine: task.machine.clone(),
+            name: name.into(),
+            issuer_id: "application-key-id".into(),
+            expires: expiry.into(),
+            key: SecretText(Zeroizing::new("synthetic-application-key-value".into())),
+        }))
+        .unwrap();
+        let replayed = reopen(&s);
+        assert_eq!(
+            replayed
+                .ai_key(&task.id, "application-key")
+                .unwrap()
+                .mint
+                .requested_cap,
+            cap
+        );
+        let task = replayed.poc_task(&task.id).unwrap();
+        let outcome = replayed.ai_key_outcome(&task, Some(0)).unwrap();
+        assert_eq!(outcome["status"], "created");
+        assert_eq!(outcome["limit_usd"], cap);
+        assert_eq!(
+            replayed.ai_key_outcome(&task, Some(1)).unwrap()["limit_usd"],
+            cap
+        );
+    }
+}

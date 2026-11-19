@@ -309,3 +309,40 @@ fn poc_credit_account_response_is_validated_as_one_pair() {
         assert!(AccountRecord::from_response(201, &value).is_err());
     }
 }
+
+#[test]
+fn poc_credit_ai_key_request_and_returned_cap_are_exactly_one_dollar() {
+    let name = "k0123456789abcdef01234567";
+    let expiry = "2026-11-11T00:00:00Z";
+    let request = ai_key_request(name, expiry);
+    assert_eq!(
+        request,
+        json!({"name":name,"usage_limit_usd":1.0,"expire_at":expiry})
+    );
+    let mint = Mint {
+        session: "session-1".into(),
+        name: name.into(),
+        requested_cap: AI_KEY_CAP,
+        requested_expiry: super::super::provisioning::timestamp(expiry).unwrap(),
+        issuer_id: None,
+        returned_cap: None,
+        returned_expiry: None,
+    };
+    assert_eq!(mint.requested_cap, 1.0);
+    let mut response = json!({"status":"success","data":request});
+    response["data"]["_id"] = json!("key-1");
+    response["data"]["reset_period"] = Value::Null;
+    assert!(returned_mint(&response, &mint).is_ok());
+    for cap in [
+        json!(0.25),
+        json!(0.5),
+        json!(0.99),
+        json!(1.01),
+        json!(2.0),
+        Value::Null,
+        json!("1"),
+    ] {
+        response["data"]["usage_limit_usd"] = cap;
+        assert!(returned_mint(&response, &mint).is_err());
+    }
+}
