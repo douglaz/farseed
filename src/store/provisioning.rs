@@ -160,9 +160,11 @@ struct Reconciliation {
     status: u16,
     checked_at: u64,
 }
+// `expires` must be present and null. `deleting_on` may be absent: LNVPS added it to the VM status on 2026-07-15
+// (e9e0427b), so an older deployment omits it; when present it must be null.
 fn unpaid_machine(vm: &Value) -> bool {
     vm.get("expires").is_some_and(Value::is_null)
-        && vm.get("deleting_on").is_some_and(Value::is_null)
+        && vm.get("deleting_on").is_none_or(Value::is_null)
 }
 fn failing_payments(p: &Purchase, history: &[Value]) -> Result<Vec<Value>, String> {
     let vm = p.vm.as_ref().ok_or(REFUSED)?;

@@ -670,7 +670,7 @@ fn b947_account_source_is_retained_across_replay() {
 
 #[test]
 fn b947_missing_unpaid_fields_are_failing_rows_in_list_and_detail() {
-    for field in ["expires", "deleting_on"] {
+    for field in ["expires"] {
         for missing_in_detail in [false, true] {
             let (mut s, mut api) = b947_intent(false);
             let vm = b947_vm(&api.inner.current_selection, 11);
@@ -692,6 +692,25 @@ fn b947_missing_unpaid_fields_are_failing_rows_in_list_and_detail() {
             );
             assert!(result.candidates.is_empty());
         }
+    }
+}
+
+#[test]
+fn b947_absent_deleting_on_is_unpaid_for_older_providers() {
+    for missing_in_detail in [false, true] {
+        let (mut s, mut api) = b947_intent(false);
+        let vm = b947_vm(&api.inner.current_selection, 11);
+        let mut older = vm.clone();
+        older.as_object_mut().unwrap().remove("deleting_on");
+        if missing_in_detail {
+            api.inner.machines = vec![vm];
+            api.inner.read_values.insert("/api/v1/vm/11".into(), older);
+        } else {
+            api.inner.machines = vec![older];
+        }
+        let result = block_on(s.reconcile_create(&mut api)).unwrap();
+        assert!(result.failing.is_empty(), "detail: {missing_in_detail}");
+        assert_eq!(result.candidates.len(), 1, "detail: {missing_in_detail}");
     }
 }
 
