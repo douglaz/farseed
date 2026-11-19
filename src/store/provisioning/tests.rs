@@ -3806,3 +3806,5 @@ fn provisioning_legacy_request_fingerprints_replay_without_changing_purchase() {
         serde_json::to_value(&event).unwrap()
     );
 }
+
+mod b947;

@@ -226,7 +226,8 @@ const renderSteps = store => {
   emphasize('store', [$('create'), $('unlock'), $('seed-backup-answer'), $('seed-backup-check'), $('redisplay')]);
   emphasize('credit', [$('credit-invoice'), $('credit-check'), $('credit-configure'), $('poc-inference-form').querySelector('button')]);
   const purchase = store.procurement;
-  const machineAction = !store.provider_configuration?.key_set ? $('provider-catalogue')
+  const machineAction = purchase?.stop ? $('provider-stop')
+    : !store.provider_configuration?.key_set ? $('provider-catalogue')
     : purchase?.phase === 'email_verification' ? (purchase.email_entered ? $('provider-email-check') : $('provider-email-form').querySelector('button'))
     : purchase?.phase === 'initial_invoice' ? $('provider-invoice')
     : purchase?.phase && !['terms_changed', 'handed_off'].includes(purchase.phase) ? $('provider-resume')
@@ -1897,6 +1898,8 @@ const updateProviderClose = () => {
   const closeEligible = Boolean(purchase.vm_id) && !purchase.target && (!purchase.payment || (purchase.payment.is_paid === false && Math.floor(Date.parse(purchase.payment.expires) / 1000) <= Math.floor(Date.now() / 1000)));
   $('provider-close').hidden = !closeEligible;
   $('provider-close').disabled = !enabled || !closeEligible;
+  $('provider-stop').hidden = !purchase.stop;
+  $('provider-stop').disabled = !enabled || !purchase.stop;
 };
 setInterval(() => {
   for (const node of document.querySelectorAll('[data-invoice-expires]')) node.textContent = `${Math.max(0, Math.ceil((Number(node.dataset.invoiceExpires) - Date.now() / 1000) / 60))} minutes left`;
@@ -1991,7 +1994,14 @@ const renderProvider = (store, enabled) => {
     ? (/^[0-9a-f]{64}$/.test(account ?? '') ? `Provider account public identity: ${account}` : 'Provider account recorded; public identity unavailable.')
     : 'The first provider action creates and keeps one provider account.';
   const fixed = recorded || Boolean(store.procurement?.phase || store.procurement?.closed);
+  $('provider-existing').hidden = true;
+  $('provider-existing').inert = true;
+  $('provider-existing').open = false;
+  $('provider-key').value = '';
+  for (const control of $('provider-key-form').elements) control.disabled = true;
   $('provider-key-form').hidden = fixed;
+  const entered = store.provider_configuration?.entered === true;
+  $('provider-entered-note').hidden = !entered;
   $('provider-account-fixed').hidden = !fixed;
   const deployed = store.provider_configuration?.relay_deployed === true;
   const relayFold = $('provider-relay-fold');
@@ -2104,10 +2114,25 @@ const renderProvider = (store, enabled) => {
   }
   const progress = $('provider-progress'); progress.replaceChildren();
   if (purchase.closed) {
-    paragraph(progress, 'The provider no longer has the earlier machine or its payment records, and this purchase recorded no payment. You can approve a new purchase. If you paid, keep your proof of payment; these checks cannot establish whether you paid.');
+    paragraph(progress, purchase.closed.startsWith('Stopped:') ? purchase.closed : 'The provider no longer has the earlier machine or its payment records, and this purchase recorded no payment. You can approve a new purchase. If you paid, keep your proof of payment; these checks cannot establish whether you paid.');
     rawDetails(progress, {closed: purchase.closed}, ['purchase-closed']);
   }
+  const stopNotice = $('provider-stop-notice'); stopNotice.replaceChildren();
+  stopNotice.hidden = !purchase.stop;
+  if (purchase.stop) paragraph(stopNotice, purchase.stop.message);
+  $('provider-stop').onclick = () => providerRequest({action: 'stop', stage: purchase.stop.stage});
   if (purchase.phase) {
+    if (purchase.duplicate_orders?.length) paragraph(progress, `The provider received this order twice. The extra machine (${purchase.duplicate_orders.join(', ')}) is unpaid; the provider deletes it within about an hour. Nothing is charged for it.`);
+    if (purchase.payment_notice) paragraph(progress, purchase.payment_notice);
+    if (purchase.stop_after && !purchase.stop) paragraph(progress, `If no machine appears by ${new Date(purchase.stop_after * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}, you can stop this purchase.`);
+    if (purchase.candidates?.length) {
+      paragraph(progress, purchase.candidates.length > 1 ? 'The provider holds more than one machine that matches this order. Choose the one this purchase uses; the others are left as they are and never invoiced here.' : 'Confirm the machine this purchase uses.');
+      for (const candidate of purchase.candidates) {
+        paragraph(progress, `Machine ${candidate.id}; created ${candidate.created}; address ${(candidate.addresses ?? []).map(address => address.ip).join(', ') || 'not allocated'}.`);
+        const choose = document.createElement('button'); choose.type = 'button'; choose.textContent = `Use machine ${candidate.id}`; choose.disabled = !enabled;
+        choose.addEventListener('click', () => providerRequest({action: 'choose', vm_id: candidate.id})); progress.append(choose);
+      }
+    }
     paragraph(progress, `${purchase.machine}: ${purchaseStatus(purchase)}`);
     rawDetails(progress, purchase, ['purchase-progress', purchase.machine]);
     paragraph(progress, `Machine provider: ${purchase.origin}`);
@@ -2165,7 +2190,8 @@ const renderProvider = (store, enabled) => {
   }
   const canReview = !purchase.phase || ['approved', 'registered', 'terms_changed', 'handed_off'].includes(purchase.phase);
   $('provider-approval-form').querySelector('button[type="submit"]').textContent = purchase.phase === 'terms_changed' ? 'Approve the new terms' : 'Approve and order this machine';
-  $('provider-approval-note').textContent = purchase.phase === 'terms_changed' ? 'This records the new terms only. Then press Create the server to order the machine. With an account this page made for you, nothing is charged until you pay its first invoice yourself, in your wallet.' : 'Approving orders this machine from the provider now. With an account this page made for you, nothing is charged until you pay its first invoice yourself, in your wallet.';
+  const chargeNote = entered ? 'With an account this page made for you, nothing is charged until you pay its first invoice yourself, in your wallet.' : 'Nothing is charged until you pay its first invoice yourself, in your wallet.';
+  $('provider-approval-note').textContent = purchase.phase === 'terms_changed' ? `This records the new terms only. Then press Create the server to order the machine. ${chargeNote}` : `Approving orders this machine from the provider now. ${chargeNote}`;
   for (const control of $('provider-selection-form').elements) control.disabled = !enabled || !canReview;
   for (const control of $('provider-approval-form').elements) control.disabled = !enabled || (Boolean(purchase.phase) && !renewal && purchase.phase !== 'handed_off') || providerSelectionDirty || !purchase.selection;
   if (renewal) {
@@ -2181,10 +2207,7 @@ const renderProvider = (store, enabled) => {
 };
 $('provider-key-form').addEventListener('submit', event => {
   event.preventDefault();
-  const field = $('provider-key'), bytes = new TextEncoder().encode(field.value); field.value = '';
-  const origin = $('provider-origin').value; $('provider-origin').value = '';
-  try { worker.postMessage({provider_configure: {key: bytes, origin}}, [bytes.buffer]); }
-  finally { if (bytes.byteLength) bytes.fill(0); }
+  $('provider-key').value = '';
 });
 $('provider-catalogue').addEventListener('click', () => providerRequest({action: 'catalogue'}));
 $('provider-selection-form').addEventListener('input', () => {

@@ -9,6 +9,9 @@ impl<S: Storage> Store<S> {
     pub(crate) fn provider_account(&self) -> Option<&Account> {
         self.provider_account.as_ref()
     }
+    pub(crate) fn provider_account_entered(&self) -> bool {
+        matches!(self.provider_account_source, Some(AccountSource::Entered))
+    }
 
     pub(crate) fn provider_entry_ready(&self) -> Result<(), String> {
         if self.provider_account.is_some() {
@@ -62,6 +65,7 @@ impl<S: Storage> Store<S> {
         self.provider_origin = normalized;
         self.procurement_selection = None;
         self.provider_account = Some(account.copy());
+        self.provider_account_source = Some(source);
         Ok(())
     }
 
@@ -70,6 +74,7 @@ impl<S: Storage> Store<S> {
         let account = record.account()?;
         self.provider_origin = record.origin.clone();
         self.provider_account = Some(account);
+        self.provider_account_source = Some(record.source);
         Ok(())
     }
 }
