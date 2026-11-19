@@ -1328,6 +1328,20 @@ const renderTasks = (store) => {
             anchor.append(domain); row.append(anchor);
             const fullLink = document.createElement('code'); fullLink.textContent = url.href;
             row.append(document.createElement('br'), fullLink);
+            const userCode = url.searchParams.get('user_code');
+            if (userCode && /^[A-Za-z0-9-]{1,32}$/.test(userCode)) {
+              const codeLine = paragraph(row, 'Code to check there: ');
+              const code = document.createElement('code'); code.textContent = userCode; codeLine.append(code);
+              const steps = document.createElement('ol');
+              for (const text of [
+                'Tap the link. Sign in there, or create an account.',
+                'Check that the page shows this code, then approve.',
+                question.choices?.length ? `Come back here and press ${question.choices[0]}.` : 'Come back here and choose your answer.',
+              ]) {
+                const step = document.createElement('li'); step.textContent = text; steps.append(step);
+              }
+              row.append(steps);
+            }
           }
           const unavailable = !session || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
           let answered = false;
