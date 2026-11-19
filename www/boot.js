@@ -2012,7 +2012,7 @@ const renderProvider = (store, enabled) => {
   }
   const canReview = !purchase.phase || ['approved', 'registered', 'terms_changed', 'handed_off'].includes(purchase.phase);
   $('provider-approval-form').querySelector('button[type="submit"]').textContent = purchase.phase === 'terms_changed' ? 'Approve the new terms' : 'Approve and order this machine';
-  $('provider-approval-note').textContent = purchase.phase === 'terms_changed' ? 'This records the new terms only. Then press Create the server to order the machine. Nothing is paid until you pay its first invoice in your wallet.' : 'This orders the machine from the provider. Nothing is paid until you pay its first invoice in your wallet.';
+  $('provider-approval-note').textContent = purchase.phase === 'terms_changed' ? 'This records the new terms only. Then press Create the server to order the machine. With an account this page made for you, nothing is charged until you pay its first invoice yourself, in your wallet.' : 'Approving orders this machine from the provider now. With an account this page made for you, nothing is charged until you pay its first invoice yourself, in your wallet.';
   for (const control of $('provider-selection-form').elements) control.disabled = !enabled || !canReview;
   for (const control of $('provider-approval-form').elements) control.disabled = !enabled || (Boolean(purchase.phase) && !renewal && purchase.phase !== 'handed_off') || providerSelectionDirty || !purchase.selection;
   if (renewal) {
