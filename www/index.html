@@ -133,6 +133,21 @@ section section { min-width: 0; }
 <p id="tau-step-machine-error" class="step-error" role="status"></p>
 <div id="tau-step-machine-action"></div>
 <div id="tau-provider-choice" hidden></div>
+<section id="tau-vpsbg-token-section" hidden>
+<h3>Your VPSBG API token</h3>
+<p data-vpsbg-token-explanation>An API token is a long code from your VPSBG account. It lets this page see your plans, your balance and your machines, top up the balance, and create or delete machines.</p>
+<p data-vpsbg-token-explanation>In VPSBG's console, open API tokens, create a token with read and <strong>write</strong> access, and copy it. VPSBG shows it only once.</p>
+<p data-vpsbg-token-explanation><strong>Whoever has this token controls every machine in that VPSBG account and can spend its whole balance.</strong></p>
+<p data-vpsbg-token-explanation>Use a VPSBG account you keep only for this, with a small balance. A token with an end date is safer.</p>
+<p data-vpsbg-token-explanation>This page keeps the token encrypted on this device and sends it only to VPSBG's API. It is never sent to us or anyone else.</p>
+<form id="tau-vpsbg-token-form" novalidate>
+<label>API token <input id="tau-vpsbg-token" type="password" autocomplete="off" spellcheck="false" autocapitalize="none"></label>
+<button type="submit" disabled>Save token</button>
+</form>
+<p id="tau-vpsbg-token-status" role="status"></p>
+<p data-vpsbg-token-stop hidden><small>To stop this token working, delete it in VPSBG's console. This page keeps its saved data and can't erase the token from it.</small></p>
+<small><button type="button" data-vpsbg-token-replace hidden>Replace token</button></small>
+</section>
 <div id="tau-provider-progress" aria-live="polite"></div>
 <div id="tau-purchase-review-slot"></div>
 <section id="tau-setup" hidden aria-label="Setup machines"></section>
