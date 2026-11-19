@@ -1647,6 +1647,10 @@ const renderDelivery = (section, machine, store) => {
   const entry = (store.delivery ?? []).find(d => d.machine === machine);
   if (!entry) return;
   const delivery = deliveryDetails.entry.get(machine)?.value ?? entry;
+  // A machine whose purchase is still open has nothing to report about delivery yet: its target is saved only once it
+  // is paid for and running.
+  if (store.procurement?.machine === machine && !(store.poc_targets ?? []).some(target => target.machine === machine) &&
+      delivery.verdict === 'delivery evidence not yet supplied' && (delivery.findings_count ?? (delivery.findings ?? []).length) === 0) return;
   const isLive = !delivery.summary && (store.poc_targets ?? []).some(target => target.machine === machine);
   const fixtureBreak = isLive ? (delivery.fixture_limit ?? '').indexOf('. ') : -1;
   const card = document.createElement('section');
@@ -1660,7 +1664,7 @@ const renderDelivery = (section, machine, store) => {
   if (plain) {
     const verdict = document.createElement('p');
     verdict.dataset.deliveryVerdict = machine;
-    verdict.textContent = "This version doesn't yet give a “Delivered” verdict for a machine you bought. Below is what tau-web checked on this machine itself, and what it didn't.";
+    verdict.textContent = "This card lists what tau-web checked on this machine itself, and what it didn't. The fuller check against tau-web's lockdown checklist isn't in this version. Each setup task's own result is on its task card.";
     card.append(verdict);
     if (entry.summary) deliveryDetailsButton(card, machine, 'entry', 'delivery details', store);
     const verdictTasks = (store.tasks ?? []).filter(task => task.machine === machine && task.verdict);
@@ -1752,7 +1756,7 @@ const renderDelivery = (section, machine, store) => {
       delivery.verdict === 'delivery evidence not yet supplied' && delivery.findings_count === 0) {
     const verdict = document.createElement('p');
     verdict.dataset.deliveryVerdict = machine;
-    verdict.textContent = "This version doesn't yet give a “Delivered” verdict for a machine you bought. Open delivery details for what tau-web checked, or see the task card.";
+    verdict.textContent = "Open delivery details for what tau-web checked on this machine and what it didn't. Each setup task's own result is on its task card.";
     card.append(verdict);
     if (entry.summary) deliveryDetailsButton(card, machine, 'entry', 'delivery details', store);
     section.append(card);
