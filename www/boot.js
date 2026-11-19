@@ -232,6 +232,7 @@ const renderSteps = store => {
   const machineAction = purchase?.stop ? $('provider-stop')
     : purchase?.phase && providerWait(purchase)?.kind === 'refused' ? null
     : choiceNeeded ? null
+    : vpsbgTokenFormShowing(purchase) ? $('vpsbg-token-form').querySelector('button[type="submit"]')
     : !store.provider_configuration?.key_set ? $('provider-catalogue')
     : purchase?.phase === 'email_verification' ? (purchase.email_entered ? $('provider-email-check') : $('provider-email-form').querySelector('button'))
     : purchase?.phase === 'initial_invoice' ? $('provider-invoice')
@@ -1993,6 +1994,51 @@ const providerChoiceOpen = purchase => purchase?.vendor_choice_open === true &&
 // Anything other than a known vendor id counts as no choice yet.
 const providerChoice = purchase => ['vpsbg', 'lnvps'].includes(purchase?.vendor_choice) ? purchase.vendor_choice : null;
 const providerChoiceNeeded = purchase => providerChoiceOpen(purchase) && providerChoice(purchase) === null;
+const vpsbgInUse = purchase => providerChoice(purchase) === 'vpsbg' || purchase?.vendor?.id === 'vpsbg';
+const vpsbgAccount = purchase => vpsbgInUse(purchase) && purchase?.vendor_account?.vendor === 'vpsbg' ? purchase.vendor_account : null;
+let vpsbgReplacingToken = false;
+let vpsbgTokenCheck;
+const vpsbgTokenFormShowing = purchase => {
+  const account = vpsbgAccount(purchase);
+  return account?.entry_allowed === true && (account.key_set !== true || account.check === 'refused' || vpsbgReplacingToken);
+};
+const vpsbgBalance = purchase => {
+  const balance = purchase?.balance;
+  return vpsbgInUse(purchase) && Number.isSafeInteger(balance?.amount) && typeof balance.currency === 'string' && balance.currency.length > 0 ? balance : null;
+};
+const renderVpsbgToken = (purchase, enabled) => {
+  const section = $('vpsbg-token-section');
+  const account = vpsbgAccount(purchase);
+  if (account?.entry_allowed !== true || account?.check !== vpsbgTokenCheck) vpsbgReplacingToken = false;
+  vpsbgTokenCheck = account?.check;
+  const formShowing = vpsbgTokenFormShowing(purchase);
+  const saved = account?.key_set === true;
+  section.hidden = !formShowing && !saved;
+  for (const line of section.querySelectorAll('[data-vpsbg-token-explanation]')) line.hidden = !formShowing;
+  const form = $('vpsbg-token-form');
+  const field = form.querySelector('input');
+  form.hidden = !formShowing;
+  field.disabled = !enabled || !formShowing;
+  if (field.disabled) field.value = '';
+  form.querySelector('button[type="submit"]').disabled = field.disabled || !field.value.length;
+  const balance = vpsbgBalance(purchase);
+  $('vpsbg-token-status').textContent = !saved ? ''
+    : account.check === 'refused' ? (account.entry_allowed === true
+      ? "VPSBG refused this token. Check that it has write access and hasn't expired, then enter it again."
+      : "VPSBG refused this token, so this page can't reach your VPSBG account. Once a machine is ordered from VPSBG, this page can't take a new token.")
+    : account.check === 'unchecked' ? 'Token saved. Checking it with VPSBG…'
+    : account.check === 'works' ? `Token works.${balance ? ` Balance: ${readableMoney(balance.amount, balance.currency)}.` : ''}` : '';
+  section.querySelector('[data-vpsbg-token-stop]').hidden = !saved;
+  const replace = section.querySelector('[data-vpsbg-token-replace]');
+  replace.hidden = !saved || formShowing || account.entry_allowed !== true;
+  replace.disabled = !enabled;
+  replace.onclick = () => {
+    if (replace.disabled || replace.hidden) return;
+    vpsbgReplacingToken = true;
+    renderVpsbgToken(purchase, enabled);
+    renderSteps(renderedReport);
+  };
+};
 const renderProviderChoice = (purchase, enabled) => {
   const slot = $('provider-choice');
   slot.replaceChildren();
@@ -2136,7 +2182,10 @@ const renderProvider = (store, enabled) => {
     $('provider-image').replaceChildren(new Option('Choose a fetched image', ''));
   }
   renderProviderChoice(purchase, enabled);
-  if (providerChoiceNeeded(purchase)) $('provider-catalogue').disabled = true;
+  renderVpsbgToken(purchase, enabled);
+  const tokenNeeded = vpsbgTokenFormShowing(purchase) && (purchase.vendor_account.key_set !== true || purchase.vendor_account.check === 'refused');
+  $('provider-existing').hidden = tokenNeeded;
+  if (providerChoiceNeeded(purchase) || tokenNeeded) $('provider-catalogue').disabled = true;
   if ((!purchase.phase || purchase.phase === 'handed_off') && store.state === 'unlocked' &&
       !$('provider-machine').value && !providerMachineTyped) {
     const names = new Set([
@@ -2216,6 +2265,13 @@ const renderProvider = (store, enabled) => {
   const vpsbg = purchase.vendor?.id === 'vpsbg';
   const vendorName = purchase.vendor?.name;
   if (vpsbg) paragraph(progress, `Provider: ${typeof vendorName === 'string' && vendorName.trim() ? vendorName : 'VPSBG'}.`);
+  const balance = vpsbgBalance(purchase);
+  if (balance) {
+    const updated = epochSeconds(balance.read_at);
+    const line = paragraph(progress, `Balance at VPSBG: ${readableMoney(balance.amount, balance.currency)}.${updated !== undefined ? ` Updated ${localTime(updated * 1000)}.` : ''}`);
+    line.id = 'tau-vpsbg-balance';
+    line.dataset.cents = String(balance.amount);
+  }
   const wait = providerWait(purchase);
   // After a refusal, no purchase action can help: the way on is a new machine.
   const refused = wait?.kind === 'refused';
@@ -2253,7 +2309,11 @@ const renderProvider = (store, enabled) => {
     paragraph(progress, `${purchase.machine}: ${purchaseStatus(purchase)}`);
     rawDetails(progress, purchase, ['purchase-progress', purchase.machine]);
     if (!vpsbg) paragraph(progress, `Machine provider: ${purchase.origin}`);
-    paragraph(progress, `Automatic renewal: ${purchase.auto_renewal_enabled === true ? 'on' : purchase.auto_renewal_enabled === false ? 'off' : 'unknown'}. This page does not change it.`);
+    if (vpsbg) {
+      const paidUntil = epochSeconds(purchase.paid_until);
+      if (paidUntil !== undefined) paragraph(progress, `Paid until ${localTime(paidUntil * 1000)}.`);
+      paragraph(progress, `Automatic renewal at VPSBG: ${['on', 'off'].includes(purchase.renewal) ? purchase.renewal : 'unknown'}. This page does not change it.`);
+    } else paragraph(progress, `Automatic renewal: ${purchase.auto_renewal_enabled === true ? 'on' : purchase.auto_renewal_enabled === false ? 'off' : 'unknown'}. This page does not change it.`);
     if (purchase.billing) {
       const quote = purchase.billing.terms;
       paragraph(progress, `Price for the first period, before any account credit: ${readableMoney(boundInvoiceTotal(quote), quote.currency)} for ${readableDuration(quote.time)} (${readableMoney(quote.amount, quote.currency)}, tax ${readableMoney(quote.tax, quote.currency)}).`);
@@ -2322,6 +2382,21 @@ const renderProvider = (store, enabled) => {
   $('provider-invoice').hidden = purchase.phase !== 'initial_invoice' || refused;
   $('provider-invoice').disabled = !enabled || purchase.phase !== 'initial_invoice' || !purchase.billing || refused;
 };
+$('vpsbg-token-form').addEventListener('input', () => {
+  const form = $('vpsbg-token-form');
+  const field = form.querySelector('input');
+  form.querySelector('button[type="submit"]').disabled = field.disabled || !field.value.length;
+});
+$('vpsbg-token-form').addEventListener('submit', event => {
+  event.preventDefault();
+  const form = $('vpsbg-token-form');
+  const submit = form.querySelector('button[type="submit"]');
+  if (form.hidden || submit.disabled) return;
+  const field = form.querySelector('input'), bytes = new TextEncoder().encode(field.value); field.value = '';
+  submit.disabled = true;
+  try { worker.postMessage({provider_token: {vendor: 'vpsbg', token: bytes}}, [bytes.buffer]); }
+  finally { if (bytes.byteLength) bytes.fill(0); }
+});
 $('provider-key-form').addEventListener('submit', event => {
   event.preventDefault();
   $('provider-key').value = '';
@@ -2371,6 +2446,7 @@ const clearPocInputs = () => {
   $('provider-selection-view').replaceChildren();
   $('provider-progress').replaceChildren();
   $('provider-key').value = '';
+  $('vpsbg-token-form').querySelector('input').value = '';
   $('provider-email-address').value = '';
   creditGoalDrafts.clear();
   creditTemplateDrafts.clear();
