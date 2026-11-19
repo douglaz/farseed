@@ -16,6 +16,8 @@ const run = async ({arm = 59000, fire = 64000, change = '', credit = false, duri
     credit_request: async request => { assert.deepEqual(JSON.parse(request), {action:'poll'}); polls++; vm.runInContext(duringCredit, context); return '{}'; },
     reportStore: async () => {},
     retirementRequested: false,
+    // The scheduler slice now reads the page's initial presence for VPS.BG polling; none was sent (VPS.BG stays off).
+    initialPresence: undefined,
   });
   vm.runInContext(source + `
     lastReport = {state:'unlocked', lifecycle_state:'running', procurement:{payment:{id:'saved-payment',is_paid:false,expires:'1970-01-01T00:00:00Z'}},credit:{invoices:${credit ? "[{id:'credit-invoice',outcome:'pending',expires_at:120}]" : '[]'}}};
@@ -56,7 +58,8 @@ const makeReady = ({now=100000, paidAt=100, handoff=false, boundary=false}={}) =
  let clock=now, serial=0, key=true, generation=1n, dispatches=[], timers=new Map(), response, floorUntil=0, held;
  const p={identity:{index:1},phase:'payment_readiness',payment:{id:'paid',is_paid:true},paid_at:paidAt,readiness_poll_seconds:60,readiness_wait_seconds:10800,target:handoff?{}:null};
  const report={state:'unlocked',lifecycle_state:'running',procurement:p};
- const context=vm.createContext({Date:{now:()=>clock,parse:Date.parse},retirementRequested:false,provider_key_is_set:()=>key,provider_action_delay:()=>Math.max(0,floorUntil-clock),publication_generation:()=>generation,
+ // initialPresence: undefined, as when the page sent none (VPS.BG polling stays off; the slice reads it on load).
+ const context=vm.createContext({Date:{now:()=>clock,parse:Date.parse},retirementRequested:false,initialPresence:undefined,provider_key_is_set:()=>key,provider_action_delay:()=>Math.max(0,floorUntil-clock),publication_generation:()=>generation,
   setTimeout:(callback,delay)=>{const id=++serial;timers.set(id,{callback,delay});return id;},clearTimeout:id=>timers.delete(id),
   provider_request:async request=>{dispatches.push({action:JSON.parse(request).action,at:clock});if(held){const wait=held;held=null;await wait;}return JSON.stringify(response??report);},credit_request:async()=>{throw Error('unexpected credit read');},open:async()=>JSON.stringify(report),
   reportStore:async value=>{vm.runInContext('lastReport = '+value,context);},
@@ -70,7 +73,7 @@ const makeReady = ({now=100000, paidAt=100, handoff=false, boundary=false}={}) =
     try{return operation(value);}finally{marks.worker_json_ms+=clock-started;}
    },
    publish_unlock_worker_timings:async()=>{},
-   task_presence:()=>{}, initialPresence:undefined,
+   task_presence:()=>{}, initialPresence:undefined, vpsbg_presence:()=>{},
    publish_report:async()=>{}, provider_visibility:()=>{},
    lifecycle_transition:async()=>vm.runInContext('JSON.stringify(lastReport)',context),
    unlock:async()=>vm.runInContext('JSON.stringify({...lastReport,state:"unlocked"})',context),
