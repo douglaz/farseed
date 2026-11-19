@@ -20,6 +20,8 @@ crate-type = ["cdylib", "rlib"]
 # (`scripts/build-web.sh served`).
 tracer = []
 history-bench = []
+# Browser read-mechanism barriers and observations; never enabled by the served build.
+read-hooks = []
 
 [[bin]]
 name = "history-bench"

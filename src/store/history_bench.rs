@@ -569,6 +569,11 @@ fn measure(files: &Files, oldest: &str, meter: &MemoryMeter) -> BenchResult<Samp
     let peak = (meter.peak)().saturating_sub(baseline);
     let marks = unlock_marks::snapshot();
     sample.extend(marks);
+    sample.insert("modelled_browser_read_ms_today", sample["records"] * 0.85);
+    sample.insert(
+        "modelled_browser_read_ms_window32",
+        sample["records"] * 0.100,
+    );
     sample.insert("memory_baseline_bytes", baseline as f64);
     // No native message post exists; retain the round-1 field as an explicit zero.
     sample.insert("publish_post_ms", 0.0);
@@ -770,6 +775,10 @@ pub fn run(meter: MemoryMeter) -> BenchResult<()> {
         columns.push((size, median));
     }
     println!("budget_cutoff {cutoff}");
+    println!("modelled_browser_read_ms_today: modelled, r8 2026-11-19 warm, per record, 0.85 ms");
+    println!(
+        "modelled_browser_read_ms_window32: modelled, probe 2026-11-19, 32 in flight, warm, 0.100 ms"
+    );
     print!("{:<40}", "metric");
     for (size, _) in &columns {
         print!(" {size:>16}");

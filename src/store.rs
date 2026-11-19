@@ -133,12 +133,34 @@ pub trait Storage {
     async fn list(&self) -> Result<Vec<String>, String>;
     /// The bytes of `name`.
     async fn read(&self, name: &str) -> Result<Vec<u8>, String>;
+    /// A replay-scoped reader. The default keeps native storage and benchmarks sequential.
+    /// Construction does no I/O; replay performs its gap check before the first read.
+    fn reader(&self, _numbers: &[u64]) -> ReplayReader {
+        ReplayReader::Sequential
+    }
     /// Writes `bytes` as the whole of `name`, creating it if absent. In OPFS this is
     /// `getFileHandle(name, { create: true })`, which makes an empty entry at once, then
     /// `createWritable()`, `write()` and `close()`, which commits the contents.
     async fn write(&self, name: &str, bytes: &[u8]) -> Result<(), String>;
     /// Moves `from` onto `to`, which silently replaces an existing `to`.
     async fn rename(&self, from: &str, to: &str) -> Result<(), String>;
+}
+
+/// Owns read-ahead without borrowing the candidate Store or giving tasks access to it.
+pub enum ReplayReader {
+    Sequential,
+    #[cfg(target_arch = "wasm32")]
+    Opfs(opfs::Reader),
+}
+
+impl ReplayReader {
+    async fn read<S: Storage>(&mut self, storage: &S, number: u64) -> Result<Vec<u8>, String> {
+        match self {
+            Self::Sequential => storage.read(&number.to_string()).await,
+            #[cfg(target_arch = "wasm32")]
+            Self::Opfs(reader) => reader.read(number).await,
+        }
+    }
 }
 
 /// PBKDF2-HMAC-SHA-256 at [`ITERATIONS`], 32 bytes out: WebCrypto's in the worker, the `pbkdf2`
@@ -1786,7 +1808,8 @@ impl<S: Storage> Store<S> {
             }
         }
         numbers.sort_unstable();
-        for (expected, number) in (FIRST..).zip(numbers) {
+        let mut reader = None;
+        for (expected, &number) in (FIRST..).zip(&numbers) {
             if number != expected {
                 return Err(format!(
                     "record {expected} is missing before record {number}; replay stopped"
@@ -1794,15 +1817,20 @@ impl<S: Storage> Store<S> {
             }
             let read_timing = unlock_marks::Timer::new(unlock_marks::Mark::Read);
             read_timing.count(unlock_marks::Counter::Records, 1);
-            let bytes = self.storage.read(&number.to_string()).await?;
+            let reader = reader.get_or_insert_with(|| self.storage.reader(&numbers));
+            let bytes = reader.read(&self.storage, number).await?;
             read_timing.count(unlock_marks::Counter::RecordBytes, bytes.len() as u64);
             drop(read_timing);
+            #[cfg(all(target_arch = "wasm32", feature = "read-hooks"))]
+            opfs::read_hooks::order("open", number);
             let (event, _plaintext) = self
                 .open_record(number, &bytes)
                 .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
             // Release this record's buffers before reading the next one. With multiple faults,
             // an earlier apply refusal precedes a later missing/read/open refusal.
             let apply_timing = unlock_marks::Timer::new(unlock_marks::Mark::Apply);
+            #[cfg(all(target_arch = "wasm32", feature = "read-hooks"))]
+            opfs::read_hooks::order("apply", number);
             match (number, &event) {
                 (FIRST, Event::Seed { mnemonic }) => {
                     let seed = Seed::import(mnemonic).map_err(|e| {
@@ -2664,6 +2692,10 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         if !matches!(self.state, State::Locked) {
             return self.report(Some("only a locked store is unlocked"));
         }
+        // Under local(): previous abandoned browser calls keep their rejection handlers
+        // until settlement. A retire followed by unlock must drain them before another reader.
+        #[cfg(target_arch = "wasm32")]
+        opfs::drain_reads().await;
         self.state = match unlock(self.storage.clone(), &self.kdf, passphrase).await {
             Ok(mut store) => {
                 self.restore_deployment(&mut store);
