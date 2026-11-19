@@ -106,8 +106,8 @@ pub const STAGING: &str = "staging";
 pub const FIRST: u64 = 0;
 /// PBKDF2-HMAC-SHA-256's work factor, the format's and nothing else.
 pub const ITERATIONS: u32 = 600_000;
-/// The shortest local passphrase, in Unicode code points.
-pub const MIN_PASSPHRASE: usize = 16;
+/// The recommended shortest local passphrase, in Unicode code points; not enforced.
+pub const RECOMMENDED_PASSPHRASE: usize = 16;
 
 /// What a failed unlock reports. A wrong passphrase and a modified envelope fail the same tag,
 /// so it claims neither.
@@ -489,17 +489,9 @@ pub async fn create<S: Storage>(
     kdf: &impl Kdf,
     passphrase: LocalPassphrase,
 ) -> Result<Store<S>, Failure> {
-    // Counted as Unicode code points of the UTF-8 received, never UTF-16 units; neither
-    // normalized nor trimmed.
-    let length = std::str::from_utf8(&passphrase.0)
-        .map_err(|_| Failure::Input("The passphrase is not UTF-8.".into()))?
-        .chars()
-        .count();
-    if length < MIN_PASSPHRASE {
-        return Err(Failure::Input(format!(
-            "The passphrase has {length} characters; at least {MIN_PASSPHRASE} are needed."
-        )));
-    }
+    // Validate UTF-8 without enforcing a length, normalizing or trimming.
+    std::str::from_utf8(&passphrase.0)
+        .map_err(|_| Failure::Input("The passphrase is not UTF-8.".into()))?;
     match probe(&storage).await {
         Ok(Found::NoStore) => {}
         Ok(Found::Envelope) => return Err(Failure::Refused("a store already exists".into())),
@@ -4013,14 +4005,14 @@ mod tests {
     }
 
     #[test]
-    fn the_passphrase_has_16_code_points_at_least_and_is_neither_trimmed_nor_normalized() {
+    fn a_passphrase_of_any_length_is_accepted_and_is_neither_trimmed_nor_normalized() {
         let create_with =
             |text: &str| block_on(create(MemoryStorage::default(), &kdf(), pass(text)));
-        let refused = |text: &str| matches!(create_with(text), Err(Failure::Input(_)));
-        assert!(refused("fifteen chars!!"), "15 code points");
+        assert!(create_with("").is_ok(), "0 code points");
+        assert!(create_with("fifteen chars!!").is_ok(), "15 code points");
         assert!(create_with("sixteen chars!!!").is_ok(), "16 code points");
         assert!(
-            refused(&"\u{1F600}".repeat(8)),
+            create_with(&"\u{1F600}".repeat(8)).is_ok(),
             "8 astral characters, 16 UTF-16 units"
         );
         assert!(create_with(&"\u{1F600}".repeat(16)).is_ok());

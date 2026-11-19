@@ -1546,9 +1546,10 @@ the host tests run.
 
 **Creating a store.**
 
-- The passphrase must be at least 16 Unicode code points of the UTF-8 the worker receives. It
-  is never normalized or trimmed. The page asks for it twice, compares the two, states the
-  minimum and encourages a password manager.
+- A passphrase of 16 Unicode code points is recommended, not enforced; a short or empty one is
+  accepted after the warning. The worker requires UTF-8 without normalization or trimming. The
+  page encourages a password manager and asks for confirmation only when the passphrase is non-empty.
+  In this version the passphrase cannot be reset or changed later.
 - The envelope is written first, then the seed record.
 - A worker killed before the envelope's move leaves no store, at most a staging file, and Create
   is offered again.
@@ -1642,9 +1643,9 @@ one, as a killed worker does. They show, for `CNF-82` and `CNF-15`:
 - **Kills.** A worker killed at every storage operation of an append leaves the record wholly
   present or absent. Killed at every operation of a creation, it leaves no store or an envelope
   whose unlock finishes the creation, never a refusal or a second seed.
-- **The passphrase.** 15 code points are refused, as are eight astral characters (16 UTF-16
-  units), and 16 are accepted. Spaces around it, and the difference between composed and
-  decomposed characters, are kept.
+- **The passphrase.** 16 Unicode code points are recommended, not enforced; a short or empty one
+  is accepted after the warning. Spaces around it, and the difference between composed and
+  decomposed characters, are kept. Invalid UTF-8 is refused.
 - **The bound.** With the next record number set one below 2^32−1, the append commits; at
   2^32−1 it is refused, with no storage operation and nothing applied.
 - **No plaintext.** The persisted bytes hold none of the secrets listed in the tracer's
@@ -2492,7 +2493,8 @@ The cases:
 | setup class questions, each build | no checked, selected, autofocus, focus or keyboard default before answering or after reload; Not sure is multi-tenant and No is single-purpose in the independent reader; maintained access with ad-hoc revision; second answer refuses |
 | setup non-operator inputs, each build | extra dispatch/collection members and malformed page messages change no journal or store state, supply no question or answer and seal nothing |
 | setup ceremony refusal, each build | locked and ceremony-active approval attempts append nothing |
-| create and unlock (twr-ggw.5, `CNF-82`) | the page offers Create, stating the 16-character minimum and a password manager, and refuses 15 characters. The independent reader reads the store the browser created, from the passphrase alone: record 0, the seed. A store the reader built, put into OPFS, unlocks in the browser and replays its command, and the unlock writes nothing: WebCrypto's PBKDF2 agrees with the host's |
+| create and unlock (twr-ggw.5, `CNF-82`) | the page offers Create, recommends 16 characters or more and a password manager, and says the passphrase may be left empty. Typing 15 characters and then clearing the field shows the short and empty warnings without pressing Create; the case then creates with its long passphrase. The independent reader reads the store the browser created, from the passphrase alone: record 0, the seed. A store the reader built, put into OPFS, unlocks in the browser and replays its command, and the unlock writes nothing: WebCrypto's PBKDF2 agrees with the host's |
+| optional passphrase (`passphrase_cases.c001.p001`, full run) | in a fresh HTTPS origin, Create with an empty passphrase needs no Confirm; reload and explicit Lock each require an Unlock press with nothing typed, and seed re-display also requires that press and shows the same twelve words. A second fresh origin accepts a 15-character passphrase after its warning; input events show Confirm as soon as the passphrase is non-empty |
 | seed-backup create and mismatch, each build | twelve numbered words match the independent reader; dispatch contacts neither fixture; answering leaves the same complete document and field values as an independent seed; another valid mnemonic restores display without an append; tracer allocation refuses in all families |
 | seed-backup collision controls, four per build | fixed-text words and adjacent phrases cause no false finding; seed-independent answering, lock, re-display and wrong-passphrase documents agree; twelve planted hidden word elements and a hidden reserved claim alongside displayed words are reported; cross-word language collisions cause no finding; mismatch and durable full re-entry work |
 | seed-backup full re-entry and explicit skip, each build | independent decryption reads the distinct completion for its own seed identifier; the page names it; restart retains it without display; tracer reservations start at zero in every family, then one after restart |

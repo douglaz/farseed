@@ -888,6 +888,7 @@ pub fn passphrase_role(passphrase: &str) -> &'static str {
         super::SERVED_PASSPHRASE => "store.served",
         super::WRONG_PASSPHRASE => "wrong",
         super::HOST_PASSPHRASE => "store.host",
+        "" => "creation.empty",
         "fifteen chars!!" => "creation.short",
         _ => "unknown",
     }

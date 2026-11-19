@@ -84,6 +84,15 @@ without implicitly ending the session, erasing uncertain effects or stopping bil
   facts, protected outcomes, budgets and uncertainty. There are no bundle briefs or generic
   context-restoration subsystem. Outgoing facts project machine names and approved entry/access
   data without journal-only seed/allocation associations; canonical encrypted records retain them.
+- **D6:** A local passphrase of 16 Unicode code points is recommended, but any length, empty
+  included, is accepted after a plain warning, on the owner's explicit direction: "this should
+  be optional"; "perhaps we recommend 16 chars min, but accept anything including zero".
+  This departs from credential-format-v1's 16-code-point minimum, STA-23's "The operator chooses
+  a local passphrase" and "no plaintext or device-synced fallback", SEC-5 rows 5, 6, 14, 15,
+  18–20 and 23, STA-17's lost-phone clause, and CNF-15/STG-10 (no credential in cleartext in
+  browser storage). An empty passphrase protects nothing beyond the phone and the browser
+  profile: one PBKDF2 run with the stored salt opens the store. Re-display and "never re-display
+  words automatically" are unchanged. No passphrase change exists in this build.
 
 Focused native `poc_session_` tests cover refusal, restoration, dormant exclusivity, admission
 scanning, scoped End and held/failed/lost append acknowledgements. Real-page cases

@@ -1073,6 +1073,10 @@ const CASES: &[(&str, &str)] = &[
         "main.c022.p002",
         "no plaintext in the tracer build (twr-ggw.5 AC4, AC5, CNF-15, STG-10)",
     ),
+    (
+        "passphrase_cases.c001.p001",
+        "empty passphrase create, reload, lock and seed re-display; short create in a second fresh origin",
+    ),
 ];
 
 pub fn cases() -> Value {

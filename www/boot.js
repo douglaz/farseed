@@ -264,6 +264,17 @@ const clearDetails = () => {
   deliveryDetails.commands.clear();
 };
 let taskDetailsStore;
+const updateCreatePassphrase = (state, error) => {
+  const value = $('passphrase').value;
+  $('confirm-field').hidden = state !== 'none' || value === '';
+  if (value === '') $('confirm').value = '';
+  const warning = $('passphrase-warning');
+  warning.hidden = state !== 'none' || [...value].length >= 16 ||
+    (value === '' && error === 'The two passphrases differ.');
+  warning.textContent = value === ''
+    ? "With no passphrase, anyone who can open this browser on this phone, or who has a copy of its data, can open tau-web: your machines' keys, your provider account (which can buy machines with your money) and your AI credit."
+    : "A passphrase shorter than 16 characters can be guessed by anyone who has a copy of this browser's data.";
+};
 const render = (store, forceRender = false) => {
   let report;
   if (store.payment_timer === true) {
@@ -329,7 +340,8 @@ const render = (store, forceRender = false) => {
   $('store-explanation').textContent = state === 'refused'
     ? `The local store is refused: ${store.reason}. Reload the page to try again.` : '';
   if (store.lifecycle_state) $('store-state').textContent += ` Session state: ${store.lifecycle_state}.`;
-  $('create-help').hidden = $('confirm-field').hidden = $('create').hidden = state !== 'none';
+  $('create-help').hidden = $('create').hidden = state !== 'none';
+  updateCreatePassphrase(state, store.error);
   $('passphrase-field').hidden = state !== 'none' && state !== 'locked';
   $('passphrase').autocomplete = state === 'none' ? 'new-password' : 'current-password';
   $('passphrase').enterKeyHint = state === 'none' ? 'next' : 'go';
@@ -2488,7 +2500,7 @@ const send = (kind) => {
   }
   const passphrase = $('passphrase');
   const confirm = $('confirm');
-  const differ = kind === 'create' && passphrase.value !== confirm.value;
+  const differ = kind === 'create' && passphrase.value !== '' && passphrase.value !== confirm.value;
   const bytes = differ ? null : new TextEncoder().encode(passphrase.value);
   passphrase.value = '';
   confirm.value = '';
@@ -2505,6 +2517,7 @@ const send = (kind) => {
 };
 $('create').addEventListener('click', () => send('create'));
 $('unlock').addEventListener('click', () => send('unlock'));
+$('passphrase').addEventListener('input', () => updateCreatePassphrase($('store').dataset.state));
 $('passphrase').addEventListener('keydown', event => {
   if (event.key !== 'Enter' || event.isComposing) return;
   if (!$('unlock').hidden && !$('unlock').disabled) {
@@ -2512,7 +2525,7 @@ $('passphrase').addEventListener('keydown', event => {
     $('unlock').click();
   } else if (!$('create').hidden) {
     event.preventDefault();
-    $('confirm').focus();
+    if ($('passphrase').value !== '') $('confirm').focus();
   }
 });
 $('confirm').addEventListener('keydown', event => {

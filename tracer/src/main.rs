@@ -56,6 +56,7 @@ mod mode_cases;
 mod observer;
 mod operation_windows;
 mod page_queries;
+mod passphrase_cases;
 mod poc_fixture;
 mod predicate_inputs;
 mod reader;
@@ -295,6 +296,18 @@ async fn run(served: &Path, tracer: &Path, mode: &str) -> Result<(), String> {
         Some(served_policy.clone()),
     )
     .await;
+    let (empty_passphrase_origin, _empty_passphrase_requests) = fixtures::https(
+        tracer.to_path_buf(),
+        tls.acceptor.clone(),
+        Some(served_policy.clone()),
+    )
+    .await;
+    let (short_passphrase_origin, _short_passphrase_requests) = fixtures::https(
+        tracer.to_path_buf(),
+        tls.acceptor.clone(),
+        Some(served_policy.clone()),
+    )
+    .await;
     println!(
         "fixture sshd 127.0.0.1:{}, relay fixture {}",
         sshd.port, relay.url
@@ -334,6 +347,7 @@ async fn run(served: &Path, tracer: &Path, mode: &str) -> Result<(), String> {
         &context,
         &served_origin,
         &tracer_origin,
+        [&empty_passphrase_origin, &short_passphrase_origin],
         &served_policy,
         &[&served_requests, &tracer_requests],
         &mut cases,
@@ -1130,6 +1144,7 @@ async fn run_cases(
     run: &Run<'_>,
     served_origin: &str,
     tracer_origin: &str,
+    passphrase_origins: [&str; 2],
     served_policy: &str,
     requests: &[&fixtures::Requests],
     cases: &mut Vec<Case>,
@@ -1337,22 +1352,34 @@ async fn run_cases(
     let mut case = Case::new("main.c002", "create and unlock (twr-ggw.5, CNF-82)");
     let view = run.view_at("view.main.initial_tracer", &tab).await?;
     case.check("main.a014",
-        "with no store, the page offers Create, stating the 16-character minimum and a password manager",
+        "with no store, Create recommends 16 characters or more and a password manager, and permits leaving the passphrase empty",
         state_inputs::all!(view.primary("main.a014"), browser
                 .evaluate(&tab.session, "document.getElementById('tau-create-help').textContent")
                 .await?
                 .as_str()
-                .is_some_and(|t| t.contains("at least 16 characters") && t.contains("password manager")),)
+                .is_some_and(|t| t.contains("16 characters or more") && t.contains("leave it empty") && t.contains("password manager")),)
     );
-    let short = run.submit(&tab, "create", "fifteen chars!!").await?;
+    let warnings = browser
+        .evaluate(
+            &tab.session,
+            r#"(() => {
+                const passphrase = document.getElementById('tau-passphrase');
+                const warning = document.getElementById('tau-passphrase-warning');
+                passphrase.value = 'fifteen chars!!';
+                passphrase.dispatchEvent(new Event('input', {bubbles: true}));
+                const short = warning.hidden === false && warning.textContent.includes('shorter than 16 characters');
+                passphrase.value = '';
+                passphrase.dispatchEvent(new Event('input', {bubbles: true}));
+                return short && warning.hidden === false && warning.textContent.includes('With no passphrase') &&
+                    document.getElementById('tau-store').dataset.state === 'none' &&
+                    document.getElementById('tau-create').hidden === false;
+            })()"#,
+        )
+        .await?;
     case.check(
         "main.a015",
-        "a passphrase of 15 characters is refused, and Create is still offered",
-        short["store"] == "none"
-            && short["create"] == true
-            && short["text"]
-                .as_str()
-                .is_some_and(|t| t.contains("at least 16")),
+        "typing a short passphrase and then clearing it shows each warning without pressing Create",
+        warnings == true,
     );
     let view = run.submit(&tab, "create", PASSPHRASE).await?;
     case.check(
@@ -3367,6 +3394,7 @@ async fn run_cases(
     if completion::rejects("main.same_browser.policy_and_command", !both) {
         return Err("required same-browser policy/command relation failed".into());
     }
+    passphrase_cases::run(run, passphrase_origins, cases).await?;
     Ok(())
 }
 
