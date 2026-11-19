@@ -226,7 +226,9 @@ const renderSteps = store => {
   emphasize('store', [$('create'), $('unlock'), $('seed-backup-answer'), $('seed-backup-check'), $('redisplay')]);
   emphasize('credit', [$('credit-invoice'), $('credit-check'), $('credit-configure'), $('poc-inference-form').querySelector('button')]);
   const purchase = store.procurement;
-  const machineAction = !store.provider_configuration?.key_set ? $('provider-catalogue')
+  // After a refusal the page offers no purchase action: the way on is a new machine.
+  const machineAction = purchase?.phase && providerWait(purchase)?.kind === 'refused' ? null
+    : !store.provider_configuration?.key_set ? $('provider-catalogue')
     : purchase?.phase === 'email_verification' ? (purchase.email_entered ? $('provider-email-check') : $('provider-email-form').querySelector('button'))
     : purchase?.phase === 'initial_invoice' ? $('provider-invoice')
     : purchase?.phase && !['terms_changed', 'handed_off'].includes(purchase.phase) ? $('provider-resume')
@@ -460,6 +462,40 @@ const purchaseStatus = purchase => ({
   handed_off: 'Machine ready.',
   terms_changed: 'The price or setup changed. Review the updated plan before approving it.'
 })[purchase.phase] ?? 'Purchase status is unavailable. Open Details for the saved information.';
+// Epoch seconds the page can show as a date; anything else (not a number, or outside the Date range) is dropped.
+const epochSeconds = value => typeof value === 'number' && Number.isFinite(new Date(value * 1000).getTime()) ? value : undefined;
+const providerIdentityWait = deadline => {
+  const text = 'The machine is proving its identity to this page.';
+  return epochSeconds(deadline) !== undefined
+    ? `${text} It has until ${localTime(deadline * 1000)} (in ${Math.max(0, Math.ceil((deadline - Date.now() / 1000) / 60))} minutes).`
+    : text;
+};
+const providerWait = purchase => {
+  if (purchase.vendor?.id !== 'vpsbg') return null;
+  const image = purchase.image && typeof purchase.image === 'object' && typeof purchase.image.state === 'string' ? purchase.image : null;
+  const introduction = purchase.introduction;
+  if (introduction?.state === 'accepted') return null;
+  let wait;
+  // A refusal is final, so no other wait may hide it.
+  if (introduction?.state === 'expired') {
+    wait = {kind: 'refused', text: "The machine didn't prove its identity in time, so this page won't connect to it.",
+      helper: 'The only safe way on is a new machine: delete this one (its unused time goes back to your VPSBG balance) and create it again.',
+      started: introduction.started};
+  } else if (image && !['ready', 'added'].includes(image.state)) {
+    wait = {kind: 'image', text: image.state === 'failed'
+      ? "VPSBG couldn't fetch the machine's system image."
+      : "VPSBG is fetching the machine's system image (about 745 MB). This usually takes a few minutes.", started: image.started};
+  } else if (introduction?.state === 'waiting') {
+    wait = {kind: 'identity', text: providerIdentityWait(introduction.deadline),
+      helper: 'On first start the machine signs its own key with a one-time key this page gave it. This page connects only to that signed key.',
+      deadline: introduction.deadline, started: introduction.started};
+  } else if (!purchase.target && ['create_uncertain', 'initial_invoice', 'invoice_uncertain', 'payment_readiness'].includes(purchase.phase)) {
+    wait = {kind: 'create', text: "VPSBG is creating the machine. It's ready when VPSBG says it's active."};
+  } else return null;
+  if (epochSeconds(wait.deadline) === undefined) delete wait.deadline;
+  wait.started = epochSeconds(wait.started) !== undefined ? ` Started ${localTime(wait.started * 1000)}.` : '';
+  return wait;
+};
 const pauseMessages = new Map();
 const pauseGroup = (reasons, message) => reasons.forEach(reason => pauseMessages.set(reason, message));
 pauseGroup(['unknown task', 'stale or ended task', 'task ended'], 'This task is no longer available to continue. Review its saved details.');
@@ -1741,12 +1777,14 @@ const invoiceControls = (parent, savedInvoice, expires, total) => {
 let providerCloseState = {purchase: {}, enabled: false};
 const updateProviderClose = () => {
   const {purchase, enabled} = providerCloseState;
-  const closeEligible = Boolean(purchase.vm_id) && !purchase.target && (!purchase.payment || (purchase.payment.is_paid === false && Math.floor(Date.parse(purchase.payment.expires) / 1000) <= Math.floor(Date.now() / 1000)));
+  const closeEligible = Boolean(purchase.vm_id) && !purchase.target && (!purchase.payment || (purchase.payment.is_paid === false && Math.floor(Date.parse(purchase.payment.expires) / 1000) <= Math.floor(Date.now() / 1000)))
+    && providerWait(purchase)?.kind !== 'refused';
   $('provider-close').hidden = !closeEligible;
   $('provider-close').disabled = !enabled || !closeEligible;
 };
 setInterval(() => {
   for (const node of document.querySelectorAll('[data-invoice-expires]')) node.textContent = `${Math.max(0, Math.ceil((Number(node.dataset.invoiceExpires) - Date.now() / 1000) / 60))} minutes left`;
+  for (const node of document.querySelectorAll('#tau-provider-wait[data-wait="identity"][data-deadline]')) node.firstChild.textContent = providerIdentityWait(Number(node.dataset.deadline));
   updateProviderClose();
 }, 1000);
 // Measured by the test side on 2026-11-18 with the default model: 0.14-0.17 USD per setup
@@ -1950,6 +1988,23 @@ const renderProvider = (store, enabled) => {
     rawDetails(selection, purchase.selection, ['purchase', purchase.origin, purchase.account ?? null]);
   }
   const progress = $('provider-progress'); progress.replaceChildren();
+  const vpsbg = purchase.vendor?.id === 'vpsbg';
+  const vendorName = purchase.vendor?.name;
+  if (vpsbg) paragraph(progress, `Provider: ${typeof vendorName === 'string' && vendorName.trim() ? vendorName : 'VPSBG'}.`);
+  const wait = providerWait(purchase);
+  // After a refusal, no purchase action can help: the way on is a new machine.
+  const refused = wait?.kind === 'refused';
+  if (wait) {
+    const line = paragraph(progress, wait.text);
+    line.id = 'tau-provider-wait';
+    line.dataset.wait = wait.kind;
+    if (wait.deadline !== undefined) line.dataset.deadline = String(wait.deadline);
+    if (wait.started) line.append(wait.started);
+    if (wait.helper) {
+      const helper = paragraph(progress, '');
+      const text = document.createElement('small'); text.textContent = wait.helper; helper.append(text);
+    }
+  }
   if (purchase.closed) {
     paragraph(progress, 'The provider no longer has the earlier machine or its payment records, and this purchase recorded no payment. You can approve a new purchase. If you paid, keep your proof of payment; these checks cannot establish whether you paid.');
     rawDetails(progress, {closed: purchase.closed}, ['purchase-closed']);
@@ -1957,7 +2012,7 @@ const renderProvider = (store, enabled) => {
   if (purchase.phase) {
     paragraph(progress, `${purchase.machine}: ${purchaseStatus(purchase)}`);
     rawDetails(progress, purchase, ['purchase-progress', purchase.machine]);
-    paragraph(progress, `Machine provider: ${purchase.origin}`);
+    if (!vpsbg) paragraph(progress, `Machine provider: ${purchase.origin}`);
     paragraph(progress, `Automatic renewal: ${purchase.auto_renewal_enabled === true ? 'on' : purchase.auto_renewal_enabled === false ? 'off' : 'unknown'}. This page does not change it.`);
     if (purchase.billing) {
       const quote = purchase.billing.terms;
@@ -1971,7 +2026,7 @@ const renderProvider = (store, enabled) => {
       paragraph(progress, `Price, before any account credit: ${readableMoney(boundInvoiceTotal(pay), pay.currency)} (amount ${readableMoney(pay.amount, pay.currency)}, tax ${readableMoney(pay.tax, pay.currency)}).`);
       if (pay.processing_fee !== 0) paragraph(progress, `Its processing fee of ${readableMoney(pay.processing_fee, pay.currency)} is not part of the Lightning invoice.`);
       paragraph(progress, `Invoice ${pay.is_paid ? 'paid' : 'awaiting payment'}; expires ${pay.expires}. Amount ${pay.amount}, tax ${pay.tax}, processing fee ${pay.processing_fee} (${pay.currency === 'BTC' ? 'millisats' : pay.currency + ' cents'}).`);
-      if (!pay.is_paid) {
+      if (!pay.is_paid && !refused) {
         invoiceControls(progress, pay.data.lightning, Math.floor(Date.parse(pay.expires) / 1000), lightningMillisats(pay));
         const check = document.createElement('button'); check.type = 'button'; check.textContent = 'Check now'; check.disabled = !enabled;
         check.addEventListener('click', () => providerRequest({action:'payment_check'})); progress.append(check);
@@ -2021,10 +2076,10 @@ const renderProvider = (store, enabled) => {
   providerCloseState = {purchase, enabled};
   updateProviderClose();
   $('provider-resume').textContent = ['approved', 'registered'].includes(purchase.phase) ? 'Create the server' : 'Check the order again';
-  $('provider-resume').hidden = !purchase.phase || purchase.phase === 'handed_off';
-  $('provider-resume').disabled = !enabled || !purchase.phase;
-  $('provider-invoice').hidden = purchase.phase !== 'initial_invoice';
-  $('provider-invoice').disabled = !enabled || purchase.phase !== 'initial_invoice' || !purchase.billing;
+  $('provider-resume').hidden = !purchase.phase || purchase.phase === 'handed_off' || refused;
+  $('provider-resume').disabled = !enabled || !purchase.phase || refused;
+  $('provider-invoice').hidden = purchase.phase !== 'initial_invoice' || refused;
+  $('provider-invoice').disabled = !enabled || purchase.phase !== 'initial_invoice' || !purchase.billing || refused;
 };
 $('provider-key-form').addEventListener('submit', event => {
   event.preventDefault();
