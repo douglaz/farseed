@@ -1,100 +1,219 @@
-//! Bounded provider protocol. Responses are observations, never instructions.
+//! LNVPS protocol, recipes and projections. No transport or journal ownership.
+use super::*;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use k256::schnorr::SigningKey;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
 
 pub const ORIGIN: &str = "https://api.lnvps.net";
-pub const REFUSED: &str = "Provider response refused; saved identities remain unchanged.";
-pub const INCOMPLETE: &str = "Provider request incomplete or browser access unavailable; unlock and Refresh the saved purchase. Uncertain operations are never resent.";
+pub(super) const NAME: &str = "LNVPS";
 pub(crate) const EMAIL_REQUIRED: &str = "Email verification is required before creating a VM";
-pub const BODY_LIMIT: usize = 256 * 1024;
 
-/// Strict origin grammar, checked before any URL parser can repair forbidden input.
-pub(crate) fn provider_origin(input: &str) -> Result<String, String> {
-    const INVALID: &str = "Enter an HTTPS provider origin with a DNS or IP host and optional port; no credentials, path, query, fragment, whitespace or backslash.";
-    let refuse = || INVALID.to_string();
-    if input.len() > 320
-        || input.chars().any(|c| c.is_whitespace() || c.is_control())
-        || input.contains(['@', '?', '#', '\\', '%'])
-    {
-        return Err(refuse());
-    }
-    let authority = input.strip_prefix("https://").ok_or_else(refuse)?;
-    let authority = authority.strip_suffix('/').unwrap_or(authority);
-    if authority.is_empty() || authority.contains('/') {
-        return Err(refuse());
-    }
-    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
-        let (host, suffix) = rest.split_once(']').ok_or_else(refuse)?;
-        let ip = host.parse::<std::net::Ipv6Addr>().map_err(|_| refuse())?;
-        // Browsers serialize mapped IPv6 using hexadecimal segments as well.
-        let host = if let Some(ip4) = ip.to_ipv4_mapped() {
-            let bytes = ip4.octets();
-            format!(
-                "::ffff:{:x}:{:x}",
-                u16::from_be_bytes([bytes[0], bytes[1]]),
-                u16::from_be_bytes([bytes[2], bytes[3]])
-            )
-        } else {
-            ip.to_string()
-        };
-        let port = if suffix.is_empty() {
-            None
-        } else {
-            Some(suffix.strip_prefix(':').ok_or_else(refuse)?)
-        };
-        (format!("[{host}]"), port)
-    } else {
-        let (host, port) = authority
-            .split_once(':')
-            .map_or((authority, None), |(h, p)| (h, Some(p)));
-        let host = host.to_ascii_lowercase();
-        let dns = host.strip_suffix('.').unwrap_or(&host);
-        if dns.is_empty()
-            || dns.len() > 253
-            || dns.split('.').any(|label| {
-                label.is_empty()
-                    || label.len() > 63
-                    || !label.as_bytes()[0].is_ascii_alphanumeric()
-                    || !label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-                    || !label
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-            })
-        {
-            return Err(refuse());
-        }
-        let last = dns.rsplit('.').next().ok_or_else(refuse)?;
-        // Refuse alternative numeric IPv4 forms that fetch would reinterpret.
-        if (last.bytes().all(|b| b.is_ascii_digit())
-            || last
-                .strip_prefix("0x")
-                .is_some_and(|s| s.bytes().all(|b| b.is_ascii_hexdigit())))
-            && (host.parse::<std::net::Ipv4Addr>().is_err() || host != dns)
-        {
-            return Err(refuse());
-        }
-        (host, port)
-    };
-    let port = port
-        .map(|p| {
-            if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(refuse());
-            }
-            p.parse::<u16>().map_err(|_| refuse())
-        })
-        .transpose()?;
-    Ok(match port {
-        Some(port) if port != 443 => format!("https://{host}:{port}"),
-        _ => format!("https://{host}"),
-    })
+pub(super) fn default_user() -> String {
+    "arch".into()
 }
 
-pub(crate) fn default_origin() -> String {
-    ORIGIN.into()
+pub(super) fn request_policy(method: &str, url: &str) -> RequestPolicy {
+    let mutation = method == "PATCH"
+        || method == "POST" && !url.ends_with("/api/v1/vm/custom-template/price")
+        || url.contains("/renew?");
+    let email_refusal = method == "POST"
+        && (url.ends_with("/api/v1/vm") || url.ends_with("/api/v1/vm/custom-template"));
+    RequestPolicy {
+        mutation,
+        missing_read: missing_read(method, url),
+        email_refusal,
+    }
+}
+
+pub(super) fn decode_response(body: &[u8]) -> Result<Value, String> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| REFUSED)?;
+    let data = value.get("data").ok_or(REFUSED)?.clone();
+    Ok(data)
+}
+
+pub(super) fn owns_read(path: &str, vm: u64, payment: Option<&Value>) -> bool {
+    path == format!("/api/v1/vm/{vm}")
+        || path == format!("/api/v1/vm/{vm}/payments?limit=100&offset=0")
+        || payment
+            .and_then(|pay| payment_id(pay).ok())
+            .is_some_and(|pay| path == format!("/api/v1/payment/{pay}"))
+}
+
+pub(super) fn account_fields() -> AccountFields {
+    AccountFields {
+        email: "email",
+        verified: "email_verified",
+        contact_flags: [
+            "contact_nip17",
+            "contact_email",
+            "contact_telegram",
+            "contact_whatsapp",
+        ],
+    }
+}
+
+pub(super) fn account(body: Option<Value>) -> VendorRequest {
+    VendorRequest {
+        method: if body.is_some() { "PATCH" } else { "GET" },
+        path: "/api/v1/account".into(),
+        body,
+    }
+}
+pub(super) fn notification_channels() -> VendorRequest {
+    VendorRequest {
+        method: "GET",
+        path: "/api/v1/notification/channels".into(),
+        body: None,
+    }
+}
+pub(super) fn catalogue() -> VendorRequest {
+    VendorRequest {
+        method: "GET",
+        path: "/api/v1/vm/templates".into(),
+        body: None,
+    }
+}
+pub(super) fn images() -> VendorRequest {
+    VendorRequest {
+        method: "GET",
+        path: "/api/v1/image".into(),
+        body: None,
+    }
+}
+pub(super) fn custom_price(resources: Value) -> VendorRequest {
+    VendorRequest {
+        method: "POST",
+        path: "/api/v1/vm/custom-template/price".into(),
+        body: Some(resources),
+    }
+}
+pub(super) fn keys() -> VendorRequest {
+    VendorRequest {
+        method: "GET",
+        path: "/api/v1/ssh-key".into(),
+        body: None,
+    }
+}
+pub(super) fn register_key(public: &Value, identity_index: u32) -> VendorRequest {
+    VendorRequest {
+        method: "POST",
+        path: "/api/v1/ssh-key".into(),
+        body: Some(
+            json!({"name":format!("tau-{identity_index}"),"key_data":public["authorized_keys"]}),
+        ),
+    }
+}
+pub(super) fn list() -> VendorRequest {
+    VendorRequest {
+        method: "GET",
+        path: "/api/v1/vm".into(),
+        body: None,
+    }
+}
+pub(super) fn get(vm_id: u64) -> VendorRequest {
+    VendorRequest {
+        method: "GET",
+        path: format!("/api/v1/vm/{vm_id}"),
+        body: None,
+    }
+}
+pub(super) fn invoice_history(vm_id: u64) -> VendorRequest {
+    VendorRequest {
+        method: "GET",
+        path: format!("/api/v1/vm/{vm_id}/payments?limit=100&offset=0"),
+        body: None,
+    }
+}
+pub(super) fn invoice_quote(vm_id: u64) -> VendorRequest {
+    VendorRequest {
+        method: "GET",
+        path: format!("/api/v1/vm/{vm_id}/renew/quote?method=lightning&intervals=1"),
+        body: None,
+    }
+}
+pub(super) fn invoice(vm_id: u64) -> VendorRequest {
+    VendorRequest {
+        method: "GET",
+        path: format!("/api/v1/vm/{vm_id}/renew?method=lightning&intervals=1"),
+        body: None,
+    }
+}
+pub(super) fn payment(payment_id: &str) -> VendorRequest {
+    VendorRequest {
+        method: "GET",
+        path: format!("/api/v1/payment/{payment_id}"),
+        body: None,
+    }
+}
+
+pub(super) fn readiness_state(vm: &Value) -> &Value {
+    &vm["status"]["state"]
+}
+pub(super) fn auto_renewal_enabled(vm: &Value) -> Option<&Value> {
+    vm.get("auto_renewal_enabled")
+}
+pub(super) fn product(selected: &Selection) -> Result<&str, String> {
+    text(&selected.offer, "name", 128)
+}
+pub(super) fn selection_region(selected: &Selection) -> Result<&str, String> {
+    text(&selected.offer["region"], "name", 128)
+}
+pub(super) fn publication(origin: &str, vm_id: &Value, vm: &Value, key: Value) -> Value {
+    json!({"origin":origin,"vm_id":vm_id,"created":vm["created"],"selected_key":key,"host_ssh_keys":vm["host_ssh_keys"]})
+}
+
+macro_rules! readiness_message {
+    ($message:ident, $prefix:ident, $start:literal, $end:literal) => {
+        pub(super) const $message: &str = concat!($start, $end);
+        const $prefix: &str = $start;
+    };
+}
+readiness_message!(
+    BOOT_WAIT,
+    BOOT_PREFIX,
+    "Waiting for provider boot readiness",
+    "; unknown state is not ready. Refresh later."
+);
+readiness_message!(
+    KEY_WAIT,
+    KEY_PREFIX,
+    "Waiting for an unambiguous supported published host key",
+    "; Refresh later."
+);
+const ADDRESS_WAIT: &str = "Waiting for one allocated IPv4 address.";
+
+pub(super) fn readiness_kind(result: &Result<(), String>) -> &'static str {
+    match result {
+        Ok(()) => "ready",
+        Err(why) if why.starts_with(BOOT_PREFIX) => "starting",
+        Err(why) if why.starts_with(KEY_PREFIX) => "published_key",
+        Err(why) if why == ADDRESS_WAIT => "address",
+        Err(_) => "refused",
+    }
+}
+
+pub(super) const CLOSE_REFUSED: &str = "Close is only for a purchase with no recorded payment whose machine the provider no longer has.";
+pub(super) fn close_payment_eligible(pay: &Value, now: u64) -> bool {
+    pay["is_paid"] == false
+        && text(pay, "expires", 40)
+            .and_then(timestamp)
+            .is_ok_and(|expires| expires <= now)
+}
+pub(super) fn missing_pause(vm: u64) -> String {
+    format!(
+        "The provider reports machine {vm} or its payment not found. LNVPS deletes a machine left unpaid for about an hour, with its payments. Close purchase checks that the provider has no record of the machine or any payment for it and that this purchase meets the closing conditions, then closes it. These checks cannot establish whether you paid."
+    )
+}
+pub(super) fn closed_message(vm: &Value, payment: Option<&Value>) -> String {
+    let vm = &vm["id"];
+    let mut message = format!(
+        "Closed: the provider no longer has machine {vm} or any payment record for it, and this purchase recorded no payment. You can approve a new purchase."
+    );
+    if let Some(payment) = payment {
+        message.push_str(&format!(" If you paid invoice {}, the provider no longer has a record of that payment; keep your proof of payment.", payment["id"].as_str().expect("saved payment id")));
+    }
+    message
 }
 
 /// Store authority supplies the entire URL to both preparation and dispatch.
@@ -209,36 +328,6 @@ impl Account {
     }
 }
 
-pub(crate) const READ_REFUSED: &str =
-    "Provider read refused; saved operation identities remain unchanged.";
-
-/// Missing evidence is distinct from transport, authentication and decoding failures.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ReadError {
-    Refused(String),
-    NotFound,
-    EmailRequired,
-}
-impl From<String> for ReadError {
-    fn from(value: String) -> Self {
-        Self::Refused(value)
-    }
-}
-impl From<&str> for ReadError {
-    fn from(value: &str) -> Self {
-        Self::Refused(value.into())
-    }
-}
-impl ReadError {
-    pub(crate) fn message(self) -> String {
-        match self {
-            Self::Refused(message) => message,
-            Self::NotFound => READ_REFUSED.into(),
-            Self::EmailRequired => EMAIL_REQUIRED.into(),
-        }
-    }
-}
-
 /// Only the existing machine/detail/history and saved-payment read routes qualify.
 pub(crate) fn missing_read(method: &str, url: &str) -> bool {
     if method != "GET" {
@@ -277,51 +366,6 @@ pub(crate) fn decoded_email_required(method: &str, url: &str, status: u16, body:
             .is_some_and(|value| value["error"].as_str() == Some(EMAIL_REQUIRED))
 }
 
-#[allow(async_fn_in_trait)]
-pub(crate) trait Api {
-    /// One exchange; no retries. All successful data must pass store credential protection.
-    async fn request(
-        &mut self,
-        method: &str,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<Value, ReadError>;
-    fn response_status(&self) -> u16 {
-        200
-    }
-    fn account(&self) -> String;
-    fn now(&self) -> u64;
-    fn current(&self) -> Result<(), String>;
-}
-
-pub(crate) fn number(v: &Value, name: &str) -> Result<u64, String> {
-    v[name]
-        .as_u64()
-        .filter(|n| *n <= 9_007_199_254_740_991)
-        .ok_or_else(|| REFUSED.into())
-}
-pub(crate) fn id(v: &Value) -> Result<u64, String> {
-    number(v, "id").and_then(|id| if id > 0 { Ok(id) } else { Err(REFUSED.into()) })
-}
-pub(crate) fn text<'a>(v: &'a Value, name: &str, max: usize) -> Result<&'a str, String> {
-    v[name]
-        .as_str()
-        .filter(|s| !s.is_empty() && s.len() <= max && !s.chars().any(char::is_control))
-        .ok_or_else(|| REFUSED.into())
-}
-pub(crate) fn array(v: &Value) -> Result<&Vec<Value>, String> {
-    v.as_array()
-        .filter(|a| a.len() <= 128)
-        .ok_or_else(|| REFUSED.into())
-}
-pub(crate) fn unique_ids(v: &Value) -> Result<Vec<u64>, String> {
-    let ids = array(v)?.iter().map(id).collect::<Result<Vec<_>, _>>()?;
-    if ids.iter().collect::<std::collections::BTreeSet<_>>().len() != ids.len() {
-        return Err(REFUSED.into());
-    }
-    Ok(ids)
-}
-
 pub(crate) fn validate_vm(vm: &Value) -> Result<(), String> {
     id(vm)?;
     timestamp(text(vm, "created", 40)?)?;
@@ -344,16 +388,8 @@ pub(crate) fn validate_vm(vm: &Value) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Charge {
-    pub currency: String,
-    pub amount: u64,
-    pub interval_amount: u64,
-    pub interval_type: String,
-}
 impl Charge {
-    pub fn parse(v: &Value) -> Result<Self, String> {
+    pub(super) fn lnvps_parse(v: &Value) -> Result<Self, String> {
         let charge = Self {
             currency: text(v, "currency", 3)?.into(),
             amount: number(v, "amount")?,
@@ -371,14 +407,6 @@ impl Charge {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Selection {
-    pub offer: Value,
-    pub image: Value,
-    pub resources: Option<Value>,
-    pub charge: Charge,
-}
 fn region(v: &Value) -> Result<(), String> {
     id(v)?;
     text(v, "name", 128)?;
@@ -548,7 +576,7 @@ pub(crate) fn catalogue_public(
             if terms["interval_type"] == "hour" {
                 terms["interval_type"] = "day".into();
             }
-            Charge::parse(&terms)?;
+            Charge::lnvps_parse(&terms)?;
             if !offer["limits"].is_object() {
                 return Err(REFUSED.into());
             }
@@ -627,7 +655,7 @@ pub(crate) fn image_user(image: &Value) -> Result<&str, String> {
         Some(value) => value.as_str().ok_or(REFUSED)?,
         None => return Err(REFUSED.into()),
     };
-    if !super::targets::valid_login_user(user) {
+    if !crate::poc::targets::valid_login_user(user) {
         return Err(REFUSED.into());
     }
     Ok(user)
@@ -729,14 +757,14 @@ fn same_image(left: &Value, right: &Value) -> bool {
     .all(|field| left[*field] == right[*field])
 }
 impl Selection {
-    pub fn same_terms(&self, other: &Self) -> bool {
+    pub(super) fn lnvps_same_terms(&self, other: &Self) -> bool {
         self.offer == other.offer
             && same_image(&self.image, &other.image)
             && self.resources == other.resources
             && self.charge == other.charge
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    pub(super) fn lnvps_validate(&self) -> Result<(), String> {
         transfer_allowance(&self.offer)?;
         if !self.offer["limits"].is_object() {
             return Err(REFUSED.into());
@@ -756,7 +784,8 @@ impl Selection {
         {
             return Err(REFUSED.into());
         }
-        let charge = Charge::parse(&serde_json::to_value(&self.charge).map_err(|_| REFUSED)?)?;
+        let charge =
+            Charge::lnvps_parse(&serde_json::to_value(&self.charge).map_err(|_| REFUSED)?)?;
         if let Some(r) = &self.resources {
             resources(r, "disk")?;
             if !r.as_object().is_some_and(|o| {
@@ -820,13 +849,13 @@ impl Selection {
             }
         } else {
             resources(&self.offer, "disk_size")?;
-            if charge != Charge::parse(&self.offer["cost_plan"])? {
+            if charge != Charge::lnvps_parse(&self.offer["cost_plan"])? {
                 return Err(REFUSED.into());
             }
         }
         Ok(())
     }
-    pub fn create(&self, key: u64) -> (&'static str, Value) {
+    pub(super) fn lnvps_create(&self, key: u64) -> (&'static str, Value) {
         if let Some(resources) = &self.resources {
             let mut body = resources.clone();
             body["image_id"] = self.image["id"].clone();
@@ -840,7 +869,7 @@ impl Selection {
         }
     }
     /// Sufficient association requires creation, key, image, region, price and every resource.
-    pub fn matches(&self, vm: &Value, key: u64, not_before: u64) -> bool {
+    pub(super) fn lnvps_matches(&self, vm: &Value, key: u64, not_before: u64) -> bool {
         let check = || -> Result<bool, String> {
             validate_vm(vm)?;
             if !self.offer["limits"].is_object() {
@@ -854,7 +883,7 @@ impl Selection {
                 || id(&vm["ssh_key"])? != key
                 || !same_image(&vm["image"], &self.image)
                 || vm["template"]["region"] != self.offer["region"]
-                || Charge::parse(&vm["template"]["cost_plan"])? != self.charge
+                || Charge::lnvps_parse(&vm["template"]["cost_plan"])? != self.charge
             {
                 return Ok(false);
             }
@@ -934,74 +963,6 @@ fn transfer_allowance(value: &Value) -> Result<Option<u64>, String> {
         .transpose()
 }
 
-/// ISO-8601 UTC provider dates, optionally fractional. No locale or permissive date parser.
-pub fn timestamp(text: &str) -> Result<u64, String> {
-    let bytes = text.as_bytes();
-    if bytes.len() < 20
-        || bytes.len() > 30
-        || &bytes[4..5] != b"-"
-        || &bytes[7..8] != b"-"
-        || bytes[10] != b'T'
-        || bytes[13] != b':'
-        || bytes[16] != b':'
-        || *bytes.last().ok_or(REFUSED)? != b'Z'
-    {
-        return Err(REFUSED.into());
-    }
-    if bytes.len() > 20
-        && (bytes[19] != b'.' || !bytes[20..bytes.len() - 1].iter().all(u8::is_ascii_digit))
-    {
-        return Err(REFUSED.into());
-    }
-    let n = |start: usize, end: usize| {
-        std::str::from_utf8(&bytes[start..end])
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .ok_or_else(|| REFUSED.to_string())
-    };
-    let (year, month, day, hour, minute, second) = (
-        n(0, 4)?,
-        n(5, 7)?,
-        n(8, 10)?,
-        n(11, 13)?,
-        n(14, 16)?,
-        n(17, 19)?,
-    );
-    let leap = |y: u64| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
-    if !(1970..=2200).contains(&year)
-        || !(1..=12).contains(&month)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return Err(REFUSED.into());
-    }
-    let months = [
-        31,
-        if leap(year) { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    if day == 0 || day > months[month as usize - 1] {
-        return Err(REFUSED.into());
-    }
-    let days = (1970..year)
-        .map(|y| if leap(y) { 366 } else { 365 })
-        .sum::<u64>()
-        + months[..month as usize - 1].iter().sum::<u64>()
-        + day
-        - 1;
-    Ok(days * 86400 + hour * 3600 + minute * 60 + second)
-}
-
 pub fn payment_id(payment: &Value) -> Result<&str, String> {
     text(payment, "id", 128).and_then(|s| {
         if s.len() >= 2 && s.len().is_multiple_of(2) && s.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1011,17 +972,8 @@ pub fn payment_id(payment: &Value) -> Result<&str, String> {
         }
     })
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BillingTerms {
-    pub amount: u64,
-    pub tax: u64,
-    pub processing_fee: u64,
-    pub currency: String,
-    pub time: u64,
-}
 impl BillingTerms {
-    pub fn parse(value: &Value) -> Result<Self, String> {
+    pub(super) fn lnvps_parse(value: &Value) -> Result<Self, String> {
         let terms = Self {
             amount: number(value, "amount")?,
             tax: number(value, "tax")?,
@@ -1034,8 +986,8 @@ impl BillingTerms {
         }
         Ok(terms)
     }
-    pub fn validate(&self) -> Result<(), String> {
-        Self::parse(&serde_json::to_value(self).map_err(|_| REFUSED)?).map(|_| ())
+    pub(super) fn lnvps_validate(&self) -> Result<(), String> {
+        Self::lnvps_parse(&serde_json::to_value(self).map_err(|_| REFUSED)?).map(|_| ())
     }
 }
 pub fn suitable_payment(payment: &Value, vm: u64, expected: &BillingTerms, created: u64) -> bool {
@@ -1044,7 +996,7 @@ pub fn suitable_payment(payment: &Value, vm: u64, expected: &BillingTerms, creat
         let invoice = text(&payment["data"], "lightning", 8192)?;
         let made = timestamp(text(payment, "created", 40)?)?;
         let expires = timestamp(text(payment, "expires", 40)?)?;
-        expected.validate()?;
+        expected.lnvps_validate()?;
         Ok(number(payment, "vm_id")? == vm
             && payment["is_upgrade"] == false
             && payment["is_paid"].is_boolean()
@@ -1093,9 +1045,7 @@ pub fn published_pin(vm: &Value) -> Result<(Value, String), String> {
     supported.sort_by(|a, b| a.1.cmp(&b.1));
     supported.dedup();
     if supported.len() != 1 {
-        return Err(
-            "Waiting for an unambiguous supported published host key; Refresh later.".into(),
-        );
+        return Err(KEY_WAIT.into());
     }
     Ok(supported.remove(0))
 }
@@ -1122,45 +1072,9 @@ pub fn allocated_ipv4(vm: &Value) -> Result<String, String> {
         found.insert(address.to_string());
     }
     if found.len() != 1 {
-        return Err("Waiting for one allocated IPv4 address.".into());
+        return Err(ADDRESS_WAIT.into());
     }
     Ok(found.into_iter().next().expect("one"))
-}
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) mod browser;
-#[cfg(test)]
-pub(crate) mod tests;
-
-pub(crate) const READINESS_STOP: &str = "Published host-key wait expired after three hours from recorded payment. First contact is stopped; this page cannot reinstall or abandon a paid purchase.";
-
-fn readiness_seconds(name: &str) -> u64 {
-    let timing = crate::BUNDLE
-        .iter()
-        .find(|(name, _)| *name == "timing.toml")
-        .expect("compiled timing input")
-        .1;
-    let value = timing
-        .lines()
-        .find_map(|line| {
-            let (key, value) = line.split_once('=')?;
-            (key.trim() == name).then(|| value.trim().trim_matches('"'))
-        })
-        .expect("published-key timing");
-    let (number, unit) = value.split_at(value.len() - 1);
-    number.parse::<u64>().expect("timing number")
-        * match unit {
-            "m" => 60,
-            "h" => 3600,
-            "s" => 1,
-            _ => panic!("timing unit"),
-        }
-}
-pub(crate) fn readiness_poll_seconds() -> u64 {
-    readiness_seconds("published_key_poll_interval")
-}
-pub(crate) fn readiness_wait_seconds() -> u64 {
-    readiness_seconds("published_key_wait_max")
 }
 
 /// Status means the provider state, not incidental uptime or utilization counters.
@@ -1181,4 +1095,116 @@ pub(crate) fn same_readiness(old: &Value, fresh: &Value) -> Result<bool, String>
     Ok(old["status"]["state"] == fresh["status"]["state"]
         && keys(old)? == keys(fresh)?
         && same_address)
+}
+
+pub(super) fn catalogue_shape(catalogue: &Value) -> Result<(), String> {
+    array(&catalogue["templates"])?;
+    if let Some(custom) = catalogue.get("custom_template") {
+        array(custom)?;
+    }
+    Ok(())
+}
+
+pub(super) fn selection_inputs(
+    catalogue: &Value,
+    resources: Option<&Value>,
+    offer_id: u64,
+    image_id: u64,
+) -> Result<(Value, Value), String> {
+    let field = if resources.is_some() {
+        "custom_template"
+    } else {
+        "templates"
+    };
+    let offers = array(&catalogue["offers"][field])?;
+    let offer = offers
+        .iter()
+        .find(|o| id(o).ok() == Some(offer_id))
+        .ok_or(REFUSED)?
+        .clone();
+    let image = array(&catalogue["images"])?
+        .iter()
+        .find(|i| id(i).ok() == Some(image_id))
+        .ok_or(REFUSED)?
+        .clone();
+    Ok((offer, image))
+}
+
+pub(super) fn validate_custom(offer: &Value, image: &Value, r: &Value) -> Result<(), String> {
+    // Validate resources with provisional terms before making even the price request.
+    let provisional = Selection {
+        offer: offer.clone(),
+        image: image.clone(),
+        resources: Some(r.clone()),
+        charge: Charge {
+            currency: "BTC".into(),
+            amount: 1,
+            interval_amount: number(offer, "interval_amount")?,
+            interval_type: text(offer, "interval_type", 5)?.into(),
+        },
+    };
+    provisional.lnvps_validate()?;
+    Ok(())
+}
+
+pub(super) fn offer_charge(offer: &Value) -> Result<Charge, String> {
+    Charge::lnvps_parse(&offer["cost_plan"])
+}
+
+pub(super) fn validate_registered(key: &Value) -> Result<(), String> {
+    id(key)?;
+    text(key, "name", 128)?;
+    timestamp(text(key, "created", 40)?)?;
+    Ok(())
+}
+
+pub(super) fn parse_history(result: &Value, vm: u64) -> Result<Vec<Value>, String> {
+    let rows = array(result)?;
+    if rows.len() >= 100 {
+        return Err("Payment history incomplete; Refresh without issuing another invoice.".into());
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for row in rows {
+        if !ids.insert(payment_id(row)?) || number(row, "vm_id")? != vm {
+            return Err(REFUSED.into());
+        }
+    }
+    Ok(rows.clone())
+}
+
+pub(super) fn payment_changed(old: &Value, payment: &Value) -> bool {
+    old["id"] != payment["id"]
+        || ["created", "expires"].into_iter().any(|field| {
+            !matches!(
+                (
+                    text(old, field, 40).and_then(timestamp),
+                    text(payment, field, 40).and_then(timestamp),
+                ),
+                (Ok(saved), Ok(reading)) if saved == reading
+            )
+        })
+        || old["data"] != payment["data"]
+        || (old["is_paid"] == true && payment["is_paid"] != true)
+}
+
+pub(super) fn raw_id(value: &Value) -> &Value {
+    &value["id"]
+}
+pub(super) fn created(value: &Value) -> Result<u64, String> {
+    timestamp(text(value, "created", 40)?)
+}
+pub(super) fn same_vm_identity(old: &Value, vm: &Value) -> bool {
+    old["id"] == vm["id"] && old["created"] == vm["created"]
+}
+pub(super) fn same_vm_id(old: &Value, vm: &Value) -> bool {
+    old["id"] == vm["id"]
+}
+pub(super) fn paid(payment: &Value) -> bool {
+    payment["is_paid"] == true
+}
+pub(super) fn payment_expires(payment: &Value) -> Result<u64, String> {
+    timestamp(text(payment, "expires", 40)?)
+}
+pub(super) fn has_billing_evidence(vm: &Value) -> bool {
+    vm.get("expires").is_some_and(|v| !v.is_null())
 }

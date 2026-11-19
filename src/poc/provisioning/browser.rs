@@ -1,5 +1,6 @@
 //! Actual browser fetch of the exact absolute URL supplied by Purchase authority.
 use super::*;
+use serde_json::json;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use tokio::sync::Notify;
@@ -61,18 +62,6 @@ pub fn provider_action_delay() -> u32 {
             (1000.0 - (now - last)).clamp(0.0, 1000.0).ceil() as u32
         }
     })
-}
-
-fn readiness_kind(result: &Result<(), String>) -> &'static str {
-    match result {
-        Ok(()) => "ready",
-        Err(why) if why.starts_with("Waiting for provider boot readiness") => "starting",
-        Err(why) if why.starts_with("Waiting for an unambiguous supported published host key") => {
-            "published_key"
-        }
-        Err(why) if why == "Waiting for one allocated IPv4 address." => "address",
-        Err(_) => "refused",
-    }
 }
 
 pub(crate) fn readiness_report(purchase: &Value) -> Value {
@@ -235,6 +224,7 @@ pub async fn provider_request(request: String) -> String {
         continuation.check()?;
         restore(store.provider_account());
         let mut api = Browser {
+            vendor: store.procurement_vendor(),
             origin: store.procurement_origin().into(),
             account: store.provider_account().ok_or("Provider account unavailable.")?.copy(),
             continuation,
@@ -285,9 +275,12 @@ pub async fn provider_request(request: String) -> String {
                 store.procurement_resume(&mut api, true).await.map(|_| None)
             }
         };
+        if api.vendor != store.procurement_vendor() {
+            return Err(REFUSED.into());
+        }
         if observe_readiness && api.requests > 0 && api.current().is_ok() && store.procurement_readiness_eligible() && store.procurement_view()["identity"] == identity {
             let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
-            READINESS_CHECKED.with_borrow_mut(|saved| *saved = Some((identity, api.now(), readiness_kind(&outcome))));
+            READINESS_CHECKED.with_borrow_mut(|saved| *saved = Some((identity, api.now(), api.vendor.readiness_kind(&outcome))));
         }
         result
     }
@@ -328,6 +321,7 @@ impl Drop for Wait {
 }
 
 struct Browser {
+    vendor: Vendor,
     origin: String,
     automatic_visibility: Option<u64>,
     account: Account,
@@ -351,6 +345,12 @@ impl Browser {
     }
 }
 impl Api for Browser {
+    fn check_vendor(&self, vendor: Vendor) -> Result<(), String> {
+        if self.vendor != vendor {
+            return Err(REFUSED.into());
+        }
+        Ok(())
+    }
     fn response_status(&self) -> u16 {
         self.response_status
     }
@@ -389,7 +389,10 @@ impl Api for Browser {
         if self.requests > 16 {
             return Err("Provider work paused at the local read bound; Refresh later.".into());
         }
-        if !request_method_allowed(&self.origin, method, url) {
+        if !self
+            .vendor
+            .request_method_allowed(&self.origin, method, url)
+        {
             return Err(REFUSED.into());
         }
         let pending = Rc::new(Pending {
@@ -423,7 +426,8 @@ impl Api for Browser {
         let body = body.map(|b| Zeroizing::new(b.to_string()));
         let mut nonce = [0; 32];
         getrandom::fill(&mut nonce).map_err(|_| REFUSED)?;
-        let auth = self.account.authorization(
+        let auth = self.vendor.authorization(
+            &self.account,
             url,
             method,
             body.as_ref().map(|b| b.as_bytes()),
@@ -454,11 +458,9 @@ impl Api for Browser {
             web_sys::Request::new_with_str_and_init(url, &init).map_err(|_| INCOMPLETE)?;
         let _ = headers.delete("Authorization");
         self.current()?;
-        let mutation = method == "PATCH"
-            || method == "POST" && !url.ends_with("/api/v1/vm/custom-template/price")
-            || url.contains("/renew?");
-        let email_refusal = method == "POST"
-            && (url.ends_with("/api/v1/vm") || url.ends_with("/api/v1/vm/custom-template"));
+        let policy = self.vendor.request_policy(method, url);
+        let mutation = policy.mutation;
+        let email_refusal = policy.email_refusal;
         let exchange = async {
             let response: web_sys::Response = JsFuture::from(worker.fetch_with_request(&request))
                 .await
@@ -476,7 +478,7 @@ impl Api for Browser {
                 })
             };
             if !(200..300).contains(&status)
-                && !(status == 404 && missing_read(method, url) && !mutation)
+                && !(status == 404 && policy.missing_read && !mutation)
                 && !(status == 403 && email_refusal)
             {
                 return Err(refused());
@@ -521,21 +523,27 @@ impl Api for Browser {
                 bytes.fill(0, 0, bytes.length());
             }
             if status == 404 {
-                return Err(if decoded_missing(method, url, status, &output) {
-                    ReadError::NotFound
-                } else {
-                    refused()
-                });
+                return Err(
+                    if self.vendor.decoded_missing(method, url, status, &output) {
+                        ReadError::NotFound
+                    } else {
+                        refused()
+                    },
+                );
             }
             if status == 403 {
-                return Err(if decoded_email_required(method, url, status, &output) {
-                    ReadError::EmailRequired
-                } else {
-                    refused()
-                });
+                return Err(
+                    if self
+                        .vendor
+                        .decoded_email_required(method, url, status, &output)
+                    {
+                        ReadError::EmailRequired
+                    } else {
+                        refused()
+                    },
+                );
             }
-            let value: Value = serde_json::from_slice(&output).map_err(|_| REFUSED)?;
-            let data = value.get("data").ok_or(REFUSED)?.clone();
+            let data = self.vendor.decode_response(&output)?;
             self.current()?;
             Ok(data)
         };
@@ -549,7 +557,7 @@ impl Api for Browser {
             if mutation && error != ReadError::EmailRequired {
                 UNKNOWN_MUTATION.into()
             } else if self.response_status == 404
-                && missing_read(method, url)
+                && policy.missing_read
                 && error != ReadError::NotFound
             {
                 READ_REFUSED.into()

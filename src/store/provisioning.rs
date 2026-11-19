@@ -4,41 +4,28 @@ use crate::dispatch::{
     Access, ApprovedEntry, BillingInterval, ClassAnswer, MachineEntry, Period, RecurringCost, Unit,
 };
 use crate::poc::provisioning::{
-    self as protocol, Api, BillingTerms, Charge, REFUSED, Selection, array, id, number, payment_id,
-    text, timestamp, unique_ids,
+    self as protocol, Api, BillingTerms, REFUSED, Selection, Vendor, VendorRequest, array, id,
+    unique_ids,
 };
+#[cfg(test)]
+use crate::poc::provisioning::{text, timestamp};
 use crate::poc::targets::TargetRecord;
-
-const CLOSE_REFUSED: &str = "Close is only for a purchase with no recorded payment whose machine the provider no longer has.";
 
 fn close_eligible(p: &Purchase, now: u64) -> bool {
     p.vm.is_some()
         && p.target.is_none()
-        && p.payment.as_ref().is_none_or(|pay| {
-            pay["is_paid"] == false
-                && text(pay, "expires", 40)
-                    .and_then(timestamp)
-                    .is_ok_and(|expires| expires <= now)
-        })
-}
-fn missing_pause(vm: u64) -> String {
-    format!(
-        "The provider reports machine {vm} or its payment not found. LNVPS deletes a machine left unpaid for about an hour, with its payments. Close purchase checks that the provider has no record of the machine or any payment for it and that this purchase meets the closing conditions, then closes it. These checks cannot establish whether you paid."
-    )
+        && p.payment
+            .as_ref()
+            .is_none_or(|pay| p.vendor.close_payment_eligible(pay, now))
 }
 fn closed_message(p: &Purchase) -> String {
-    let vm = &p.vm.as_ref().expect("closed associated purchase")["id"];
-    let mut message = format!(
-        "Closed: the provider no longer has machine {vm} or any payment record for it, and this purchase recorded no payment. You can approve a new purchase."
-    );
-    if let Some(payment) = &p.payment {
-        message.push_str(&format!(" If you paid invoice {}, the provider no longer has a record of that payment; keep your proof of payment.", payment["id"].as_str().expect("saved payment id")));
-    }
-    message
+    p.vendor.closed_message(
+        p.vm.as_ref().expect("closed associated purchase"),
+        p.payment.as_ref(),
+    )
 }
-
 fn default_purchase_user() -> String {
-    "arch".into()
+    Vendor::Lnvps.default_user()
 }
 
 // Only EmailEntered carries personal data, in encrypted journal custody. This projection
@@ -60,6 +47,8 @@ fn valid_email(email: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Purchase {
+    #[serde(default, skip_serializing_if = "Vendor::is_lnvps")]
+    pub vendor: Vendor,
     pub origin: String,
     pub machine: String,
     pub identity: Identity,
@@ -179,6 +168,12 @@ impl<S: Storage> Store<S> {
         }
         Ok(())
     }
+    pub(crate) fn procurement_vendor(&self) -> Vendor {
+        self.procurement
+            .as_ref()
+            .filter(|p| p.target.is_none())
+            .map_or(Vendor::Lnvps, |p| p.vendor)
+    }
     pub(crate) fn procurement_origin(&self) -> &str {
         self.procurement
             .as_ref()
@@ -195,19 +190,20 @@ impl<S: Storage> Store<S> {
     }
     fn check_api(&self, api: &impl Api) -> Result<(), String> {
         api.current()?;
+        api.check_vendor(self.procurement_vendor())?;
         self.procurement_account(&api.account())
     }
     async fn provider_response(
         &mut self,
         api: &mut impl Api,
-        method: &str,
-        path: &str,
-        body: Option<Value>,
+        request: VendorRequest,
     ) -> Result<(u16, Value), protocol::ReadError> {
         self.check_api(api)?;
-        let url = protocol::request_url(self.procurement_origin(), path)?;
+        let url = self
+            .procurement_vendor()
+            .request_url(self.procurement_origin(), &request.path)?;
         self.check_api(api)?;
-        let result = api.request(method, &url, body).await;
+        let result = api.request(request.method, &url, request.body).await;
         self.check_api(api)?;
         let value = result?;
         if !crate::poc::inference::safe(self, &value, &[]) {
@@ -218,22 +214,22 @@ impl<S: Storage> Store<S> {
     async fn provider_read(
         &mut self,
         api: &mut impl Api,
-        method: &str,
-        path: &str,
-        body: Option<Value>,
+        request: VendorRequest,
     ) -> Result<Value, String> {
-        match self.provider_response(api, method, path, body).await {
+        let method = request.method;
+        let path = request.path.clone();
+        match self.provider_response(api, request).await {
             Ok((_, value)) => Ok(value),
             Err(protocol::ReadError::NotFound) => {
                 let p = self.procurement.as_ref();
                 if let Some(vm) = p.and_then(|p| p.vm.as_ref()).and_then(|vm| id(vm).ok()) {
-                    let own = path == format!("/api/v1/vm/{vm}")
-                        || path == format!("/api/v1/vm/{vm}/payments?limit=100&offset=0")
-                        || p.and_then(|p| p.payment.as_ref())
-                            .and_then(|pay| payment_id(pay).ok())
-                            .is_some_and(|pay| path == format!("/api/v1/payment/{pay}"));
+                    let own = self.procurement_vendor().owns_read(
+                        &path,
+                        vm,
+                        p.and_then(|p| p.payment.as_ref()),
+                    );
                     if method == "GET" && own {
-                        return Err(missing_pause(vm));
+                        return Err(self.procurement_vendor().missing_pause(vm));
                     }
                 }
                 Err(protocol::READ_REFUSED.into())
@@ -249,9 +245,12 @@ impl<S: Storage> Store<S> {
         body: Option<Value>,
     ) -> Result<Value, String> {
         self.check_api(api)?;
-        let url = protocol::request_url(self.procurement_origin(), "/api/v1/account")?;
-        let method = if body.is_some() { "PATCH" } else { "GET" };
-        let result = api.request(method, &url, body).await;
+        let request = self.procurement_vendor().account(body);
+        let url = self
+            .procurement_vendor()
+            .request_url(self.procurement_origin(), &request.path)?;
+        let method = request.method;
+        let result = api.request(method, &url, request.body).await;
         self.check_api(api)?;
         // Never forward provider errors or account fields to any publication boundary.
         let account = result.map_err(|_| if method == "PATCH" {
@@ -281,12 +280,13 @@ impl<S: Storage> Store<S> {
             // A previously recorded gate still needs its matching verified account.
             Err(_) => return Ok(!self.procurement_email.required),
         };
-        let verified = account["email_verified"].as_bool();
+        let fields = self.procurement_vendor().account_fields();
+        let verified = account[fields.verified].as_bool();
         let matches = self
             .procurement_email
             .expected
             .as_ref()
-            .is_none_or(|email| account["email"].as_str() == Some(email.as_str()));
+            .is_none_or(|email| account[fields.email].as_str() == Some(email.as_str()));
         if verified == Some(true) && matches {
             if self.procurement_email.required {
                 self.procurement_commit(Record::EmailVerified).await?;
@@ -294,7 +294,7 @@ impl<S: Storage> Store<S> {
             return Ok(true);
         }
         if self.procurement_email.expected.is_some()
-            && (verified.is_none() || account["email"].as_str().is_none())
+            && (verified.is_none() || account[fields.email].as_str().is_none())
         {
             return Err(
                 "Could not read the provider account. Check again; no new order was sent.".into(),
@@ -305,13 +305,13 @@ impl<S: Storage> Store<S> {
                 return Ok(!self.procurement_email.required);
             }
             let channels = match self
-                .provider_response(api, "GET", "/api/v1/notification/channels", None)
+                .provider_response(api, self.procurement_vendor().notification_channels())
                 .await
             {
                 Ok((status, channels)) if (200..300).contains(&status) => channels,
                 _ => return Ok(!self.procurement_email.required),
             };
-            match channels["email"].as_bool() {
+            match channels[fields.email].as_bool() {
                 Some(false) => {
                     if self.procurement_email.required {
                         self.procurement_commit(Record::EmailVerified).await?;
@@ -348,15 +348,11 @@ impl<S: Storage> Store<S> {
             return Err("Enter a valid email address.".into());
         }
         let account = self.private_account(api, None).await?;
-        let mut body = json!({"email":email});
+        let fields = self.procurement_vendor().account_fields();
+        let mut body = json!({(fields.email):email});
         // This provider requires the first two flags and overwrites the other two even
         // when omitted. Preserve all four; never copy billing or read-only account fields.
-        for field in [
-            "contact_nip17",
-            "contact_email",
-            "contact_telegram",
-            "contact_whatsapp",
-        ] {
+        for field in fields.contact_flags {
             body[field] = json!(account[field].as_bool().ok_or(
                 "Provider notification settings are unavailable; the email update was not sent."
             )?);
@@ -374,23 +370,26 @@ impl<S: Storage> Store<S> {
             .procurement
             .as_ref()
             .filter(|p| close_eligible(p, api.now()))
-            .ok_or(CLOSE_REFUSED)?;
-        let vm_id = id(p.vm.as_ref().ok_or(CLOSE_REFUSED)?)?;
+            .ok_or(self.procurement_vendor().close_refused())?;
+        let vm_id = id(p
+            .vm
+            .as_ref()
+            .ok_or(self.procurement_vendor().close_refused())?)?;
         let (inventory_status, inventory) = self
-            .provider_response(api, "GET", "/api/v1/vm", None)
+            .provider_response(api, self.procurement_vendor().list())
             .await
             .map_err(protocol::ReadError::message)?;
         if !(200..300).contains(&inventory_status) || unique_ids(&inventory)?.contains(&vm_id) {
             return Err(REFUSED.into());
         }
         for vm in array(&inventory)? {
-            protocol::validate_vm(vm)?;
+            self.procurement_vendor().validate_vm(vm)?;
         }
-        for path in [
-            format!("/api/v1/vm/{vm_id}"),
-            format!("/api/v1/vm/{vm_id}/payments?limit=100&offset=0"),
+        for request in [
+            self.procurement_vendor().get(vm_id),
+            self.procurement_vendor().invoice_history(vm_id),
         ] {
-            match self.provider_response(api, "GET", &path, None).await {
+            match self.provider_response(api, request).await {
                 Err(protocol::ReadError::NotFound) => (),
                 _ => return Err(REFUSED.into()),
             }
@@ -402,7 +401,7 @@ impl<S: Storage> Store<S> {
             .as_ref()
             .is_none_or(|p| !close_eligible(p, checked_at))
         {
-            return Err(CLOSE_REFUSED.into());
+            return Err(self.procurement_vendor().close_refused().into());
         }
         self.procurement_commit(Record::Closed {
             vm_id,
@@ -449,7 +448,7 @@ impl<S: Storage> Store<S> {
         let mut view = self.procurement_current_view();
         if !self.completed_purchases.is_empty() {
             view["completed"] = self.completed_purchases.iter().map(|p| {
-                json!({"machine":p.machine,"origin":p.origin,"vm_id":p.vm.as_ref().map(|vm|&vm["id"]),"payment_id":p.payment.as_ref().map(|pay|&pay["id"]),"is_paid":p.payment.as_ref().is_some_and(|pay|pay["is_paid"] == true),"target_saved":p.target.is_some()})
+                json!({"machine":p.machine,"origin":p.origin,"vm_id":p.vm.as_ref().map(|vm|p.vendor.raw_id(vm)),"payment_id":p.payment.as_ref().map(|pay|p.vendor.raw_id(pay)),"is_paid":p.payment.as_ref().is_some_and(|pay|p.vendor.paid(pay)),"target_saved":p.target.is_some()})
             }).collect();
         }
         view
@@ -484,7 +483,7 @@ impl<S: Storage> Store<S> {
         } else {
             Some(p.pending_selection.as_ref().unwrap_or(&p.selected))
         };
-        let mut view = json!({"origin":p.origin,"phase":phase,"machine":p.machine,"account":p.account,"selection":selection,"approved_selection":p.selected,"relay":p.relay,"class_answer":p.class_answer,"identity":p.identity,"ssh_key_id":p.ssh_key.as_ref().map(|k|&k["id"]),"vm_id":p.vm.as_ref().map(|vm|&vm["id"]),"billing":p.billing,"payment":p.payment,"paid_at":p.paid_at,"readiness_poll_seconds":protocol::readiness_poll_seconds(),"readiness_wait_seconds":protocol::readiness_wait_seconds(),"readiness_state":p.vm.as_ref().map(|vm|&vm["status"]["state"]),"auto_renewal_enabled":p.vm.as_ref().and_then(|vm|vm.get("auto_renewal_enabled")),"target":p.target,"publication":p.publication,"public_keys":self.poc_identity_public_keys(&p.machine,&p.identity).ok()});
+        let mut view = json!({"origin":p.origin,"phase":phase,"machine":p.machine,"account":p.account,"selection":selection,"approved_selection":p.selected,"relay":p.relay,"class_answer":p.class_answer,"identity":p.identity,"ssh_key_id":p.ssh_key.as_ref().map(|k|p.vendor.raw_id(k)),"vm_id":p.vm.as_ref().map(|vm|p.vendor.raw_id(vm)),"billing":p.billing,"payment":p.payment,"paid_at":p.paid_at,"readiness_poll_seconds":protocol::readiness_poll_seconds(),"readiness_wait_seconds":protocol::readiness_wait_seconds(),"readiness_state":p.vm.as_ref().map(|vm|p.vendor.readiness_state(vm)),"auto_renewal_enabled":p.vm.as_ref().and_then(|vm|p.vendor.auto_renewal_enabled(vm)),"target":p.target,"publication":p.publication,"public_keys":self.poc_identity_public_keys(&p.machine,&p.identity).ok()});
         if phase == "email_verification" {
             view["email_entered"] = json!(self.procurement_email.expected.is_some());
         }
@@ -496,16 +495,15 @@ impl<S: Storage> Store<S> {
     ) -> Result<Value, String> {
         self.check_api(api)?;
         let catalogue = self
-            .provider_read(api, "GET", "/api/v1/vm/templates", None)
+            .provider_read(api, self.procurement_vendor().catalogue())
             .await?;
-        array(&catalogue["templates"])?;
-        if let Some(custom) = catalogue.get("custom_template") {
-            array(custom)?;
-        }
+        self.procurement_vendor().catalogue_shape(&catalogue)?;
         let images = self
-            .provider_read(api, "GET", "/api/v1/image", None)
+            .provider_read(api, self.procurement_vendor().images())
             .await?;
-        let (catalogue, images) = protocol::catalogue_public(catalogue, images)?;
+        let (catalogue, images) = self
+            .procurement_vendor()
+            .catalogue_public(catalogue, images)?;
         Ok(json!({"offers":catalogue,"images":images}))
     }
     pub(crate) async fn procurement_select(
@@ -540,47 +538,21 @@ impl<S: Storage> Store<S> {
         choice: Choice,
     ) -> Result<Selection, String> {
         let catalogue = self.procurement_catalogue(api).await?;
-        let field = if choice.resources.is_some() {
-            "custom_template"
-        } else {
-            "templates"
-        };
-        let offers = array(&catalogue["offers"][field])?;
-        let offer = offers
-            .iter()
-            .find(|o| id(o).ok() == Some(choice.offer_id))
-            .ok_or(REFUSED)?
-            .clone();
-        let image = array(&catalogue["images"])?
-            .iter()
-            .find(|i| id(i).ok() == Some(choice.image_id))
-            .ok_or(REFUSED)?
-            .clone();
+        let (offer, image) = self.procurement_vendor().selection_inputs(
+            &catalogue,
+            choice.resources.as_ref(),
+            choice.offer_id,
+            choice.image_id,
+        )?;
         let charge = if let Some(r) = &choice.resources {
-            // Validate resources with provisional terms before making even the price request.
-            let provisional = Selection {
-                offer: offer.clone(),
-                image: image.clone(),
-                resources: Some(r.clone()),
-                charge: Charge {
-                    currency: "BTC".into(),
-                    amount: 1,
-                    interval_amount: number(&offer, "interval_amount")?,
-                    interval_type: text(&offer, "interval_type", 5)?.into(),
-                },
-            };
-            provisional.validate()?;
+            self.procurement_vendor()
+                .validate_custom(&offer, &image, r)?;
             let price = self
-                .provider_read(
-                    api,
-                    "POST",
-                    "/api/v1/vm/custom-template/price",
-                    Some(r.clone()),
-                )
+                .provider_read(api, self.procurement_vendor().custom_price(r.clone()))
                 .await?;
-            Charge::parse(&price)?
+            self.procurement_vendor().parse_charge(&price)?
         } else {
-            Charge::parse(&offer["cost_plan"])?
+            self.procurement_vendor().offer_charge(&offer)?
         };
         let selected = Selection {
             offer,
@@ -588,7 +560,7 @@ impl<S: Storage> Store<S> {
             resources: choice.resources,
             charge,
         };
-        selected.validate()?;
+        self.procurement_vendor().validate_selection(&selected)?;
         Ok(selected)
     }
     pub(crate) async fn procurement_approve(
@@ -656,7 +628,7 @@ impl<S: Storage> Store<S> {
                 },
             )
             .await?;
-        if !fresh.same_terms(&selected) {
+        if !self.procurement_vendor().same_terms(&fresh, &selected) {
             if existing.is_some() {
                 self.procurement_commit(Record::TermsChanged(fresh)).await?;
             } else {
@@ -673,6 +645,7 @@ impl<S: Storage> Store<S> {
                 .await;
         }
         let record = Purchase {
+            vendor: self.procurement_vendor(),
             origin: self.procurement_origin().into(),
             machine: approval.machine,
             identity: self
@@ -689,7 +662,10 @@ impl<S: Storage> Store<S> {
             class_answer: approval.class_answer,
             account: api.account(),
             relay: approval.relay,
-            user: protocol::image_user(&selected.image)?.into(),
+            user: self
+                .procurement_vendor()
+                .image_user(&selected.image)?
+                .into(),
             selected,
             approved_at: api.now(),
             pending_selection: None,
@@ -740,8 +716,8 @@ impl<S: Storage> Store<S> {
             {
                 return Err(REFUSED.into());
             }
-            p.selected.validate()?;
-            if p.user != protocol::image_user(&p.selected.image)? {
+            p.vendor.validate_selection(&p.selected)?;
+            if p.user != p.vendor.image_user(&p.selected.image)? {
                 return Err(REFUSED.into());
             }
             if protocol::provider_origin(&p.origin)? != p.origin {
@@ -800,14 +776,15 @@ impl<S: Storage> Store<S> {
             .chain(&self.completed_purchases)
         {
             let reused = match record {
-                Record::Associated(vm) => {
-                    closed.vm.as_ref().is_some_and(|old| old["id"] == vm["id"])
-                }
+                Record::Associated(vm) => closed
+                    .vm
+                    .as_ref()
+                    .is_some_and(|old| p.vendor.same_vm_id(old, vm)),
                 Record::Payment { payment, .. } => closed
                     .payment
                     .as_ref()
-                    .and_then(|old| payment_id(old).ok())
-                    .zip(payment_id(payment).ok())
+                    .and_then(|old| self.procurement_vendor().payment_id(old).ok())
+                    .zip(self.procurement_vendor().payment_id(payment).ok())
                     .is_some_and(|(old, new)| old.eq_ignore_ascii_case(new)),
                 _ => false,
             };
@@ -858,7 +835,7 @@ impl<S: Storage> Store<S> {
                 if p.create.is_some() || p.vm.is_some() || p.target.is_some() {
                     return Err(REFUSED.into());
                 }
-                selected.validate()?;
+                p.vendor.validate_selection(selected)?;
                 p.pending_selection = Some(selected.clone());
             }
             Record::Reapproved {
@@ -873,8 +850,8 @@ impl<S: Storage> Store<S> {
                 {
                     return Err(REFUSED.into());
                 }
-                selected.validate()?;
-                p.user = protocol::image_user(&selected.image)?.into();
+                p.vendor.validate_selection(selected)?;
+                p.user = p.vendor.image_user(&selected.image)?.into();
                 p.selected = selected.clone();
                 p.approved_at = *approved_at;
                 p.pending_selection = None;
@@ -889,9 +866,7 @@ impl<S: Storage> Store<S> {
                 if !p.registration_sent || p.ssh_key.is_some() {
                     return Err(REFUSED.into());
                 }
-                id(key)?;
-                text(key, "name", 128)?;
-                timestamp(text(key, "created", 40)?)?;
+                p.vendor.validate_registered(key)?;
                 p.ssh_key = Some(key.clone());
             }
             Record::CreateSent(intent) => {
@@ -907,15 +882,16 @@ impl<S: Storage> Store<S> {
                     return Err(REFUSED.into());
                 }
                 for vm in &intent.before {
-                    protocol::validate_vm(vm)?;
+                    self.procurement_vendor().validate_vm(vm)?;
                 }
                 p.create = Some(intent.clone());
             }
             Record::Associated(vm) => {
                 let intent = p.create.as_ref().ok_or(REFUSED)?;
                 if p.vm.is_some()
-                    || intent.before.iter().any(|old| old["id"] == vm["id"])
-                    || !p.selected.matches(
+                    || intent.before.iter().any(|old| p.vendor.same_vm_id(old, vm))
+                    || !p.vendor.matches(
+                        &p.selected,
                         vm,
                         id(p.ssh_key.as_ref().ok_or(REFUSED)?)?,
                         intent.started,
@@ -930,7 +906,7 @@ impl<S: Storage> Store<S> {
                 if billing.vm_id != id(vm)? || p.invoice.is_some() || p.payment.is_some() {
                     return Err(REFUSED.into());
                 }
-                billing.terms.validate()?;
+                p.vendor.validate_billing(&billing.terms)?;
                 p.billing = Some(billing.clone());
             }
             Record::InvoiceSent(intent) => {
@@ -948,7 +924,7 @@ impl<S: Storage> Store<S> {
             }
             Record::Payment { payment, paid_at } => {
                 let vm = p.vm.as_ref().ok_or(REFUSED)?;
-                if !protocol::suitable_payment(
+                if !p.vendor.suitable_payment(
                     payment,
                     id(vm)?,
                     &p.billing
@@ -956,24 +932,15 @@ impl<S: Storage> Store<S> {
                         .filter(|b| id(vm).ok() == Some(b.vm_id))
                         .ok_or(REFUSED)?
                         .terms,
-                    timestamp(text(vm, "created", 40)?)?,
-                ) || p.payment.as_ref().is_some_and(|old| {
-                    old["id"] != payment["id"]
-                        || ["created", "expires"].into_iter().any(|field| {
-                            !matches!(
-                                (
-                                    text(old, field, 40).and_then(timestamp),
-                                    text(payment, field, 40).and_then(timestamp),
-                                ),
-                                (Ok(saved), Ok(reading)) if saved == reading
-                            )
-                        })
-                        || old["data"] != payment["data"]
-                        || (old["is_paid"] == true && payment["is_paid"] != true)
-                }) {
+                    p.vendor.created(vm)?,
+                ) || p
+                    .payment
+                    .as_ref()
+                    .is_some_and(|old| p.vendor.payment_changed(old, payment))
+                {
                     return Err(REFUSED.into());
                 }
-                if (payment["is_paid"] == true) != paid_at.is_some()
+                if p.vendor.paid(payment) != paid_at.is_some()
                     || p.paid_at.is_some_and(|saved| Some(saved) != *paid_at)
                 {
                     return Err(REFUSED.into());
@@ -983,9 +950,9 @@ impl<S: Storage> Store<S> {
             }
             Record::Observation(vm) => {
                 let old = p.vm.as_ref().ok_or(REFUSED)?;
-                if old["id"] != vm["id"]
-                    || old["created"] != vm["created"]
-                    || !p.selected.matches(
+                if !p.vendor.same_vm_identity(old, vm)
+                    || !p.vendor.matches(
+                        &p.selected,
                         vm,
                         id(p.ssh_key.as_ref().ok_or(REFUSED)?)?,
                         p.create.as_ref().ok_or(REFUSED)?.started,
@@ -994,8 +961,8 @@ impl<S: Storage> Store<S> {
                     return Err(REFUSED.into());
                 }
                 if let Some(target) = &p.target {
-                    let (_, pin) = protocol::published_pin(vm)?;
-                    if target.pin != pin || target.host != protocol::allocated_ipv4(vm)? {
+                    let (_, pin) = p.vendor.published_pin(vm)?;
+                    if target.pin != pin || target.host != p.vendor.allocated_ipv4(vm)? {
                         return Err(
                             "Published identity conflicts with the immutable target.".into()
                         );
@@ -1008,23 +975,25 @@ impl<S: Storage> Store<S> {
                 publication,
             } => {
                 let vm = p.vm.as_ref().ok_or(REFUSED)?;
-                let (key, pin) = protocol::published_pin(vm)?;
+                let (key, pin) = p.vendor.published_pin(vm)?;
                 let expected = TargetRecord {
                     machine: p.machine.clone(),
                     relay: p.relay.clone(),
                     profile: "v1".into(),
-                    host: protocol::allocated_ipv4(vm)?,
+                    host: p.vendor.allocated_ipv4(vm)?,
                     port: 22,
                     user: p.user.clone(),
                     elevation: crate::jobs::Elevation::SudoNoninteractive,
                     pin,
                 };
                 if p.target.is_some()
-                    || p.payment.as_ref().is_none_or(|pay| pay["is_paid"] != true)
-                    || vm["status"]["state"] != "running"
+                    || p.payment.as_ref().is_none_or(|pay| !p.vendor.paid(pay))
+                    || p.vendor.readiness_state(vm) != "running"
                     || target != &expected
                     || publication
-                        != &json!({"origin":p.origin,"vm_id":vm["id"],"created":vm["created"],"selected_key":key,"host_ssh_keys":vm["host_ssh_keys"]})
+                        != &p
+                            .vendor
+                            .publication(&p.origin, p.vendor.raw_id(vm), vm, key)
                 {
                     return Err(REFUSED.into());
                 }
@@ -1074,9 +1043,9 @@ impl<S: Storage> Store<S> {
             let approved = ApprovedEntry {
                 entry: MachineEntry {
                     machine: p.machine.clone(),
-                    vendor: "LNVPS".into(),
-                    product: text(&p.selected.offer, "name", 128)?.into(),
-                    region: text(&p.selected.offer["region"], "name", 128)?.into(),
+                    vendor: p.vendor.name().into(),
+                    product: p.vendor.product(&p.selected)?.into(),
+                    region: p.vendor.region(&p.selected)?.into(),
                     cost: RecurringCost {
                         amount: charge.amount,
                         unit: match charge.currency.as_str() {
@@ -1163,46 +1132,24 @@ impl<S: Storage> Store<S> {
     }
     async fn history(&mut self, api: &mut impl Api, vm: u64) -> Result<Vec<Value>, String> {
         let result = self
-            .provider_read(
-                api,
-                "GET",
-                &format!("/api/v1/vm/{vm}/payments?limit=100&offset=0"),
-                None,
-            )
+            .provider_read(api, self.procurement_vendor().invoice_history(vm))
             .await?;
-        let rows = array(&result)?;
-        if rows.len() >= 100 {
-            return Err(
-                "Payment history incomplete; Refresh without issuing another invoice.".into(),
-            );
-        }
-        let mut ids = std::collections::BTreeSet::new();
-        for row in rows {
-            if !ids.insert(payment_id(row)?) || number(row, "vm_id")? != vm {
-                return Err(REFUSED.into());
-            }
-        }
-        Ok(rows.clone())
+        self.procurement_vendor().parse_history(&result, vm)
     }
     async fn initial_billing_quote(&mut self, api: &mut impl Api) -> Result<Billing, String> {
         let p = self.procurement.clone().ok_or(REFUSED)?;
         let vm_id = id(p.vm.as_ref().ok_or(REFUSED)?)?;
         // The quote is for this same approved machine, not an unverified current configuration.
         let vm = self
-            .provider_read(api, "GET", &format!("/api/v1/vm/{vm_id}"), None)
+            .provider_read(api, self.procurement_vendor().get(vm_id))
             .await?;
         self.procurement_commit(Record::Observation(vm)).await?;
         let value = self
-            .provider_read(
-                api,
-                "GET",
-                &format!("/api/v1/vm/{vm_id}/renew/quote?method=lightning&intervals=1"),
-                None,
-            )
+            .provider_read(api, p.vendor.invoice_quote(vm_id))
             .await?;
         Ok(Billing {
             vm_id,
-            terms: BillingTerms::parse(&value)?,
+            terms: p.vendor.parse_billing(&value)?,
         })
     }
     async fn associate_payment(&mut self, api: &mut impl Api, issue: bool) -> Result<(), String> {
@@ -1225,12 +1172,10 @@ impl<S: Storage> Store<S> {
                     billing
                 }
             };
-            if !protocol::suitable_payment(
-                &history[0],
-                vm_id,
-                &billing.terms,
-                timestamp(text(vm, "created", 40)?)?,
-            ) {
+            if !p
+                .vendor
+                .suitable_payment(&history[0], vm_id, &billing.terms, p.vendor.created(vm)?)
+            {
                 return Err("Initial payment evidence conflicts or cannot be established from the saved one-period quote; no invoice issued.".into());
             }
             return self
@@ -1254,7 +1199,7 @@ impl<S: Storage> Store<S> {
             .as_ref()
             .and_then(|p| p.vm.as_ref())
             .ok_or(REFUSED)?;
-        if current.get("expires").is_some_and(|v| !v.is_null()) {
+        if p.vendor.has_billing_evidence(current) {
             return Err("Existing billing evidence prevents initial invoice issuance.".into());
         }
         self.procurement_commit(Record::InvoiceSent(Invoice {
@@ -1262,14 +1207,7 @@ impl<S: Storage> Store<S> {
             started: api.now(),
         }))
         .await?;
-        let payment = self
-            .provider_read(
-                api,
-                "GET",
-                &format!("/api/v1/vm/{vm_id}/renew?method=lightning&intervals=1"),
-                None,
-            )
-            .await?;
+        let payment = self.provider_read(api, p.vendor.invoice(vm_id)).await?;
         self.procurement_commit(self.payment_record(payment, api.now()))
             .await
     }
@@ -1288,11 +1226,13 @@ impl<S: Storage> Store<S> {
             .payment
             .as_ref()
             .ok_or("No saved machine invoice to check.")?;
-        if payment["is_paid"] == true {
+        if purchase.vendor.paid(payment) {
             return Ok(());
         }
-        let path = format!("/api/v1/payment/{}", payment_id(payment)?);
-        let updated = self.provider_read(api, "GET", &path, None).await?;
+        let request = purchase
+            .vendor
+            .payment(self.procurement_vendor().payment_id(payment)?);
+        let updated = self.provider_read(api, request).await?;
         self.procurement_commit(self.payment_record(updated, api.now()))
             .await
     }
@@ -1323,14 +1263,15 @@ impl<S: Storage> Store<S> {
             self.readiness_current(api, &p)?;
         }
         if p.registration_sent && p.ssh_key.is_none() {
-            self.provider_read(api, "GET", "/api/v1/ssh-key", None)
-                .await?;
+            self.provider_read(api, p.vendor.keys()).await?;
             return Err("SSH registration outcome unknown. The provider list has no public-key material to prove a match; no insertion or order is retried.".into());
         }
         if p.ssh_key.is_none() {
             let public = self.poc_identity_public_keys(&p.machine, &p.identity)?;
             self.procurement_commit(Record::RegistrationSent).await?;
-            let key=self.provider_read(api,"POST","/api/v1/ssh-key",Some(json!({"name":format!("tau-{}",p.identity.index),"key_data":public["authorized_keys"]}))).await?;
+            let key = self
+                .provider_read(api, p.vendor.register_key(&public, p.identity.index))
+                .await?;
             self.procurement_commit(Record::Registered(key)).await?;
             p = self.procurement.clone().ok_or(REFUSED)?;
         }
@@ -1346,14 +1287,14 @@ impl<S: Storage> Store<S> {
                         },
                     )
                     .await?;
-                if !fresh.same_terms(&p.selected) {
+                if !p.vendor.same_terms(&fresh, &p.selected) {
                     self.procurement_commit(Record::TermsChanged(fresh)).await?;
                     return Err("The offer or price changed; review and approve the new terms before creating.".into());
                 }
-                let before = self.provider_read(api, "GET", "/api/v1/vm", None).await?;
+                let before = self.provider_read(api, p.vendor.list()).await?;
                 unique_ids(&before)?;
                 for vm in array(&before)? {
-                    protocol::validate_vm(vm)?;
+                    self.procurement_vendor().validate_vm(vm)?;
                 }
                 let before = array(&before)?.clone();
                 let started = api.now();
@@ -1362,8 +1303,10 @@ impl<S: Storage> Store<S> {
                 #[cfg(all(feature = "tracer", target_arch = "wasm32"))]
                 crate::testonly::session_point("procurement_create_intent").await;
                 self.check_api(api)?;
-                let (path, body) = p.selected.create(id(p.ssh_key.as_ref().ok_or(REFUSED)?)?);
-                let vm = match self.provider_read(api, "POST", path, Some(body)).await {
+                let request = p
+                    .vendor
+                    .create(&p.selected, id(p.ssh_key.as_ref().ok_or(REFUSED)?)?);
+                let vm = match self.provider_read(api, request).await {
                     Err(why) if why == protocol::EMAIL_REQUIRED => {
                         self.procurement_commit(Record::CreateEmailRefused).await?;
                         return Ok(());
@@ -1373,23 +1316,20 @@ impl<S: Storage> Store<S> {
                 self.procurement_commit(Record::Associated(vm)).await?;
             } else {
                 let intent = p.create.as_ref().ok_or(REFUSED)?;
-                let after = self.provider_read(api, "GET", "/api/v1/vm", None).await?;
+                let after = self.provider_read(api, p.vendor.list()).await?;
                 unique_ids(&after)?;
                 if array(&after)?.len() > 8 {
                     return Err("Create inventory exceeds the bounded reconciliation limit; no order is retried.".into());
                 }
                 let mut candidates = Vec::new();
                 for vm in array(&after)? {
-                    if !intent.before.iter().any(|old| old["id"] == vm["id"]) {
+                    if !intent.before.iter().any(|old| p.vendor.same_vm_id(old, vm)) {
                         // Require complete matching list and detail evidence, never uniqueness alone.
-                        let detail = self
-                            .provider_read(api, "GET", &format!("/api/v1/vm/{}", id(vm)?), None)
-                            .await?;
+                        let detail = self.provider_read(api, p.vendor.get(id(vm)?)).await?;
                         let key = id(p.ssh_key.as_ref().ok_or(REFUSED)?)?;
-                        if !p.selected.matches(vm, key, intent.started)
-                            || !p.selected.matches(&detail, key, intent.started)
-                            || vm["id"] != detail["id"]
-                            || vm["created"] != detail["created"]
+                        if !p.vendor.matches(&p.selected, vm, key, intent.started)
+                            || !p.vendor.matches(&p.selected, &detail, key, intent.started)
+                            || !p.vendor.same_vm_identity(vm, &detail)
                         {
                             return Err(
                                 "Create evidence incomplete or conflicting; no order is retried."
@@ -1415,17 +1355,12 @@ impl<S: Storage> Store<S> {
         }
         let payment = p.payment.as_ref().ok_or(REFUSED)?;
         let updated = self
-            .provider_read(
-                api,
-                "GET",
-                &format!("/api/v1/payment/{}", payment_id(payment)?),
-                None,
-            )
+            .provider_read(api, p.vendor.payment(p.vendor.payment_id(payment)?))
             .await?;
         self.procurement_commit(self.payment_record(updated.clone(), api.now()))
             .await?;
-        if updated["is_paid"] != true {
-            if timestamp(text(&updated, "expires", 40)?)? <= api.now() {
+        if !p.vendor.paid(&updated) {
+            if p.vendor.payment_expires(&updated)? <= api.now() {
                 return Err("Initial invoice expired; this purchase remains paused with the same VM/payment. Reissue is unsupported.".into());
             }
             return Err(
@@ -1437,7 +1372,7 @@ impl<S: Storage> Store<S> {
     }
 
     fn payment_record(&self, payment: Value, now: u64) -> Record {
-        let paid_at = (payment["is_paid"] == true).then(|| {
+        let paid_at = self.procurement_vendor().paid(&payment).then(|| {
             self.procurement
                 .as_ref()
                 .and_then(|p| p.paid_at)
@@ -1448,7 +1383,7 @@ impl<S: Storage> Store<S> {
 
     pub(crate) fn procurement_readiness_eligible(&self) -> bool {
         self.procurement.as_ref().is_some_and(|p| {
-            p.payment.as_ref().is_some_and(|pay| pay["is_paid"] == true)
+            p.payment.as_ref().is_some_and(|pay| p.vendor.paid(pay))
                 && p.paid_at.is_some()
                 && p.target.is_none()
                 && p.pending_selection.is_none()
@@ -1496,13 +1431,17 @@ impl<S: Storage> Store<S> {
         self.readiness_current(api, &p)?;
         let vm_id = id(p.vm.as_ref().ok_or(REFUSED)?)?;
         let fresh = self
-            .provider_read(api, "GET", &format!("/api/v1/vm/{vm_id}"), None)
+            .provider_read(api, self.procurement_vendor().get(vm_id))
             .await?;
         self.readiness_current(api, &p)?;
         let observation = Record::Observation(fresh.clone());
         // Validate the complete fresh response before considering suppression.
         self.procurement_projection(&observation)?;
-        if !automatic || !protocol::same_readiness(p.vm.as_ref().ok_or(REFUSED)?, &fresh)? {
+        if !automatic
+            || !p
+                .vendor
+                .same_readiness(p.vm.as_ref().ok_or(REFUSED)?, &fresh)?
+        {
             self.procurement_commit(observation).await?;
             self.readiness_current(api, &p)?;
         }
@@ -1512,25 +1451,26 @@ impl<S: Storage> Store<S> {
         // Publication must agree exactly with the recorded VM, even after a reordered key set.
         let saved = self.procurement.clone().ok_or(REFUSED)?;
         let vm = saved.vm.as_ref().ok_or(REFUSED)?;
-        if vm["status"]["state"] != "running" {
-            return Err(
-                "Waiting for provider boot readiness; unknown state is not ready. Refresh later."
-                    .into(),
-            );
+        if p.vendor.readiness_state(vm) != "running" {
+            return Err(p.vendor.boot_wait().into());
         }
-        let (key, pin) = protocol::published_pin(vm)?;
+        let (key, pin) = p.vendor.published_pin(vm)?;
         let target = TargetRecord {
             machine: p.machine.clone(),
             relay: p.relay.clone(),
             profile: "v1".into(),
-            host: protocol::allocated_ipv4(vm)?,
+            host: p.vendor.allocated_ipv4(vm)?,
             port: 22,
             user: p.user.clone(),
             elevation: crate::jobs::Elevation::SudoNoninteractive,
             pin,
         };
         self.readiness_current(api, &p)?;
-        self.procurement_commit(Record::Handoff {target,publication:json!({"origin":p.origin,"vm_id":vm_id,"created":vm["created"],"selected_key":key,"host_ssh_keys":vm["host_ssh_keys"]})}).await
+        self.procurement_commit(Record::Handoff {
+            target,
+            publication: p.vendor.publication(&p.origin, &json!(vm_id), vm, key),
+        })
+        .await
     }
 }
 
