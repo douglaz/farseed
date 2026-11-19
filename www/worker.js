@@ -153,7 +153,9 @@ let lastReport = null;
 // so a fresh key submitted after End is compared with the sessions the page shows, not with a stale store report.
 let latestSessions = null;
 const paymentsEligible = () => !retirementRequested && pageVisible && lastReport?.state === 'unlocked' && !['suspended','reconciling','ended'].includes(lastReport?.lifecycle_state);
-// VPSBG never consults LNVPS's account flag, payment fields or target presence.
+// Durable VPSBG contexts include first-create continuation after settlement/coverage,
+// including a wake after the settlement append but before any introduction or create.
+// They never consult LNVPS's account flag, payment fields or target presence.
 let vpsbgDepositTimer = null;
 let vpsbgDepositBusy = false;
 let vpsbgScheduling = false;

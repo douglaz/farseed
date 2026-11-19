@@ -46,6 +46,16 @@ pub struct Identity {
     pub index: u32,
 }
 
+/// Public, immutable purchase-to-machine/pass pairing. Retired pairs remain in exports.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachinePassBinding {
+    pub purchase: String,
+    pub machine: String,
+    pub machine_identity: Identity,
+    pub pass_identity: Identity,
+}
+
 /// An entry's status. `Failed` and `Destroyed` are `STA-22b`'s tombstones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +116,8 @@ pub struct Metadata {
     entries: Vec<Entry>,
     restored_from_import: bool,
     seed_backup: Option<Completion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    machine_pass_bindings: Vec<MachinePassBinding>,
 }
 
 /// The recorded completion of the seed-backup ceremony (`STA-23`).
@@ -198,6 +210,7 @@ impl Metadata {
             entries: Vec::new(),
             restored_from_import: false,
             seed_backup: None,
+            machine_pass_bindings: Vec::new(),
         }
     }
 
@@ -234,6 +247,81 @@ impl Metadata {
     /// are twr-ggw.27's.
     pub fn export(&self) -> Metadata {
         self.clone()
+    }
+
+    pub fn machine_pass_bindings(&self) -> &[MachinePassBinding] {
+        &self.machine_pass_bindings
+    }
+
+    /// Called on a projected metadata copy, atomically with the two reservations.
+    pub(crate) fn bind_machine(&mut self, binding: MachinePassBinding) -> Result<(), Refusal> {
+        self.validate_binding(&binding)?;
+        if self.machine_pass_bindings.iter().any(|old| {
+            old.machine == binding.machine
+                || old.machine_identity == binding.machine_identity
+                || old.pass_identity == binding.pass_identity
+        }) {
+            return Err(Refusal::NotFresh);
+        }
+        self.machine_pass_bindings.push(binding);
+        Ok(())
+    }
+
+    fn validate_binding(&self, b: &MachinePassBinding) -> Result<(), Refusal> {
+        if b.purchase.len() != 32
+            || !b
+                .purchase
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            || b.machine.is_empty()
+            || b.machine.len() > 64
+            || !b.machine.as_bytes()[0].is_ascii_alphanumeric()
+            || !b
+                .machine
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
+            || b.machine_identity.family != Family::Machines
+            || b.pass_identity.family != Family::Passes
+            || b.machine_identity.seed != b.pass_identity.seed
+            || b.machine_identity.derivation_version != VERSION
+            || b.pass_identity.derivation_version != VERSION
+        {
+            return Err(Refusal::NotFresh);
+        }
+        let status = |id: &Identity| {
+            let mut entries = self.entries.iter().filter(|e| &e.identity == id);
+            let entry = entries.next().ok_or(Refusal::NotFresh)?;
+            if entries.next().is_some()
+                || id.index > MAX_INDEX
+                || (id.seed == self.seed && id.index >= self.next_unused.get(id.family))
+            {
+                return Err(Refusal::NotFresh);
+            }
+            Ok(entry.status)
+        };
+        let machine = status(&b.machine_identity)?;
+        let pass = status(&b.pass_identity)?;
+        let retired = |s| matches!(s, Status::Failed | Status::Destroyed);
+        if retired(machine) != retired(pass)
+            || (!retired(machine) && b.machine_identity.seed != self.seed)
+        {
+            return Err(Refusal::NotFresh);
+        }
+        Ok(())
+    }
+
+    fn validate_bindings(&self) -> Result<(), Refusal> {
+        for (i, b) in self.machine_pass_bindings.iter().enumerate() {
+            self.validate_binding(b)?;
+            if self.machine_pass_bindings[..i].iter().any(|old| {
+                old.machine == b.machine
+                    || old.machine_identity == b.machine_identity
+                    || old.pass_identity == b.pass_identity
+            }) {
+                return Err(Refusal::NotFresh);
+            }
+        }
+        Ok(())
     }
 
     /// The identity a reservation of `family` would take now, changing nothing: the caller
@@ -287,6 +375,27 @@ impl Metadata {
                 self.observe(identity, Status::Created, Status::Destroyed)?
             }
             Event::Restore(export) => {
+                export.validate_bindings()?;
+                if self
+                    .machine_pass_bindings
+                    .iter()
+                    .any(|old| !export.machine_pass_bindings.contains(old))
+                {
+                    return Err(Refusal::NotFresh);
+                }
+                for binding in &self.machine_pass_bindings {
+                    for id in [&binding.machine_identity, &binding.pass_identity] {
+                        if self.entries.iter().any(|e| {
+                            &e.identity == id
+                                && matches!(e.status, Status::Failed | Status::Destroyed)
+                        }) && !export.entries.iter().any(|e| {
+                            &e.identity == id
+                                && matches!(e.status, Status::Failed | Status::Destroyed)
+                        }) {
+                            return Err(Refusal::NotFresh);
+                        }
+                    }
+                }
                 let mut versions = std::iter::once(export.derivation_version)
                     .chain(export.entries.iter().map(|e| e.identity.derivation_version));
                 if let Some(version) = versions.find(|v| *v != VERSION) {

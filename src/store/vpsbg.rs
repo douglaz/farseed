@@ -1,6 +1,7 @@
 //! Separate VPSBG custody, purchase journal and deposit reconciliation.
 use super::*;
 use crate::poc::provisioning::{self as protocol, Vendor, vpsbg as wire};
+mod create;
 
 #[cfg(test)]
 mod tests;
@@ -41,13 +42,76 @@ impl TokenRecord {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct MachinePassBinding {
-    pub purchase: String,
-    pub machine: String,
-    pub machine_identity: Identity,
-    pub pass_identity: Identity,
+pub use crate::allocation::MachinePassBinding;
+
+/// Capability made only by the checked, machine-scoped selector. Contains public identities.
+pub(crate) struct BoundMachineRelay {
+    binding: MachinePassBinding,
+}
+
+impl<S: Storage> Store<S> {
+    pub(super) fn bound_relay_key(
+        &self,
+        bound: &BoundMachineRelay,
+    ) -> Option<crate::credential::RelayKey> {
+        let id = &bound.binding.pass_identity;
+        self.seed()?.relay_key(id.derivation_version, id.index).ok()
+    }
+    pub(super) fn vpsbg_machine_known(&self, machine: &str) -> bool {
+        self.vpsbg_history()
+            .any(|p| p.vendor == Vendor::Vpsbg && p.machine == machine)
+            || self
+                .vpsbg_purchases
+                .values()
+                .any(|s| s.replaced.iter().any(|b| b.machine == machine))
+    }
+
+    pub(crate) fn bound_machine_relay(&self, machine: &str) -> Result<BoundMachineRelay, String> {
+        self.procurement_ready()?;
+        let allocation = self.allocation();
+        let mut matches = allocation
+            .machine_pass_bindings()
+            .iter()
+            .filter(|b| b.machine == machine);
+        let binding = matches.next().ok_or(protocol::REFUSED)?;
+        if matches.next().is_some()
+            || self.seed().is_none_or(|s| s.id() != allocation.seed())
+            || binding.machine_identity.seed != allocation.seed()
+            || binding.pass_identity.seed != allocation.seed()
+            || binding.machine_identity.derivation_version != crate::seed::VERSION
+            || binding.pass_identity.derivation_version != crate::seed::VERSION
+            || binding.machine_identity.family != Family::Machines
+            || binding.pass_identity.family != Family::Passes
+            || [&binding.machine_identity, &binding.pass_identity]
+                .iter()
+                .any(|id| {
+                    allocation
+                        .entries()
+                        .iter()
+                        .filter(|e| {
+                            &e.identity == *id
+                                && matches!(
+                                    e.status,
+                                    allocation::Status::Reserved | allocation::Status::Created
+                                )
+                        })
+                        .count()
+                        != 1
+                })
+        {
+            return Err(protocol::REFUSED.into());
+        }
+        if let Some(p) = self.vpsbg_purchase(&binding.purchase)
+            && (p.machine != machine
+                || p.vpsbg.as_ref().is_none_or(|v| v.binding != *binding)
+                || self.vpsbg_purchases[&binding.purchase].closed_at.is_some())
+        {
+            return Err(protocol::REFUSED.into());
+        }
+        Ok(BoundMachineRelay {
+            binding: binding.clone(),
+        })
+    }
 }
 /// Approval's immutable purchase id and atomically reserved machine/pass pair.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,6 +168,8 @@ impl VpsbgPurchase {
 
 #[derive(Default)]
 pub(super) struct ReadState {
+    // A weak reference never extends the private material beyond its bounded invocation.
+    pub create_held: std::rc::Weak<create::HeldCreate>,
     pub balance: Option<(wire::Balance, u64)>,
     // Absence means unreconciled since open, or a covering read awaiting suppression.
     // Only a complete reconciliation below F (or a freshly preflighted issuance) clears an attempt.
@@ -134,6 +200,8 @@ pub(crate) struct MoneyReview {
     pub revision: u64,
     pub replaces_deposit: Vec<DepositRef>,
     pub late_credit_disclosed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pay_order: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,6 +215,39 @@ pub(crate) struct Record {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ClosureReason {
     AbandonedBeforeCreate,
+    LoginRefused { attempt: u8, refusal_sequence: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum LoginReason {
+    MissingLogin,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum AssociationFact {
+    Create(wire::CreateAck),
+    Read(wire::Detail),
+}
+impl AssociationFact {
+    fn ack(&self) -> &wire::CreateAck {
+        match self {
+            Self::Create(s) => s,
+            Self::Read(s) => &s.server,
+        }
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ChargeEvidence {
+    CreateAccepted { status: u16, first_period: u64 },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum PayOutcome {
+    Paid(wire::OrderFact),
+    NotApplied { status: String, checked_at: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +272,8 @@ pub(crate) enum Change {
         approved_at: u64,
         replaces_deposit: Vec<DepositRef>,
         late_credit_disclosed: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pay_order: Option<u64>,
     },
     ImageSent {
         url: String,
@@ -205,6 +308,63 @@ pub(crate) enum Change {
         balance: wire::Cents,
         first_period: wire::Cents,
         checked_at: u64,
+    },
+    CreateSent {
+        attempt: u8,
+        name: String,
+        machine_identity: Identity,
+        image: wire::ImageFact,
+        approval_revision: u64,
+        started: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh_key: Option<u64>,
+    },
+    CreateLoginRefused {
+        attempt: u8,
+        checked_at: u64,
+        reason: LoginReason,
+    },
+    KeyRegistrationSent {
+        started: u64,
+    },
+    KeyRegistered {
+        id: u64,
+        fingerprint: String,
+    },
+    OrderUnpaid {
+        order: u64,
+        create_attempt: u8,
+        checked_at: u64,
+    },
+    PayOrderSent {
+        order: u64,
+        approval_revision: u64,
+        started: u64,
+    },
+    PayOrderResolved {
+        order: u64,
+        outcome: PayOutcome,
+    },
+    Associated {
+        server: AssociationFact,
+        charge: Option<ChargeEvidence>,
+        checked_at: u64,
+    },
+    OrderPaid {
+        order: wire::OrderFact,
+        checked_at: u64,
+    },
+    Observed {
+        server: wire::Detail,
+        checked_at: u64,
+    },
+    MachineReplaced {
+        old_machine: String,
+        entry: crate::dispatch::MachineEntry,
+        identity: Identity,
+        relay_identity: Identity,
+        binding: MachinePassBinding,
+        replaced_at: u64,
     },
     Closed {
         reason: ClosureReason,
@@ -241,6 +401,23 @@ pub(super) struct PurchaseState {
     pub image: Option<wire::ImageFact>,
     pub deposits: Vec<Attempt>,
     pub closed_at: Option<u64>,
+    pub creates: Vec<CreateAttempt>,
+    pub key_registration: Option<u64>,
+    pub key: Option<(u64, String)>,
+    pub unpaid: Option<(u64, u8, u64)>,
+    pub pay_sent: Option<(u64, u64, u64)>,
+    pub pay_resolved: Option<PayOutcome>,
+    pub associated: Option<(AssociationFact, Option<ChargeEvidence>)>,
+    pub order_paid: Option<wire::OrderFact>,
+    pub observed: Option<wire::Detail>,
+    pub replaced: Vec<MachinePassBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CreateAttempt {
+    attempt: u8,
+    started: u64,
+    refusal: Option<u64>,
 }
 
 struct Projection {
@@ -254,12 +431,25 @@ pub(crate) struct PollContext {
     pub purchase: String,
     pub machine: String,
     pub binding: MachinePassBinding,
+    pub create_pending: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct ActionContext {
+    pub vendor: Vendor,
+    pub origin: String,
+    pub account: String,
+    pub generation: u64,
+    pub purchase: String,
 }
 
 impl<S: Storage> Store<S> {
     pub(crate) fn procurement_admit_action(&self, action: &str) -> Result<(), String> {
         if self.procurement_vendor() == Vendor::Vpsbg {
-            if matches!(action, "read" | "approve" | "close") {
+            if matches!(
+                action,
+                "read" | "approve" | "close" | "resume" | "payment_check" | "pay_order"
+            ) {
                 Ok(())
             } else {
                 Err(wire::READ_ONLY.into())
@@ -273,6 +463,12 @@ impl<S: Storage> Store<S> {
         api.current()?;
         api.check_vendor(Vendor::Vpsbg)?;
         let account = api.account();
+        if let Some(context) = api.vpsbg_context() {
+            self.vpsbg_context_current(context)?;
+            if purchase.is_some_and(|id| id != context.purchase) {
+                return Err(protocol::REFUSED.into());
+            }
+        }
         if self
             .vpsbg_token
             .as_ref()
@@ -280,6 +476,36 @@ impl<S: Storage> Store<S> {
             || purchase.is_some_and(|id| {
                 self.vpsbg_purchase(id)
                     .is_none_or(|p| p.account != account || p.origin != wire::ORIGIN)
+            })
+        {
+            return Err(protocol::REFUSED.into());
+        }
+        Ok(())
+    }
+    pub(crate) fn vpsbg_action_context(&self, purchase: &str) -> Result<ActionContext, String> {
+        let p = self.vpsbg_purchase(purchase).ok_or(protocol::REFUSED)?;
+        let token = self.vpsbg_token.as_ref().ok_or(protocol::REFUSED)?;
+        let context = ActionContext {
+            vendor: p.vendor,
+            origin: p.origin.clone(),
+            account: p.account.clone(),
+            generation: token.generation,
+            purchase: purchase.into(),
+        };
+        self.vpsbg_context_current(&context)?;
+        Ok(context)
+    }
+    pub(crate) fn vpsbg_context_current(&self, context: &ActionContext) -> Result<(), String> {
+        if context.vendor != Vendor::Vpsbg
+            || context.origin != wire::ORIGIN
+            || self
+                .vpsbg_token
+                .as_ref()
+                .is_none_or(|t| t.account != context.account || t.generation != context.generation)
+            || self.vpsbg_purchase(&context.purchase).is_none_or(|p| {
+                p.vendor != context.vendor
+                    || p.origin != context.origin
+                    || p.account != context.account
             })
         {
             return Err(protocol::REFUSED.into());
@@ -505,6 +731,12 @@ impl<S: Storage> Store<S> {
                 .unwrap_or(1),
             late_credit_disclosed: !refs.is_empty(),
             replaces_deposit: refs,
+            pay_order: self
+                .procurement
+                .as_ref()
+                .and_then(|p| p.vpsbg.as_ref())
+                .and_then(|v| self.vpsbg_purchases.get(&v.purchase))
+                .and_then(|s| s.unpaid.map(|(id, _, _)| id)),
         })
     }
     pub(crate) async fn vpsbg_approve(
@@ -544,7 +776,9 @@ impl<S: Storage> Store<S> {
             resources: None,
         };
         plans.0 = Value::Null;
-        let balance = self.vpsbg_preflight(api, None).await?;
+        let balance = self
+            .vpsbg_approval_preflight(api, displayed.pay_order)
+            .await?;
         self.vpsbg_second_writer(api, None).await?;
         let mut current = self.vpsbg_review(&fresh, &balance, api.now())?;
         // A new read timestamp is not a price change, but the displayed snapshot must be genuine.
@@ -558,6 +792,7 @@ impl<S: Storage> Store<S> {
             return Err("VPSBG terms changed; review and approve the displayed money plan and card flag again.".into());
         }
         current.payment_plan.read_at = api.now();
+        let approved_at = current.payment_plan.read_at;
         self.vpsbg_check_fence(
             &api.account(),
             api.now(),
@@ -565,6 +800,29 @@ impl<S: Storage> Store<S> {
             &current.replaces_deposit,
             current.late_credit_disclosed,
         )?;
+        if let Some(p) = self
+            .procurement
+            .as_ref()
+            .filter(|p| p.vendor == Vendor::Vpsbg)
+            && approval.machine != p.machine
+        {
+            let id = p.vpsbg.as_ref().ok_or(protocol::REFUSED)?.purchase.clone();
+            let state = &self.vpsbg_purchases[&id];
+            let last = state.creates.last().ok_or(protocol::REFUSED)?;
+            let reason = ClosureReason::LoginRefused {
+                attempt: last.attempt,
+                refusal_sequence: last.refusal.ok_or(protocol::REFUSED)?,
+            };
+            // This transition is reachable only from this explicit fresh-approval request.
+            self.vpsbg_commit(
+                &id,
+                Change::Closed {
+                    reason,
+                    closed_at: api.now(),
+                },
+            )
+            .await?;
+        }
         let existing = self
             .procurement
             .clone()
@@ -584,9 +842,10 @@ impl<S: Storage> Store<S> {
                     selected: fresh,
                     payment_plan: current.payment_plan,
                     approved_card: current.approved_card,
-                    approved_at: api.now(),
+                    approved_at,
                     replaces_deposit: current.replaces_deposit,
                     late_credit_disclosed: current.late_credit_disclosed,
+                    pay_order: current.pay_order,
                 },
             )
             .await?;
@@ -625,7 +884,7 @@ impl<S: Storage> Store<S> {
                 relay: approval.relay,
                 selected: fresh,
                 user: "nixos".into(),
-                approved_at: api.now(),
+                approved_at,
                 pending_selection: None,
                 registration_sent: false,
                 ssh_key: None,
@@ -650,7 +909,19 @@ impl<S: Storage> Store<S> {
             id
         };
         self.vpsbg_reads.terms_changed = false;
-        self.vpsbg_progress(api, &purchase, true).await
+        if api
+            .vpsbg_context()
+            .is_some_and(|context| context.purchase != purchase)
+        {
+            // A fresh approval closed a definitively refused purchase. The next wake
+            // constructs its own immutable context for the newly approved purchase.
+            return Ok(());
+        }
+        if self.vpsbg_purchases[&purchase].unpaid.is_some() {
+            Ok(())
+        } else {
+            self.vpsbg_progress(api, &purchase, true).await
+        }
     }
     async fn vpsbg_ensure_image(
         &mut self,
@@ -773,6 +1044,12 @@ impl<S: Storage> Store<S> {
         if self.vpsbg_purchases[purchase].closed_at.is_some() {
             return Ok(());
         }
+        if !self.vpsbg_purchases[purchase].creates.is_empty()
+            || self.vpsbg_purchases[purchase].associated.is_some()
+        {
+            api.vpsbg_begin_window()?;
+            return self.vpsbg_reconcile_create(api, purchase).await;
+        }
         // The durable current approval authorizes the first image add after reload as well.
         // ImageSent permanently removes that authority; it is never derived from a lost reply.
         let image = self.vpsbg_ensure_image(api, purchase, true).await?;
@@ -792,6 +1069,9 @@ impl<S: Storage> Store<S> {
                 .iter()
                 .any(|a| a.revision == v.approval_revision)
         {
+            if !_approved_invocation && self.vpsbg_create_pending(purchase) {
+                return self.vpsbg_continue_create(api, purchase).await;
+            }
             return Ok(());
         }
         let balance = self
@@ -877,12 +1157,32 @@ impl<S: Storage> Store<S> {
             .insert((purchase.into(), attempt));
         Ok(())
     }
+    /// Automatic deposit ticks need no server-detail refresh once association is observed.
+    /// Readiness will own its own refreshes; explicit Resume still reconciles creation.
+    pub(crate) async fn vpsbg_poll_deposit(
+        &mut self,
+        api: &mut impl protocol::Api,
+        purchase: &str,
+    ) -> Result<(), String> {
+        let current = self
+            .procurement
+            .as_ref()
+            .and_then(|p| p.vpsbg.as_ref())
+            .is_some_and(|v| v.purchase == purchase);
+        if current && self.vpsbg_purchases[purchase].observed.is_none() {
+            self.vpsbg_progress(api, purchase, false).await
+        } else {
+            self.vpsbg_deposit_check(api, purchase).await
+        }
+    }
+
     pub(crate) async fn vpsbg_deposit_check(
         &mut self,
         api: &mut impl protocol::Api,
         purchase: &str,
     ) -> Result<(), String> {
         self.vpsbg_api(api, Some(purchase))?;
+        api.vpsbg_begin_window()?;
         self.vpsbg_reads
             .deposit_clear
             .retain(|(id, _)| id != purchase);
@@ -892,7 +1192,7 @@ impl<S: Storage> Store<S> {
             .as_ref()
             .and_then(|p| p.vpsbg.as_ref())
             .is_some_and(|v| v.purchase == purchase);
-        if current {
+        if current && self.vpsbg_purchases[purchase].unpaid.is_none() {
             if let Err(error) = &result {
                 self.vpsbg_reads
                     .deposit_clear
@@ -975,6 +1275,11 @@ impl<S: Storage> Store<S> {
                 }
             }
         }
+        // A sent or associated purchase can only settle its existing deposits.
+        // Coverage, balance shortfalls and fence release only gate pre-create top-ups.
+        if !state.creates.is_empty() || state.associated.is_some() {
+            return Ok(());
+        }
         let unresolved = self.vpsbg_purchases[purchase]
             .deposits
             .iter()
@@ -1053,7 +1358,8 @@ impl<S: Storage> Store<S> {
         self.vpsbg_purchases
             .iter()
             .filter(|(id, state)| {
-                state.deposits.iter().any(|a| a.transaction.is_none())
+                self.vpsbg_create_pending(id)
+                    || state.deposits.iter().any(|a| a.transaction.is_none())
                     || (state.closed_at.is_none()
                         && self
                             .procurement
@@ -1075,6 +1381,7 @@ impl<S: Storage> Store<S> {
                     purchase: id.clone(),
                     machine: p.machine.clone(),
                     binding: p.vpsbg.as_ref()?.binding.clone(),
+                    create_pending: self.vpsbg_create_pending(id),
                 })
             })
             .collect()
@@ -1162,9 +1469,28 @@ impl<S: Storage> Store<S> {
         allocation
             .apply(&allocation::Event::Reserve(p.relay_identity.clone()))
             .map_err(|e| e.to_string())?;
+        allocation
+            .bind_machine(p.vpsbg.as_ref().ok_or(protocol::REFUSED)?.binding.clone())
+            .map_err(|e| e.to_string())?;
         Ok((allocation, dispatch))
     }
     fn vpsbg_projection(&self, record: &Record) -> Result<Projection, String> {
+        if matches!(
+            record.change,
+            Change::CreateSent { .. }
+                | Change::CreateLoginRefused { .. }
+                | Change::KeyRegistrationSent { .. }
+                | Change::KeyRegistered { .. }
+                | Change::OrderUnpaid { .. }
+                | Change::PayOrderSent { .. }
+                | Change::PayOrderResolved { .. }
+                | Change::Associated { .. }
+                | Change::OrderPaid { .. }
+                | Change::Observed { .. }
+                | Change::MachineReplaced { .. }
+        ) {
+            return self.vpsbg_project_create(record);
+        }
         let refused = protocol::REFUSED;
         if let Change::Approved {
             purchase,
@@ -1190,6 +1516,11 @@ impl<S: Storage> Store<S> {
                             .as_ref()
                             .is_some_and(|old| old.purchase == v.purchase || old.name == v.name)
                 })
+                || self
+                    .allocation()
+                    .machine_pass_bindings()
+                    .iter()
+                    .any(|b| b.machine == p.machine)
                 || self.dispatch.approved_entries.contains_key(&p.machine)
                 || self.poc_targets.contains_key(&p.machine)
                 || self.commands.iter().any(|(_, e)| e.machine == p.machine)
@@ -1254,11 +1585,22 @@ impl<S: Storage> Store<S> {
                         revision: 1,
                         replaces_deposit: replaces_deposit.clone(),
                         late_credit_disclosed: *late_credit_disclosed,
+                        pay_order: None,
                     }],
                     image_sent: None,
                     image: None,
                     deposits: Vec::new(),
                     closed_at: None,
+                    creates: Vec::new(),
+                    key_registration: None,
+                    key: None,
+                    unpaid: None,
+                    pay_sent: None,
+                    pay_resolved: None,
+                    associated: None,
+                    order_paid: None,
+                    observed: None,
+                    replaced: Vec::new(),
                 },
             });
         }
@@ -1291,6 +1633,7 @@ impl<S: Storage> Store<S> {
                 approved_at,
                 replaces_deposit,
                 late_credit_disclosed,
+                pay_order,
             } => {
                 if v.approval_revision.checked_add(1) != Some(*revision)
                     || *approved_at < p.approved_at
@@ -1298,6 +1641,14 @@ impl<S: Storage> Store<S> {
                     || p.create.is_some()
                     || p.vm.is_some()
                     || p.target.is_some()
+                    || state.associated.is_some()
+                    || (!state.creates.is_empty()
+                        && (pay_order.is_none()
+                            || *pay_order != state.unpaid.map(|(id, _, _)| id)
+                            || *selected != p.selected))
+                    || pay_order
+                        .is_some_and(|id| state.unpaid.is_none_or(|(saved, _, _)| id != saved))
+                    || state.pay_sent.is_some()
                 {
                     return Err(refused.into());
                 }
@@ -1320,6 +1671,7 @@ impl<S: Storage> Store<S> {
                     revision: *revision,
                     replaces_deposit: replaces_deposit.clone(),
                     late_credit_disclosed: *late_credit_disclosed,
+                    pay_order: *pay_order,
                 });
             }
             Change::ImageSent { url, name, started } => {
@@ -1467,15 +1819,27 @@ impl<S: Storage> Store<S> {
                 }
                 a.suppressed = true;
             }
-            Change::Closed {
-                reason: ClosureReason::AbandonedBeforeCreate,
-                closed_at,
-            } => {
+            Change::Closed { reason, closed_at } => {
+                let proof = match reason {
+                    ClosureReason::AbandonedBeforeCreate => state.creates.is_empty(),
+                    ClosureReason::LoginRefused {
+                        attempt,
+                        refusal_sequence,
+                    } => {
+                        state.unpaid.is_none()
+                            && state.associated.is_none()
+                            && state.creates.last().is_some_and(|a| {
+                                a.attempt == *attempt && a.refusal == Some(*refusal_sequence)
+                            })
+                            && state.creates.iter().all(|a| a.refusal.is_some())
+                    }
+                };
                 if self.procurement.as_ref().is_none_or(|p| {
                     p.vpsbg
                         .as_ref()
                         .is_none_or(|v| v.purchase != record.purchase)
-                }) || p.create.is_some()
+                }) || !proof
+                    || p.create.is_some()
                     || p.vm.is_some()
                     || p.target.is_some()
                     || *closed_at < p.approved_at
@@ -1491,6 +1855,7 @@ impl<S: Storage> Store<S> {
                 }
                 state.closed_at = Some(*closed_at);
             }
+            _ => unreachable!("create records use their separate projection"),
         }
         p.vpsbg.as_ref().ok_or(refused)?.validate(&p)?;
         Ok(Projection {
@@ -1502,7 +1867,7 @@ impl<S: Storage> Store<S> {
     fn apply_vpsbg(&mut self, number: u64, record: &Record, projection: Projection) {
         let Projection {
             purchase: p,
-            state,
+            mut state,
             allocations,
         } = projection;
         let closed = state.closed_at.is_some();
@@ -1516,6 +1881,9 @@ impl<S: Storage> Store<S> {
                         .iter()
                         .any(|a| a.attempt == *attempt && !a.suppressed && a.transaction.is_none()))
         });
+        if let Change::CreateLoginRefused { .. } = record.change {
+            state.creates.last_mut().expect("validated refusal").refusal = Some(number);
+        }
         self.vpsbg_purchases.insert(record.purchase.clone(), state);
         if let Some((allocation, mut dispatch)) = allocations {
             dispatch
@@ -1523,6 +1891,10 @@ impl<S: Storage> Store<S> {
                 .insert(p.machine.clone(), number);
             self.allocation = Some(allocation);
             self.dispatch = dispatch;
+            if matches!(record.change, Change::MachineReplaced { .. }) {
+                self.procurement = Some(p);
+                return;
+            }
             if let Some(previous) = self.procurement.take() {
                 self.completed_purchases.push(previous);
             }
@@ -1610,6 +1982,9 @@ impl<S: Storage> Store<S> {
                     && p.create.is_none()
                     && p.vm.is_none()
                     && p.target.is_none()
+                    && self.vpsbg_purchases.get(purchase).is_some_and(|s| {
+                        s.creates.is_empty() && s.unpaid.is_none() && s.associated.is_none()
+                    })
                     && [&p.identity, &p.relay_identity].iter().all(|identity| {
                         self.allocation().entries().iter().any(|entry| {
                             &entry.identity == *identity
@@ -1819,10 +2194,12 @@ impl<S: Storage> Store<S> {
             }
             view["close_allowed"] = json!(self.vpsbg_close_allowed(&v.purchase));
             view["pause"] = json!(self.vpsbg_reads.pause);
-            let changed_top_up = !state
-                .deposits
-                .iter()
-                .any(|a| a.revision == v.approval_revision)
+            let changed_top_up = state.creates.is_empty()
+                && state.associated.is_none()
+                && !state
+                    .deposits
+                    .iter()
+                    .any(|a| a.revision == v.approval_revision)
                 && self
                     .vpsbg_reads
                     .balance
@@ -1849,6 +2226,41 @@ impl<S: Storage> Store<S> {
                 if state.image.is_some() {"ready"} else if state.image_sent.is_some() {"asking"} else {"needed"})});
             view["introduction"] = Value::Null;
             view["deposit"] = self.vpsbg_deposit_view(&v.purchase, now);
+            view["create_pending"] = json!(self.vpsbg_create_pending(&v.purchase));
+            view["provisioning"] = json!({"state":if state.associated.is_some() {"associated"}
+                else if state.unpaid.is_some() {"unpaid_order"} else if !state.creates.is_empty() {"create_unknown"}
+                else if self.vpsbg_create_pending(&v.purchase) {"create_pending"} else {"deposit"}});
+            if let Some((server, charge)) = &state.associated {
+                view["vm_id"] = json!(server.ack().id);
+                view["paid_until"] = json!(
+                    state
+                        .observed
+                        .as_ref()
+                        .map_or(server.ack().expiry_at, |d| d.server.expiry_at)
+                );
+                view["renewal"] = json!(match state.observed.as_ref().and_then(|d| d.auto_renew) {
+                    Some(true) => "on",
+                    Some(false) => "off",
+                    None => "unknown",
+                });
+                if charge.is_none() && state.order_paid.is_none() {
+                    view["pause"] = json!({"kind":"payment_unproven","message":"The named server is associated, but its order-to-server payment association is not confirmed."});
+                }
+            }
+            if let Some((order, _, _)) = state.unpaid {
+                let pay_allowed = state.pay_sent.is_none()
+                    && self
+                        .attest_deadline(&p.machine)
+                        .is_some_and(|end| wire::budget_fits(now, end));
+                view["pause"] =
+                    json!({"kind":"unpaid_order","order":order,"pay_allowed":pay_allowed});
+            } else if let Some(last) = state.creates.last()
+                && last.refusal.is_some()
+            {
+                view["pause"] = json!({"kind":"login_refused","message":"VPSBG refused login. Explicitly approve a fresh purchase to close this one."});
+            } else if state.associated.is_none() && !state.creates.is_empty() {
+                view["pause"] = json!({"kind":"create_unknown","message":"The create outcome is unknown. Resume only reconciles the saved name."});
+            }
         }
     }
     fn vpsbg_deposit_view(&self, purchase: &str, now: u64) -> Value {

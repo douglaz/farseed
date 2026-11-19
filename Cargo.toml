@@ -80,6 +80,7 @@ web-sys = { version = "0.3", features = [
 
 [build-dependencies]
 toml = "1"
+sha2 = { version = "0.11", default-features = false }
 
 # The tests run the gate `build.rs` runs, on TOML of their own.
 [dev-dependencies]

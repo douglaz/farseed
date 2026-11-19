@@ -1241,7 +1241,19 @@ impl<S: Storage> Store<S> {
     }
 
     /// The harness derives this per attempt; no session receives the relay key.
-    pub fn relay_key(&self) -> Option<crate::credential::RelayKey> {
+    pub fn relay_key(&self, machine: &str) -> Option<crate::credential::RelayKey> {
+        // A recorded VPSBG pairing is authoritative, including after retirement or restore.
+        // Purchase history also fences a missing metadata binding; never guess a pass.
+        if self
+            .allocation()
+            .machine_pass_bindings()
+            .iter()
+            .any(|b| b.machine == machine)
+            || self.vpsbg_machine_known(machine)
+        {
+            let bound = self.bound_machine_relay(machine).ok()?;
+            return self.bound_relay_key(&bound);
+        }
         let identity = &self
             .allocation()
             .entries()
@@ -1611,6 +1623,11 @@ impl<S: Storage> Store<S> {
         let seed = self.seed.as_ref().ok_or(crate::poc::wait::UNLOCKED_SEED)?;
         let mut borrowed: Vec<&[u8]> = vec![seed.bytes(), &self.key.0];
         let mut derived = Vec::new();
+        derived.extend(
+            self.vpsbg_create_secrets()
+                .into_iter()
+                .map(CheckValue::Text),
+        );
         let mut bindings = Vec::new();
         if let Some(account) = &self.inference.account {
             borrowed.push(&account.0);
@@ -6025,8 +6042,8 @@ impl<S: Storage> crate::harness::BoundJournal for Store<S> {
     ) -> Result<Rc<Session>, AdmissionRefusal> {
         Store::connection_session_for(self, machine, origin).await
     }
-    async fn relay_key(&self) -> Option<crate::credential::RelayKey> {
-        Store::relay_key(self)
+    async fn relay_key(&self, machine: &str) -> Option<crate::credential::RelayKey> {
+        Store::relay_key(self, machine)
     }
 }
 

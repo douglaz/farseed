@@ -847,8 +847,8 @@ mod worker {
                 )),
             }
         }
-        async fn relay_key(&self) -> Option<crate::credential::RelayKey> {
-            self.local.lock().await.store()?.relay_key()
+        async fn relay_key(&self, machine: &str) -> Option<crate::credential::RelayKey> {
+            self.local.lock().await.store()?.relay_key(machine)
         }
         fn credentials_available(&self) -> bool {
             !self.unavailable
