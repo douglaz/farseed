@@ -649,6 +649,16 @@ impl<S: Storage> Store<S> {
         api: &mut impl Api,
         choice: Choice,
     ) -> Result<(), String> {
+        if self.procurement.as_ref().is_some_and(|p| {
+            p.vendor == Vendor::Vpsbg
+                && p.vpsbg.as_ref().is_some_and(|v| {
+                    self.vpsbg_purchases
+                        .get(&v.purchase)
+                        .is_some_and(|s| !s.creates.is_empty())
+                })
+        }) {
+            return Err("The saved VPSBG plan cannot change after a possible create.".into());
+        }
         // Invalidate the prior candidate even when the replacement fails validation.
         self.procurement_selection = None;
         self.check_api(api)?;

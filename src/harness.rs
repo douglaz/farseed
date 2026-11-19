@@ -189,7 +189,7 @@ pub trait BoundJournal: Journal {
         machine: &str,
         origin: Option<&std::rc::Rc<crate::binding::Session>>,
     ) -> Result<std::rc::Rc<crate::binding::Session>, crate::binding::AdmissionRefusal>;
-    async fn relay_key(&self) -> Option<crate::credential::RelayKey>;
+    async fn relay_key(&self, machine: &str) -> Option<crate::credential::RelayKey>;
     fn credentials_available(&self) -> bool {
         true
     }

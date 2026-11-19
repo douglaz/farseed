@@ -7,6 +7,8 @@ use std::cell::{Cell, RefCell};
 
 const MONEY_NOW: u64 = 1_767_225_600;
 
+mod c1_tests;
+
 #[test]
 fn vpsbg_invoice_publication_requires_committed_issue() {
     #[derive(Deserialize)]
@@ -1616,20 +1618,27 @@ fn vpsbg_card_flag_bound_to_money_approval() {
     block_on(r.vpsbg_progress(api.action(), &id, false)).unwrap();
     assert_eq!(r.procurement_view()["phase"], "terms_changed");
     assert_eq!(api.posts("/v1/balance"), 1);
-    for action in ["resume", "pay_order", "create", "first_contact"] {
+    // b2b-2 (task-c1 item 13) admits resume and pay_order at the guard; terms_changed still refuses below.
+    for action in ["create", "first_contact"] {
         assert!(r.procurement_admit_action(action).is_err());
     }
-    for action in ["read", "approve", "close"] {
+    for action in ["read", "approve", "close", "resume", "pay_order"] {
         r.procurement_admit_action(action).unwrap();
     }
     assert!(block_on(r.procurement_resume(api.action(), false)).is_err());
+    // b2b-2 (task-c1 item 13) allowlists both POST routes; delete stays b2c's.
     for route in ["/v1/servers", "/v1/orders/pay"] {
-        assert!(!Vendor::Vpsbg.request_method_allowed(
+        assert!(Vendor::Vpsbg.request_method_allowed(
             wire::ORIGIN,
             "POST",
             &format!("{}{route}", wire::ORIGIN)
         ));
     }
+    assert!(!Vendor::Vpsbg.request_method_allowed(
+        wire::ORIGIN,
+        "DELETE",
+        &format!("{}/v1/servers/1", wire::ORIGIN)
+    ));
     assert!(
         !api.calls
             .iter()

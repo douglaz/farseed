@@ -1,8 +1,12 @@
-//! VPS.BG's bounded protocol. Only image-add and deposit mutations are enabled.
+//! VPS.BG's bounded protocol through association. Readiness and deletion remain disabled.
 use super::*;
 use serde_json::json;
 pub(crate) mod bolt11;
+mod create;
+pub(crate) use create::*;
 
+#[cfg(test)]
+mod create_tests;
 #[cfg(test)]
 mod tests;
 
@@ -23,6 +27,9 @@ pub const DISCLOSURES: [&str; 4] = [
 pub(crate) const IMAGE_URL: &str =
     "https://app.poc.asf0.org/images/nixos-tau-26.05-f1e5c35-3.qcow2";
 pub(crate) const IMAGE_SIZE: u64 = 745_465_344;
+// Provisional: measure both at the first paid run (78 s observed create-to-certificate).
+pub(crate) const BOOT_BUDGET: u64 = 300;
+pub(crate) const RELAY_BUDGET: u64 = 600;
 
 pub(crate) fn mutation_budget(requests: usize, remaining_ms: f64) -> Result<(), String> {
     if requests >= 16 || !remaining_ms.is_finite() || remaining_ms < 15_000.0 {
@@ -329,6 +336,9 @@ pub(super) fn path_allowed(path: &str) -> bool {
     if matches!(path, "/v1/servers/plans" | "/v1/balance") {
         return true;
     }
+    if let Some(id) = path.strip_prefix("/v1/servers/") {
+        return positive_id(id);
+    }
     let (base, page) = match path.split_once('?') {
         Some((base, query)) => (
             base,
@@ -339,7 +349,11 @@ pub(super) fn path_allowed(path: &str) -> bool {
     page.is_some()
         && matches!(
             base,
-            "/v1/balance/transactions" | "/v1/orders" | "/v1/servers" | "/v1/custom-server-images"
+            "/v1/balance/transactions"
+                | "/v1/orders"
+                | "/v1/servers"
+                | "/v1/custom-server-images"
+                | "/v1/ssh-keys"
         )
 }
 fn canonical_page(s: &str) -> bool {
@@ -348,7 +362,7 @@ fn canonical_page(s: &str) -> bool {
         .is_some_and(|n| (1..=16).contains(&n) && n.to_string() == s)
 }
 pub(super) fn request_url(origin: &str, path: &str) -> Result<String, String> {
-    if origin != ORIGIN || !path_allowed(path) {
+    if origin != ORIGIN || !(path_allowed(path) || path == "/v1/orders/pay") {
         return Err(REFUSED.into());
     }
     Ok(format!("{ORIGIN}{path}"))
@@ -357,7 +371,15 @@ pub(super) fn request_method_allowed(origin: &str, method: &str, url: &str) -> b
     origin == ORIGIN
         && url.strip_prefix(ORIGIN).is_some_and(|path| {
             (method == "GET" && path_allowed(path))
-                || (method == "POST" && matches!(path, "/v1/balance" | "/v1/custom-server-images"))
+                || (method == "POST"
+                    && matches!(
+                        path,
+                        "/v1/balance"
+                            | "/v1/custom-server-images"
+                            | "/v1/servers"
+                            | "/v1/ssh-keys"
+                            | "/v1/orders/pay"
+                    ))
         })
 }
 
@@ -471,18 +493,35 @@ pub(crate) fn reduce_response(
     crate::store::unique_provider_json(&exact)?;
     let value = crate::poc::credit::decode(&exact).map_err(|_| REFUSED)?;
     bounded(&value.0, 0)?;
-    if !scan_value(&value.0)
-        || !request_method_allowed(ORIGIN, method, &format!("{ORIGIN}{path}"))
-        || !path_allowed(path)
-        || !(200..300).contains(&status)
+    if !scan_value(&value.0) || !request_method_allowed(ORIGIN, method, &format!("{ORIGIN}{path}"))
     {
         return Err(REFUSED.into());
     }
     let raw = &value.0;
     let base = path.split('?').next().ok_or(REFUSED)?;
+    if !(200..300).contains(&status) {
+        if method == "POST" && path == "/v1/servers" && matches!(status, 400 | 403 | 422) {
+            return Ok(json!(create_error(raw)?));
+        }
+        return Err(REFUSED.into());
+    }
     if method == "POST" {
         let v = raw.get("data").unwrap_or(raw);
         return match base {
+            "/v1/servers" => {
+                let rows = array(&raw["data"])?;
+                if rows.len() != 1 {
+                    return Err(REFUSED.into());
+                }
+                let ack = create_ack(&rows[0])?;
+                validate_create_ack(&ack)?;
+                Ok(json!(CreateReply::Accepted(ack)))
+            }
+            "/v1/ssh-keys" => Ok(json!(ssh_key_fact(v)?)),
+            "/v1/orders/pay" => {
+                // No response can establish payment. Ignore all non-allowlisted fields.
+                Ok(json!({"acknowledged":true}))
+            }
             "/v1/custom-server-images" => {
                 let status = text(v, "status", 64)?;
                 if !matches!(status, "downloading" | "downloaded" | "pending" | "failed") {
@@ -545,6 +584,10 @@ pub(crate) fn reduce_response(
         "/v1/orders" => page(raw, path, order),
         "/v1/servers" => page(raw, path, server),
         "/v1/custom-server-images" => page(raw, path, image_fact),
+        "/v1/ssh-keys" => page(raw, path, ssh_key_fact),
+        _ if base.strip_prefix("/v1/servers/").is_some_and(positive_id) => {
+            Ok(json!(server(raw.get("data").unwrap_or(raw))?))
+        }
         _ => Err(REFUSED.into()),
     }
 }
@@ -730,34 +773,7 @@ fn server(v: &Value) -> Result<ServerFact, String> {
                 .transpose()?,
         }));
     }
-    let status = match text(v, "status", 64)? {
-        "processing" => ServerStatus::Processing,
-        "active" => ServerStatus::Active,
-        "suspended" => ServerStatus::Suspended,
-        "stopped" => ServerStatus::Stopped,
-        other => ServerStatus::Unknown(other.into()),
-    };
-    let billing_cycle = match &v["billing_cycle"] {
-        Value::String(s) => s.parse::<u32>().map_err(|_| REFUSED)?,
-        _ => u32::try_from(number(v, "billing_cycle")?).map_err(|_| REFUSED)?,
-    };
-    if billing_cycle == 0 {
-        return Err(REFUSED.into());
-    }
-    let plan = &v["plan"];
-    let ack = CreateAck {
-        id: server_id,
-        hostname,
-        billing_cycle,
-        status,
-        plan: PlanFact {
-            id: id(plan)?,
-            key: text(plan, "key", 128)?.into(),
-            price_with_vat: money(&plan["price_with_vat"])?,
-        },
-        created_at: vpsbg_timestamp(text(v, "created_at", 40)?)?,
-        expiry_at: vpsbg_timestamp(text(v, "expiry_at", 40)?)?,
-    };
+    let ack = create_ack(v)?;
     let mut public_ipv4 = None;
     if let Some(addresses) = v.get("ip_addresses") {
         for a in array(addresses)? {
@@ -791,6 +807,44 @@ fn server(v: &Value) -> Result<ServerFact, String> {
             }
         }
     }
+    detail(v, ack, public_ipv4)
+}
+
+fn create_ack(v: &Value) -> Result<CreateAck, String> {
+    let status = match text(v, "status", 64)? {
+        "processing" => ServerStatus::Processing,
+        "active" => ServerStatus::Active,
+        "suspended" => ServerStatus::Suspended,
+        "stopped" => ServerStatus::Stopped,
+        other => ServerStatus::Unknown(other.into()),
+    };
+    let billing_cycle = match &v["billing_cycle"] {
+        Value::String(s) => s.parse::<u32>().map_err(|_| REFUSED)?,
+        _ => u32::try_from(number(v, "billing_cycle")?).map_err(|_| REFUSED)?,
+    };
+    if billing_cycle == 0 {
+        return Err(REFUSED.into());
+    }
+    let plan = &v["plan"];
+    Ok(CreateAck {
+        id: id(v)?,
+        hostname: text(v, "hostname", 128)?.into(),
+        billing_cycle,
+        status,
+        plan: PlanFact {
+            id: id(plan)?,
+            key: text(plan, "key", 128)?.into(),
+            price_with_vat: money(&plan["price_with_vat"])?,
+        },
+        created_at: vpsbg_timestamp(text(v, "created_at", 40)?)?,
+        expiry_at: vpsbg_timestamp(text(v, "expiry_at", 40)?)?,
+    })
+}
+fn detail(
+    v: &Value,
+    ack: CreateAck,
+    public_ipv4: Option<std::net::Ipv4Addr>,
+) -> Result<ServerFact, String> {
     let state = v
         .get("state")
         .filter(|v| !v.is_null())

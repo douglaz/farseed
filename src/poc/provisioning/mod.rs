@@ -695,12 +695,19 @@ pub(crate) trait Api {
     fn take_vpsbg_response(&mut self) -> Option<Zeroizing<Vec<u8>>> {
         None
     }
+    /// Start a separate bounded VPSBG exchange window, retaining lifecycle authority.
+    fn vpsbg_begin_window(&mut self) -> Result<(), String> {
+        self.current()
+    }
     /// Check a full exchange's request/time budget before a durable VPSBG intent.
     fn vpsbg_mutation_budget(&self) -> Result<(), String> {
         Err(REFUSED.into())
     }
     fn response_status(&self) -> u16 {
         200
+    }
+    fn vpsbg_context(&self) -> Option<&crate::store::vpsbg::ActionContext> {
+        None
     }
     fn account(&self) -> String;
     fn now(&self) -> u64;

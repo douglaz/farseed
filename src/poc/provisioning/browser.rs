@@ -213,6 +213,7 @@ enum Action {
     },
     Resume,
     PaymentCheck,
+    PayOrder,
     ReadinessCheck,
     EmailCheck,
     EmailSend {
@@ -271,7 +272,7 @@ pub async fn provider_request(request: String) -> String {
             return Ok(None);
         }
         let action_name = match &action {
-            Action::Approve { .. } => "approve", Action::Resume => "resume", Action::PaymentCheck => "payment_check",
+            Action::Approve { .. } => "approve", Action::Resume => "resume", Action::PaymentCheck => "payment_check", Action::PayOrder => "pay_order",
             Action::EmailCheck => "email_check", Action::InitialInvoice { .. } => "initial_invoice",
             Action::Close => "close", Action::EmailSend { .. } => "email_send", Action::EmailReissue => "email_reissue",
             _ => "read",
@@ -294,7 +295,11 @@ pub async fn provider_request(request: String) -> String {
             Vendor::Lnvps => Credential::Lnvps(store.provider_account().ok_or("Provider account unavailable.")?.copy()),
             Vendor::Vpsbg => Credential::VpsbgToken(store.vpsbg_token().ok_or("Enter the VPSBG token first.")?.copy()),
         };
+        let context = if store.procurement_vendor() == Vendor::Vpsbg {
+            store.procurement_view()["purchase"].as_str().map(|id| store.vpsbg_action_context(id)).transpose()?
+        } else { None };
         let mut api = Browser {
+            context,
             vendor: store.procurement_vendor(),
             origin: store.procurement_origin().into(),
             credential,
@@ -348,8 +353,20 @@ pub async fn provider_request(request: String) -> String {
             Action::EmailCheck => store.procurement_resume(&mut api, false).await.map(|_| None),
             Action::EmailSend { email } => store.procurement_email_send(&mut api, Some(email)).await.map(|_| None),
             Action::EmailReissue => store.procurement_email_send(&mut api, None).await.map(|_| None),
+            Action::PaymentCheck if api.vendor == Vendor::Vpsbg => {
+                let purchase = api.context.as_ref().ok_or(REFUSED)?.purchase.clone();
+                store.vpsbg_progress(&mut api, &purchase, false).await.map(|_| None)
+            }
             Action::PaymentCheck => store.procurement_payment_check(&mut api).await.map(|_| None),
+            Action::PayOrder => {
+                let purchase = api.context.as_ref().ok_or(REFUSED)?.purchase.clone();
+                store.vpsbg_pay_order(&mut api, &purchase).await.map(|_| None)
+            }
             Action::Close => store.procurement_close(&mut api).await.map(|_| None),
+            Action::Resume if api.vendor == Vendor::Vpsbg => {
+                let purchase = api.context.as_ref().ok_or(REFUSED)?.purchase.clone();
+                store.vpsbg_progress(&mut api, &purchase, false).await.map(|_| None)
+            }
             Action::Resume => store
                 .procurement_resume(&mut api, false)
                 .await
@@ -361,7 +378,8 @@ pub async fn provider_request(request: String) -> String {
                 store.procurement_resume(&mut api, true).await.map(|_| None)
             }
         };
-        if api.vendor != store.procurement_vendor()
+        if let Some(context) = &api.context { store.vpsbg_context_current(context)?; }
+        if api.context.is_none() && api.vendor != store.procurement_vendor()
             && !(result.is_ok() && closing_purchase.as_deref().is_some_and(|purchase|
                 store.vpsbg_closed_dispatch(api.vendor, purchase))) {
             return Err(REFUSED.into());
@@ -434,6 +452,7 @@ pub async fn vpsbg_poll(purchase: String) -> String {
             .ok_or(REFUSED)?
             .copy();
         let mut api = Browser {
+            context: Some(store.vpsbg_action_context(&purchase)?),
             vendor: Vendor::Vpsbg,
             origin: vpsbg::ORIGIN.into(),
             credential: Credential::VpsbgToken(record),
@@ -445,12 +464,7 @@ pub async fn vpsbg_poll(purchase: String) -> String {
             requests: 0,
             response_status: 0,
         };
-        let current = store.procurement_view()["purchase"].as_str() == Some(purchase.as_str());
-        if current {
-            store.vpsbg_progress(&mut api, &purchase, false).await
-        } else {
-            store.vpsbg_deposit_check(&mut api, &purchase).await
-        }
+        store.vpsbg_poll_deposit(&mut api, &purchase).await
     }
     .await;
     let shared = crate::worker::local();
@@ -509,6 +523,7 @@ impl Credential {
     }
 }
 struct Browser {
+    context: Option<crate::store::vpsbg::ActionContext>,
     vendor: Vendor,
     origin: String,
     automatic_visibility: Option<u64>,
@@ -535,6 +550,18 @@ impl Browser {
     }
 }
 impl Api for Browser {
+    fn vpsbg_begin_window(&mut self) -> Result<(), String> {
+        self.check_vendor(Vendor::Vpsbg)?;
+        self.current()?;
+        self.started = monotonic_ms()?;
+        self.requests = 0;
+        self.response_status = 0;
+        self.raw_response = None;
+        Ok(())
+    }
+    fn vpsbg_context(&self) -> Option<&crate::store::vpsbg::ActionContext> {
+        self.context.as_ref()
+    }
     fn vpsbg_mutation_budget(&self) -> Result<(), String> {
         self.current()?;
         vpsbg::mutation_budget(usize::from(self.requests), self.remaining_ms()?)
@@ -623,7 +650,12 @@ impl Api for Browser {
             _callback: callback,
         };
         let cancelled = pending.notify.notified();
-        let body = body.map(|b| Zeroizing::new(b.to_string()));
+        let body = if self.vendor == Vendor::Vpsbg {
+            body.map(crate::poc::credit::ClearedValue)
+                .map(|b| Zeroizing::new(b.0.to_string()))
+        } else {
+            body.map(|b| Zeroizing::new(b.to_string()))
+        };
         let mut nonce = [0; 32];
         getrandom::fill(&mut nonce).map_err(|_| REFUSED)?;
         let auth = match &self.credential {
@@ -686,6 +718,15 @@ impl Api for Browser {
                     READ_REFUSED
                 })
             };
+            if self.vendor == Vendor::Vpsbg
+                && !(200..300).contains(&status)
+                && !matches!(status, 400 | 403)
+                && !(status == 422
+                    && method == "POST"
+                    && url == format!("{}/v1/servers", vpsbg::ORIGIN))
+            {
+                return Err(refused());
+            }
             if self.vendor != Vendor::Vpsbg
                 && (!(200..300).contains(&status)
                     && !(status == 404 && policy.missing_read && !mutation)

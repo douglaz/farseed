@@ -296,6 +296,7 @@ impl Seeds {
                 .collect(),
             restored_from_import: start.restored_from_import,
             seed_backup: start.seed_backup.completion(),
+            machine_pass_bindings: Vec::new(),
         }
     }
 }

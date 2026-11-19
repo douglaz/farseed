@@ -1558,7 +1558,7 @@ async fn connect(
     if !journal.credentials_available() {
         return Err(Refusal::NoCredentials);
     }
-    let Some(relay_key) = journal.relay_key().await else {
+    let Some(relay_key) = journal.relay_key(&target.machine).await else {
         return Err(Refusal::NoCredentials);
     };
     // Borrow the holding only while deriving the transport key, before any network wait.

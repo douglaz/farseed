@@ -886,8 +886,8 @@ impl BoundJournal for ScopedJournal {
             .connection_session(machine, Some(&self.origin))
             .await
     }
-    async fn relay_key(&self) -> Option<crate::credential::RelayKey> {
-        self.base.relay_key().await
+    async fn relay_key(&self, machine: &str) -> Option<crate::credential::RelayKey> {
+        self.base.relay_key(machine).await
     }
 }
 

@@ -709,10 +709,10 @@ fn binding_uses_ceremony_allocated_and_restored_listed_identities_only() {
             }
             assert_eq!(restored.allocation().entries(), export.entries());
             assert_eq!(restored.allocation().next_unused(), export.next_unused());
-            assert_eq!(restored.relay_key().is_some(), listed_pass);
+            assert_eq!(restored.relay_key("machine-a").is_some(), listed_pass);
             if listed_pass {
                 assert_eq!(
-                    restored.relay_key().unwrap().public_key(),
+                    restored.relay_key("machine-a").unwrap().public_key(),
                     restored
                         .seed()
                         .unwrap()
