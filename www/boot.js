@@ -562,7 +562,7 @@ const checkSummary = (check, outcome) => {
 const showCheckReport = (parent, report) => {
   const result = report.status === 'still running in the background' ? report.status : report.status === 'not run' ? 'not run' : report.exit_status == null
     ? (['queued', 'attempted', 'pending'].includes(report.status) ? 'waiting' : 'result unknown')
-    : report.exit_status === 0 ? 'passed' : `failed (exit ${report.exit_status})`;
+    : report.exit_status === 0 ? 'ran without an error (exit 0)' : `failed (exit ${report.exit_status})`;
   paragraph(parent, `${commandSummary(report.command)} — ${result}`);
   rawDetails(parent, report);
 };
