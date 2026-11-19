@@ -19,6 +19,9 @@ fn close_eligible(p: &Purchase, now: u64) -> bool {
             .is_none_or(|pay| p.vendor.close_payment_eligible(pay, now))
 }
 fn closed_message(p: &Purchase) -> String {
+    if p.vendor == Vendor::Vpsbg {
+        return "VPSBG purchase abandoned before create. Earlier top-ups may still settle as VPSBG credit.".into();
+    }
     p.vendor.closed_message(
         p.vm.as_ref().expect("closed associated purchase"),
         p.payment.as_ref(),
@@ -463,6 +466,18 @@ impl<S: Storage> Store<S> {
     }
     /// Fresh absence evidence is usable only by this explicit action.
     pub(crate) async fn procurement_close(&mut self, api: &mut impl Api) -> Result<(), String> {
+        if self.procurement_vendor() == Vendor::Vpsbg {
+            if !self
+                .procurement
+                .as_ref()
+                .and_then(|p| p.vpsbg.as_ref())
+                .is_some_and(|v| self.vpsbg_close_allowed(&v.purchase))
+            {
+                return Err(protocol::vpsbg::READ_ONLY.into());
+            }
+            api.current()?;
+            return self.vpsbg_close(api.now()).await;
+        }
         self.procurement_no_money()?;
         self.check_api(api)?;
         let p = self
@@ -533,6 +548,13 @@ impl<S: Storage> Store<S> {
                 .all(|machine| self.dispatch.approved_entries.contains_key(machine))
     }
     pub(crate) fn procurement_review_selection(&self) -> Option<&Selection> {
+        if self.procurement_vendor() == Vendor::Vpsbg {
+            return self.procurement_selection.as_ref().or_else(|| {
+                self.procurement
+                    .as_ref()
+                    .and_then(|p| p.pending_selection.as_ref().or(Some(&p.selected)))
+            });
+        }
         match &self.procurement {
             Some(purchase) if purchase.target.is_none() => purchase.pending_selection.as_ref(),
             _ => self.procurement_selection.as_ref(),
@@ -589,7 +611,9 @@ impl<S: Storage> Store<S> {
         } else {
             "approved"
         };
-        let selection = if p.target.is_some() {
+        let selection = if p.vendor == Vendor::Vpsbg {
+            self.procurement_review_selection()
+        } else if p.target.is_some() {
             self.procurement_selection.as_ref()
         } else {
             Some(p.pending_selection.as_ref().unwrap_or(&p.selected))
@@ -634,6 +658,10 @@ impl<S: Storage> Store<S> {
             return Err("Complete the saved purchase before reviewing another machine.".into());
         }
         let selected = self.procurement_fetch_selection(api, choice).await?;
+        if self.procurement_vendor() == Vendor::Vpsbg {
+            self.procurement_selection = Some(selected);
+            return Ok(());
+        }
         if self
             .procurement
             .as_ref()

@@ -1,5 +1,90 @@
 use super::*;
 
+#[test]
+fn vpsbg_image_ack_is_not_readiness() {
+    let reduce = |body: Value| {
+        Vendor::Vpsbg.reduce_response(
+            "POST",
+            "/v1/custom-server-images",
+            200,
+            &serde_json::to_vec(&body).unwrap(),
+            |_| Ok(()),
+            |_| true,
+        )
+    };
+    assert_eq!(
+        reduce(json!({"data":{"id":41,"status":"downloading","discard":"fake"}})).unwrap(),
+        json!({"id":41,"status":"downloading"})
+    );
+    assert!(reduce(json!({"data":{"id":0,"status":"downloaded"}})).is_err());
+    assert!(reduce(json!({"data":{"id":41,"status":"unknown"}})).is_err());
+}
+
+#[test]
+fn vpsbg_bolt11_observed_invoice_and_rejections() {
+    // Generated here, with an invented hash/order and an all-zero unsigned signature.
+    // Only the observed *shape* and the public 900s/34,886,000-msat fields are modelled.
+    let fake = bolt11::fake(123456, 1_767_225_600, "348860n", &[]);
+    let decoded = bolt11::decode(&fake).unwrap();
+    assert_eq!(decoded.order, 123456);
+    assert_eq!(decoded.amount_msat, 34_886_000);
+    assert_eq!(decoded.expires - decoded.timestamp, 900);
+    assert_eq!(decoded.payment_hash.len(), 64);
+    assert_eq!(bolt11::decode(&fake.to_ascii_uppercase()).unwrap(), decoded);
+    assert_eq!(
+        bolt11::decode(&bolt11::fake(7, 1234, "10p", &[]))
+            .unwrap()
+            .amount_msat,
+        1
+    );
+    let mut checksum = fake.clone();
+    checksum.pop();
+    checksum.push(if fake.ends_with('q') { 'p' } else { 'q' });
+    for bad in [
+        checksum,
+        fake.replacen("lnbc", "lntb", 1),
+        fake.replacen("lnbc", "LNbc", 1),
+        bolt11::fake(7, 1234, "", &[]),
+        bolt11::fake(7, 1234, "1p", &[]),
+        bolt11::fake(7, 1234, "18446744073709551615m", &[]),
+        bolt11::fake(0, 1234, "1n", &[]),
+        bolt11::fake(7, 0, "1n", &[]),
+        bolt11::fake(7, 1234, "1n", &[1, 0, 0]), // duplicate hash
+        bolt11::fake(7, 1234, "1n", &[13, 0, 0]), // duplicate description
+        bolt11::fake(7, 1234, "1n", &[6, 0, 1, 0]), // duplicate/zero expiry
+        bolt11::fake(7, 1234, "1n", &[23, 0, 0]), // contradictory hashed description
+        bolt11::fake(7, 1234, "1n", &[7, 31, 31]), // truncated field
+        "q".repeat(4097),
+    ] {
+        assert!(
+            bolt11::decode(&bad).is_err(),
+            "invalid fake invoice accepted"
+        );
+    }
+    let response = json!({"data":{"amount":"19.03","currency":"EUR","payment_method":"bitcoin-ln",
+        "payment_information":{"payment_request":fake,"expiry_at":"2026-01-01T00:12:00Z"}}});
+    let reduced = Vendor::Vpsbg
+        .reduce_response(
+            "POST",
+            "/v1/balance",
+            200,
+            &serde_json::to_vec(&response).unwrap(),
+            |_| Ok(()),
+            |_| true,
+        )
+        .unwrap();
+    let invoice: DepositInvoice = serde_json::from_value(reduced).unwrap();
+    assert_eq!(invoice.amount, 1903);
+    assert_eq!(invoice.expires, 1_767_225_600 + 720);
+    let mut mismatched = invoice.clone();
+    mismatched.order += 1;
+    assert!(mismatched.validate().is_err());
+    mismatched = invoice.clone();
+    mismatched.expires += 1;
+    assert!(mismatched.validate().is_err());
+    assert!(!format!("{invoice:?}").contains(&invoice.bolt11));
+}
+
 // Entirely synthetic wire values; no captured response or credential is used.
 const PLANS: &[u8] = br#"{"data":[{"id":7,"key":"fake-plan","name":"Fake plan","type":"vps","vcpus":2,"dedicated_cpu":false,"memory":2048,"disk":20,"bandwidth":1000,"network_speed":100,"minimum_billing_cycle":1,"available":true,"price_with_vat":39.01}]}"#;
 

@@ -294,6 +294,7 @@ pub(crate) enum Event {
     ProviderProtection(crate::poc::inference::EchoFingerprints),
     PocProviderAccount(crate::poc::provisioning::AccountRecord),
     VpsbgTokenEntered(vpsbg::TokenRecord),
+    Vpsbg(vpsbg::Record),
     PocCreditAccount(crate::poc::credit::AccountRecord),
     PocCredit(credit::Record),
     PocAiKey(ai_keys::Record),
@@ -462,6 +463,7 @@ pub struct Store<S> {
     vendor_choice: Option<crate::poc::provisioning::Vendor>,
     vpsbg_token: Option<vpsbg::TokenRecord>,
     vpsbg_reads: vpsbg::ReadState,
+    vpsbg_purchases: std::collections::BTreeMap<String, vpsbg::PurchaseState>,
     provider_origin: String,
     provider_account: Option<crate::poc::provisioning::Account>,
     deployment_origin: Option<String>,
@@ -644,6 +646,7 @@ impl<S: Storage> Store<S> {
             vendor_choice: None,
             vpsbg_token: None,
             vpsbg_reads: Default::default(),
+            vpsbg_purchases: Default::default(),
             provider_origin: crate::poc::provisioning::default_origin(),
             provider_account: None,
             deployment_origin: None,
@@ -1866,6 +1869,7 @@ impl<S: Storage> Store<S> {
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
                 (_, Event::VpsbgTokenEntered(record)) => self.replay_vpsbg_token(record)?,
+                (_, Event::Vpsbg(record)) => self.replay_vpsbg(number, record)?,
                 (_, Event::PocProviderAccount(account)) => self.replay_provider_account(account)?,
                 (_, Event::PocCreditAccount(account)) => self.replay_credit_account(account)?,
                 (_, Event::PocCredit(record)) => self.replay_credit(record)?,
@@ -2265,6 +2269,7 @@ impl<S: Storage> Store<S> {
         if matches!(
             event,
             Event::VpsbgTokenEntered(_)
+                | Event::Vpsbg(_)
                 | Event::PocProviderAccount(_)
                 | Event::PocCreditAccount(_)
                 | Event::PocCredit(_)
@@ -2426,6 +2431,9 @@ impl<S: Storage> Store<S> {
                 .is_ok_and(|safe| safe == metadata)
             {
                 return Err(crate::poc::wait::JOURNAL_REFUSED.into());
+            }
+            if matches!(event, Event::Vpsbg(_)) {
+                drop(crate::poc::credit::ClearedValue(metadata));
             }
         }
         let previous = hex::encode(self.previous.0);
