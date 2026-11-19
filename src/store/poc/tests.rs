@@ -3143,3 +3143,5 @@ fn poc_requirements_approval_releases_only_its_declaration_pause_and_replays() {
 mod completion_tests;
 
 mod correction_tests;
+
+mod interruption_tests;
