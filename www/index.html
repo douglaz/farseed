@@ -36,6 +36,8 @@ a[data-operator-link], a[data-delivered-url] { display: block; width: 100%; min-
 button.main-action { background: #175b5b; border-color: #175b5b; color: white; font-weight: 700; }
 [data-missing-record] button { display: block; width: 100%; min-height: 48px; margin-right: 0; white-space: normal; }
 [data-task] button { min-height: 48px; }
+/* No double-tap-zoom wait on controls, so a tap clicks at once; pinch zoom and panning stay. */
+button, a, summary, label, input, select, textarea { touch-action: manipulation; }
 button:disabled { opacity: .55; cursor: default; }
 button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible, select:focus-visible { outline: 3px solid #d48516; outline-offset: 3px; }
 pre { white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: auto; max-width: 100%; padding: 12px; background: #f1f5f6; border-radius: 6px; font-size: .85rem; }
