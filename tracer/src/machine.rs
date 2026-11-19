@@ -12,6 +12,7 @@ pub struct Job {
     pub command: Vec<u8>,
     pub pid: u32,
     pub group: ProcessIdentity,
+    pub command_group: ProcessIdentity,
     start: u64,
     pub ended: Option<Instant>,
 }
@@ -52,7 +53,8 @@ impl ProcessIdentity {
 }
 
 pub fn kill_group(group: ProcessIdentity) {
-    if !group.matches() {
+    // Never PID 0 or 1: `kill -- -1` signals every process the user may signal, and init leads its own group.
+    if group.pid <= 1 || !group.matches() {
         return;
     }
     // A group is only signalled while its original leader still has this identity.
@@ -172,6 +174,7 @@ impl Machine {
                     pid: pid.pid,
                     start: pid.start,
                     group: runner,
+                    command_group: pid,
                     ended: None,
                 };
                 launches.push((id.clone(), job.clone()));
@@ -208,6 +211,7 @@ impl Machine {
         if self.root.exists() {
             for (_, job) in self.launches() {
                 kill_group(job.group);
+                kill_group(job.command_group);
             }
             std::fs::remove_dir_all(&self.root).expect("remove exact fixture directory");
         }
@@ -313,6 +317,7 @@ impl Machine {
     pub fn reboot(&self) {
         for (_, job) in self.launches() {
             kill_group(job.group);
+            kill_group(job.command_group);
         }
         std::fs::write(
             self.root.join("boot"),
@@ -412,25 +417,33 @@ mod tests {
         assert!(machine.reboot_with_running(&id, setup).await.is_err());
     }
 
+    // Formerly runner_rechecks_pid_after_fast_command_is_reaped: since 81f97bc the command is fenced until `go` and
+    // `ready`, so it can no longer run (or be reaped) while the runner waits for `pid`, and that re-check no longer
+    // exists. This test now proves what replaced it: `pid` is published while the command is live and before any
+    // of ready, go, started, exit or result, and the job then finishes normally.
     #[tokio::test]
-    async fn runner_rechecks_pid_after_fast_command_is_reaped() {
+    async fn pid_is_published_while_the_command_is_fenced_before_ready() {
         let machine = Machine::new();
         let id = "a".repeat(48);
         let original = include_str!("../../src/jobs/runner.sh");
+        let command_original = include_str!("../../src/jobs/command.sh");
         // The interpreter cannot publish pid until the runner has entered the gap.
-        let runner = replace_once(
-            original,
+        let command_runner = replace_once(
+            command_original,
             "    d=$1\n",
             "    d=$1\n    while [ ! -f \"$d/pid-gap\" ]; do sleep 0.01; done\n    sleep 0.05\n",
         );
+        // Publication precedes ready/go, so even a fast command must remain live here.
         let runner = replace_once(
-            &runner,
+            original,
             "while [ ! -f \"$d/pid\" ]; do\n",
-            "while [ ! -f \"$d/pid\" ]; do\n    : > \"$d/pid-gap\"\n    sleep 0.2\n    while kill -0 \"$command_pid\" 2>/dev/null; do sleep 0.01; done\n",
+            "while [ ! -f \"$d/pid\" ]; do\n    : > \"$d/pid-gap\"\n    while [ ! -f \"$d/pid\" ]; do sleep 0.01; done\n    sleep 0.2\n    IFS=' ' read -r gap_pid gap_start < \"$d/pid\" || exit 1\n    [ \"$(identity \"$gap_pid\")\" = \"$gap_start\" ] || exit 1\n    [ ! -f \"$d/ready\" ] && [ ! -f \"$d/go\" ] && [ ! -f \"$d/started\" ] && [ ! -f \"$d/exit\" ] && [ ! -f \"$d/result\" ] || exit 1\n    : > \"$d/pid-gap-checked\"\n",
         );
+        let original = replace_once(original, "@COMMAND_RUNNER@", &shell_quote(command_original));
+        let runner = replace_once(&runner, "@COMMAND_RUNNER@", &shell_quote(&command_runner));
         let launch = replace_once(
             &jobs::launch(&id, "fixture", b"exit 7"),
-            &shell_quote(original),
+            &shell_quote(&original),
             &shell_quote(&runner),
         );
         let (child, _guard) = start(&machine, &launch);
@@ -447,11 +460,15 @@ mod tests {
             output.status
         );
         assert!(machine.path(&id, "pid-gap").is_file());
+        assert!(machine.path(&id, "pid-gap-checked").is_file());
         assert!(
             ready,
             "runner lost ready after the command published pid and ended"
         );
         assert_eq!(exit.as_deref(), Some("7\n"));
+        let command =
+            recorded_identity(&std::fs::read_to_string(machine.path(&id, "pid")).unwrap()).unwrap();
+        assert!(!command.matches(), "fast command was not reaped");
         assert!(output.status.success());
         assert_eq!(record.classify("fixture"), State::Finished);
         assert!(matches!(
@@ -704,6 +721,7 @@ mod tests {
             ("ready", ""),
             ("pid", "0 0\n"),
             ("runner", "0 0\n"),
+            ("group", "0 0\n"),
         ] {
             std::fs::write(machine.path(id, name), bytes).unwrap();
         }
@@ -734,7 +752,7 @@ mod tests {
     async fn missing_record_files_fail_instead_of_fabricating_fields() {
         let machine = Machine::new();
         for (i, file) in [
-            "stdout", "machine", "command", "boot", "stderr", "pid", "runner",
+            "stdout", "machine", "command", "boot", "stderr", "pid", "runner", "group",
         ]
         .into_iter()
         .enumerate()
@@ -764,6 +782,7 @@ mod tests {
             ("pid", "12"),
             ("pid", "12 nope\n"),
             ("runner", ""),
+            ("group", ""),
             ("exit", ""),
             ("exit", "256\n"),
             ("exit", "0\n1\n"),
@@ -787,6 +806,7 @@ mod tests {
             ("exit", b"1\x002\n".as_slice()),
             ("pid", b"1\x002 0\n".as_slice()),
             ("runner", b"1\x002 0\n".as_slice()),
+            ("group", b"1\x002 0\n".as_slice()),
             ("boot", b"old\x00boot\n".as_slice()),
         ]
         .into_iter()
@@ -817,7 +837,7 @@ mod tests {
         let id = "a".repeat(48);
         crafted(&machine, &id);
         for suffix in ["", "\n"] {
-            for file in ["pid", "runner"] {
+            for file in ["pid", "runner", "group"] {
                 std::fs::write(machine.path(&id, file), format!("0 0{suffix}")).unwrap();
             }
             std::fs::write(machine.path(&id, "boot"), format!("old-boot{suffix}")).unwrap();
@@ -835,6 +855,7 @@ mod tests {
             ("pid", "0  0\n"),
             ("pid", " 0 0\n"),
             ("runner", "0 0 \n"),
+            ("group", "0 0 \n"),
             ("exit", "12\r\n"),
             ("exit", "12\n\n"),
             ("boot", "old\tboot\n"),
@@ -884,11 +905,15 @@ mod tests {
         let id = "2".repeat(48);
         crafted(&machine, &id);
         let process = ProcessIdentity::current(std::process::id()).unwrap();
-        std::fs::write(
-            machine.path(&id, "runner"),
-            format!("{} {}\n", process.pid, process.start),
-        )
-        .unwrap();
+        // A live supervisor and a live runner: the reader would wait for both, so only the exit record's
+        // precedence lets this read finish.
+        for file in ["runner", "group"] {
+            std::fs::write(
+                machine.path(&id, file),
+                format!("{} {}\n", process.pid, process.start),
+            )
+            .unwrap();
+        }
         std::fs::write(machine.path(&id, "exit"), "0\n").unwrap();
         let (read, _guard) = start(&machine, &jobs::collect(&id));
         assert_eq!(result(read).await.classify("fixture"), State::Finished);
@@ -902,6 +927,12 @@ mod tests {
             let id = format!("{i:048x}");
             crafted(&machine, &id);
             std::fs::write(machine.path(&id, "pid"), "1 0\n").unwrap();
+            // A live supervisor makes the runner's start-time check decisive for waiting.
+            std::fs::write(
+                machine.path(&id, "group"),
+                format!("{} {}\n", process.pid, process.start),
+            )
+            .unwrap();
             std::fs::write(
                 machine.path(&id, file),
                 format!("{} {}\n", process.pid, process.start + 1),
@@ -1078,6 +1109,7 @@ mod tests {
         let (read, _guard) = start(&machine, &jobs::collect(&id));
         assert_eq!(result(read).await.classify("fixture"), State::Ended);
         kill_group(job.group);
+        kill_group(job.command_group);
         let boot = std::fs::read(machine.path(&id, "boot")).unwrap();
         std::fs::write(machine.root.join("boot"), boot).unwrap();
         let (read, _guard) = start(&machine, &jobs::collect(&id));
