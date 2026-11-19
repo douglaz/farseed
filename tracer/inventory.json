@@ -296,11 +296,11 @@
     {"id":"delivery_cases.c010.p001","site_id":"delivery_cases.c010","label":"failing real model report cannot spoil clean delivery or block placement","scenario_id":"delivery_cases.serial","predicates":[["delivery_cases.a035",1],["delivery_cases.a036",1],["delivery_cases.a037",1]],"invocation":1},
     {"id":"main.c022.p001","site_id":"main.c022","label":"no plaintext in the served build (twr-ggw.5 AC4, AC5, CNF-15, STG-10)","scenario_id":"main.serial","predicates":[["main.a101",1],["main.a102",1],["main.a103",1],["main.a104",1],["main.a107",20],["main.a108",3],["main.a109",2],["main.a110",1],["main.a111",1],["main.a112",1],["main.a113",1],["main.a114",1]],"invocation":1},
     {"id":"main.c022.p002","site_id":"main.c022","label":"no plaintext in the tracer build (twr-ggw.5 AC4, AC5, CNF-15, STG-10)","scenario_id":"main.serial","predicates":[["main.a101",1],["main.a102",1],["main.a103",1],["main.a104",1],["main.a105",1],["main.a106",16],["main.a107",20],["main.a108",3],["main.a109",2],["main.a110",1],["main.a111",1],["main.a112",1],["main.a113",1],["main.a114",1]],"invocation":1},
-    {"id":"passphrase_cases.c001.p001","site_id":"passphrase_cases.c001","label":"empty passphrase create, reload, lock and seed re-display; short create in a second fresh origin","scenario_id":"passphrase_cases.serial","predicates":[["passphrase_cases.a001",1],["passphrase_cases.a002",1],["passphrase_cases.a003",1],["passphrase_cases.a004",1],["passphrase_cases.a005",1],["passphrase_cases.a006",1],["passphrase_cases.a007",1],["passphrase_cases.a008",1],["passphrase_cases.a009",1],["passphrase_cases.a010",1],["passphrase_cases.a011",1],["passphrase_cases.a012",1],["passphrase_cases.a013",1]],"invocation":1}
+    {"id":"passphrase_cases.c001.p001","site_id":"passphrase_cases.c001","label":"empty passphrase create, reload, lock and seed re-display; short create in a second fresh origin","scenario_id":"passphrase_cases.serial","predicates":[["passphrase_cases.a001",1],["passphrase_cases.a002",1],["passphrase_cases.a003",1],["passphrase_cases.a004",1],["passphrase_cases.a005",1],["passphrase_cases.a006",1],["passphrase_cases.a007",1],["passphrase_cases.a008",1],["passphrase_cases.a014",1],["passphrase_cases.a009",1],["passphrase_cases.a010",1],["passphrase_cases.a011",1],["passphrase_cases.a012",1],["passphrase_cases.a013",1]],"invocation":1}
   ],
   "dynamic_prerequisites": {
     "runtime.worker.ready": {"instance_template":"runtime.worker.ready.i{ordinal}","rule":"Full cardinality is fixed in prerequisites. Targeted helper request domains correspond to their reviewed selected/support callgraph; conditional readiness predicates complete once per logical request. These domains cannot promote targeted execution to full.","poll_bound":300,"full_count":710},
-    "runtime.store.ready_nontransient": {"instance_template":"runtime.store.ready_nontransient.i{ordinal}","rule":"Full cardinality is fixed in prerequisites. Targeted helper request domains correspond to their reviewed selected/support callgraph; conditional readiness predicates complete once per logical request. These domains cannot promote targeted execution to full.","poll_bound":300,"full_count":1325},
+    "runtime.store.ready_nontransient": {"instance_template":"runtime.store.ready_nontransient.i{ordinal}","rule":"Full cardinality is fixed in prerequisites. Targeted helper request domains correspond to their reviewed selected/support callgraph; conditional readiness predicates complete once per logical request. These domains cannot promote targeted execution to full.","poll_bound":300,"full_count":1326},
     "runtime.store.not_failed": {"instance_template":"runtime.store.not_failed.i{ordinal}","rule":"One completion at the actual source predicate per separately counted logical helper request; predicates and callers are bound by assertion-source contracts. Conditional contract reloads and asynchronous readiness make cardinality data dependent.","poll_bound":300},
     "binding.fixture_class.ready": {"instance_template":"binding.fixture_class.ready.i{ordinal}","rule":"Full cardinality is fixed in prerequisites. Targeted helper request domains correspond to their reviewed selected/support callgraph; conditional readiness predicates complete once per logical request. These domains cannot promote targeted execution to full.","poll_bound":300,"full_count":95},
     "binding.page.bound": {"instance_template":"binding.page.bound.i{ordinal}","rule":"Full cardinality is fixed in prerequisites. Targeted helper request domains correspond to their reviewed selected/support callgraph; conditional readiness predicates complete once per logical request. These domains cannot promote targeted execution to full.","poll_bound":300,"full_count":442}
@@ -833,7 +833,7 @@
   "placements": [
     [["full","seed.*","hold.*","setup.*","mode.*"],"main.run",1,"inside","main.c001.p001",[84,1,2],[3,4]],
     [["full","seed.*","hold.*","setup.*","mode.*"],"main.run",1,"inside","main.c002.p001",[4,85,6,86,7],[]],
-    [["full"],"passphrase_cases.run",1,"inside","passphrase_cases.c001.p001",[195,196,197,198,199,198,199,198,200,201],[340]],
+    [["full"],"passphrase_cases.run",1,"inside","passphrase_cases.c001.p001",[195,196,197,198,199,198,202,199,198,200,201],[340]],
     [["full","setup.existing"],"main.run",1,"inside","main.c004.p001",[87,7,8,88,7,9],[]],
     [["full","setup.existing"],"main.run",1,"inside","main.c005.p001",[89,7,9],[]],
     [["full","setup.existing"],"main.run",1,"inside","main.c008.p001",[90,7,9],[]],
@@ -2167,7 +2167,8 @@
     ["call:runtime.submit","passphrase.empty",null,null,["unlock","creation.empty"]],
     ["call:runtime.worker","passphrase.empty",null,{"in_use":false,"old":"source_entry_current"},null,null],
     ["call:runtime.worker","new:passphrase.short",null,{"in_use":false,"old":"none"},null,null],
-    ["call:runtime.submit","passphrase.short",null,null,["create","creation.short"]]
+    ["call:runtime.submit","passphrase.short",null,null,["create","creation.short"]],
+    ["call:runtime.settled","passphrase.empty",null,{"in_use":false}]
   ],
   "fixture_rules": [
     ["seed_cases.c007.p001","seed_cases.run",[["exec","inside",1,"seed.redisplay.running_exec",1,1,null,[["dispatch","inside",1,"harness.start"]]],["socket","inside",1,"seed.redisplay.socket_closed",2,3,null,[["start","inside",1,"harness.start"],["end","inside",1,"page.evaluate"]]]],[[0,0],[1,0],[0,1],[1,2],[1,3]]],
@@ -2412,7 +2413,7 @@
     "goal.status.other_done_visible": "true",
     "delivery.card.applications_visible": "two"
   },
-  "view_query_sha256": "d0f4bb338df3491c791ca806592c0d80196b6bab574b28ce990a05d2e9794e66",
+  "view_query_sha256": "9d39477905ee8abd4efafaddc9437cd6d2f601eb1f783545b59398d3d46ee340",
   "view_direct_sources": {
     "view.main.initial_served": ["main.c001","served","main.a004"],
     "view.main.initial_tracer": ["main.c002","tracer","main.a014"],
