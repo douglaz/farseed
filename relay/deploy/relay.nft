@@ -31,6 +31,7 @@ table inet tau_relay {
         # a new relay TCP connection to loopback cannot match this exception.
         meta skuid $relay_uid oifname "lo" ct direction reply ct state established accept
         meta skuid $relay_uid ip daddr $resolver udp dport 53 accept
+        meta skuid $relay_uid tcp dport != 22 reject
         meta skuid $relay_uid ip daddr @forbidden4 reject
         meta skuid $relay_uid ip6 daddr != 2000::/3 reject
         meta skuid $relay_uid ip6 daddr @forbidden6 reject

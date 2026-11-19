@@ -174,3 +174,116 @@ exception permits UDP to the configured address at port 53; it cannot admit TCP
 destinations. Established reply-direction loopback traffic permits replies to
 Caddy; new relay TCP connections to loopback still fail. Existing host firewall
 rules may further restrict this policy. Static validation never applies rules.
+
+For fresh deployments, `relay.nft` also restricts the relay user's new TCP egress
+to destination port 22 (`meta skuid $relay_uid tcp dport != 22 reject`). The existing
+reply-direction loopback exception still permits replies to Caddy. The deployment
+script substitutes the service UID in the rule along with its other UID rules.
+
+For an existing relay2, use `relay/deploy/upgrade.py`, **not `deploy.py`**.
+The upgrade replaces only `/usr/local/bin/tau-relay` and
+`/etc/systemd/system/tau-relay.service`. It uses the same strict SSH option list
+as deployment, one passwordless `sudo -n` session and `set -euo pipefail`.
+It holds `/run/lock/tau-relay-passes.lock` to exclude pass-file operations during
+the upgrade. The host needs Python 3 with `tomllib`, `flock`, `nft`, systemd and
+journal access. The operator supplies an already reviewed executable; this script
+performs no build, package transaction or host-key discovery.
+
+```sh
+python3 relay/deploy/upgrade.py --dry-run \
+  --host relay.example.net --known-hosts /operator/known_hosts \
+  --identity /operator/ssh_key --binary /artifacts/tau-relay \
+  --standing-key "$STANDING_KEY" \
+  --expect-old-binary-sha256 "$OLD_BINARY_SHA256" \
+  --expect-old-unit-sha256 "$OLD_UNIT_SHA256"
+```
+
+The expected hashes identify the installed files before replacement. Before and
+after, the script prints hashes of the binary, unit, configuration, pass file,
+Caddyfile and stored firewall, plus the standing-record digest. That digest is
+SHA-256 of the parsed standing record encoded as JSON with sorted keys and no
+spaces. The standing pass must be present and in force. The live output chain and
+stored firewall must both contain the numeric service UID's port-22 restriction.
+Configuration, passes, Caddy and firewall hashes must remain unchanged.
+
+The new binary and repository unit are staged as `.new`; the executable bit and
+binary hash are checked, and `systemd-analyze verify` checks a copy of the staged
+unit with a valid `.service` basename. The old binary and unit are durably saved
+as `.prev` beside their installed files before replacement. After daemon reload,
+the script captures a journal cursor and restarts only `tau-relay.service`.
+Within 30 seconds, it requires an active unit, a fresh exact `listening <socket>`
+startup line with a loopback socket, and the expected running executable hash
+read through `/proc/<MainPID>/exe`. It checks the installed binary and unit too.
+No firewall or Caddy service is restarted.
+
+Failure after replacement restores both `.prev` files, reloads the systemd
+manager, restarts the relay and checks active state, the old running binary hash,
+both restored file hashes and all protected state. It exits nonzero and prints
+`ROLLED BACK` or `ROLLBACK FAILED`. A refusal before replacement leaves the
+installed files intact. For a separate explicit rollback, use the same connection,
+standing key and original expected hashes with `--rollback`; `--binary` is then
+unnecessary. An explicit successful rollback returns zero. Restarts end existing
+relay sessions. Keep both `.prev` files until the upgrade has been accepted.
+
+Issue one pass per machine with `relay/deploy/issue-pass.py issue`; use `revoke`
+with the same key and address to revoke that exact single-address record:
+
+```sh
+python3 relay/deploy/issue-pass.py issue --dry-run \
+  --host relay.example.net --known-hosts /operator/known_hosts \
+  --identity /operator/ssh_key --key "$MACHINE_KEY" --address "$MACHINE_IPV4" \
+  --expiry-unix "$EXPIRY_UNIX" --standing-key "$STANDING_KEY" \
+  --expect-binary-sha256 "$REVIEWED_RELOAD_BINARY_SHA256" \
+  --deny-cidr "$EXCLUDED_CIDR"
+```
+
+Remove `--expiry-unix` for `revoke`. `--max-hours` defaults to 24 and `--timeout`
+to 60 seconds. An issued expiry must exceed the host's current time by 600 seconds
+and be no later than current time plus `--max-hours`. Repeat `--deny-cidr` for
+additional exclusions. Keys must be valid 64-hex x-only curve points. The address
+must be a literal IPv4 for which Python `ipaddress.is_global` is true, outside
+`own_public` in the deployed configuration and outside all supplied exclusions.
+A live address on another pass, a key on another record, or the standing key is
+refused. The configured pass-file path must be the fixed deployed path.
+
+An exact live `(key, address)` returns `ALREADY` without writing or signaling.
+For an address recorded on an expired or revoked pass, issuance removes that
+entire inactive record and prints a masked tombstone before appending the new
+single-address record. The standing record is never changed. The fixed TOML
+writer parses its output back to exactly the intended records, preserving even
+an omitted standing `revoked` field. A record expiry in the inclusive interval
+`[now - 5, now + timeout + 30]` blocks publication, including a record to be removed.
+This keeps the expected in-force count stable during confirmation.
+
+The entire remote program runs under one
+`sudo -n flock -x /run/lock/tau-relay-passes.lock python3 -` SSH command.
+The lock covers preflight, read, planning, staging, cursor capture, atomic rename,
+directory fsync, the single reload and the complete confirmation wait. Preflight
+requires an active unit, the reviewed running executable hash, the exact
+`ExecReload=/bin/kill -HUP $MAINPID` line and both firewall rules. The temporary
+pass file retains owner, group and mode, and is fsynced before rename.
+
+Only the first reload outcome after the cursor counts. Success requires an exact
+`pass reload applied: N passes, M in force` line for the computed record and
+in-force counts, plus an unchanged published file hash, standing digest, running
+binary hash and an active unit. `pass reload refused`, timeout or any mismatch
+returns nonzero with `NOT CONFIRMED: <reason>`. **Stop on NOT CONFIRMED. Do not
+retry by hand.** The file remains published; the script neither restores it nor
+sends another reload. Establish the relay's actual state before an operator
+chooses a recovery action. Revocation prevents new admissions; existing sessions
+continue until they end or the relay is restarted.
+
+Normal output contains status, mode, eight key hex characters, the first two IPv4
+octets (`a.b.x.x`), expiry, counts, hashes and masked tombstones. It does not print
+complete keys, addresses or file contents. Dry runs execute no remote command
+and read no operator binary or trust files. They print the remote program with
+sensitive parameter placeholders and the local plan; actual counts, tombstones
+and idempotence need the locked remote snapshot. Dry-run previews are deliberately
+non-executable. These scripts never read a file with mode 0600.
+
+Offline script tests use a temporary root and fake service, journal, firewall and
+running-executable readers; they invoke no real service or network commands:
+
+```sh
+python3 -I -m unittest discover -s relay/deploy/tests -v
+```
