@@ -1611,6 +1611,37 @@ const renderTasks = (store) => {
   }
 };
 
+const deliveryTaskChecksPassed = task => {
+  if (!task || ![
+    'Delivered (service and TCP checks only)',
+    'Delivered (service, TCP and sign-in checks only)',
+    'Delivered (service, TCP, sign-in and control-center checks only)',
+    'Handed over with findings',
+  ].includes(task.verdict) || !Array.isArray(task.findings ?? []) ||
+      !(task.findings ?? []).every(finding => ['control_center_files', 'unmet_command'].includes(finding?.field)) ||
+      !Array.isArray(task.read_plan) || !Array.isArray(task.verification) ||
+      task.read_plan.length === 0 || task.read_plan.length !== task.verification.length) return false;
+  return task.read_plan.every((read, index) => {
+    const observation = task.verification[index]?.observation;
+    if (!read || !observation) return false;
+    switch (read.kind) {
+      case 'running':
+      case 'enabled':
+        return typeof read.service?.name === 'string' && read.service.name.length > 0 &&
+          observation.kind === read.kind && observation.value === true;
+      case 'listeners':
+        return observation.kind === 'sockets' && Array.isArray(observation.value);
+      case 'sign_in':
+        return typeof read.url === 'string' && read.url.length > 0 && observation.kind === 'sign_in';
+      case 'control_center':
+        return observation.kind === 'control_center' && observation.value?.passed === true;
+      default:
+        return false;
+    }
+  });
+};
+const deliveryCheckExcerptLines = verification => typeof verification?.excerpt === 'string' ? verification.excerpt.split(/\r?\n/) : [];
+
 const renderDelivery = (section, machine, store) => {
   const worker = snapshotWorker();
   const entry = (store.delivery ?? []).find(d => d.machine === machine);
@@ -1623,6 +1654,110 @@ const renderDelivery = (section, machine, store) => {
   const heading = document.createElement('h3');
   heading.textContent = `Delivery for ${machine}`;
   card.append(heading);
+  const plain = isLive && delivery.last_check == null && delivery.last_completed_check == null &&
+    (delivery.findings ?? []).length === 0 && delivery.findings_unknown !== true &&
+    (delivery.applications ?? []).length === 0 && (delivery.subsequent_placement_sessions ?? []).length === 0;
+  if (plain) {
+    const verdict = document.createElement('p');
+    verdict.dataset.deliveryVerdict = machine;
+    verdict.textContent = "This version doesn't yet give a “Delivered” verdict for a machine you bought. Below is what tau-web checked on this machine itself, and what it didn't.";
+    card.append(verdict);
+    if (entry.summary) deliveryDetailsButton(card, machine, 'entry', 'delivery details', store);
+    const verdictTasks = (store.tasks ?? []).filter(task => task.machine === machine && task.verdict);
+    const recordTasks = (store.tasks ?? []).filter(task => task.machine === machine && task.summary !== true &&
+      Array.isArray(task.read_plan) && task.read_plan.length > 0);
+    const summaryTasks = (store.tasks ?? []).filter(task => task.machine === machine && task.summary === true);
+    const task = recordTasks.length === 1 ? recordTasks[0] : null;
+    const checked = document.createElement('section');
+    checked.dataset.deliveryChecked = machine;
+    if (deliveryTaskChecksPassed(task)) {
+      const count = task.read_plan.length;
+      paragraph(checked, count === 1
+        ? 'When the AI handed the setup over, tau-web ran 1 check on this machine itself. It passed:'
+        : `When the AI handed the setup over, tau-web ran ${count} checks on this machine itself. All ${count} passed:`);
+      const list = document.createElement('ul');
+      for (const [index, read] of task.read_plan.entries()) {
+        const item = document.createElement('li');
+        switch (read.kind) {
+          case 'running': item.textContent = `${read.service.name} is running`; break;
+          case 'enabled': item.textContent = `${read.service.name} is set to start at boot`; break;
+          case 'listeners': item.textContent = 'Only the TCP ports the setup declared are listening'; break;
+          case 'sign_in': item.textContent = `${read.url} asks for a sign-in`; break;
+          case 'control_center': {
+            const lastLine = deliveryCheckExcerptLines(task.verification[index]).filter(line => line.trim()).at(-1) ?? '';
+            const counts = /^CHECKS done PASS (\d+)\/(\d+)$/.exec(lastLine);
+            item.textContent = counts && BigInt(counts[1]) > 0n && BigInt(counts[1]) === BigInt(counts[2])
+              ? `The control center's own final check: all ${BigInt(counts[1])} of its checks passed`
+              : "The control center's own final check passed";
+            break;
+          }
+        }
+        list.append(item);
+      }
+      checked.append(list);
+      if (task.read_plan.some(read => read.kind === 'control_center')) {
+        paragraph(checked, "The control center's check records names only for checks that fail, so the ones that passed aren't listed here.");
+      }
+      if ((task.findings ?? []).length > 0) {
+        paragraph(checked, 'The setup still has something left to do outside these checks. Its task card says what.');
+      }
+    } else if (task) {
+      const count = task.read_plan.length;
+      const results = Array.isArray(task.verification) ? task.verification.filter(entry => entry?.observation != null).length : 0;
+      paragraph(checked, results === 0
+        ? `tau-web's own final checks on this machine have no result yet: 0 of ${count}. The task card shows what happens next.`
+        : `tau-web's own final checks on this machine haven't all passed: ${results} of ${count} have a result so far. The task card shows which, and what to do next.`);
+    } else if (recordTasks.length > 1) {
+      paragraph(checked, `tau-web has final-check records from ${recordTasks.length} setup tasks on this machine. Each task card shows its own results.`);
+    } else if (summaryTasks.length > 0) {
+      paragraph(checked, "This page shows this machine's earlier tasks in short form, so their final checks aren't listed here. Each task card shows its result.");
+    } else paragraph(checked, "tau-web has no record of its own final checks on this machine yet.");
+    card.append(checked);
+    const unchecked = document.createElement('section');
+    unchecked.dataset.deliveryUnchecked = machine;
+    paragraph(unchecked, "What tau-web didn't check:");
+    const list = document.createElement('ul');
+    const addUnchecked = text => {
+      const item = document.createElement('li');
+      item.textContent = text;
+      list.append(item);
+    };
+    addUnchecked("The whole machine against tau-web's lockdown checklist: this version can't run that check yet");
+    addUnchecked('Where the machine connects out to');
+    if (task) {
+      if (task.read_plan.some(read => read?.kind === 'enabled')) addUnchecked('That the services come back after a restart: no reboot was tried');
+      if (task.read_plan.some(read => read?.kind === 'sign_in')) addUnchecked('That the apps work the way you want: the sign-in checks only show that each address asks for a sign-in');
+      if (task.read_plan.some((read, index) => read?.kind === 'control_center' &&
+          deliveryCheckExcerptLines(task.verification?.[index]).includes('T3 Code: not linked yet (the user chose Later)'))) {
+        addUnchecked("Your T3 Code link: you chose Later, so it isn't linked yet");
+      }
+    }
+    addUnchecked("Anything that changes later: tau-web doesn't keep watching the machine, so these results are from when the checks ran");
+    unchecked.append(list);
+    card.append(unchecked);
+    if (verdictTasks.length === 1) renderDeliveredUrls(card, taskDeliveredUrls(verdictTasks[0]));
+    if (Number.isInteger(delivery.reports_count)) {
+      const reports = document.createElement('section');
+      paragraph(reports, delivery.report_label);
+      if (delivery.report_note) paragraph(reports, delivery.report_note);
+      const count = deliveryDetails.commands.get(machine)?.value?.length ?? delivery.reports_count;
+      const records = deliveryDetailsButton(reports, machine, 'commands', `commands (${count})`, store);
+      for (const [index, report] of (records ?? []).entries()) rawDetails(reports, report, ['delivery', machine, 'report', index]);
+      card.append(reports);
+    }
+    section.append(card);
+    return;
+  }
+  if (delivery.summary === true && (store.poc_targets ?? []).some(target => target.machine === machine) &&
+      delivery.verdict === 'delivery evidence not yet supplied' && delivery.findings_count === 0) {
+    const verdict = document.createElement('p');
+    verdict.dataset.deliveryVerdict = machine;
+    verdict.textContent = "This version doesn't yet give a “Delivered” verdict for a machine you bought. Open delivery details for what tau-web checked, or see the task card.";
+    card.append(verdict);
+    if (entry.summary) deliveryDetailsButton(card, machine, 'entry', 'delivery details', store);
+    section.append(card);
+    return;
+  }
   if (delivery.fixture_limit) paragraph(card, fixtureBreak === -1 ? delivery.fixture_limit : delivery.fixture_limit.slice(0, fixtureBreak + 1));
   const verdict = document.createElement('p');
   verdict.dataset.deliveryVerdict = machine;
