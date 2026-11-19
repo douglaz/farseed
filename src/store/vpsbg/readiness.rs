@@ -43,6 +43,7 @@ impl<S: Storage> Store<S> {
             return false;
         };
         s.closed_at.is_none()
+            && s.delete_sent.is_none()
             && s.attest_target.as_ref().is_some_and(|pending| {
                 pending.pin.is_empty()
                     && self.poc_target(&p.machine) == Some(pending)
@@ -110,6 +111,7 @@ impl<S: Storage> Store<S> {
             || token.account != p.account
             || token.generation != probe.token_generation
             || s.closed_at.is_some()
+            || s.delete_sent.is_some()
             || s.ready_at.is_some()
             || self.attest_installation_binding(&p.machine)? != probe.installation_binding
             || s.attest_target.as_ref() != self.poc_target(&p.machine)
@@ -176,7 +178,7 @@ impl<S: Storage> Store<S> {
             .get(&record.purchase)
             .ok_or(protocol::REFUSED)?
             .clone();
-        if s.closed_at.is_some() || s.ready_at.is_some() {
+        if s.closed_at.is_some() || s.delete_sent.is_some() || s.ready_at.is_some() {
             return Err(protocol::REFUSED.into());
         }
         match &record.change {
@@ -375,6 +377,7 @@ impl<S: Storage> Store<S> {
             return;
         };
         view["purchase"] = json!(v.purchase);
+        self.vpsbg_delete_view(view, p);
         view["introduction"] = self.vpsbg_introduction_view(&v.purchase, now);
         view["trust"] = json!({"route":"AttestCertificate","residual":"VPS.BG boots the image it downloaded; the page cannot check those bytes."});
         let paid_until = s
@@ -398,10 +401,26 @@ impl<S: Storage> Store<S> {
             .pass_issued_at
             .checked_add(31 * 86400)
             .map(|end| paid_until.map_or(end, |paid| paid.min(end)))
-            && let Some(key) = self.relay_key(&p.machine)
+            && let Some(key) = if matches!(s.closure, Some(ClosureReason::Deleted { .. })) {
+                self.seed().and_then(|seed| {
+                    seed.relay_key(p.relay_identity.derivation_version, p.relay_identity.index)
+                        .ok()
+                })
+            } else {
+                self.relay_key(&p.machine)
+            }
         {
             view["relay_pass"] = json!({"key":hex::encode(key.public_key()),"host":s.observed.as_ref().and_then(|d| d.public_ipv4).map(|ip| ip.to_string()),"expiry":expiry,
                 "state":if self.vpsbg_reads.relay_admitted.contains(&(v.purchase.clone(), p.machine.clone())) {"admitted"} else {"needed"}});
+            if matches!(s.closure, Some(ClosureReason::Deleted { .. })) {
+                view["relay_pass"]["state"] = json!("revoke_requested");
+                view["relay_pass"]["revoke_requested_at"] = json!(
+                    s.retirement
+                        .as_ref()
+                        .map(|r| r.revoke_requested_at)
+                        .or(s.closed_at)
+                );
+            }
         }
     }
 

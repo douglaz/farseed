@@ -156,18 +156,20 @@ const paymentsEligible = () => !retirementRequested && pageVisible && lastReport
 // Durable VPSBG contexts include first-create continuation after settlement/coverage,
 // including a wake after the settlement append but before any introduction or create.
 // They never consult LNVPS's account flag, payment fields or target presence.
-let vpsbgDepositTimer = null;
-let vpsbgAttestTimer = null;
-let vpsbgDepositBusy = false;
-let vpsbgAttestBusy = false;
+const vpsbgSchedules = {
+  deposit: { timer: null, busy: false },
+  delete: { timer: null, busy: false },
+  attest: { timer: null, busy: false },
+};
 let vpsbgScheduling = false;
 let vpsbgEpoch = 0;
 let vpsbgProviderQueue = Promise.resolve();
 const vpsbgEligible = () => paymentsEligible() && pageOnline && vpsbgVisible;
 const stopVpsbg = () => {
   vpsbgEpoch++;
-  clearTimeout(vpsbgDepositTimer); vpsbgDepositTimer = null;
-  clearTimeout(vpsbgAttestTimer); vpsbgAttestTimer = null;
+  for (const schedule of Object.values(vpsbgSchedules)) {
+    clearTimeout(schedule.timer); schedule.timer = null;
+  }
 };
 const queueVpsbg = operation => {
   const work = vpsbgProviderQueue.then(async () => {
@@ -200,19 +202,20 @@ const scheduleVpsbg = async () => {
   // Rust may have dropped the context while the refresh crossed its deadline.
   // The last published waiting card still needs a terminal local report.
   if (contexts.some(expired) || [lastReport?.procurement, ...(lastReport?.procurement?.completed || [])].some(expired)) {
-    clearTimeout(vpsbgAttestTimer); vpsbgAttestTimer = null;
+    clearTimeout(vpsbgSchedules.attest.timer); vpsbgSchedules.attest.timer = null;
     await publishExpiry();
     return;
   }
   const arm = (kind, selected) => {
-    if (!selected.length || (kind === 'deposit' ? vpsbgDepositTimer || vpsbgDepositBusy : vpsbgAttestTimer || vpsbgAttestBusy)) return;
+    const schedule = vpsbgSchedules[kind];
+    if (!selected.length || schedule.timer || schedule.busy) return;
     const deadline = kind === 'attest' ? Math.min(...selected.filter(c => !c.accepted).map(c => c.introduction.deadline * 1000)) : Infinity;
     const accepted = kind === 'attest' && selected.some(c => c.accepted);
     const delay = Math.min(accepted ? provider_action_delay() : Math.max(5000, provider_action_delay()), Math.max(0, deadline - Date.now()));
     const timer = setTimeout(async () => {
-      if (kind === 'deposit') vpsbgDepositTimer = null; else vpsbgAttestTimer = null;
+      schedule.timer = null;
       if (!live()) return;
-      if (kind === 'deposit') vpsbgDepositBusy = true; else vpsbgAttestBusy = true;
+      schedule.busy = true;
       try {
         for (const context of selected) {
           await queueVpsbg(async () => {
@@ -234,13 +237,15 @@ const scheduleVpsbg = async () => {
           });
         }
       } finally {
-        if (kind === 'deposit') vpsbgDepositBusy = false; else vpsbgAttestBusy = false;
+        schedule.busy = false;
         void scheduleVpsbg();
       }
     }, delay);
-    if (kind === 'deposit') vpsbgDepositTimer = timer; else vpsbgAttestTimer = timer;
+    schedule.timer = timer;
   };
+  // Deletion never replaces settlement work, including after a refused or failed check.
   arm('deposit', contexts.filter(c => c.deposit_pending));
+  arm('delete', contexts.filter(c => c.delete_pending));
   arm('attest', contexts.filter(c => c.attest_pending && c.installation_binding &&
     (c.accepted || c.introduction?.state === 'waiting')));
 };
@@ -685,7 +690,7 @@ onmessage = async ({ data: envelope }) => {
   else if (data.provider_request && typeof data.provider_request === 'object') {
     try {
       const request = () => provider_request(JSON.stringify(data.provider_request));
-      const addressedVpsbg = typeof data.provider_request.purchase === 'string';
+      const addressedVpsbg = typeof data.provider_request.purchase === 'string' || ['delete', 'delete_check'].includes(data.provider_request.action);
       const value = JSON.parse(await (addressedVpsbg || lastReport?.procurement?.vendor?.id === 'vpsbg' ? queueVpsbg(request) : request()));
       if (data.provider_request.action === 'vendor') value.provider_selection_reviewed = false;
       if (data.provider_request.action === 'select' && !value.error) value.provider_selection_reviewed = true;

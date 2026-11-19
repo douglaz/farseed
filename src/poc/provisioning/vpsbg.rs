@@ -1,9 +1,11 @@
-//! VPS.BG's bounded protocol through association. Readiness and deletion remain disabled.
+//! VPS.BG's bounded, route-specific protocol.
 use super::*;
 use serde_json::json;
 pub(crate) mod bolt11;
 mod create;
+mod delete;
 pub(crate) use create::*;
+pub(crate) use delete::*;
 
 #[cfg(test)]
 mod create_tests;
@@ -228,6 +230,8 @@ pub struct OrderFact {
     pub id: u64,
     pub created_at: u64,
     pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -304,6 +308,12 @@ pub enum ServerFact {
     Terminated(Terminated),
 }
 impl ServerFact {
+    pub fn hostname(&self) -> &str {
+        match self {
+            Self::Live(d) => &d.server.hostname,
+            Self::Terminated(d) => &d.hostname,
+        }
+    }
     pub fn id(&self) -> u64 {
         match self {
             Self::Live(d) => d.server.id,
@@ -337,7 +347,7 @@ pub(super) fn path_allowed(path: &str) -> bool {
         return true;
     }
     if let Some(id) = path.strip_prefix("/v1/servers/") {
-        return positive_id(id);
+        return positive_id(id) || id.strip_suffix("/refund-quote").is_some_and(positive_id);
     }
     let (base, page) = match path.split_once('?') {
         Some((base, query)) => (
@@ -362,7 +372,9 @@ fn canonical_page(s: &str) -> bool {
         .is_some_and(|n| (1..=16).contains(&n) && n.to_string() == s)
 }
 pub(super) fn request_url(origin: &str, path: &str) -> Result<String, String> {
-    if origin != ORIGIN || !(path_allowed(path) || path == "/v1/orders/pay") {
+    if origin != ORIGIN
+        || !(path_allowed(path) || path == "/v1/orders/pay" || delete_path_allowed(path))
+    {
         return Err(REFUSED.into());
     }
     Ok(format!("{ORIGIN}{path}"))
@@ -371,6 +383,7 @@ pub(super) fn request_method_allowed(origin: &str, method: &str, url: &str) -> b
     origin == ORIGIN
         && url.strip_prefix(ORIGIN).is_some_and(|path| {
             (method == "GET" && path_allowed(path))
+                || (method == "DELETE" && delete_path_allowed(path))
                 || (method == "POST"
                     && matches!(
                         path,
@@ -489,6 +502,9 @@ pub(crate) fn reduce_response(
     scan_value: impl Fn(&Value) -> bool,
 ) -> Result<Value, String> {
     scan_bytes(bytes)?;
+    if method == "DELETE" && delete_path_allowed(path) && status == 204 && bytes.is_empty() {
+        return Ok(json!({"acknowledged":true}));
+    }
     let exact = exact_json(bytes)?;
     crate::store::unique_provider_json(&exact)?;
     let value = crate::poc::credit::decode(&exact).map_err(|_| REFUSED)?;
@@ -499,6 +515,18 @@ pub(crate) fn reduce_response(
     }
     let raw = &value.0;
     let base = path.split('?').next().ok_or(REFUSED)?;
+    if method == "GET" && server_detail_path(path) && status == 404 {
+        // A complete protected JSON body on precisely the bound route is evidence.
+        if raw["message"] != "Server not found" {
+            return Err(REFUSED.into());
+        }
+        return Ok(json!({"evidenced_gone":{"detail_status":404}}));
+    }
+    if method == "DELETE" && status == 403 {
+        text(raw, "message", 512)?;
+        // Publish a fixed instruction, never provider-controlled error text.
+        return Ok(json!({"step_up_refused":true}));
+    }
     if !(200..300).contains(&status) {
         if method == "POST" && path == "/v1/servers" && matches!(status, 400 | 403 | 422) {
             return Ok(json!(create_error(raw)?));
@@ -554,6 +582,26 @@ pub(crate) fn reduce_response(
             }
             _ => Err(REFUSED.into()),
         };
+    }
+    if method != "GET" {
+        return Err(REFUSED.into());
+    }
+    if path.ends_with("/refund-quote") {
+        // exact_json protects number lexemes for other routes. This route's contract
+        // specifically requires a wire string, so also check its original JSON type.
+        let original = crate::poc::credit::decode(bytes).map_err(|_| REFUSED)?;
+        let original = original.0.get("data").unwrap_or(&original.0);
+        if !original["refund_gross"].is_string() {
+            return Err(REFUSED.into());
+        }
+        let v = raw.get("data").unwrap_or(raw);
+        if v["currency"] != "EUR" {
+            return Err(REFUSED.into());
+        }
+        return Ok(json!(Money {
+            amount: cents(v["refund_gross"].as_str().ok_or(REFUSED)?)?,
+            currency: Currency::Eur
+        }));
     }
     match base {
         "/v1/servers/plans" => {
@@ -741,10 +789,12 @@ fn order(v: &Value) -> Result<OrderFact, String> {
         id: id(v)?,
         created_at: vpsbg_timestamp(text(v, "created_at", 40)?)?,
         status: text(v, "status", 64)?.into(),
+        // B963 has not confirmed an orders server-reference field or its wire shape.
+        server_id: None,
     })
 }
 pub(crate) fn preflight_order_allowed(row: &OrderFact) -> bool {
-    row.status == "paid"
+    row.status == "paid" || CONFIRMED_CANCELLED_ORDER_STATUSES.contains(&row.status.as_str())
 }
 fn optional_bool(v: &Value, field: &str) -> Result<Option<bool>, String> {
     match v.get(field) {

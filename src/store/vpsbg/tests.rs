@@ -1530,7 +1530,8 @@ fn vpsbg_preflight_fails_closed_on_orders() {
             wire::preflight_order_allowed(&wire::OrderFact {
                 id: 1,
                 created_at: MONEY_NOW,
-                status: status.into()
+                status: status.into(),
+                server_id: None,
             }),
             status == "paid"
         );

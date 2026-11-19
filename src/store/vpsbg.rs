@@ -2,6 +2,8 @@
 use super::*;
 use crate::poc::provisioning::{self as protocol, Vendor, vpsbg as wire};
 mod create;
+mod delete;
+use delete::{DeleteIntent, DeleteRefusal, Retirement, TerminationProof};
 pub(crate) mod readiness;
 
 #[cfg(test)]
@@ -55,6 +57,14 @@ impl<S: Storage> Store<S> {
         &self,
         bound: &BoundMachineRelay,
     ) -> Option<crate::credential::RelayKey> {
+        if self
+            .bound_machine_relay(&bound.binding.machine)
+            .ok()?
+            .binding
+            != bound.binding
+        {
+            return None;
+        }
         let id = &bound.binding.pass_identity;
         self.seed()?.relay_key(id.derivation_version, id.index).ok()
     }
@@ -185,6 +195,9 @@ pub(super) struct ReadState {
     pub preflight_at: Option<u64>,
     pub image_state: Option<&'static str>,
     pub relay_admitted: std::collections::BTreeSet<(String, String)>,
+    pub delete_quotes: std::collections::BTreeMap<String, wire::Money>,
+    pub delete_acknowledged: std::collections::BTreeSet<String>,
+    pub refunds: std::collections::BTreeMap<String, wire::Money>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,7 +230,24 @@ pub(crate) struct Record {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ClosureReason {
     AbandonedBeforeCreate,
-    LoginRefused { attempt: u8, refusal_sequence: u64 },
+    LoginRefused {
+        attempt: u8,
+        refusal_sequence: u64,
+    },
+    Deleted {
+        server_id: u64,
+        proof: TerminationProof,
+    },
+    OrderCancelled {
+        order: wire::OrderFact,
+        checked_at: u64,
+    },
+    ChargedServerGone {
+        order: wire::OrderFact,
+        debit: Option<wire::TransactionFact>,
+        server: wire::Terminated,
+        checked_at: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,6 +411,9 @@ pub(crate) enum Change {
         reason: ClosureReason,
         closed_at: u64,
     },
+    DeleteSent(DeleteIntent),
+    DeleteRefused(DeleteRefusal),
+    Retirement(Retirement),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -425,6 +458,10 @@ pub(super) struct PurchaseState {
     pub replaced: Vec<MachinePassBinding>,
     pub attest_target: Option<crate::poc::targets::TargetRecord>,
     pub ready_at: Option<u64>,
+    pub delete_sent: Option<DeleteIntent>,
+    pub delete_refused: Option<DeleteRefusal>,
+    pub closure: Option<ClosureReason>,
+    pub retirement: Option<Retirement>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -447,6 +484,7 @@ pub(crate) struct PollContext {
     pub binding: MachinePassBinding,
     pub create_pending: bool,
     pub deposit_pending: bool,
+    pub delete_pending: bool,
     pub introduction: Option<Value>,
     pub accepted: bool,
     pub attest_pending: bool,
@@ -458,6 +496,7 @@ pub(crate) struct PollContext {
 pub(crate) enum PollKind {
     Deposit,
     Attest,
+    Delete,
 }
 
 pub(crate) fn poll_authority(
@@ -487,7 +526,13 @@ impl<S: Storage> Store<S> {
         self.procurement_ready()?;
         if matches!(
             action,
-            "read" | "resume" | "payment_check" | "pay_order" | "attest"
+            "read"
+                | "resume"
+                | "payment_check"
+                | "pay_order"
+                | "attest"
+                | "delete"
+                | "delete_check"
         ) {
             Ok(())
         } else {
@@ -498,7 +543,15 @@ impl<S: Storage> Store<S> {
         if self.procurement_vendor() == Vendor::Vpsbg {
             if matches!(
                 action,
-                "read" | "approve" | "close" | "resume" | "payment_check" | "pay_order" | "attest"
+                "read"
+                    | "approve"
+                    | "close"
+                    | "resume"
+                    | "payment_check"
+                    | "pay_order"
+                    | "attest"
+                    | "delete"
+                    | "delete_check"
             ) {
                 Ok(())
             } else {
@@ -1091,10 +1144,15 @@ impl<S: Storage> Store<S> {
         self.vpsbg_api(api, Some(purchase))?;
         let transactions_read = !self.vpsbg_purchases[purchase].deposits.is_empty();
         if transactions_read {
+            // Resume/PaymentCheck observe late credit before any pending delete check can fail.
             self.vpsbg_deposit_check(api, purchase).await?;
         }
         if self.vpsbg_purchases[purchase].closed_at.is_some() {
             return Ok(());
+        }
+        if self.vpsbg_purchases[purchase].delete_sent.is_some() {
+            api.vpsbg_begin_window()?;
+            return self.vpsbg_delete_check(api, purchase).await;
         }
         if !self.vpsbg_purchases[purchase].creates.is_empty()
             || self.vpsbg_purchases[purchase].associated.is_some()
@@ -1221,7 +1279,10 @@ impl<S: Storage> Store<S> {
             .as_ref()
             .and_then(|p| p.vpsbg.as_ref())
             .is_some_and(|v| v.purchase == purchase);
-        if current && self.vpsbg_purchases[purchase].observed.is_none() {
+        if current
+            && self.vpsbg_purchases[purchase].observed.is_none()
+            && self.vpsbg_purchases[purchase].delete_sent.is_none()
+        {
             self.vpsbg_progress(api, purchase, false).await
         } else {
             self.vpsbg_deposit_check(api, purchase).await
@@ -1329,7 +1390,7 @@ impl<S: Storage> Store<S> {
         }
         // A sent or associated purchase can only settle its existing deposits.
         // Coverage, balance shortfalls and fence release only gate pre-create top-ups.
-        if !state.creates.is_empty() || state.associated.is_some() {
+        if state.closed_at.is_some() || !state.creates.is_empty() || state.associated.is_some() {
             return Ok(());
         }
         let unresolved = self.vpsbg_purchases[purchase]
@@ -1433,9 +1494,11 @@ impl<S: Storage> Store<S> {
                 let introduction = self.vpsbg_introduction_view(id, now);
                 let accepted = self.vpsbg_accepted(id);
                 let attest_pending = state.closed_at.is_none()
+                    && state.delete_sent.is_none()
                     && state.ready_at.is_none()
                     && (accepted || introduction["state"] == "waiting");
-                if !deposit_pending && !attest_pending {
+                let delete_pending = state.closed_at.is_none() && state.delete_sent.is_some();
+                if !deposit_pending && !attest_pending && !delete_pending {
                     return None;
                 }
                 Some(PollContext {
@@ -1444,6 +1507,7 @@ impl<S: Storage> Store<S> {
                     binding: p.vpsbg.as_ref()?.binding.clone(),
                     create_pending: self.vpsbg_create_pending(id),
                     deposit_pending,
+                    delete_pending,
                     introduction: (!introduction.is_null()).then_some(introduction),
                     accepted,
                     attest_pending,
@@ -1466,6 +1530,7 @@ impl<S: Storage> Store<S> {
         let allowed = match kind {
             PollKind::Deposit => context.deposit_pending,
             PollKind::Attest => context.attest_pending,
+            PollKind::Delete => context.delete_pending,
         };
         if !allowed {
             return Err(protocol::REFUSED.into());
@@ -1561,6 +1626,20 @@ impl<S: Storage> Store<S> {
         Ok((allocation, dispatch))
     }
     fn vpsbg_projection(&self, record: &Record) -> Result<Projection, String> {
+        if matches!(
+            record.change,
+            Change::DeleteSent(_)
+                | Change::DeleteRefused(_)
+                | Change::Retirement(_)
+                | Change::Closed {
+                    reason: ClosureReason::Deleted { .. }
+                        | ClosureReason::OrderCancelled { .. }
+                        | ClosureReason::ChargedServerGone { .. },
+                    ..
+                }
+        ) {
+            return self.vpsbg_project_delete(record);
+        }
         if matches!(
             record.change,
             Change::AttestTarget { .. } | Change::Ready { .. }
@@ -1696,6 +1775,10 @@ impl<S: Storage> Store<S> {
                     replaced: Vec::new(),
                     attest_target: None,
                     ready_at: None,
+                    delete_sent: None,
+                    delete_refused: None,
+                    closure: None,
+                    retirement: None,
                 },
             });
         }
@@ -1928,6 +2011,7 @@ impl<S: Storage> Store<S> {
                             })
                             && state.creates.iter().all(|a| a.refusal.is_some())
                     }
+                    _ => return Err(refused.into()),
                 };
                 if self.procurement.as_ref().is_none_or(|p| {
                     p.vpsbg
@@ -1949,6 +2033,7 @@ impl<S: Storage> Store<S> {
                     return Err(refused.into());
                 }
                 state.closed_at = Some(*closed_at);
+                state.closure = Some(reason.clone());
             }
             _ => unreachable!("create records use their separate projection"),
         }
@@ -1980,6 +2065,9 @@ impl<S: Storage> Store<S> {
             state.creates.last_mut().expect("validated refusal").refusal = Some(number);
         }
         self.vpsbg_purchases.insert(record.purchase.clone(), state);
+        if let Change::DeleteSent(sent) = &record.change {
+            self.vpsbg_fence_sessions(&sent.machine);
+        }
         if let Change::AttestTarget { target, .. } = &record.change {
             self.vpsbg_apply_target(&p, target.clone());
         }
@@ -2002,38 +2090,21 @@ impl<S: Storage> Store<S> {
             return;
         }
         if matches!(record.change, Change::Closed { .. }) {
-            // No server or first contact exists in this slice. Retain identity tombstones and all history.
-            self.dispatch.approved_entries.remove(&p.machine);
-            self.dispatch.associations.retain(|a| a.entry != p.machine);
-            self.dispatch.current_installations.remove(&p.machine);
-            self.dispatch.purchase_approvals.remove(&p.machine);
-            self.poc_targets.remove(&p.machine);
-            for exposure in &self.exposure_ledger {
-                if exposure
-                    .bound_set
-                    .iter()
-                    .any(|bound| bound.machine == p.machine)
-                {
-                    self.ended_sessions.insert(exposure.session.clone());
-                }
+            self.vpsbg_apply_closure(&p, &record.purchase);
+            if self.procurement.as_ref().is_some_and(|old| {
+                old.vpsbg
+                    .as_ref()
+                    .is_some_and(|v| v.purchase == record.purchase)
+            }) {
+                self.procurement = None;
+                self.procurement_selection = None;
+                self.vendor_choice = None;
             }
-            for session in &self.sessions {
-                if session.bound_set.contains(&p.machine) {
-                    self.ended_sessions.insert(session.identity.clone());
-                    session.ended.set(true);
-                    session.given.borrow_mut().clear();
-                }
-            }
-            for identity in [&p.identity, &p.relay_identity] {
-                self.allocation
-                    .as_mut()
-                    .expect("validated allocation")
-                    .apply(&allocation::Event::Failed(identity.clone()))
-                    .expect("reserved approval identity");
-            }
-            self.procurement = None;
-            self.procurement_selection = None;
-            self.vendor_choice = None;
+            self.completed_purchases.retain(|old| {
+                old.vpsbg
+                    .as_ref()
+                    .is_none_or(|v| v.purchase != record.purchase)
+            });
             self.closed_purchases.push(p);
         } else if let Some(old) = self.procurement.as_mut().filter(|old| {
             old.vpsbg
