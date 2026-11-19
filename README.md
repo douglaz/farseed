@@ -1592,12 +1592,14 @@ the host tests run.
 
 **Persistent storage.** On every load, the page checks `navigator.storage.persisted()` and calls
 `navigator.storage.persist()` if false. It requests again inside the Create/Unlock click, before
-any await. The API exists in the page and not in the worker. The answer shows only on an open store,
+any await, inside the refused note's "Check again" press, and (as on load) when the page becomes
+visible again after a refusal. The API exists in the page and not in the worker. The answer shows only on an open store,
 after the seed words, never on the create or locked screens. A refusal, including API absence or an
 exception, stays visible in the store step: "Chrome hasn't promised to keep tau-web's data on this
 phone. If the phone runs short of space, Chrome may delete it, and with it your AI credit and your
-provider account. Your machines would keep running, but this page could no longer reach them. Using
-tau-web regularly makes Chrome more likely to keep it." A grant, requested in that load or not, reads
+provider account. Your machines would keep running, but this page could no longer reach them.
+Bookmark this page in Chrome, then press Check again: when we tested Chrome on Android, a bookmark
+was enough for it to agree to keep the data." followed by the Check again button. A grant, requested in that load or not, reads
 "Chrome has agreed to keep tau-web's data on this phone. It can still be lost if the phone is lost or reset, or its browser data is cleared." inside Store options. Nothing on
 the page promises the store cannot be lost.
 

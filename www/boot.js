@@ -2721,12 +2721,19 @@ $('seed-backup-skip').addEventListener('click', () => {
 const persist = $('persist');
 // Only the most recently started request may draw the line; an older answer arriving late is dropped.
 let persistGeneration = 0;
+// A refusal carries its own re-check: the press asks Chrome again inside the gesture, as Create and Unlock do.
+const persistCheck = document.createElement('button');
+persistCheck.type = 'button';
+persistCheck.dataset.persistCheck = '';
+persistCheck.textContent = 'Check again';
+persistCheck.addEventListener('click', () => requestPersistence());
 const renderPersistence = (generation, granted) => {
   if (generation !== persistGeneration) return;
   persist.dataset.state = granted ? 'granted' : 'refused';
   persist.textContent = granted
     ? "Chrome has agreed to keep tau-web's data on this phone. It can still be lost if the phone is lost or reset, or its browser data is cleared."
-    : "Chrome hasn't promised to keep tau-web's data on this phone. If the phone runs short of space, Chrome may delete it, and with it your AI credit and your provider account. Your machines would keep running, but this page could no longer reach them. Using tau-web regularly makes Chrome more likely to keep it.";
+    : "Chrome hasn't promised to keep tau-web's data on this phone. If the phone runs short of space, Chrome may delete it, and with it your AI credit and your provider account. Your machines would keep running, but this page could no longer reach them. Bookmark this page in Chrome, then press Check again: when we tested Chrome on Android, a bookmark was enough for it to agree to keep the data. ";
+  if (!granted) persist.append(persistCheck);
   // A refusal stays visible in the store step (STA-23: visibly report a refusal); the granted line sits in Store options.
   const fold = $('step-store-fold');
   if (granted) fold.append(persist);
@@ -2741,6 +2748,12 @@ const request = async () => {
 };
 const loadGeneration = ++persistGeneration;
 request().then(granted => renderPersistence(loadGeneration, granted));
+// Coming back to the page after a refusal (another app or tab, for example after bookmarking) asks again.
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || persist.dataset.state !== 'refused') return;
+  const generation = ++persistGeneration;
+  request().then(granted => renderPersistence(generation, granted));
+});
 const requestPersistence = async () => {
   const generation = ++persistGeneration;
   let granted = false;
