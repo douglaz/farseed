@@ -8,6 +8,7 @@ use std::cell::{Cell, RefCell};
 const MONEY_NOW: u64 = 1_767_225_600;
 
 mod c1_tests;
+mod render_fixtures;
 
 #[test]
 fn vpsbg_invoice_publication_requires_committed_issue() {

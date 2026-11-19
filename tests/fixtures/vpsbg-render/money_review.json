@@ -1,0 +1,181 @@
+{
+  "store": {
+    "connection_refusals": [],
+    "delivery": [],
+    "exposure_ledger": [],
+    "goal_templates": [
+      {
+        "id": "control-center@1",
+        "inputs": [
+          {
+            "label": "Your SSH public key (optional): lets you log in to the machine directly",
+            "name": "USER_SSH_KEY"
+          }
+        ],
+        "name": "Control center",
+        "options": [
+          {
+            "default": false,
+            "label": "Also reach it over Tor (an onion address)",
+            "name": "TOR"
+          }
+        ],
+        "text": "Your own private AI machine. It runs NixOS, has an AI agent with a web dashboard, and only you can reach it. It can install more for you later."
+      }
+    ],
+    "goals": [],
+    "installations": [],
+    "lifecycle_generation": "1",
+    "lifecycle_state": "running",
+    "mode_acceptances": [],
+    "poc_configuration": {
+      "configuration": {
+        "endpoint": "https://fake-inference.invalid/chat/completions",
+        "model": "fake-render-model"
+      },
+      "key_set": false
+    },
+    "procurement": {
+      "archive": [],
+      "balance": {
+        "amount": 1998,
+        "currency": "EUR",
+        "has_valid_card": false,
+        "read_at": 1767225600
+      },
+      "capabilities": {
+        "auto_renew_switch": false,
+        "billing": "PrepaidBalance",
+        "delete": true,
+        "host_key_route": "AttestCertificate",
+        "renew": false,
+        "user_data": true,
+        "user_data_exposure": {
+          "api_read_back": "yes",
+          "metadata": "unknown"
+        }
+      },
+      "close_allowed": false,
+      "closed": null,
+      "disclosures": [
+        "Use this VPS.BG token in this browser only. A top-up asked for anywhere else (another browser, the VPS.BG console) cancels the invoice shown here, and an order placed elsewhere is charged separately.",
+        "Asking for a top-up cancels any other unpaid VPS.BG top-up invoice.",
+        "Pay only the newest invoice shown here.",
+        "If this VPSBG account has a saved card or other payment method, VPSBG can charge it when the balance runs short; this page can't stop that."
+      ],
+      "introduction": null,
+      "late_credit_disclosure": "The earlier top-up invoice may still have been paid. If both are paid, the extra stays at VPSBG as credit for later.",
+      "money_review": {
+        "approved_card": false,
+        "late_credit_disclosed": false,
+        "payment_plan": {
+          "balance": 1998,
+          "currency": "eur",
+          "first_period": 3901,
+          "left_as_credit": 0,
+          "minimum": 1000,
+          "price": 3901,
+          "read_at": 1767225600,
+          "top_up": 1903
+        },
+        "replaces_deposit": [],
+        "revision": 1
+      },
+      "origin": "https://api.vpsbg.eu",
+      "paid_until": null,
+      "payment_plan": {
+        "balance": 1998,
+        "currency": "EUR",
+        "first_period": 3901,
+        "left_as_credit": 0,
+        "minimum": 1000,
+        "price": 3901,
+        "read_at": 1767225600,
+        "top_up": 1903,
+        "top_up_allowed_from": null
+      },
+      "renewal": "unknown",
+      "selection": {
+        "charge": {
+          "amount": 3901,
+          "currency": "EUR",
+          "interval_amount": 1,
+          "interval_type": "month"
+        },
+        "image": {
+          "default_username": "nixos",
+          "id": 1,
+          "name": "Deployment image",
+          "source": "deployment"
+        },
+        "offer": {
+          "available": true,
+          "bandwidth": 1000,
+          "billing_cycle": "1",
+          "dedicated_cpu": false,
+          "disk": 20,
+          "id": 7,
+          "key": "fake-plan",
+          "memory": 2048,
+          "minimum_billing_cycle": 1,
+          "name": "Fake plan",
+          "network_speed": 100,
+          "price_with_vat": 3901,
+          "type": "vps",
+          "vcpus": 2
+        },
+        "resources": null
+      },
+      "trust": {
+        "residual": "VPS.BG boots the image it downloaded; the page cannot check those bytes.",
+        "route": "AttestCertificate"
+      },
+      "vendor": {
+        "billing": "PrepaidBalance",
+        "host_key_route": "AttestCertificate",
+        "id": "vpsbg",
+        "name": "VPS.BG Ltd (Bulgaria)"
+      },
+      "vendor_account": {
+        "check": "works",
+        "checked_at": 1767225600,
+        "entry_allowed": false,
+        "key_set": true,
+        "vendor": "vpsbg"
+      },
+      "vendor_choice": "vpsbg",
+      "vendor_choice_open": true,
+      "vendors_available": [
+        {
+          "billing": "Invoice",
+          "host_key_route": "ProviderPublication",
+          "id": "lnvps",
+          "name": "LNVPS"
+        },
+        {
+          "billing": "PrepaidBalance",
+          "host_key_route": "AttestCertificate",
+          "id": "vpsbg",
+          "name": "VPS.BG Ltd (Bulgaria)"
+        }
+      ]
+    },
+    "provider_configuration": {
+      "account": null,
+      "entered": false,
+      "key_set": false,
+      "origin": "https://api.vpsbg.eu",
+      "recorded": false,
+      "relay_deployed": false
+    },
+    "provider_selection_reviewed": true,
+    "seed_backup_completion": "skipped",
+    "seed_backup_owed": false,
+    "seed_backup_stage": "inactive",
+    "sessions": [],
+    "setup": [],
+    "setup_offer": null,
+    "signature_refusals": [],
+    "store_state": "unlocked"
+  }
+}

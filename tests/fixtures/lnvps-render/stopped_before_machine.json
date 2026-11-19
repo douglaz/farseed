@@ -1,0 +1,83 @@
+{
+  "store": {
+    "connection_refusals": [],
+    "delivery": [],
+    "exposure_ledger": [],
+    "goal_templates": [
+      {
+        "id": "control-center@1",
+        "inputs": [
+          {
+            "label": "Your SSH public key (optional): lets you log in to the machine directly",
+            "name": "USER_SSH_KEY"
+          }
+        ],
+        "name": "Control center",
+        "options": [
+          {
+            "default": false,
+            "label": "Also reach it over Tor (an onion address)",
+            "name": "TOR"
+          }
+        ],
+        "text": "Your own private AI machine. It runs NixOS, has an AI agent with a web dashboard, and only you can reach it. It can install more for you later."
+      }
+    ],
+    "goals": [],
+    "installations": [],
+    "lifecycle_generation": "1",
+    "lifecycle_state": "running",
+    "mode_acceptances": [],
+    "poc_configuration": {
+      "configuration": {
+        "endpoint": "https://fake-inference.invalid/chat/completions",
+        "model": "fake-render-model"
+      },
+      "key_set": false
+    },
+    "procurement": {
+      "archive": [
+        {
+          "machine": "machine-a",
+          "message": "Stopped: order abandoned; no machine adopted. Any late order will be ignored.",
+          "vm_id": null
+        }
+      ],
+      "closed": "Stopped: order abandoned; no machine adopted. Any late order will be ignored.",
+      "origin": "https://fake-lnvps.invalid",
+      "selection": null,
+      "vendor_choice": null,
+      "vendor_choice_open": true,
+      "vendors_available": [
+        {
+          "billing": "Invoice",
+          "host_key_route": "ProviderPublication",
+          "id": "lnvps",
+          "name": "LNVPS"
+        },
+        {
+          "billing": "PrepaidBalance",
+          "host_key_route": "AttestCertificate",
+          "id": "vpsbg",
+          "name": "VPS.BG Ltd (Bulgaria)"
+        }
+      ]
+    },
+    "provider_configuration": {
+      "account": "989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f",
+      "entered": false,
+      "key_set": true,
+      "origin": "https://fake-lnvps.invalid",
+      "recorded": true,
+      "relay_deployed": false
+    },
+    "seed_backup_completion": "skipped",
+    "seed_backup_owed": false,
+    "seed_backup_stage": "inactive",
+    "sessions": [],
+    "setup": [],
+    "setup_offer": null,
+    "signature_refusals": [],
+    "store_state": "unlocked"
+  }
+}

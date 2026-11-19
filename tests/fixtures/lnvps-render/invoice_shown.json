@@ -1,0 +1,247 @@
+{
+  "store": {
+    "connection_refusals": [],
+    "delivery": [
+      {
+        "findings_count": 0,
+        "machine": "machine-a",
+        "reports_revision": 0,
+        "summary": true,
+        "verdict": "delivery evidence not yet supplied"
+      }
+    ],
+    "exposure_ledger": [],
+    "goal_templates": [
+      {
+        "id": "control-center@1",
+        "inputs": [
+          {
+            "label": "Your SSH public key (optional): lets you log in to the machine directly",
+            "name": "USER_SSH_KEY"
+          }
+        ],
+        "name": "Control center",
+        "options": [
+          {
+            "default": false,
+            "label": "Also reach it over Tor (an onion address)",
+            "name": "TOR"
+          }
+        ],
+        "text": "Your own private AI machine. It runs NixOS, has an AI agent with a web dashboard, and only you can reach it. It can install more for you later."
+      }
+    ],
+    "goals": [],
+    "installations": [],
+    "lifecycle_generation": "1",
+    "lifecycle_state": "running",
+    "mode_acceptances": [],
+    "page_error_step": "machine",
+    "poc_configuration": {
+      "configuration": {
+        "endpoint": "https://fake-inference.invalid/chat/completions",
+        "model": "fake-render-model"
+      },
+      "key_set": false
+    },
+    "procurement": {
+      "account": "989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f",
+      "approved_selection": {
+        "charge": {
+          "amount": 1000000,
+          "currency": "BTC",
+          "interval_amount": 1,
+          "interval_type": "month"
+        },
+        "image": {
+          "cpu_arch": "x86_64",
+          "default_username": "arch",
+          "distribution": "archlinux",
+          "encrypted": false,
+          "flavour": "base",
+          "id": 3,
+          "popularity": 0.1,
+          "release_date": "2026-10-01T00:00:00Z",
+          "version": "rolling"
+        },
+        "offer": {
+          "cost_plan": {
+            "amount": 1000000,
+            "currency": "BTC",
+            "id": 1,
+            "interval_amount": 1,
+            "interval_type": "month",
+            "name": "Monthly"
+          },
+          "cpu": 1,
+          "cpu_arch": "x86_64",
+          "created": "2026-01-01T00:00:00Z",
+          "disk_interface": "scsi",
+          "disk_size": 10737418240,
+          "disk_type": "ssd",
+          "id": 1,
+          "limits": {},
+          "memory": 1073741824,
+          "name": "Small fixed",
+          "region": {
+            "company_id": 1,
+            "country_code": "IE",
+            "id": 1,
+            "name": "Dublin fixture"
+          }
+        },
+        "resources": null
+      },
+      "archive": [],
+      "auto_renewal_enabled": true,
+      "billing": {
+        "terms": {
+          "amount": 1000000,
+          "currency": "BTC",
+          "processing_fee": 10000,
+          "tax": 230000,
+          "time": 2592000
+        },
+        "vm_id": 11
+      },
+      "candidates": [],
+      "class_answer": "no",
+      "duplicate_orders": [],
+      "identity": {
+        "derivation_version": 1,
+        "family": "machines",
+        "index": 0,
+        "seed": "867d2dc9307f7f1a3f06be4a4e8bc8993c2fdc29871507f9aa70ee8406502584"
+      },
+      "machine": "machine-a",
+      "origin": "https://fake-lnvps.invalid",
+      "paid_at": null,
+      "payment": {
+        "amount": 1000000,
+        "created": "2026-11-06T14:00:00Z",
+        "currency": "BTC",
+        "data": {
+          "lightning": "lnbc1fixtureinvoice"
+        },
+        "expires": "2026-11-07T14:00:00Z",
+        "id": "aabb",
+        "is_paid": false,
+        "is_upgrade": false,
+        "processing_fee": 10000,
+        "tax": 230000,
+        "time": 2592000,
+        "vm_id": 11
+      },
+      "payment_notice": null,
+      "phase": "payment_readiness",
+      "public_keys": {
+        "authorized_keys": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM9edDAhZCRg2tLOCWW393M6QkVy4swuV6ZwUDzajUtK",
+        "machine": "machine-a",
+        "relay_pubkey": "04c1c85f7862bb086fa743421464be2409303446a47e469988b830f68d161ca4"
+      },
+      "publication": null,
+      "readiness_poll_seconds": 60,
+      "readiness_state": "running",
+      "readiness_wait_seconds": 10800,
+      "relay": "wss://relay.invalid/",
+      "selection": {
+        "charge": {
+          "amount": 1000000,
+          "currency": "BTC",
+          "interval_amount": 1,
+          "interval_type": "month"
+        },
+        "image": {
+          "cpu_arch": "x86_64",
+          "default_username": "arch",
+          "distribution": "archlinux",
+          "encrypted": false,
+          "flavour": "base",
+          "id": 3,
+          "popularity": 0.1,
+          "release_date": "2026-10-01T00:00:00Z",
+          "version": "rolling"
+        },
+        "offer": {
+          "cost_plan": {
+            "amount": 1000000,
+            "currency": "BTC",
+            "id": 1,
+            "interval_amount": 1,
+            "interval_type": "month",
+            "name": "Monthly"
+          },
+          "cpu": 1,
+          "cpu_arch": "x86_64",
+          "created": "2026-01-01T00:00:00Z",
+          "disk_interface": "scsi",
+          "disk_size": 10737418240,
+          "disk_type": "ssd",
+          "id": 1,
+          "limits": {},
+          "memory": 1073741824,
+          "name": "Small fixed",
+          "region": {
+            "company_id": 1,
+            "country_code": "IE",
+            "id": 1,
+            "name": "Dublin fixture"
+          }
+        },
+        "resources": null
+      },
+      "ssh_key_id": 7,
+      "stop": null,
+      "stop_after": null,
+      "target": null,
+      "vm_id": 11
+    },
+    "provider_configuration": {
+      "account": "989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f",
+      "entered": false,
+      "key_set": true,
+      "origin": "https://fake-lnvps.invalid",
+      "recorded": true,
+      "relay_deployed": false
+    },
+    "seed_backup_completion": "skipped",
+    "seed_backup_owed": false,
+    "seed_backup_stage": "inactive",
+    "sessions": [],
+    "setup": [
+      {
+        "access": {
+          "model": "maintained",
+          "profile": "ad-hoc",
+          "revision": 3
+        },
+        "answer": "no",
+        "class": "single_purpose",
+        "declaration": null,
+        "entry": {
+          "cost": {
+            "amount": 1000000,
+            "period": {
+              "billing": {
+                "count": 1,
+                "interval": "month"
+              }
+            },
+            "unit": "millisat"
+          },
+          "machine": "machine-a",
+          "product": "Small fixed",
+          "region": "Dublin fixture",
+          "vendor": "LNVPS"
+        },
+        "family": "machines",
+        "index": 0,
+        "requirements": []
+      }
+    ],
+    "setup_offer": null,
+    "signature_refusals": [],
+    "store_error": "Waiting for external payment of the displayed initial invoice; Refresh later.",
+    "store_state": "unlocked"
+  }
+}

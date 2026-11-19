@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::task::{Context, Poll, Waker};
 
+pub(in crate::store) mod render_fixtures;
+
 fn pass() -> LocalPassphrase {
     LocalPassphrase::new(b"inference fixture passphrase".to_vec())
 }

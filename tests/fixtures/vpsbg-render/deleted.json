@@ -1,0 +1,186 @@
+{
+  "store": {
+    "connection_refusals": [],
+    "delivery": [],
+    "exposure_ledger": [],
+    "goal_templates": [
+      {
+        "id": "control-center@1",
+        "inputs": [
+          {
+            "label": "Your SSH public key (optional): lets you log in to the machine directly",
+            "name": "USER_SSH_KEY"
+          }
+        ],
+        "name": "Control center",
+        "options": [
+          {
+            "default": false,
+            "label": "Also reach it over Tor (an onion address)",
+            "name": "TOR"
+          }
+        ],
+        "text": "Your own private AI machine. It runs NixOS, has an AI agent with a web dashboard, and only you can reach it. It can install more for you later."
+      }
+    ],
+    "goals": [],
+    "installations": [],
+    "lifecycle_generation": "1",
+    "lifecycle_state": "running",
+    "mode_acceptances": [],
+    "poc_configuration": {
+      "configuration": {
+        "endpoint": "https://fake-inference.invalid/chat/completions",
+        "model": "fake-render-model"
+      },
+      "key_set": false
+    },
+    "procurement": {
+      "archive": [
+        {
+          "closed": true,
+          "closure": {
+            "deleted": {
+              "proof": {
+                "terminated": {
+                  "delete_refund_total": 3879,
+                  "hostname": "tau-web-cccccccccccccccccccccccccccccccc",
+                  "id": 51,
+                  "status": "terminated"
+                }
+              },
+              "server_id": 51
+            }
+          },
+          "delete": {
+            "refund": {
+              "amount": 3879,
+              "currency": "EUR"
+            },
+            "refund_quote": {
+              "amount": 3879,
+              "currency": "EUR"
+            },
+            "state": "confirmed"
+          },
+          "introduction": {
+            "deadline": 1767227400,
+            "state": "expired"
+          },
+          "machine": "fake-render-machine",
+          "origin": "https://api.vpsbg.eu",
+          "paid_until": 1796083200,
+          "purchase": "cccccccccccccccccccccccccccccccc",
+          "relay_pass": {
+            "expiry": 1769904000,
+            "host": null,
+            "key": "04c1c85f7862bb086fa743421464be2409303446a47e469988b830f68d161ca4",
+            "revoke_requested_at": 1767227400,
+            "state": "revoke_requested"
+          },
+          "renewal": "unknown",
+          "trust": {
+            "residual": "VPS.BG boots the image it downloaded; the page cannot check those bytes.",
+            "route": "AttestCertificate"
+          },
+          "vendor": {
+            "billing": "PrepaidBalance",
+            "host_key_route": "AttestCertificate",
+            "id": "vpsbg",
+            "name": "VPS.BG Ltd (Bulgaria)"
+          },
+          "vm_id": 51
+        }
+      ],
+      "closed": "VPSBG purchase closed. Earlier top-ups may still settle as VPSBG credit.",
+      "closed_card": {
+        "closed": true,
+        "closure": {
+          "deleted": {
+            "proof": {
+              "terminated": {
+                "delete_refund_total": 3879,
+                "hostname": "tau-web-cccccccccccccccccccccccccccccccc",
+                "id": 51,
+                "status": "terminated"
+              }
+            },
+            "server_id": 51
+          }
+        },
+        "delete": {
+          "refund": {
+            "amount": 3879,
+            "currency": "EUR"
+          },
+          "refund_quote": {
+            "amount": 3879,
+            "currency": "EUR"
+          },
+          "state": "confirmed"
+        },
+        "introduction": {
+          "deadline": 1767227400,
+          "state": "expired"
+        },
+        "machine": "fake-render-machine",
+        "origin": "https://api.vpsbg.eu",
+        "paid_until": 1796083200,
+        "purchase": "cccccccccccccccccccccccccccccccc",
+        "relay_pass": {
+          "expiry": 1769904000,
+          "host": null,
+          "key": "04c1c85f7862bb086fa743421464be2409303446a47e469988b830f68d161ca4",
+          "revoke_requested_at": 1767227400,
+          "state": "revoke_requested"
+        },
+        "renewal": "unknown",
+        "trust": {
+          "residual": "VPS.BG boots the image it downloaded; the page cannot check those bytes.",
+          "route": "AttestCertificate"
+        },
+        "vendor": {
+          "billing": "PrepaidBalance",
+          "host_key_route": "AttestCertificate",
+          "id": "vpsbg",
+          "name": "VPS.BG Ltd (Bulgaria)"
+        },
+        "vm_id": 51
+      },
+      "origin": "https://api.lnvps.net",
+      "selection": null,
+      "vendor_choice": null,
+      "vendor_choice_open": true,
+      "vendors_available": [
+        {
+          "billing": "Invoice",
+          "host_key_route": "ProviderPublication",
+          "id": "lnvps",
+          "name": "LNVPS"
+        },
+        {
+          "billing": "PrepaidBalance",
+          "host_key_route": "AttestCertificate",
+          "id": "vpsbg",
+          "name": "VPS.BG Ltd (Bulgaria)"
+        }
+      ]
+    },
+    "provider_configuration": {
+      "account": null,
+      "entered": false,
+      "key_set": false,
+      "origin": "https://api.lnvps.net",
+      "recorded": false,
+      "relay_deployed": false
+    },
+    "seed_backup_completion": "skipped",
+    "seed_backup_owed": false,
+    "seed_backup_stage": "inactive",
+    "sessions": [],
+    "setup": [],
+    "setup_offer": null,
+    "signature_refusals": [],
+    "store_state": "unlocked"
+  }
+}
