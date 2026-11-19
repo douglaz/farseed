@@ -10,12 +10,15 @@ fn ready() -> Store<MemoryStorage> {
     block_on(store.seed_backup(allocation::Completion::Skipped)).unwrap();
     store
 }
+// B947/D3: procurement_configure now always refuses a typed account, so the custody tests install the typed key
+// through provider_install with its entered source (the record an older store holds); no test here makes a purchase.
 fn install(store: &mut Store<MemoryStorage>) -> Result<(), String> {
     let account = Account::parse(KEY.to_uppercase().as_bytes()).unwrap();
-    block_on(store.procurement_configure(
+    block_on(store.provider_install(
         &account,
         KEY.to_uppercase().as_bytes(),
         "https://Fixture.INVALID:443/",
+        AccountSource::Entered,
     ))
 }
 fn reopen(store: &Store<MemoryStorage>) -> Result<Store<MemoryStorage>, String> {
@@ -574,7 +577,15 @@ fn provider_entry_invalid_origin_is_atomic_before_custody() {
         "https://127.1",
         " https://fixture.invalid",
     ] {
-        assert!(block_on(store.procurement_configure(&account, KEY.as_bytes(), origin)).is_err());
+        assert!(
+            block_on(store.provider_install(
+                &account,
+                KEY.as_bytes(),
+                origin,
+                AccountSource::Entered
+            ))
+            .is_err()
+        );
         assert!(store.provider_account().is_none());
         assert_eq!(store.protect_output(&json!(KEY)).unwrap(), json!(KEY));
         assert_eq!(store.storage.files(), before);
@@ -590,8 +601,13 @@ fn provider_custody_numeric_spelling_refuses_append_and_replay_failure_is_protec
     let mut store = ready();
     let key = "12".repeat(32);
     let account = Account::parse(key.as_bytes()).unwrap();
-    block_on(store.procurement_configure(&account, key.as_bytes(), "https://fixture.invalid"))
-        .unwrap();
+    block_on(store.provider_install(
+        &account,
+        key.as_bytes(),
+        "https://fixture.invalid",
+        AccountSource::Entered,
+    ))
+    .unwrap();
     let text = [
         "{\"journal_version\":2,\"event\":{\"procurement\":{\"observation\":{\"amount\":",
         key.as_str(),
@@ -683,8 +699,13 @@ fn provider_custody_out_of_range_filename_never_echoes_the_key() {
     let mut store = ready();
     let key = "12".repeat(32);
     let account = Account::parse(key.as_bytes()).unwrap();
-    block_on(store.procurement_configure(&account, key.as_bytes(), "https://fixture.invalid"))
-        .unwrap();
+    block_on(store.provider_install(
+        &account,
+        key.as_bytes(),
+        "https://fixture.invalid",
+        AccountSource::Entered,
+    ))
+    .unwrap();
     let mut files = store.storage.files();
     files.insert(key.clone(), vec![]);
     let why = block_on(unlock(MemoryStorage::with_files(files), &Fixed, pass()))

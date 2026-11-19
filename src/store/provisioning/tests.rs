@@ -42,6 +42,9 @@ struct Fixture {
     machines: Vec<Value>,
     payments: Vec<Value>,
     history_response: Option<Value>,
+    // B947: adopting a created machine first reads its payment history and requires it empty. Tests about the
+    // later initial-invoice history set this to answer that adoption read with [] and only later reads with theirs.
+    empty_history_reads: usize,
     read_errors: std::collections::BTreeMap<String, protocol::ReadError>,
     read_values: std::collections::BTreeMap<String, Value>,
     email_account: Option<Value>,
@@ -78,6 +81,7 @@ impl Fixture {
             machines: Vec::new(),
             payments: Vec::new(),
             history_response: None,
+            empty_history_reads: 0,
             read_errors: Default::default(),
             read_values: Default::default(),
             email_account: None,
@@ -232,6 +236,12 @@ impl Api for Fixture {
                     } else {
                         Ok(vm)
                     }
+                }
+                ("GET", "/api/v1/vm/11/payments?limit=100&offset=0")
+                    if self.empty_history_reads > 0 =>
+                {
+                    self.empty_history_reads -= 1;
+                    Ok(json!([]))
                 }
                 ("GET", "/api/v1/vm/11/payments?limit=100&offset=0") => Ok(self
                     .history_response
@@ -599,17 +609,21 @@ fn history_rows(count: usize) -> Vec<Value> {
 fn assert_history_refused(api: &mut Fixture, reason: &str) {
     let mut s = ready();
     approve(&mut s, api);
+    // The created machine is adopted on an empty history (B947); the crafted history answers the initial-invoice read.
+    api.empty_history_reads = 1;
     assert_eq!(
         block_on(s.procurement_resume(api, true)).unwrap_err(),
         reason
     );
+    assert_eq!(api.empty_history_reads, 0, "the adoption read happened");
     let p = s.procurement.as_ref().unwrap();
     assert!(p.payment.is_none());
     assert!(p.invoice.is_none());
     assert!(p.billing.is_none());
+    // One adoption read plus exactly one initial-invoice history read.
     assert_eq!(
         api.count("GET /api/v1/vm/11/payments?limit=100&offset=0"),
-        1
+        2
     );
     assert_eq!(
         api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
@@ -714,8 +728,34 @@ fn provisioning_history_duplicate_wrong_vm_and_missing_identity_are_refused() {
                 api.payments[0].as_object_mut().unwrap().remove("vm_id");
             }
         }
-        assert_history_refused(&mut api, REFUSED);
+        if matches!(mode, "wrong_vm" | "missing_vm") {
+            // B947 keeps rows naming another (or no) machine as evidence and lets suitability decide: the read is
+            // accepted, the row is unusable, and no payment or invoice results.
+            assert_history_conflict(&mut api);
+        } else {
+            assert_history_refused(&mut api, REFUSED);
+        }
     }
+}
+
+fn assert_history_conflict(api: &mut Fixture) {
+    let mut s = ready();
+    approve(&mut s, api);
+    api.empty_history_reads = 1;
+    assert_eq!(
+        block_on(s.procurement_resume(api, true)).unwrap_err(),
+        "Initial payment evidence conflicts or cannot be established from the saved one-period quote; no invoice issued."
+    );
+    assert_eq!(api.empty_history_reads, 0, "the adoption read happened");
+    let p = s.procurement.as_ref().unwrap();
+    assert_eq!(p.billing.as_ref().unwrap().terms, fixtures::billing_terms());
+    assert!(p.payment.is_none());
+    assert!(p.invoice.is_none());
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        0
+    );
+    assert_eq!(reopen(&s).procurement, s.procurement);
 }
 
 #[test]
@@ -725,10 +765,13 @@ fn provisioning_history_missing_payment_terms_cannot_issue_invoice() {
     approve(&mut s, &mut api);
     api.payments.push(fixtures::payment(11));
     api.payments[0].as_object_mut().unwrap().remove("time");
+    // The created machine is adopted on an empty history (B947); the incomplete row answers the initial-invoice read.
+    api.empty_history_reads = 1;
     assert_eq!(
         block_on(s.procurement_resume(&mut api, true)).unwrap_err(),
         "Initial payment evidence conflicts or cannot be established from the saved one-period quote; no invoice issued."
     );
+    assert_eq!(api.empty_history_reads, 0, "the adoption read happened");
     let p = s.procurement.as_ref().unwrap();
     assert_eq!(p.billing.as_ref().unwrap().terms, fixtures::billing_terms());
     assert!(p.payment.is_none());
@@ -1266,11 +1309,25 @@ fn provisioning_multiple_incomplete_and_conflicting_invoice_evidence_never_reiss
             }
             _ => api.payments.clear(),
         }
-        for _ in 0..2 {
-            let mut loaded = reopen(&s);
-            assert!(issue_invoice(&mut loaded, &mut api).is_err());
-            assert_eq!(loaded.procurement, Some(original.clone()));
-            s = loaded;
+        if mode == "multiple" {
+            // B947: a lost invoice reply is recovered from the provider's history by choosing one payment (the
+            // earliest by creation time, then id), so two unpaid invoices adopt "aabb" once and never reissue.
+            for _ in 0..2 {
+                let mut loaded = reopen(&s);
+                let _ = issue_invoice(&mut loaded, &mut api);
+                let p = loaded.procurement.as_ref().unwrap();
+                assert_eq!(p.payment.as_ref().unwrap()["id"], json!("aabb"));
+                assert_eq!(p.invoice, original.invoice);
+                assert_eq!(p.vm, original.vm);
+                s = loaded;
+            }
+        } else {
+            for _ in 0..2 {
+                let mut loaded = reopen(&s);
+                assert!(issue_invoice(&mut loaded, &mut api).is_err());
+                assert_eq!(loaded.procurement, Some(original.clone()));
+                s = loaded;
+            }
         }
         assert_eq!(
             api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
@@ -2163,14 +2220,20 @@ fn provisioning_missing_limits_refuse_before_approval_and_authenticated_replay()
 fn configure_origin(s: &mut Store<MemoryStorage>, origin: &str) {
     let secret = hex::encode([7; 32]);
     let account = protocol::Account::parse(secret.as_bytes()).unwrap();
-    block_on(s.procurement_configure(&account, secret.as_bytes(), origin)).unwrap();
+    block_on(s.provider_install(&account, secret.as_bytes(), origin, generated())).unwrap();
+}
+
+// B947/D3: the page no longer enters a typed provider account (procurement_configure always refuses), so these
+// tests install the account the way the live page does, as generated; the install checks they assert are shared.
+fn generated() -> protocol::AccountSource {
+    protocol::AccountSource::Generated
 }
 
 fn assert_origin_fixed(s: &mut Store<MemoryStorage>, origin: &str) {
     let secret = hex::encode([7; 32]);
     let account = protocol::Account::parse(secret.as_bytes()).unwrap();
     assert_eq!(
-        block_on(s.procurement_configure(&account, secret.as_bytes(), origin)).unwrap_err(),
+        block_on(s.provider_install(&account, secret.as_bytes(), origin, generated())).unwrap_err(),
         "Provider account already recorded"
     );
 }
@@ -2191,7 +2254,7 @@ fn provisioning_origin_invalid_configuration_is_atomic_and_credential_safe() {
     let initial_next = s.next;
     let initial_previous = s.previous.0;
     assert_eq!(
-        block_on(s.procurement_configure(&account, secret.as_bytes(), origin)).unwrap_err(),
+        block_on(s.provider_install(&account, secret.as_bytes(), origin, generated())).unwrap_err(),
         "Provider origin contains protected or unscannable material."
     );
     assert!(s.provider_account().is_none());
@@ -2226,8 +2289,8 @@ fn provisioning_origin_invalid_configuration_is_atomic_and_credential_safe() {
         "https://second.invalid/..",
         "https://guarded-origin.invalid",
     ] {
-        let reason =
-            block_on(s.procurement_configure(&account, secret.as_bytes(), input)).unwrap_err();
+        let reason = block_on(s.provider_install(&account, secret.as_bytes(), input, generated()))
+            .unwrap_err();
         assert_eq!(reason, "Provider account already recorded");
         assert!(!reason.contains(input));
         assert_eq!(s.procurement_origin(), "https://first.invalid:8443");
@@ -2239,10 +2302,11 @@ fn provisioning_origin_invalid_configuration_is_atomic_and_credential_safe() {
     }
     let alias = base64::engine::general_purpose::STANDARD_NO_PAD.encode([7; 32]);
     assert!(
-        block_on(s.procurement_configure(
+        block_on(s.provider_install(
             &account,
             secret.as_bytes(),
-            &format!("https://{alias}.invalid")
+            &format!("https://{alias}.invalid"),
+            generated()
         ))
         .is_err()
     );
@@ -2266,10 +2330,11 @@ fn provisioning_origin_stale_consent_cannot_cross_identical_providers() {
     let selected = s.procurement_selection.clone();
     let account = protocol::Account::parse(hex::encode([7; 32]).as_bytes()).unwrap();
     assert_eq!(
-        block_on(s.procurement_configure(
+        block_on(s.provider_install(
             &account,
             hex::encode([7; 32]).as_bytes(),
-            "https://second.invalid"
+            "https://second.invalid",
+            generated()
         ))
         .unwrap_err(),
         "Provider account already recorded"
@@ -2516,7 +2581,7 @@ fn provisioning_origin_normalization_cannot_introduce_candidate_key_material() {
         protocol::provider_origin(&input).unwrap(),
         format!("https://{alias}.invalid")
     );
-    let reason = block_on(s.procurement_configure(&account, secret.as_bytes(), &input))
+    let reason = block_on(s.provider_install(&account, secret.as_bytes(), &input, generated()))
         .expect_err("normalized origin must not introduce an exact held value");
     assert!(reason.contains("protected or unscannable"));
     assert_eq!(s.procurement_origin(), "https://first.invalid:8443");
@@ -2529,7 +2594,7 @@ fn provisioning_origin_normalization_cannot_introduce_candidate_key_material() {
         protocol::provider_origin(&input).unwrap(),
         format!("https://{alias}.invalid")
     );
-    block_on(s.procurement_configure(&account, secret.as_bytes(), &input)).unwrap();
+    block_on(s.provider_install(&account, secret.as_bytes(), &input, generated())).unwrap();
     assert_eq!(s.procurement_origin(), format!("https://{alias}.invalid"));
     assert_eq!(s.protect_output(&json!(alias)).unwrap(), json!(alias));
     assert_ne!(s.protect_output(&json!(secret)).unwrap(), json!(secret));
