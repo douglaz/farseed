@@ -227,8 +227,11 @@ const renderSteps = store => {
   emphasize('credit', [$('credit-invoice'), $('credit-check'), $('credit-configure'), $('poc-inference-form').querySelector('button')]);
   const purchase = store.procurement;
   const choiceNeeded = providerChoiceNeeded(purchase);
-  // After a refusal the page offers no purchase action: the way on is a new machine.
-  const machineAction = purchase && providerWait(purchase)?.kind === 'refused' ? null
+  const deletion = vpsbgDelete(purchase);
+  const deleteAction = document.querySelector('[data-delete-current]');
+  // A refusal offers only deletion; its confirmation always needs a separate, deliberate press.
+  const machineAction = purchase && providerWait(purchase)?.kind === 'refused' ? deleteAction
+    : deletion?.state === 'unknown' ? deleteAction
     : choiceNeeded ? null
     : vpsbgTokenFormShowing(purchase) ? $('vpsbg-token-form').querySelector('button[type="submit"]')
     // The LNVPS account key gates only LNVPS: a VPSBG purchase's prerequisite is its token (checked above).
@@ -486,7 +489,7 @@ const providerWait = purchase => {
   // A refusal is final, so no other wait may hide it.
   if (introduction?.state === 'expired') {
     wait = {kind: 'refused', text: "The machine didn't prove its identity in time, so this page won't connect to it.",
-      helper: 'The only safe way on is a new machine: delete this one (its unused time goes back to your VPSBG balance) and create it again.',
+      helper: 'The only safe way on is a new machine: delete this one (its unused time goes back to your VPSBG balance), then approve a new one.',
       started: introduction.started};
   } else if (image && !['ready', 'added'].includes(image.state)) {
     wait = {kind: 'image', text: image.state === 'failed'
@@ -1876,6 +1879,81 @@ const vpsbgApprovalShowing = purchase => vpsbgDraft(purchase) &&
     ['another_writer', 'balance_short'].includes(vpsbgPause(purchase)?.kind) ||
     (vpsbgReviewNewTopup && vpsbgNewTopupAllowed(purchase)));
 const vpsbgMoney = (amount, currency) => readableMoney(amount, currency).replace(/^(.+) EUR \(([0-9]+) EUR cents\)$/, '€$1 ($2 cents)');
+// Only a machine name is retained for an open confirmation. A pressed delete reads as sent only until the next report
+// arrives; from then on the worker's published state decides (so a refused request offers the delete again).
+let vpsbgDeleteConfirm = null;
+let vpsbgDeleteSent = null;
+// The core's machine-name rule (src/store/provisioning.rs:753-759): 1-64 ASCII letters, digits, '-' or '_',
+// starting with a letter or digit.
+const vpsbgMachineName = name => typeof name === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name);
+const vpsbgDeleteMoney = money => Number.isSafeInteger(money?.amount) && money.amount >= 0 && money.currency === 'EUR';
+const vpsbgDelete = entry => {
+  const deletion = entry?.delete;
+  if (!vpsbgHeld(entry) || !vpsbgMachineName(entry.machine) ||
+      !['available', 'sent', 'unknown', 'confirmed', 'step_up_refused'].includes(deletion?.state)) return null;
+  // Absent quotes are fine; malformed published money never enables an action.
+  if (['available', 'unknown'].includes(deletion.state) &&
+      [deletion.refund_quote, deletion.refund].some(money => money != null && !vpsbgDeleteMoney(money))) return null;
+  const pressed = vpsbgDeleteSent?.machine === entry.machine && vpsbgDeleteSent.report === renderedReport;
+  return {...deletion, state: deletion.state === 'available' && pressed ? 'sent' : deletion.state};
+};
+const renderVpsbgDelete = (parent, entry, balance, enabled, current = false) => {
+  const deletion = vpsbgDelete(entry);
+  if (!deletion) return;
+  const machine = entry.machine;
+  const section = document.createElement('section'); section.dataset.vpsbgDelete = machine;
+  parent.append(section);
+  // The full render keeps every fold's open or closed state (Earlier purchases, Details).
+  const refresh = () => render(renderedReport, true);
+  const button = (label, selector, action, main = false) => {
+    const control = document.createElement('button'); control.type = 'button'; control.textContent = label;
+    control.dataset[selector] = machine; control.disabled = !enabled;
+    if (current && main) control.dataset.deleteCurrent = '';
+    control.addEventListener('click', () => {
+      if (!control.disabled) action(control);
+    });
+    section.append(control);
+  };
+  if (deletion.state === 'available') {
+    if (vpsbgDeleteConfirm !== machine) {
+      button('Delete this machine', 'deleteMachine', () => {
+        vpsbgDeleteConfirm = machine;
+        refresh();
+      }, true);
+    } else {
+      paragraph(section, `Delete ${machine} at VPSBG? It stops the machine and its charges now. VPSBG puts the unused time back in your balance, by the hour. Everything on the machine is lost.`);
+      if (vpsbgDeleteMoney(deletion.refund_quote)) paragraph(section, `VPSBG says ${vpsbgMoney(deletion.refund_quote.amount, deletion.refund_quote.currency)} goes back to your balance.`);
+      button('Delete', 'deleteConfirm', control => {
+        if ((vpsbgDeleteSent?.machine === machine && vpsbgDeleteSent.report === renderedReport) || vpsbgDeleteConfirm !== machine) return;
+        control.disabled = true;
+        vpsbgDeleteSent = {machine, report: renderedReport};
+        vpsbgDeleteConfirm = null;
+        $('provider-approve-charge').checked = false;
+        $('provider-approve-access').checked = false;
+        providerRequest({action: 'delete', machine});
+        refresh();
+      });
+      button('Keep', 'deleteKeep', () => {
+        vpsbgDeleteConfirm = null;
+        refresh();
+      });
+    }
+  } else if (deletion.state === 'sent') paragraph(section, `Deleting ${machine} at VPSBG…`);
+  else if (deletion.state === 'unknown') {
+    paragraph(section, "VPSBG's answer to the delete was lost.");
+    button('Check the deletion', 'deleteCheck', control => {
+      control.disabled = true;
+      providerRequest({action: 'delete_check', machine});
+    }, true);
+  } else if (deletion.state === 'step_up_refused') {
+    paragraph(section, `VPSBG wants an extra confirmation before deleting ${machine}. Delete it in VPSBG's console; this page won't try again.`);
+  } else {
+    paragraph(section, vpsbgDeleteMoney(deletion.refund)
+      ? `Deleted. ${vpsbgMoney(deletion.refund.amount, deletion.refund.currency)} went back to your balance.`
+      : vpsbgDeleteMoney(balance) ? `Deleted. Balance now ${vpsbgMoney(balance.amount, balance.currency).split(' (')[0]}.` : 'Deleted.');
+    if (entry.relay_pass?.state === 'revoke_requested') paragraph(section, "This page asked for the machine's relay pass to be withdrawn.");
+  }
+};
 const vpsbgTopupWarnings = parent => {
   paragraph(parent, 'Asking for a top-up cancels any other unpaid VPSBG top-up invoice.');
   paragraph(parent, 'Pay only the newest invoice shown here.');
@@ -2132,6 +2210,8 @@ const renderProvider = (store, enabled) => {
     : 'After enrollment, configure inference, then press Start session for the displayed model and machine. Copy its public keys. Install the SSH line and enroll the separate relay public key with the relay operator.';
   $('relay-deployment-status').textContent = deployed ? 'The deployment relay key is in use.' : 'No valid deployment relay key is loaded. The seed-derived relay key requires manual enrollment.';
   const purchase = store.procurement ?? {};
+  if (!enabled || ![purchase, ...(purchase.completed ?? [])].some(entry =>
+    entry?.machine === vpsbgDeleteConfirm && vpsbgDelete(entry)?.state === 'available')) vpsbgDeleteConfirm = null;
   const vpsbg = vpsbgDraft(purchase);
   const vpsbgHeldPurchase = vpsbgHeld(purchase);
   const plan = vpsbgPaymentPlan(purchase);
@@ -2140,7 +2220,8 @@ const renderProvider = (store, enabled) => {
     ['another_writer', 'balance_short'].includes(vpsbgPause(purchase)?.kind) || vpsbgReviewNewTopup);
   if (store.readiness?.checked_at) $('step-machine-status').title = `${new Date(store.readiness.checked_at).toISOString()} UTC`;
   else $('step-machine-status').removeAttribute('title');
-  const emailRequired = purchase.phase === 'email_verification';
+  const refused = providerWait(purchase)?.kind === 'refused';
+  const emailRequired = purchase.phase === 'email_verification' && !refused;
   $('provider-email').hidden = !emailRequired;
   $('provider-email-wait').hidden = !purchase.email_entered;
   for (const control of $('provider-email-form').elements) control.disabled = !enabled || !emailRequired;
@@ -2174,7 +2255,7 @@ const renderProvider = (store, enabled) => {
   renderVpsbgToken(purchase, enabled);
   const tokenNeeded = vpsbgTokenFormShowing(purchase) && (purchase.vendor_account.key_set !== true || purchase.vendor_account.check === 'refused');
   $('provider-existing').hidden = tokenNeeded;
-  if (providerChoiceNeeded(purchase) || tokenNeeded) $('provider-catalogue').disabled = true;
+  if (providerChoiceNeeded(purchase) || tokenNeeded || refused) $('provider-catalogue').disabled = true;
   if ((!purchase.phase || purchase.phase === 'handed_off') && store.state === 'unlocked' &&
       !$('provider-machine').value && !providerMachineTyped) {
     const names = new Set([
@@ -2204,7 +2285,7 @@ const renderProvider = (store, enabled) => {
   providerDisplayedSelection = purchase.selection ? structuredClone(purchase.selection) : null;
   const renewal = purchase.phase === 'terms_changed';
   const reviewToken = purchase.selection ? JSON.stringify([purchase.origin, purchase.selection,
-    ...(vpsbg ? [plan && ['balance', 'price', 'minimum', 'top_up', 'first_period', 'left_as_credit', 'currency'].map(field => plan[field]), purchase.phase === 'terms_changed', vpsbgPause(purchase)?.kind, vpsbgReviewNewTopup] : [])]) : null;
+    ...(vpsbg ? [plan && ['balance', 'price', 'minimum', 'top_up', 'first_period', 'left_as_credit', 'currency'].map(field => plan[field]), purchase.phase === 'terms_changed', vpsbgPause(purchase)?.kind, vpsbgReviewNewTopup, vpsbgDelete(purchase)?.state === 'confirmed'] : [])]) : null;
   if (providerReviewToken !== reviewToken) {
     $('provider-approve-charge').checked = false;
     $('provider-approve-access').checked = false;
@@ -2262,8 +2343,7 @@ const renderProvider = (store, enabled) => {
     line.dataset.cents = String(balance.amount);
   }
   const wait = providerWait(purchase);
-  // After a refusal, no purchase action can help: the way on is a new machine.
-  const refused = wait?.kind === 'refused';
+  // After a refusal, deletion is the only purchase action offered.
   if (wait) {
     const line = paragraph(progress, wait.text);
     line.id = 'tau-provider-wait';
@@ -2275,6 +2355,7 @@ const renderProvider = (store, enabled) => {
       const text = document.createElement('small'); text.textContent = wait.helper; helper.append(text);
     }
   }
+  renderVpsbgDelete(progress, purchase, purchase.balance, enabled, true);
   renderVpsbgTopup(progress, purchase, enabled, refused);
   renderVpsbgPause(progress, purchase, enabled, refused);
   if (purchase.closed) {
@@ -2333,12 +2414,14 @@ const renderProvider = (store, enabled) => {
       paragraph(relay, deployed ? 'Deployment relay public key:' : 'Relay public key — enroll this separately with the relay operator:');
       const publicKey = document.createElement('pre'); publicKey.textContent = purchase.public_keys.relay_pubkey; relay.append(publicKey);
     }
-    if (purchase.target) paragraph(progress, `The machine’s published host key is saved. Press Start session ${purchase.machine} below to continue setup.`);
+    if (purchase.target && vpsbgDelete(purchase)?.state !== 'confirmed') paragraph(progress, `The machine’s published host key is saved. Press Start session ${purchase.machine} below to continue setup.`);
   }
   if (purchase.completed?.length) {
     const earlier = detailFold(progress, `Earlier purchases (${purchase.completed.length})`, ['purchase-completed']);
     for (const completed of purchase.completed) {
       paragraph(earlier, `${completed.machine}: Purchase completed. Provider: ${completed.origin}. VM: ${completed.vm_id ?? 'unknown'}. Payment: ${completed.payment_id ?? 'none'} (${completed.is_paid ? 'paid' : 'not recorded as paid'}). Target saved: ${completed.target_saved ? 'yes' : 'no'}.`);
+      // After a refusal the current purchase's delete is the only purchase action.
+      renderVpsbgDelete(earlier, completed, purchase.balance, enabled && !refused);
     }
   }
   const canReview = !purchase.phase || ['approved', 'registered', 'terms_changed', 'handed_off'].includes(purchase.phase);
@@ -2346,7 +2429,7 @@ const renderProvider = (store, enabled) => {
   $('provider-approval-note').textContent = purchase.phase === 'terms_changed' ? 'This records the new terms only. Then press Create the server to order the machine. With an account this page made for you, nothing is charged until you pay its first invoice yourself, in your wallet.' : 'Approving orders this machine from the provider now. With an account this page made for you, nothing is charged until you pay its first invoice yourself, in your wallet.';
   renderVpsbgApproval(purchase, plan);
   $('provider-approval-form').hidden = vpsbg && (refused || !vpsbgApprovalShowing(purchase));
-  for (const control of $('provider-selection-form').elements) control.disabled = !enabled || !canReview;
+  for (const control of $('provider-selection-form').elements) control.disabled = !enabled || !canReview || refused;
   for (const control of $('provider-approval-form').elements) control.disabled = !enabled ||
     (vpsbg ? refused || !vpsbgApprovalShowing(purchase) || !plan : Boolean(purchase.phase) && !renewal && purchase.phase !== 'handed_off') ||
     providerSelectionDirty || !purchase.selection;
@@ -2423,6 +2506,7 @@ $('provider-email-reissue').addEventListener('click', () => providerRequest({act
 $('provider-resume').addEventListener('click', () => providerRequest({action: 'resume'}));
 $('provider-invoice').addEventListener('click', () => providerRequest({action: 'initial_invoice', billing: providerDisplayedBilling}));
 const clearPocInputs = () => {
+  vpsbgDeleteConfirm = null;
   pocKeySubmission = null;
   providerMachineTyped = false;
   rawFoldChoices.clear();
