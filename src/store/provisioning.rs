@@ -1059,8 +1059,8 @@ impl<S: Storage> Store<S> {
             .iter()
             .chain(&self.completed_purchases)
         {
-            if closed.vendor != p.vendor || closed.account != p.account || closed.origin != p.origin
-            {
+            // Vendors never share an origin. Any account at this origin: ids are provider-unique.
+            if closed.origin != p.origin {
                 continue;
             }
             let reused = match record {
