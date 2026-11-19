@@ -18,13 +18,16 @@ thread_local! {
     static READINESS_CHECKED: RefCell<Option<(Value, u64, &'static str)>> = const {RefCell::new(None)};
     static VISIBLE: Cell<bool> = const {Cell::new(true)};
     static VPSBG_ONLINE: Cell<bool> = const {Cell::new(true)};
+    static VPSBG_VISIBLE: Cell<bool> = const {Cell::new(true)};
     static VPSBG_EPOCH: Cell<u64> = const {Cell::new(0)};
     static VISIBILITY: Cell<u64> = const {Cell::new(0)};
     static LAST: Cell<Option<f64>> = const {Cell::new(None)};
+    static ATTEST_PACE: RefCell<std::collections::BTreeMap<String, crate::store::vpsbg::readiness::AttestPace>> = const { RefCell::new(std::collections::BTreeMap::new()) };
     #[cfg(feature="tracer")]
     static TEST_ORIGIN: RefCell<Option<String>> = const {RefCell::new(None)};
 }
 pub(crate) fn freeze() {
+    crate::harness::stop_probe();
     PENDING.with_borrow(|p| {
         if let Some(p) = p {
             p.stop();
@@ -55,12 +58,48 @@ pub fn provider_visibility(visible: bool) {
     if VISIBLE.replace(visible) != visible {
         VISIBILITY.set(VISIBILITY.get().wrapping_add(1));
     }
+    if !visible {
+        crate::harness::stop_probe();
+    }
 }
 
 #[wasm_bindgen]
-pub fn vpsbg_presence(online: bool) {
-    if VPSBG_ONLINE.replace(online) != online {
+pub fn vpsbg_presence(visible: bool, online: bool) {
+    let was_visible = VPSBG_VISIBLE.replace(visible);
+    if VPSBG_ONLINE.replace(online) != online || was_visible != visible {
         VPSBG_EPOCH.set(VPSBG_EPOCH.get().wrapping_add(1));
+    }
+    if !online || !visible {
+        crate::harness::stop_probe();
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ProbeEpoch {
+    visibility: u64,
+    online: u64,
+    lifecycle: u64,
+}
+impl ProbeEpoch {
+    pub(crate) fn capture() -> Result<Self, String> {
+        let epoch = Self {
+            visibility: VISIBILITY.get(),
+            online: VPSBG_EPOCH.get(),
+            lifecycle: crate::lifecycle::owner().generation(),
+        };
+        epoch.check()?;
+        Ok(epoch)
+    }
+    pub(crate) fn check(&self) -> Result<(), String> {
+        let owner = crate::lifecycle::owner();
+        crate::store::vpsbg::poll_authority(
+            VISIBLE.get() && VPSBG_VISIBLE.get(),
+            VPSBG_ONLINE.get(),
+            owner.ordinary().is_ok(),
+            self.visibility == VISIBILITY.get()
+                && self.online == VPSBG_EPOCH.get()
+                && self.lifecycle == owner.generation(),
+        )
     }
 }
 
@@ -211,10 +250,22 @@ enum Action {
         #[serde(default, deserialize_with = "money_review_input")]
         vpsbg: Option<crate::store::vpsbg::MoneyReview>,
     },
-    Resume,
-    PaymentCheck,
-    PayOrder,
-    ReadinessCheck,
+    Resume {
+        #[serde(default)]
+        purchase: Option<String>,
+    },
+    PaymentCheck {
+        #[serde(default)]
+        purchase: Option<String>,
+    },
+    PayOrder {
+        #[serde(default)]
+        purchase: Option<String>,
+    },
+    ReadinessCheck {
+        #[serde(default)]
+        purchase: Option<String>,
+    },
     EmailCheck,
     EmailSend {
         email: String,
@@ -272,47 +323,65 @@ pub async fn provider_request(request: String) -> String {
             return Ok(None);
         }
         let action_name = match &action {
-            Action::Approve { .. } => "approve", Action::Resume => "resume", Action::PaymentCheck => "payment_check", Action::PayOrder => "pay_order",
+            Action::Approve { .. } => "approve", Action::Resume { .. } => "resume", Action::PaymentCheck { .. } => "payment_check", Action::PayOrder { .. } => "pay_order",
             Action::EmailCheck => "email_check", Action::InitialInvoice { .. } => "initial_invoice",
             Action::Close => "close", Action::EmailSend { .. } => "email_send", Action::EmailReissue => "email_reissue",
             _ => "read",
         };
-        store.procurement_admit_action(action_name)?;
-        let automatic = matches!(action, Action::ReadinessCheck | Action::EmailCheck);
+        let addressed = match &action {
+            Action::Resume { purchase } | Action::PaymentCheck { purchase }
+                | Action::PayOrder { purchase } | Action::ReadinessCheck { purchase } => purchase.as_deref(),
+            _ => None,
+        };
+        let addressed_context = addressed.map(|id| store.vpsbg_action_context(id)).transpose()?;
+        let vendor = addressed_context.as_ref().map_or(store.procurement_vendor(), |c| c.vendor);
+        if addressed_context.is_some() {
+            store.vpsbg_admit_addressed(action_name)?;
+        } else {
+            store.procurement_admit_action(action_name)?;
+        }
+        let automatic = matches!(action, Action::ReadinessCheck { .. } | Action::EmailCheck);
+        let context = if addressed_context.is_some() { addressed_context } else if vendor == Vendor::Vpsbg {
+            store.procurement_view()["purchase"].as_str().map(|id| store.vpsbg_action_context(id)).transpose()?
+        } else { None };
+        if automatic && vendor == Vendor::Vpsbg {
+            if !VISIBLE.get() || !VPSBG_VISIBLE.get() || !VPSBG_ONLINE.get() {
+                return Ok(None);
+            }
+            let Some(context) = &context else { return Ok(None) };
+            store.vpsbg_poll_admit(&context.purchase, crate::store::vpsbg::PollKind::Attest)?;
+        }
         let eligible = if matches!(action, Action::EmailCheck) {
             store.procurement_email_eligible()
         } else {
             store.procurement_readiness_eligible()
         };
-        if automatic && (!VISIBLE.get() || if store.procurement_vendor() == Vendor::Vpsbg { store.vpsbg_token().is_none() } else { !key_is_set() || !eligible }) {
+        if automatic && (!VISIBLE.get() || if vendor == Vendor::Vpsbg { store.vpsbg_token().is_none() } else { !key_is_set() || !eligible }) {
             return Ok(None);
         }
-        if !automatic && store.procurement_vendor() == Vendor::Lnvps { store.provider_generate().await?; }
+        if !automatic && vendor == Vendor::Lnvps { store.provider_generate().await?; }
         continuation.check()?;
         restore(store.provider_account());
         restore_vpsbg(store.vpsbg_token());
-        let credential = match store.procurement_vendor() {
+        let credential = match vendor {
             Vendor::Lnvps => Credential::Lnvps(store.provider_account().ok_or("Provider account unavailable.")?.copy()),
             Vendor::Vpsbg => Credential::VpsbgToken(store.vpsbg_token().ok_or("Enter the VPSBG token first.")?.copy()),
         };
-        let context = if store.procurement_vendor() == Vendor::Vpsbg {
-            store.procurement_view()["purchase"].as_str().map(|id| store.vpsbg_action_context(id)).transpose()?
-        } else { None };
         let mut api = Browser {
             context,
-            vendor: store.procurement_vendor(),
-            origin: store.procurement_origin().into(),
+            vendor,
+            origin: if vendor == Vendor::Vpsbg { vpsbg::ORIGIN.into() } else { store.procurement_origin().into() },
             credential,
             raw_response: None,
             continuation,
-            automatic_visibility: (automatic || store.procurement_vendor() == Vendor::Vpsbg).then(|| VISIBILITY.get()),
+            automatic_visibility: (automatic || vendor == Vendor::Vpsbg).then(|| VISIBILITY.get()),
             vpsbg_epoch: VPSBG_EPOCH.get(),
             started: now,
             requests: 0,
             response_status: 0,
         };
         api.current()?;
-        let observe_readiness = matches!(action, Action::ReadinessCheck | Action::Resume | Action::InitialInvoice { .. });
+        let observe_readiness = matches!(action, Action::ReadinessCheck { .. } | Action::Resume { .. } | Action::InitialInvoice { .. });
         let identity = store.procurement_view()["identity"].clone();
         let closing_purchase = if matches!(action, Action::Close) && api.vendor == Vendor::Vpsbg {
             store.procurement_view()["purchase"].as_str().map(str::to_string)
@@ -344,30 +413,27 @@ pub async fn provider_request(request: String) -> String {
                     Ok(None)
                 }
             }
-            Action::ReadinessCheck if api.vendor == Vendor::Vpsbg => {
-                let purchase = store.procurement_view()["purchase"].as_str().map(str::to_string);
-                if let Some(purchase) = purchase { store.vpsbg_progress(&mut api, &purchase, false).await.map(|_| None) }
-                else { store.vpsbg_read_account(&mut api).await.map(|_| None) }
-            },
-            Action::ReadinessCheck => store.procurement_readiness_check(&mut api).await.map(|_| None),
+            // The addressed attest continuation below owns the one detail refresh and probe.
+            Action::ReadinessCheck { .. } if api.vendor == Vendor::Vpsbg => Ok(None),
+            Action::ReadinessCheck { .. } => store.procurement_readiness_check(&mut api).await.map(|_| None),
             Action::EmailCheck => store.procurement_resume(&mut api, false).await.map(|_| None),
             Action::EmailSend { email } => store.procurement_email_send(&mut api, Some(email)).await.map(|_| None),
             Action::EmailReissue => store.procurement_email_send(&mut api, None).await.map(|_| None),
-            Action::PaymentCheck if api.vendor == Vendor::Vpsbg => {
+            Action::PaymentCheck { .. } if api.vendor == Vendor::Vpsbg => {
                 let purchase = api.context.as_ref().ok_or(REFUSED)?.purchase.clone();
                 store.vpsbg_progress(&mut api, &purchase, false).await.map(|_| None)
             }
-            Action::PaymentCheck => store.procurement_payment_check(&mut api).await.map(|_| None),
-            Action::PayOrder => {
+            Action::PaymentCheck { .. } => store.procurement_payment_check(&mut api).await.map(|_| None),
+            Action::PayOrder { .. } => {
                 let purchase = api.context.as_ref().ok_or(REFUSED)?.purchase.clone();
                 store.vpsbg_pay_order(&mut api, &purchase).await.map(|_| None)
             }
             Action::Close => store.procurement_close(&mut api).await.map(|_| None),
-            Action::Resume if api.vendor == Vendor::Vpsbg => {
+            Action::Resume { .. } if api.vendor == Vendor::Vpsbg => {
                 let purchase = api.context.as_ref().ok_or(REFUSED)?.purchase.clone();
                 store.vpsbg_progress(&mut api, &purchase, false).await.map(|_| None)
             }
-            Action::Resume => store
+            Action::Resume { .. } => store
                 .procurement_resume(&mut api, false)
                 .await
                 .map(|_| None),
@@ -388,6 +454,17 @@ pub async fn provider_request(request: String) -> String {
             let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
             READINESS_CHECKED.with_borrow_mut(|saved| *saved = Some((identity, api.now(), api.vendor.readiness_kind(&outcome))));
         }
+        if observe_readiness && result.is_ok() && api.vendor == Vendor::Vpsbg
+            && let Some(context) = &api.context
+        {
+            let purchase = context.purchase.clone();
+            if store.vpsbg_poll_admit(&purchase, crate::store::vpsbg::PollKind::Attest).is_ok() {
+                let probe = store.vpsbg_prepare_attest(&mut api, &purchase).await?;
+                drop(local);
+                finish_attest(&api, &purchase, probe).await?;
+                return Ok(None);
+            }
+        }
         result
     }
     .await;
@@ -403,7 +480,11 @@ pub async fn provider_request(request: String) -> String {
 /// Worker-only deposit contexts come from retained journal projections, including closed ones.
 #[wasm_bindgen]
 pub async fn vpsbg_poll_contexts() -> String {
-    if !VISIBLE.get() || !VPSBG_ONLINE.get() || crate::lifecycle::owner().ordinary().is_err() {
+    if !VISIBLE.get()
+        || !VPSBG_VISIBLE.get()
+        || !VPSBG_ONLINE.get()
+        || crate::lifecycle::owner().ordinary().is_err()
+    {
         return "[]".into();
     }
     let shared = crate::worker::local();
@@ -418,10 +499,14 @@ pub async fn vpsbg_poll_contexts() -> String {
 }
 
 #[wasm_bindgen]
-pub async fn vpsbg_poll(purchase: String) -> String {
+pub async fn vpsbg_poll(purchase: String, kind: String) -> String {
     let result = async {
         let _active = Active::acquire()?;
-        if !VISIBLE.get() || !VPSBG_ONLINE.get() || crate::poc::inference::response_pending() {
+        if !VISIBLE.get()
+            || !VPSBG_VISIBLE.get()
+            || !VPSBG_ONLINE.get()
+            || crate::poc::inference::response_pending()
+        {
             return Err(REFUSED.into());
         }
         let now = monotonic_ms()?;
@@ -437,13 +522,9 @@ pub async fn vpsbg_poll(purchase: String) -> String {
             return Err(REFUSED.into());
         }
         let store = local.store().ok_or(REFUSED)?;
-        if !store
-            .vpsbg_poll_contexts()
-            .iter()
-            .any(|c| c.purchase == purchase)
-        {
-            return Err(REFUSED.into());
-        }
+        let kind: crate::store::vpsbg::PollKind =
+            serde_json::from_value(json!(kind)).map_err(|_| REFUSED)?;
+        let context = store.vpsbg_poll_admit(&purchase, kind)?;
         // Resolve the addressed purchase before constructing the transport. Draft vendor is irrelevant.
         let p = store.vpsbg_purchase(&purchase).ok_or(REFUSED)?;
         let record = store
@@ -452,7 +533,7 @@ pub async fn vpsbg_poll(purchase: String) -> String {
             .ok_or(REFUSED)?
             .copy();
         let mut api = Browser {
-            context: Some(store.vpsbg_action_context(&purchase)?),
+            context: Some(context),
             vendor: Vendor::Vpsbg,
             origin: vpsbg::ORIGIN.into(),
             credential: Credential::VpsbgToken(record),
@@ -464,12 +545,78 @@ pub async fn vpsbg_poll(purchase: String) -> String {
             requests: 0,
             response_status: 0,
         };
-        store.vpsbg_poll_deposit(&mut api, &purchase).await
+        if kind == crate::store::vpsbg::PollKind::Deposit {
+            store.vpsbg_poll_deposit(&mut api, &purchase).await?;
+            api.current()?;
+            store.vpsbg_context_current(api.context.as_ref().ok_or(REFUSED)?)
+        } else {
+            let probe = store.vpsbg_prepare_attest(&mut api, &purchase).await?;
+            drop(local);
+            finish_attest(&api, &purchase, probe).await
+        }
     }
     .await;
     let shared = crate::worker::local();
     let local = shared.lock().await;
     local.encode_report(local.report(result.as_ref().err().map(String::as_str)))
+}
+
+async fn finish_attest(
+    api: &Browser,
+    purchase: &str,
+    probe: Option<crate::harness::AttestProbe>,
+) -> Result<(), String> {
+    let Some(probe) = probe else { return Ok(()) };
+    api.current()?;
+    let key = format!("{purchase}/{}", probe.installation_binding);
+    let shared = crate::worker::local();
+    let deadline = {
+        let mut local = shared.lock().await;
+        api.current()?;
+        local
+            .store()
+            .ok_or(REFUSED)?
+            .attest_deadline(&probe.machine)
+            .ok_or(REFUSED)?
+    };
+    let began = ATTEST_PACE.with_borrow_mut(|p| {
+        p.entry(key.clone())
+            .or_default()
+            .begin(js_sys::Date::now() as u64, deadline)
+            .is_some()
+    });
+    if !began {
+        return Ok(());
+    }
+    struct PaceGuard(String);
+    impl Drop for PaceGuard {
+        fn drop(&mut self) {
+            ATTEST_PACE.with_borrow_mut(|p| {
+                if let Some(p) = p.get_mut(&self.0) {
+                    p.finish();
+                }
+            });
+        }
+    }
+    let _pace = PaceGuard(key);
+    let stop = crate::harness::Stop::new(&probe.machine);
+    let outcome =
+        crate::harness::probe_attest(purchase, &probe.machine, &probe.installation_binding, &stop)
+            .await;
+    let shared = crate::worker::local();
+    let mut local = shared.lock().await;
+    api.current()?;
+    let store = local.store().ok_or(REFUSED)?;
+    store.vpsbg_context_current(api.context.as_ref().ok_or(REFUSED)?)?;
+    store.vpsbg_probe_current(&probe)?;
+    // An acceptance is durable even when the later response or disconnect was lost.
+    if store.vpsbg_accepted(purchase) {
+        return store.vpsbg_mark_ready(purchase, api.now()).await;
+    }
+    match outcome {
+        Err(why) => Err(store.poc_refusal(&why.to_json())),
+        Ok(()) => Err("The machine has not yet proved its identity.".into()),
+    }
 }
 
 struct Pending {
@@ -587,7 +734,9 @@ impl Api for Browser {
     fn current(&self) -> Result<(), String> {
         self.continuation.check()?;
         if self.vendor == Vendor::Vpsbg
-            && (!VPSBG_ONLINE.get() || self.vpsbg_epoch != VPSBG_EPOCH.get())
+            && (!VPSBG_VISIBLE.get()
+                || !VPSBG_ONLINE.get()
+                || self.vpsbg_epoch != VPSBG_EPOCH.get())
         {
             return Err("VPSBG work paused while offline; only reconcile on the next wake.".into());
         }

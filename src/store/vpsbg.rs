@@ -2,6 +2,7 @@
 use super::*;
 use crate::poc::provisioning::{self as protocol, Vendor, vpsbg as wire};
 mod create;
+pub(crate) mod readiness;
 
 #[cfg(test)]
 mod tests;
@@ -183,6 +184,7 @@ pub(super) struct ReadState {
     pub terms_changed: bool,
     pub preflight_at: Option<u64>,
     pub image_state: Option<&'static str>,
+    pub relay_admitted: std::collections::BTreeSet<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -358,6 +360,15 @@ pub(crate) enum Change {
         server: wire::Detail,
         checked_at: u64,
     },
+    AttestTarget {
+        target: crate::poc::targets::TargetRecord,
+        server_id: u64,
+        introduction_binding: String,
+        checked_at: u64,
+    },
+    Ready {
+        accepted_at: u64,
+    },
     MachineReplaced {
         old_machine: String,
         entry: crate::dispatch::MachineEntry,
@@ -396,6 +407,7 @@ impl Attempt {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct PurchaseState {
+    pass_issued_at: u64,
     pub approvals: Vec<MoneyReview>,
     pub image_sent: Option<(String, String, u64)>,
     pub image: Option<wire::ImageFact>,
@@ -411,6 +423,8 @@ pub(super) struct PurchaseState {
     pub order_paid: Option<wire::OrderFact>,
     pub observed: Option<wire::Detail>,
     pub replaced: Vec<MachinePassBinding>,
+    pub attest_target: Option<crate::poc::targets::TargetRecord>,
+    pub ready_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -432,6 +446,31 @@ pub(crate) struct PollContext {
     pub machine: String,
     pub binding: MachinePassBinding,
     pub create_pending: bool,
+    pub deposit_pending: bool,
+    pub introduction: Option<Value>,
+    pub accepted: bool,
+    pub attest_pending: bool,
+    pub installation_binding: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PollKind {
+    Deposit,
+    Attest,
+}
+
+pub(crate) fn poll_authority(
+    visible: bool,
+    online: bool,
+    unlocked: bool,
+    current: bool,
+) -> Result<(), String> {
+    if visible && online && unlocked && current {
+        Ok(())
+    } else {
+        Err(protocol::REFUSED.into())
+    }
 }
 
 #[derive(Clone)]
@@ -444,11 +483,22 @@ pub(crate) struct ActionContext {
 }
 
 impl<S: Storage> Store<S> {
+    pub(crate) fn vpsbg_admit_addressed(&self, action: &str) -> Result<(), String> {
+        self.procurement_ready()?;
+        if matches!(
+            action,
+            "read" | "resume" | "payment_check" | "pay_order" | "attest"
+        ) {
+            Ok(())
+        } else {
+            Err(wire::READ_ONLY.into())
+        }
+    }
     pub(crate) fn procurement_admit_action(&self, action: &str) -> Result<(), String> {
         if self.procurement_vendor() == Vendor::Vpsbg {
             if matches!(
                 action,
-                "read" | "approve" | "close" | "resume" | "payment_check" | "pay_order"
+                "read" | "approve" | "close" | "resume" | "payment_check" | "pay_order" | "attest"
             ) {
                 Ok(())
             } else {
@@ -725,6 +775,7 @@ impl<S: Storage> Store<S> {
             revision: self
                 .procurement
                 .as_ref()
+                .filter(|p| !self.vpsbg_is_ready(p))
                 .and_then(|p| p.vpsbg.as_ref())
                 .map(|v| v.approval_revision.checked_add(1).ok_or(protocol::REFUSED))
                 .transpose()?
@@ -734,6 +785,7 @@ impl<S: Storage> Store<S> {
             pay_order: self
                 .procurement
                 .as_ref()
+                .filter(|p| !self.vpsbg_is_ready(p))
                 .and_then(|p| p.vpsbg.as_ref())
                 .and_then(|v| self.vpsbg_purchases.get(&v.purchase))
                 .and_then(|s| s.unpaid.map(|(id, _, _)| id)),
@@ -803,7 +855,7 @@ impl<S: Storage> Store<S> {
         if let Some(p) = self
             .procurement
             .as_ref()
-            .filter(|p| p.vendor == Vendor::Vpsbg)
+            .filter(|p| p.vendor == Vendor::Vpsbg && !self.vpsbg_is_ready(p))
             && approval.machine != p.machine
         {
             let id = p.vpsbg.as_ref().ok_or(protocol::REFUSED)?.purchase.clone();
@@ -826,7 +878,7 @@ impl<S: Storage> Store<S> {
         let existing = self
             .procurement
             .clone()
-            .filter(|p| p.vendor == Vendor::Vpsbg);
+            .filter(|p| p.vendor == Vendor::Vpsbg && !self.vpsbg_is_ready(p));
         let purchase = if let Some(p) = existing {
             if approval.machine != p.machine
                 || approval.relay != p.relay
@@ -1352,13 +1404,16 @@ impl<S: Storage> Store<S> {
         Ok(())
     }
     pub(crate) fn vpsbg_poll_contexts(&self) -> Vec<PollContext> {
+        self.vpsbg_poll_contexts_at(crate::hostcert::now_unix().unwrap_or(u64::MAX))
+    }
+    fn vpsbg_poll_contexts_at(&self, now: u64) -> Vec<PollContext> {
         if self.procurement_ready().is_err() || self.vpsbg_token.is_none() {
             return Vec::new();
         }
         self.vpsbg_purchases
             .iter()
-            .filter(|(id, state)| {
-                self.vpsbg_create_pending(id)
+            .filter_map(|(id, state)| {
+                let deposit_pending = self.vpsbg_create_pending(id)
                     || state.deposits.iter().any(|a| a.transaction.is_none())
                     || (state.closed_at.is_none()
                         && self
@@ -1366,25 +1421,56 @@ impl<S: Storage> Store<S> {
                             .as_ref()
                             .and_then(|p| p.vpsbg.as_ref())
                             .is_some_and(|v| {
-                                &v.purchase == *id
+                                &v.purchase == id
                                     && (state.image.is_none()
                                         || (v.payment_plan.top_up > 0
                                             && !state
                                                 .deposits
                                                 .iter()
                                                 .any(|a| a.revision == v.approval_revision)))
-                            }))
-            })
-            .filter_map(|(id, _)| {
+                            }));
                 let p = self.vpsbg_purchase(id)?;
+                let introduction = self.vpsbg_introduction_view(id, now);
+                let accepted = self.vpsbg_accepted(id);
+                let attest_pending = state.closed_at.is_none()
+                    && state.ready_at.is_none()
+                    && (accepted || introduction["state"] == "waiting");
+                if !deposit_pending && !attest_pending {
+                    return None;
+                }
                 Some(PollContext {
                     purchase: id.clone(),
                     machine: p.machine.clone(),
                     binding: p.vpsbg.as_ref()?.binding.clone(),
                     create_pending: self.vpsbg_create_pending(id),
+                    deposit_pending,
+                    introduction: (!introduction.is_null()).then_some(introduction),
+                    accepted,
+                    attest_pending,
+                    installation_binding: self.attest_installation_binding(&p.machine).ok(),
                 })
             })
             .collect()
+    }
+    pub(crate) fn vpsbg_poll_admit(
+        &self,
+        purchase: &str,
+        kind: PollKind,
+    ) -> Result<ActionContext, String> {
+        self.procurement_ready()?;
+        let context = self
+            .vpsbg_poll_contexts()
+            .into_iter()
+            .find(|c| c.purchase == purchase)
+            .ok_or(protocol::REFUSED)?;
+        let allowed = match kind {
+            PollKind::Deposit => context.deposit_pending,
+            PollKind::Attest => context.attest_pending,
+        };
+        if !allowed {
+            return Err(protocol::REFUSED.into());
+        }
+        self.vpsbg_action_context(purchase)
     }
 }
 impl<S: Storage> Store<S> {
@@ -1475,6 +1561,12 @@ impl<S: Storage> Store<S> {
         Ok((allocation, dispatch))
     }
     fn vpsbg_projection(&self, record: &Record) -> Result<Projection, String> {
+        if matches!(
+            record.change,
+            Change::AttestTarget { .. } | Change::Ready { .. }
+        ) {
+            return self.vpsbg_project_readiness(record);
+        }
         if matches!(
             record.change,
             Change::CreateSent { .. }
@@ -1579,6 +1671,7 @@ impl<S: Storage> Store<S> {
                 purchase: p.clone(),
                 allocations: Some(allocations),
                 state: PurchaseState {
+                    pass_issued_at: p.approved_at,
                     approvals: vec![MoneyReview {
                         payment_plan: v.payment_plan.clone(),
                         approved_card: v.approved_card,
@@ -1601,6 +1694,8 @@ impl<S: Storage> Store<S> {
                     order_paid: None,
                     observed: None,
                     replaced: Vec::new(),
+                    attest_target: None,
+                    ready_at: None,
                 },
             });
         }
@@ -1885,6 +1980,9 @@ impl<S: Storage> Store<S> {
             state.creates.last_mut().expect("validated refusal").refusal = Some(number);
         }
         self.vpsbg_purchases.insert(record.purchase.clone(), state);
+        if let Change::AttestTarget { target, .. } = &record.change {
+            self.vpsbg_apply_target(&p, target.clone());
+        }
         if let Some((allocation, mut dispatch)) = allocations {
             dispatch
                 .purchase_approvals
@@ -2123,7 +2221,12 @@ impl<S: Storage> Store<S> {
     pub(super) fn vpsbg_view(&self, view: &mut Value) {
         let vendor = self.procurement_vendor();
         // Even a handed-off LNVPS purchase retains its exact legacy Details view.
-        if vendor == Vendor::Lnvps && self.procurement.is_some() {
+        if vendor == Vendor::Lnvps
+            && self
+                .procurement
+                .as_ref()
+                .is_some_and(|p| p.vendor == Vendor::Lnvps)
+        {
             return;
         }
         let choice_open = self.procurement_vendor_choice_open();
@@ -2147,6 +2250,7 @@ impl<S: Storage> Store<S> {
             "checked_at":self.vpsbg_reads.checked_at, "entry_allowed":self.vpsbg_token_entry_ready().is_ok()});
         view["balance"] = Value::Null;
         view["paid_until"] = Value::Null;
+        view["introduction"] = Value::Null;
         view["renewal"] = json!("unknown");
         view["close_allowed"] = json!(false);
         view["disclosures"] = json!(wire::DISCLOSURES);
@@ -2178,7 +2282,7 @@ impl<S: Storage> Store<S> {
         if let Some(p) = self
             .procurement
             .as_ref()
-            .filter(|p| p.vendor == Vendor::Vpsbg)
+            .filter(|p| p.vendor == Vendor::Vpsbg && !self.vpsbg_is_ready(p))
             && let Some(v) = &p.vpsbg
             && let Some(state) = self.vpsbg_purchases.get(&v.purchase)
         {
@@ -2224,7 +2328,7 @@ impl<S: Storage> Store<S> {
             }
             view["image"] = json!({"state":self.vpsbg_reads.image_state.unwrap_or(
                 if state.image.is_some() {"ready"} else if state.image_sent.is_some() {"asking"} else {"needed"})});
-            view["introduction"] = Value::Null;
+            self.vpsbg_machine_view(view, p, now);
             view["deposit"] = self.vpsbg_deposit_view(&v.purchase, now);
             view["create_pending"] = json!(self.vpsbg_create_pending(&v.purchase));
             view["provisioning"] = json!({"state":if state.associated.is_some() {"associated"}
@@ -2339,6 +2443,7 @@ impl<S: Storage> Store<S> {
             }
         }
     }
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(crate) async fn vpsbg_read_account(
         &mut self,
         api: &mut impl protocol::Api,
@@ -2376,6 +2481,7 @@ impl<S: Storage> Store<S> {
         }
         Ok(())
     }
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     async fn vpsbg_pages<T: serde::de::DeserializeOwned>(
         &mut self,
         api: &mut impl protocol::Api,

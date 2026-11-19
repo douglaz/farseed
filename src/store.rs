@@ -884,6 +884,7 @@ impl<S: Storage> Store<S> {
         if credit && !self.credit_can_start() {
             return Err("Read a positive inference credit balance before Start.".into());
         }
+        self.vpsbg_session_ready(machine)?;
         inference_approval.validate()?;
 
         if !crate::poc::inference::safe(
@@ -1340,6 +1341,7 @@ impl<S: Storage> Store<S> {
             return Err("invalid exposure ledger entry".into());
         }
         for bound in &exposure.bound_set {
+            self.vpsbg_session_ready(&bound.machine)?;
             self.check_binding_modes(&bound.machine, &exposure.accepted_modes)?;
             let approved = self
                 .dispatch

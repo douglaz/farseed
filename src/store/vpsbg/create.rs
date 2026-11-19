@@ -1036,6 +1036,12 @@ impl<S: Storage> Store<S> {
                 if !same_machine(associated.ack(), &server.server) || *checked_at < p.approved_at {
                     return Err(refused.into());
                 }
+                if state.attest_target.as_ref().is_some_and(|target| {
+                    server.public_ipv4.map(|ip| ip.to_string()).as_deref()
+                        != Some(target.host.as_str())
+                }) {
+                    return Err("Published VPSBG access conflicts with the pending target.".into());
+                }
                 state.observed = Some(server.clone());
             }
             Change::OrderPaid { .. } => {
@@ -1101,6 +1107,7 @@ impl<S: Storage> Store<S> {
                 dispatch.current_installations.remove(old_machine);
                 dispatch.purchase_approvals.remove(old_machine);
                 state.replaced.push(v.binding.clone());
+                state.pass_issued_at = *replaced_at;
                 p.machine = entry.machine.clone();
                 p.identity = identity.clone();
                 p.relay_identity = relay_identity.clone();

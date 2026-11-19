@@ -157,7 +157,9 @@ const paymentsEligible = () => !retirementRequested && pageVisible && lastReport
 // including a wake after the settlement append but before any introduction or create.
 // They never consult LNVPS's account flag, payment fields or target presence.
 let vpsbgDepositTimer = null;
+let vpsbgAttestTimer = null;
 let vpsbgDepositBusy = false;
+let vpsbgAttestBusy = false;
 let vpsbgScheduling = false;
 let vpsbgEpoch = 0;
 let vpsbgProviderQueue = Promise.resolve();
@@ -165,6 +167,7 @@ const vpsbgEligible = () => paymentsEligible() && pageOnline && vpsbgVisible;
 const stopVpsbg = () => {
   vpsbgEpoch++;
   clearTimeout(vpsbgDepositTimer); vpsbgDepositTimer = null;
+  clearTimeout(vpsbgAttestTimer); vpsbgAttestTimer = null;
 };
 const queueVpsbg = operation => {
   const work = vpsbgProviderQueue.then(async () => {
@@ -177,7 +180,7 @@ const queueVpsbg = operation => {
 };
 const scheduleVpsbg = async () => {
   if (!vpsbgEligible()) { stopVpsbg(); return; }
-  if (vpsbgDepositTimer || vpsbgDepositBusy || vpsbgScheduling) return;
+  if (vpsbgScheduling) return;
   const epoch = vpsbgEpoch;
   vpsbgScheduling = true;
   let contexts;
@@ -187,28 +190,59 @@ const scheduleVpsbg = async () => {
     if (vpsbgEligible()) queueMicrotask(() => { void scheduleVpsbg(); });
     return;
   }
-  if (!contexts.length) return;
   const generation = publication_generation();
-  vpsbgDepositTimer = setTimeout(async () => {
-    vpsbgDepositTimer = null;
-    if (!vpsbgEligible() || epoch !== vpsbgEpoch || generation !== publication_generation()) return;
-    vpsbgDepositBusy = true;
-    try {
-      for (const context of contexts) {
-        await queueVpsbg(async () => {
-          if (!vpsbgEligible() || epoch !== vpsbgEpoch || generation !== publication_generation()) return;
-          const current = JSON.parse(await vpsbg_poll_contexts());
-          if (!current.some(item => JSON.stringify(item) === JSON.stringify(context))) return;
-          const report = await vpsbg_poll(context.purchase);
-          if (!vpsbgEligible() || epoch !== vpsbgEpoch || generation !== publication_generation()) return;
-          await reportStore(report, generation, '', 'machine', true);
-        });
+  const live = () => vpsbgEligible() && epoch === vpsbgEpoch && generation === publication_generation();
+  const expired = entry => entry?.introduction?.state === 'waiting' && Date.now() >= entry.introduction.deadline * 1000;
+  const publishExpiry = async () => {
+    const report = await open();
+    if (live()) await reportStore(report, generation, '', 'machine', true);
+  };
+  // Rust may have dropped the context while the refresh crossed its deadline.
+  // The last published waiting card still needs a terminal local report.
+  if (contexts.some(expired) || [lastReport?.procurement, ...(lastReport?.procurement?.completed || [])].some(expired)) {
+    clearTimeout(vpsbgAttestTimer); vpsbgAttestTimer = null;
+    await publishExpiry();
+    return;
+  }
+  const arm = (kind, selected) => {
+    if (!selected.length || (kind === 'deposit' ? vpsbgDepositTimer || vpsbgDepositBusy : vpsbgAttestTimer || vpsbgAttestBusy)) return;
+    const deadline = kind === 'attest' ? Math.min(...selected.filter(c => !c.accepted).map(c => c.introduction.deadline * 1000)) : Infinity;
+    const accepted = kind === 'attest' && selected.some(c => c.accepted);
+    const delay = Math.min(accepted ? provider_action_delay() : Math.max(5000, provider_action_delay()), Math.max(0, deadline - Date.now()));
+    const timer = setTimeout(async () => {
+      if (kind === 'deposit') vpsbgDepositTimer = null; else vpsbgAttestTimer = null;
+      if (!live()) return;
+      if (kind === 'deposit') vpsbgDepositBusy = true; else vpsbgAttestBusy = true;
+      try {
+        for (const context of selected) {
+          await queueVpsbg(async () => {
+            if (!live()) return;
+            // Expiry publishes from the original durable deadline without another contact.
+            if (kind === 'attest' && !context.accepted && Date.now() >= context.introduction.deadline * 1000) {
+              await publishExpiry();
+              return;
+            }
+            const current = JSON.parse(await vpsbg_poll_contexts());
+            if (!live()) return;
+            if (kind === 'attest' && !context.accepted && Date.now() >= context.introduction.deadline * 1000) {
+              await publishExpiry();
+              return;
+            }
+            if (!current.some(item => JSON.stringify(item) === JSON.stringify(context))) return;
+            const report = await vpsbg_poll(context.purchase, kind);
+            if (live()) await reportStore(report, generation, '', 'machine', true);
+          });
+        }
+      } finally {
+        if (kind === 'deposit') vpsbgDepositBusy = false; else vpsbgAttestBusy = false;
+        void scheduleVpsbg();
       }
-    } finally {
-      vpsbgDepositBusy = false;
-      void scheduleVpsbg();
-    }
-  }, Math.max(5000, provider_action_delay()));
+    }, delay);
+    if (kind === 'deposit') vpsbgDepositTimer = timer; else vpsbgAttestTimer = timer;
+  };
+  arm('deposit', contexts.filter(c => c.deposit_pending));
+  arm('attest', contexts.filter(c => c.attest_pending && c.installation_binding &&
+    (c.accepted || c.introduction?.state === 'waiting')));
 };
 const pendingCredit = () => {
   const invoice = lastReport?.credit?.invoices?.at(-1);
@@ -475,6 +509,7 @@ const publishTask = async (request, generation, session, step, automatic = false
   try {
     let report = automatic ? await publication.continue_task(request.id, session) : await publication.request(JSON.stringify(request));
     const published = JSON.parse(report);
+    if (['suspended', 'ended'].includes(published.lifecycle_state)) stopVpsbg();
     if (Array.isArray(published.sessions)) latestSessions = published.sessions;
     discardStalePocConfiguration(published);
     report = presentationReport(report, step);
@@ -509,7 +544,7 @@ onmessage = async ({ data: envelope }) => {
     clearPendingPocConfiguration();
     clearTimeout(paymentTimer); paymentTimer = null;
     stopReadiness(); stopEmail(); provider_visibility(false);
-    stopVpsbg(); vpsbg_presence(false);
+    stopVpsbg(); vpsbg_presence(false, false);
     await retire_runtime();
     postMessage({ runtime_retired: true });
     return;
@@ -535,7 +570,7 @@ onmessage = async ({ data: envelope }) => {
     task_presence(data.task_presence.visible, data.task_presence.online);
     pageOnline = data.task_presence.online;
     vpsbgVisible = data.task_presence.visible;
-    vpsbg_presence(pageOnline);
+    vpsbg_presence(vpsbgVisible, pageOnline);
     if (!pageOnline || !data.task_presence.visible) stopVpsbg();
     else void scheduleVpsbg();
     return;
@@ -650,7 +685,8 @@ onmessage = async ({ data: envelope }) => {
   else if (data.provider_request && typeof data.provider_request === 'object') {
     try {
       const request = () => provider_request(JSON.stringify(data.provider_request));
-      const value = JSON.parse(await (lastReport?.procurement?.vendor?.id === 'vpsbg' ? queueVpsbg(request) : request()));
+      const addressedVpsbg = typeof data.provider_request.purchase === 'string';
+      const value = JSON.parse(await (addressedVpsbg || lastReport?.procurement?.vendor?.id === 'vpsbg' ? queueVpsbg(request) : request()));
       if (data.provider_request.action === 'vendor') value.provider_selection_reviewed = false;
       if (data.provider_request.action === 'select' && !value.error) value.provider_selection_reviewed = true;
       report = JSON.stringify(value);
@@ -762,5 +798,5 @@ onmessage = async ({ data: envelope }) => {
   }
 };
 task_presence(initialPresence?.visible === true, initialPresence?.online === true);
-vpsbg_presence(pageOnline);
+vpsbg_presence(vpsbgVisible, pageOnline);
 await reportStore(await open());
