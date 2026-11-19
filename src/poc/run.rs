@@ -512,6 +512,33 @@ pub fn refusal_reason(report: &Value) -> String {
             collection_cause(failed)
         );
     }
+    if category == "attest" {
+        let why = report["why"].as_str().unwrap_or("certificate refused");
+        if why == "attest introduction expired" {
+            return "The machine didn't prove its identity in time, so this page won't connect to it. The only safe way on is a new machine: delete this one and create it again.".into();
+        }
+        if why.starts_with("attest acceptance append failed:") {
+            return format!("Saving the machine's identity failed; setup is paused: {why}");
+        }
+        let deadline = report["deadline_unix"].as_u64().map(|deadline| {
+            #[cfg(target_arch = "wasm32")]
+            {
+                let date =
+                    js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(deadline as f64 * 1000.0));
+                format!("{:02}:{:02}", date.get_hours(), date.get_minutes())
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                format!("{:02}:{:02}", deadline / 3600 % 24, deadline / 60 % 60)
+            }
+        });
+        let until = deadline
+            .map(|time| format!("; it has until {time}."))
+            .unwrap_or_else(|| ".".into());
+        return format!(
+            "The machine hasn't proved its identity to this page yet, so setup is paused. Resume tries again{until}"
+        );
+    }
     let action = match category {
         "host-key" => "host-key mismatch; verify the trusted host pin before Resume",
         "held" | "command-held" => {

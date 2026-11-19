@@ -114,21 +114,41 @@ async fn access(
     let mut local = local.lock().await;
     let store = local.store().ok_or("locked before target resolution")?;
     let (resolved, pins) = crate::poc::targets::resolve(store, &target.machine)?;
-    let pin = pins
-        .pin(&target.machine)
-        .ok_or("stored target pin missing")?;
+    let pin = pins.pin(&target.machine);
+    if pin.is_none()
+        && store
+            .attest_introduction(&target.machine, crate::hostcert::now_unix()?)
+            .is_none()
+    {
+        return Err("stored target pin missing".into());
+    }
     let elevation = store
         .poc_target(&target.machine)
         .ok_or("stored target missing")?
         .elevation;
-    Ok((resolved, elevation, Some(pin)))
+    Ok((resolved, elevation, pin))
+}
+
+async fn access_refusal(target: &Target, reason: String) -> Refusal {
+    let local = crate::worker::local();
+    let mut local = local.lock().await;
+    if let Some(store) = local.store()
+        && let Ok(now) = crate::hostcert::now_unix()
+        && store.attest_expired(&target.machine, now)
+    {
+        return Refusal::Attest {
+            why: "attest introduction expired".into(),
+            deadline_unix: store.attest_deadline(&target.machine),
+        };
+    }
+    Refusal::Failed(reason)
 }
 
 /// Why an attempt ended without the command being sent, or without its result.
 #[derive(Debug)]
 pub enum Refusal {
     SignatureLowering(crate::modes::SignatureRefusal),
-    /// No pin for the machine: refused before the relay is contacted (`CHN-R4`, `CNF-23`).
+    /// Neither a pin nor a usable introduction: refused before relay contact (`CHN-2`, `CNF-23`).
     NoPin,
     NoEntry(String),
     Unbound(String),
@@ -145,6 +165,11 @@ pub enum Refusal {
     HostKey {
         pinned: String,
         presented: String,
+    },
+    /// Certificate first contact refused without admitting authentication.
+    Attest {
+        why: String,
+        deadline_unix: Option<u64>,
     },
     /// The journal refused the append, so no `exec` was sent (`STA-3`).
     Journal(String),
@@ -193,6 +218,9 @@ impl Refusal {
             }
             Refusal::HostKey { pinned, presented } => {
                 json!({ "refused": "host-key", "pinned": pinned, "presented": presented })
+            }
+            Refusal::Attest { why, deadline_unix } => {
+                json!({ "refused": "attest", "why": why, "deadline_unix": deadline_unix })
             }
             Refusal::Journal(why) => json!({ "refused": "journal", "why": why }),
             Refusal::Disposition(record) => {
@@ -267,6 +295,10 @@ fn failed(context: &str) -> impl Fn(String) -> Refusal + '_ {
 /// both keys.
 struct PinCheck {
     pinned: String,
+    machine: String,
+    attest: bool,
+    attest_deadline: Option<u64>,
+    attest_refusal: Arc<Mutex<Option<String>>>,
     presented: Arc<Mutex<Option<String>>>,
     generation: u64,
     session: String,
@@ -332,9 +364,90 @@ impl client::Handler for PinCheck {
             }
         }
         .to_string();
-        let matches = presented == self.pinned;
+        let matches = if self.attest {
+            let certificate = key.certificate().cloned();
+            let machine = self.machine.clone();
+            let session = self.session.clone();
+            let generation = self.generation;
+            let deadline = self.attest_deadline;
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = async {
+                    let local = crate::worker::local();
+                    let mut local = local.lock().await;
+                    let owner = crate::lifecycle::owner();
+                    if owner.generation() != generation {
+                        return Err("stale attest continuation".into());
+                    }
+                    owner.ordinary()?;
+                    let store = local.store().ok_or("locked before attest acceptance")?;
+                    store.live_goal_session(&session)?;
+                    // Another serialized handshake may already have consumed the introduction.
+                    // Every later check uses only the committed pin, including SSH rekeys.
+                    if let Some(target) = store.attest_target(&machine)
+                        && !target.pin.is_empty()
+                    {
+                        return Ok(target.pin);
+                    }
+                    let now = crate::hostcert::now_unix()?;
+                    if deadline.is_some_and(|deadline| now >= deadline) {
+                        return Err("attest introduction expired".into());
+                    }
+                    let intro = store
+                        .attest_introduction(&machine, now)
+                        .ok_or("attest introduction unavailable")?
+                        .clone();
+                    let fingerprint = crate::hostcert::verify(certificate.as_ref(), &intro, now)?;
+                    store
+                        .attest_accept(&machine, &fingerprint, &intro.installation_binding)
+                        .await
+                        .map_err(|why| {
+                            if crate::hostcert::now_unix()
+                                .is_ok_and(|now| now >= intro.deadline_unix)
+                            {
+                                "attest introduction expired".into()
+                            } else {
+                                format!("attest acceptance append failed: {why}")
+                            }
+                        })?;
+                    Ok::<_, String>(fingerprint)
+                }
+                .await;
+                let _ = reply.send(result);
+            });
+            match answer.await {
+                Ok(Ok(pin)) => {
+                    self.pinned = pin;
+                    self.attest = false;
+                    presented == self.pinned
+                }
+                Ok(Err(why)) => {
+                    *self.attest_refusal.lock().expect("attest refusal lock") = Some(why);
+                    false
+                }
+                Err(_) => {
+                    *self.attest_refusal.lock().expect("attest refusal lock") =
+                        Some("attest callback ended before a decision".into());
+                    false
+                }
+            }
+        } else {
+            presented == self.pinned
+        };
         *self.presented.lock().expect("pin check lock") = Some(presented);
         let accepted = matches && self.current().await;
+        if !accepted && self.attest_deadline.is_some() {
+            self.attest_refusal
+                .lock()
+                .expect("attest refusal lock")
+                .get_or_insert_with(|| {
+                    if matches {
+                        "stale attest continuation".into()
+                    } else {
+                        "attest accepted host key differs".into()
+                    }
+                });
+        }
         if accepted {
             drop(Timer::since(
                 self.cycle,
@@ -378,7 +491,10 @@ pub(crate) async fn run_command_input(
     origin: Option<&std::rc::Rc<Session>>,
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<CommandOutcome, Refusal> {
-    let (target, elevation, _) = access(target).await.map_err(Refusal::Failed)?;
+    let (target, elevation, _) = match access(target).await {
+        Ok(resolved) => resolved,
+        Err(reason) => return Err(access_refusal(target, reason).await),
+    };
     let target = &target;
     let session = resolve(journal, &target.machine, origin).await?;
     journal
@@ -846,7 +962,10 @@ pub async fn collect_jobs(
     target: &Target,
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<Vec<Value>, Refusal> {
-    let (target, _, _) = access(target).await.map_err(Refusal::Failed)?;
+    let (target, _, _) = match access(target).await {
+        Ok(resolved) => resolved,
+        Err(reason) => return Err(access_refusal(target, reason).await),
+    };
     let target = &target;
     let stop = wait::Stop::collection();
     let session = resolve(journal, &target.machine, None).await?;
@@ -1402,16 +1521,40 @@ async fn connect(
     Refusal,
 > {
     stop.associate(&session.identity);
-    let (target, _, stored_pin) = access(target).await.map_err(Refusal::Failed)?;
+    let resolved = access(target).await;
+    let introduction = if target.stored {
+        let local = crate::worker::local();
+        let mut local = local.lock().await;
+        local.store().and_then(|store| {
+            let now = crate::hostcert::now_unix().ok()?;
+            if store.attest_expired(&target.machine, now) {
+                return Some(Err(Refusal::Attest {
+                    why: "attest introduction expired".into(),
+                    deadline_unix: store.attest_deadline(&target.machine),
+                }));
+            }
+            store
+                .attest_introduction(&target.machine, now)
+                .cloned()
+                .map(Ok)
+        })
+    } else {
+        None
+    }
+    .transpose()?;
+    let (target, _, stored_pin) = resolved.map_err(Refusal::Failed)?;
     let target = &target;
-    // CHN-R4: with no pin there is nothing to check a key against, so nothing is contacted.
+    // CHN-2: no pin admits contact only through a committed, usable CHN-R5a introduction.
     let pinned = if target.stored {
         stored_pin
     } else {
         pins.pin(&target.machine)
     }
-    .ok_or(Refusal::NoPin)?
-    .0;
+    .map(|pin| pin.0);
+    let introduction = introduction.filter(|_| pinned.is_none());
+    if pinned.is_none() && introduction.is_none() {
+        return Err(Refusal::NoPin);
+    }
     if !journal.credentials_available() {
         return Err(Refusal::NoCredentials);
     }
@@ -1430,7 +1573,17 @@ async fn connect(
         .map_err(|e| Refusal::Failed(format!("ssh client key: {e}")))?
     };
 
-    let url = target.contact_url(Some(&pinned)).map_err(Refusal::Failed)?;
+    let url = if let Some(introduction) = &introduction {
+        target.attest_contact_url(
+            introduction,
+            crate::hostcert::now_unix().map_err(Refusal::Failed)?,
+        )
+    } else {
+        target.contact_url(pinned.as_deref())
+    }
+    .map_err(Refusal::Failed)?;
+    let attest = introduction.is_some();
+    let pinned = pinned.unwrap_or_default();
     let cycle = journal.command_cycle();
     let mut retries = 0;
     let mut not_before = 0.0;
@@ -1534,8 +1687,14 @@ async fn connect(
     // WIR-8 (paid-tcp-relay 844e834): from here on, binary frames carry the TCP bytes; SSH runs
     // over them.
     let presented = Arc::new(Mutex::new(None));
+    let attest_refusal = Arc::new(Mutex::new(None));
+    let attest_deadline = introduction.as_ref().map(|intro| intro.deadline_unix);
     let handler = PinCheck {
         pinned: pinned.clone(),
+        machine: target.machine.clone(),
+        attest,
+        attest_deadline,
+        attest_refusal: attest_refusal.clone(),
         presented: presented.clone(),
         generation: crate::lifecycle::owner().generation(),
         session: session.identity.clone(),
@@ -1544,7 +1703,13 @@ async fn connect(
     };
     // ADR-0024: no keepalive and no inactivity timeout, which need a tokio timer the browser
     // does not have.
-    let config = Arc::new(client::Config::default());
+    let mut config = client::Config::default();
+    if attest {
+        config.preferred.host_key_certificates =
+            std::borrow::Cow::Borrowed(&[ssh_key::Algorithm::Ed25519]);
+        config.preferred.key = std::borrow::Cow::Borrowed(&[]);
+    }
+    let config = Arc::new(config);
     journal.current(session).await.map_err(Refusal::Journal)?;
     let handler = PinCheck {
         handshake_started: cycle.and_then(|_| timings::now()),
@@ -1555,14 +1720,45 @@ async fn connect(
         {
             Ok(ssh) => ssh,
             Err(e) => {
+                if let Some(why) = attest_refusal.lock().expect("attest refusal lock").clone() {
+                    return Err(Refusal::Attest {
+                        why,
+                        deadline_unix: attest_deadline,
+                    });
+                }
                 let presented = presented.lock().expect("pin check lock").clone();
                 return Err(match presented {
-                    Some(presented) if presented != pinned => {
+                    Some(presented) if !attest && presented != pinned => {
                         Refusal::HostKey { pinned, presented }
+                    }
+                    _ if attest
+                        && matches!(
+                            &e,
+                            russh::Error::NoCommonAlgo {
+                                kind: russh::AlgorithmKind::Key,
+                                ..
+                            }
+                        ) =>
+                    {
+                        Refusal::Attest {
+                            why: if attest_deadline.is_some_and(|deadline| {
+                                crate::hostcert::now_unix().is_ok_and(|now| now >= deadline)
+                            }) {
+                                "attest introduction expired"
+                            } else {
+                                "machine has not presented a host certificate yet"
+                            }
+                            .into(),
+                            deadline_unix: attest_deadline,
+                        }
                     }
                     _ if websocket.ready_state() >= web_sys::WebSocket::CLOSING => {
                         Refusal::Transport(format!("ssh: {e}"))
                     }
+                    _ if attest => Refusal::Attest {
+                        why: format!("attest certificate negotiation refused: {e}"),
+                        deadline_unix: attest_deadline,
+                    },
                     _ => Refusal::Failed(format!("ssh: {e}")),
                 });
             }
@@ -1572,6 +1768,8 @@ async fn connect(
         .expect("pin check lock")
         .clone()
         .unwrap_or_default();
+    // A successful first handshake has durably pinned exactly this inner key.
+    let pinned = if attest { host_key.clone() } else { pinned };
 
     journal.current(session).await.map_err(Refusal::Journal)?;
     let login_timing = Timer::new(cycle, Mark::Login);

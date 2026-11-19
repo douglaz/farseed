@@ -21,7 +21,8 @@ use serde::{Deserialize, Serialize};
 mod comparison;
 
 /// A role family, each with its own counter. Roles 0–2 share the machine index; role 3 takes
-/// a pass index and role 4 a handoff index (`STA-22`, credential format v1's role table).
+/// a pass index and role 4 a handoff index. Role 6 shares the machine index; role 5 remains
+/// reserved (`STA-22`, credential format v1's role table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Family {

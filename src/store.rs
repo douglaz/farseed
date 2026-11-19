@@ -60,6 +60,7 @@ pub mod opfs;
     allow(dead_code, reason = "task keys are driven by the browser worker")
 )]
 pub(crate) mod ai_keys;
+pub mod attest;
 pub(crate) mod authority;
 #[cfg_attr(
     not(target_arch = "wasm32"),
@@ -287,6 +288,8 @@ pub(crate) enum Event {
     InferenceTerminal(crate::inference::Terminal),
     DedicatedReinstall(reinstall::Record),
     PocTarget(poc_targets::Record),
+    AttestIntroduction(attest::Introduction),
+    AttestAcceptance(attest::Acceptance),
     Procurement(provisioning::Record),
     ProviderProtection(crate::poc::inference::EchoFingerprints),
     PocProviderAccount(crate::poc::provisioning::AccountRecord),
@@ -448,6 +451,7 @@ pub struct Store<S> {
     ai_keys: Vec<ai_keys::Entry>,
     reinstall: reinstall::State,
     poc_targets: std::collections::BTreeMap<String, poc_targets::Record>,
+    attest: std::collections::BTreeMap<String, attest::State>,
     procurement: Option<provisioning::Purchase>,
     procurement_email: provisioning::EmailState,
     // Rebuilt from encrypted custody records, including addresses replaced by the operator.
@@ -630,6 +634,7 @@ impl<S: Storage> Store<S> {
             ai_keys: Vec::new(),
             reinstall: Default::default(),
             poc_targets: Default::default(),
+            attest: Default::default(),
             procurement: None,
             procurement_email: Default::default(),
             provider_emails: Vec::new(),
@@ -1869,6 +1874,10 @@ impl<S: Storage> Store<S> {
                     self.replay_poc_target(number, record)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::AttestIntroduction(record)) => {
+                    self.replay_attest_introduction(record)?
+                }
+                (_, Event::AttestAcceptance(record)) => self.replay_attest_acceptance(record)?,
                 (_, Event::Procurement(record)) => self.replay_procurement(number, record)?,
                 (_, Event::ProviderProtection(_)) => {}
                 (_, Event::DedicatedReinstall(record)) => {
