@@ -18,7 +18,61 @@ fn close_eligible(p: &Purchase, now: u64) -> bool {
             .as_ref()
             .is_none_or(|pay| p.vendor.close_payment_eligible(pay, now))
 }
-fn closed_message(p: &Purchase) -> String {
+const ENTERED_REFUSED: &str = "This page no longer starts purchases on a provider account you entered yourself. Your existing machines keep working here.";
+const ENTERED_ISSUANCE_REFUSED: &str = "This page can't pay for this purchase, because it no longer issues invoices on a provider account you entered yourself. Leave it with Stop this purchase or Close purchase below. Your existing machines keep working here.";
+const SECOND_INVOICE: &str = "The provider made a second invoice for this machine by mistake. It is not shown here; don't pay any invoice except the one on this page. It expires unpaid.";
+const PAID_TWICE: &str =
+    "The provider shows this machine paid twice. Contact the provider about the second payment.";
+
+fn stopped_message(p: &Purchase, stage: StopStage, entered: bool) -> String {
+    match stage {
+        StopStage::BeforeMachine => {
+            "Stopped: order abandoned; no machine adopted. Any late order will be ignored.".into()
+        }
+        StopStage::PaymentConflict => {
+            let vm =
+                p.vm.as_ref()
+                    .map(|vm| &vm["id"])
+                    .expect("stopped associated purchase");
+            if entered {
+                format!(
+                    "Stopped: this purchase's payment couldn't be confirmed here. Machine {vm} is left as it is at the provider; manage it there."
+                )
+            } else {
+                format!(
+                    "Stopped: this purchase's payment couldn't be confirmed here. Machine {vm} is left as it is at the provider. This purchase will never use, invoice or pay for it; if it is unpaid, the provider deletes it within about an hour."
+                )
+            }
+        }
+    }
+}
+fn stop_prompt(p: &Purchase, stop: &Stopped, entered: bool) -> String {
+    if stop.stage == StopStage::PaymentConflict {
+        return stopped_message(p, stop.stage, entered)
+            .trim_start_matches("Stopped: this purchase's payment couldn't be confirmed here. ")
+            .into();
+    }
+    if stop.failing_ids.is_empty() {
+        "No machine has appeared for this order. Stopping doesn't cancel anything at the provider: if an order arrived there, it stays unpaid and expires by itself within about an hour. This page will never use or invoice it. Nothing has been charged.".into()
+    } else {
+        let mut text = stop
+            .failing_ids
+            .iter()
+            .map(|id| {
+                format!(
+                    "Machine {id} matches this order but can't be used here; it is left as it is."
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        text.push_str(" Stopping cancels nothing at the provider, and this purchase will never use or invoice any machine.");
+        text
+    }
+}
+fn closed_message(p: &Purchase, entered: bool) -> String {
+    if let Some(stop) = &p.stopped {
+        return stopped_message(p, stop.stage, entered);
+    }
     p.vendor.closed_message(
         p.vm.as_ref().expect("closed associated purchase"),
         p.payment.as_ref(),
@@ -73,6 +127,71 @@ pub struct Purchase {
     pub paid_at: Option<u64>,
     pub publication: Option<Value>,
     pub target: Option<TargetRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub duplicate_orders: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<Stopped>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StopStage {
+    BeforeMachine,
+    PaymentConflict,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Stopped {
+    pub checked_at: u64,
+    pub stage: StopStage,
+    pub read_status: u16,
+    pub failing_ids: Vec<Value>,
+    pub history: Vec<Value>,
+}
+#[derive(Default)]
+pub(super) struct Recovery {
+    candidates: Vec<Value>,
+    stop: Option<Stopped>,
+    payment_notice: Option<&'static str>,
+}
+struct Reconciliation {
+    candidates: Vec<Value>,
+    failing: Vec<u64>,
+    ignored: Vec<u64>,
+    status: u16,
+    checked_at: u64,
+}
+fn unpaid_machine(vm: &Value) -> bool {
+    vm.get("expires").is_some_and(Value::is_null)
+        && vm.get("deleting_on").is_some_and(Value::is_null)
+}
+fn failing_payments(p: &Purchase, history: &[Value]) -> Result<Vec<Value>, String> {
+    let vm = p.vm.as_ref().ok_or(REFUSED)?;
+    let billing = p.billing.as_ref().ok_or(REFUSED)?;
+    let mut failing = Vec::new();
+    for row in history {
+        if !p
+            .vendor
+            .suitable_payment(row, id(vm)?, &billing.terms, p.vendor.created(vm)?)
+        {
+            failing.push(json!(p.vendor.payment_id(row)?.to_ascii_lowercase()));
+        }
+    }
+    failing.sort_by_key(Value::to_string);
+    Ok(failing)
+}
+fn initial_history(p: &Purchase, value: &Value) -> Result<Vec<Value>, String> {
+    let rows = array(value)?;
+    if rows.len() >= 100 {
+        return Err("Payment history incomplete; Refresh without issuing another invoice.".into());
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for row in rows {
+        if !ids.insert(p.vendor.payment_id(row)?.to_ascii_lowercase()) {
+            return Err(REFUSED.into());
+        }
+    }
+    // Keep conflicting machine ids as evidence; suitability decides whether a row is usable.
+    Ok(rows.clone())
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,6 +238,10 @@ pub enum Record {
     EmailVerified,
     CreateEmailRefused,
     Associated(Value),
+    DuplicateOrders {
+        vm_ids: Vec<u64>,
+    },
+    PurchaseStopped(Stopped),
     BillingQuoted(Billing),
     InvoiceSent(Invoice),
     Payment {
@@ -181,12 +304,11 @@ impl<S: Storage> Store<S> {
     }
     pub(crate) async fn procurement_configure(
         &mut self,
-        account: &protocol::Account,
-        secret: &[u8],
-        origin: &str,
+        _account: &protocol::Account,
+        _secret: &[u8],
+        _origin: &str,
     ) -> Result<(), String> {
-        self.provider_install(account, secret, origin, protocol::AccountSource::Entered)
-            .await
+        Err(ENTERED_REFUSED.into())
     }
     fn check_api(&self, api: &impl Api) -> Result<(), String> {
         api.current()?;
@@ -446,6 +568,7 @@ impl<S: Storage> Store<S> {
     }
     pub(crate) fn procurement_view(&self) -> Value {
         let mut view = self.procurement_current_view();
+        view["archive"] = json!(self.closed_purchases.iter().map(|p| json!({"machine":p.machine,"vm_id":p.vm.as_ref().map(|vm|p.vendor.raw_id(vm)),"message":closed_message(p, self.provider_account_entered())})).collect::<Vec<_>>());
         if !self.completed_purchases.is_empty() {
             view["completed"] = self.completed_purchases.iter().map(|p| {
                 json!({"machine":p.machine,"origin":p.origin,"vm_id":p.vm.as_ref().map(|vm|p.vendor.raw_id(vm)),"payment_id":p.payment.as_ref().map(|pay|p.vendor.raw_id(pay)),"is_paid":p.payment.as_ref().is_some_and(|pay|p.vendor.paid(pay)),"target_saved":p.target.is_some()})
@@ -455,7 +578,7 @@ impl<S: Storage> Store<S> {
     }
     fn procurement_current_view(&self) -> Value {
         let Some(p) = &self.procurement else {
-            return json!({"origin":self.procurement_origin(),"selection":self.procurement_selection,"closed":self.closed_purchases.last().map(closed_message)});
+            return json!({"origin":self.procurement_origin(),"selection":self.procurement_selection,"closed":self.closed_purchases.last().map(|p| closed_message(p, self.provider_account_entered()))});
         };
         let phase = if p.pending_selection.is_some() {
             "terms_changed"
@@ -487,6 +610,16 @@ impl<S: Storage> Store<S> {
         if phase == "email_verification" {
             view["email_entered"] = json!(self.procurement_email.expected.is_some());
         }
+        view["duplicate_orders"] = json!(p.duplicate_orders);
+        view["candidates"] = json!(self.procurement_recovery.candidates.iter().map(|vm| json!({"id":vm["id"],"created":vm["created"],"addresses":vm["ip_assignments"]})).collect::<Vec<_>>());
+        view["stop"] = json!(self.procurement_recovery.stop.as_ref().map(|stop| json!({"stage":stop.stage,"checked_at":stop.checked_at,"read_status":stop.read_status,"failing_ids":stop.failing_ids,"message":stop_prompt(p, stop, self.provider_account_entered())})));
+        view["payment_notice"] = json!(self.procurement_recovery.payment_notice);
+        view["stop_after"] = json!(
+            p.create
+                .as_ref()
+                .filter(|_| p.vm.is_none())
+                .map(|c| c.started.saturating_add(300))
+        );
         view
     }
     pub(crate) async fn procurement_catalogue(
@@ -586,6 +719,12 @@ impl<S: Storage> Store<S> {
             );
         }
         let existing = self.procurement.clone().filter(|p| p.target.is_none());
+        if existing.is_none()
+            && self.procurement_vendor().is_lnvps()
+            && self.provider_account_entered()
+        {
+            return Err(ENTERED_REFUSED.into());
+        }
         if let Some(p) = &existing {
             if p.create.is_some() || p.pending_selection.is_none() {
                 return Err(
@@ -679,6 +818,8 @@ impl<S: Storage> Store<S> {
             paid_at: None,
             publication: None,
             target: None,
+            duplicate_orders: Vec::new(),
+            stopped: None,
         };
         self.procurement_commit(Record::Approved(Box::new(record)))
             .await?;
@@ -744,6 +885,8 @@ impl<S: Storage> Store<S> {
                 || p.payment.is_some()
                 || p.target.is_some()
                 || p.publication.is_some()
+                || !p.duplicate_orders.is_empty()
+                || p.stopped.is_some()
             {
                 return Err(REFUSED.into());
             }
@@ -769,6 +912,9 @@ impl<S: Storage> Store<S> {
             return Ok(*p.clone());
         }
         let mut p = self.procurement.clone().ok_or(REFUSED)?;
+        if p.stopped.is_some() {
+            return Err(REFUSED.into());
+        }
         // Archived VM and payment identities remain consumed.
         for closed in self
             .closed_purchases
@@ -776,10 +922,13 @@ impl<S: Storage> Store<S> {
             .chain(&self.completed_purchases)
         {
             let reused = match record {
-                Record::Associated(vm) => closed
-                    .vm
-                    .as_ref()
-                    .is_some_and(|old| p.vendor.same_vm_id(old, vm)),
+                Record::Associated(vm) => {
+                    closed
+                        .vm
+                        .as_ref()
+                        .is_some_and(|old| p.vendor.same_vm_id(old, vm))
+                        || id(vm).is_ok_and(|id| closed.duplicate_orders.contains(&id))
+                }
                 Record::Payment { payment, .. } => closed
                     .payment
                     .as_ref()
@@ -830,6 +979,57 @@ impl<S: Storage> Store<S> {
                 {
                     return Err(REFUSED.into());
                 }
+            }
+            Record::PurchaseStopped(stop) => {
+                if p.target.is_some() || !(200..300).contains(&stop.read_status) {
+                    return Err(REFUSED.into());
+                }
+                match stop.stage {
+                    StopStage::BeforeMachine => {
+                        if p.create
+                            .as_ref()
+                            .is_none_or(|c| stop.checked_at < c.started.saturating_add(300))
+                            || p.vm.is_some()
+                            || p.invoice.is_some()
+                            || p.payment.is_some()
+                            || !stop.history.is_empty()
+                            || stop.failing_ids.len() > 128
+                            || stop
+                                .failing_ids
+                                .iter()
+                                .any(|v| id(&json!({"id":v})).is_err())
+                        {
+                            return Err(REFUSED.into());
+                        }
+                    }
+                    StopStage::PaymentConflict => {
+                        if p.payment.is_some()
+                            || p.invoice
+                                .as_ref()
+                                .is_none_or(|i| stop.checked_at < i.started)
+                        {
+                            return Err(REFUSED.into());
+                        }
+                        let vm = p.vm.as_ref().ok_or(REFUSED)?;
+                        id(vm)?;
+                        let history = initial_history(&p, &json!(stop.history))?;
+                        let failing = failing_payments(&p, &history)?;
+                        if failing.is_empty() || failing != stop.failing_ids {
+                            return Err(REFUSED.into());
+                        }
+                    }
+                }
+                if stop
+                    .failing_ids
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len()
+                    != stop.failing_ids.len()
+                {
+                    return Err(REFUSED.into());
+                }
+                p.stopped = Some(stop.clone());
             }
             Record::TermsChanged(selected) => {
                 if p.create.is_some() || p.vm.is_some() || p.target.is_some() {
@@ -889,6 +1089,9 @@ impl<S: Storage> Store<S> {
             Record::Associated(vm) => {
                 let intent = p.create.as_ref().ok_or(REFUSED)?;
                 if p.vm.is_some()
+                    || p.duplicate_orders
+                        .iter()
+                        .any(|duplicate| id(vm).is_ok_and(|associated| associated >= *duplicate))
                     || intent.before.iter().any(|old| p.vendor.same_vm_id(old, vm))
                     || !p.vendor.matches(
                         &p.selected,
@@ -900,6 +1103,29 @@ impl<S: Storage> Store<S> {
                     return Err(REFUSED.into());
                 }
                 p.vm = Some(vm.clone());
+            }
+            Record::DuplicateOrders { vm_ids } => {
+                let intent = p.create.as_ref().ok_or(REFUSED)?;
+                if self.provider_account_entered()
+                    || vm_ids.is_empty()
+                    || vm_ids.len() > 7
+                    || p.invoice.is_some()
+                    || p.payment.is_some()
+                    || p.target.is_some()
+                    || vm_ids.windows(2).any(|ids| ids[0] >= ids[1])
+                    || vm_ids.iter().any(|vm| {
+                        *vm == 0
+                            || intent.before.iter().any(|old| id(old).ok() == Some(*vm))
+                            || p.vm
+                                .as_ref()
+                                .is_some_and(|own| id(own).is_ok_and(|own| *vm <= own))
+                    })
+                {
+                    return Err(REFUSED.into());
+                }
+                p.duplicate_orders.extend(vm_ids);
+                p.duplicate_orders.sort_unstable();
+                p.duplicate_orders.dedup();
             }
             Record::BillingQuoted(billing) => {
                 let vm = p.vm.as_ref().ok_or(REFUSED)?;
@@ -1010,7 +1236,8 @@ impl<S: Storage> Store<S> {
         record: &Record,
         p: Purchase,
     ) -> Result<(), String> {
-        if matches!(record, Record::Closed { .. }) {
+        if matches!(record, Record::Closed { .. } | Record::PurchaseStopped(_)) {
+            self.procurement_recovery = Default::default();
             self.procurement_email = Default::default();
             self.dispatch.approved_entries.remove(&p.machine);
             self.dispatch.associations.retain(|a| a.entry != p.machine);
@@ -1024,7 +1251,10 @@ impl<S: Storage> Store<S> {
             return Ok(());
         }
         match record {
-            Record::Approved(_) => self.procurement_email = Default::default(),
+            Record::Approved(_) => {
+                self.procurement_email = Default::default();
+                self.procurement_recovery = Default::default();
+            }
             Record::EmailRequired | Record::CreateEmailRefused => {
                 self.procurement_email.required = true;
             }
@@ -1136,6 +1366,226 @@ impl<S: Storage> Store<S> {
             .await?;
         self.procurement_vendor().parse_history(&result, vm)
     }
+    async fn reconcile_create(&mut self, api: &mut impl Api) -> Result<Reconciliation, String> {
+        self.procurement_recovery = Default::default();
+        let p = self.procurement.clone().ok_or(REFUSED)?;
+        let intent = p.create.as_ref().ok_or(REFUSED)?;
+        let key = id(p.ssh_key.as_ref().ok_or(REFUSED)?)?;
+        let checked_at = api.now();
+        let (status, inventory) = self
+            .provider_response(api, p.vendor.list())
+            .await
+            .map_err(protocol::ReadError::message)?;
+        if !(200..300).contains(&status) {
+            return Err(REFUSED.into());
+        }
+        // Other keys and the before-list never consume the detail/history budget.
+        let rows: Vec<_> = inventory
+            .as_array()
+            .ok_or(REFUSED)?
+            .iter()
+            .filter(|vm| {
+                vm["ssh_key"]["id"].as_u64() == Some(key)
+                    && !intent.before.iter().any(|old| p.vendor.same_vm_id(old, vm))
+            })
+            .collect();
+        let ids = unique_ids(&json!(rows))?;
+        let mut result = Reconciliation {
+            candidates: Vec::new(),
+            failing: Vec::new(),
+            ignored: Vec::new(),
+            status,
+            checked_at,
+        };
+        if rows.len() > 8 {
+            result.failing = ids;
+            return Ok(result);
+        }
+        for vm in rows {
+            let vm_id = id(vm)?;
+            if p.duplicate_orders.contains(&vm_id) {
+                result.ignored.push(vm_id);
+                continue;
+            }
+            if !p.vendor.matches(&p.selected, vm, key, intent.started) || !unpaid_machine(vm) {
+                result.failing.push(vm_id);
+                continue;
+            }
+            let detail = self.provider_read(api, p.vendor.get(vm_id)).await;
+            let usable = if let Ok(detail) = detail {
+                if p.vendor.matches(&p.selected, &detail, key, intent.started)
+                    && p.vendor.same_vm_identity(vm, &detail)
+                    && unpaid_machine(&detail)
+                    && self
+                        .history(api, vm_id)
+                        .await
+                        .is_ok_and(|history| history.is_empty())
+                {
+                    result.candidates.push(detail);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !usable {
+                result.failing.push(vm_id);
+            }
+        }
+        self.check_api(api)?;
+        result
+            .candidates
+            .sort_by_key(|vm| id(vm).expect("validated candidate"));
+        result.failing.sort_unstable();
+        Ok(result)
+    }
+    fn offer_create_stop(&mut self, result: &Reconciliation) {
+        let Some(p) = &self.procurement else {
+            return;
+        };
+        if p.vm.is_none()
+            && p.invoice.is_none()
+            && p.target.is_none()
+            && p.create
+                .as_ref()
+                .is_some_and(|c| result.checked_at >= c.started.saturating_add(300))
+            && (result.candidates.is_empty() || !result.failing.is_empty())
+        {
+            self.procurement_recovery.stop = Some(Stopped {
+                checked_at: result.checked_at,
+                stage: StopStage::BeforeMachine,
+                read_status: result.status,
+                failing_ids: result
+                    .failing
+                    .iter()
+                    .chain(&result.ignored)
+                    .map(|id| json!(id))
+                    .collect(),
+                history: Vec::new(),
+            });
+        }
+    }
+    async fn associate_create(
+        &mut self,
+        api: &mut impl Api,
+        choice: Option<u64>,
+    ) -> Result<(), String> {
+        let mut result = self.reconcile_create(api).await?;
+        self.offer_create_stop(&result);
+        if !result.failing.is_empty() {
+            return Err("Create evidence incomplete or conflicting; no order is retried.".into());
+        }
+        if result.candidates.is_empty() {
+            return Err(
+                "Create outcome unknown: no evidenced machine. Refresh later; no order is retried."
+                    .into(),
+            );
+        }
+        let vm = if self.provider_account_entered() {
+            let Some(choice) = choice else {
+                self.procurement_recovery.candidates = result.candidates;
+                return Err("The provider holds machines that match this order. Confirm the one this purchase uses; the others are left as they are and never invoiced here.".into());
+            };
+            let index = result
+                .candidates
+                .iter()
+                .position(|vm| id(vm).ok() == Some(choice))
+                .ok_or(REFUSED)?;
+            result.candidates.remove(index)
+        } else {
+            if choice.is_some() {
+                return Err(REFUSED.into());
+            }
+            let vm = result.candidates.remove(0);
+            let vm_ids: Vec<_> = result.candidates.iter().map(id).collect::<Result<_, _>>()?;
+            if !vm_ids.is_empty() {
+                self.procurement_commit(Record::DuplicateOrders { vm_ids })
+                    .await?;
+            }
+            vm
+        };
+        self.procurement_commit(Record::Associated(vm)).await?;
+        self.procurement_recovery = Default::default();
+        Ok(())
+    }
+    pub(crate) async fn procurement_choose(
+        &mut self,
+        api: &mut impl Api,
+        vm_id: u64,
+    ) -> Result<(), String> {
+        self.check_api(api)?;
+        if !self.provider_account_entered()
+            || self.procurement.as_ref().is_none_or(|p| p.vm.is_some())
+        {
+            return Err(REFUSED.into());
+        }
+        self.associate_create(api, Some(vm_id)).await
+    }
+    pub(crate) async fn procurement_stop(
+        &mut self,
+        api: &mut impl Api,
+        stage: StopStage,
+    ) -> Result<(), String> {
+        self.check_api(api)?;
+        self.procurement_recovery.stop = None;
+        match stage {
+            StopStage::BeforeMachine => {
+                let p = self.procurement.as_ref().ok_or(REFUSED)?;
+                if p.vm.is_some()
+                    || p.invoice.is_some()
+                    || p.target.is_some()
+                    || p.create
+                        .as_ref()
+                        .is_none_or(|c| api.now() < c.started.saturating_add(300))
+                {
+                    return Err(REFUSED.into());
+                }
+                let result = self.reconcile_create(api).await?;
+                self.offer_create_stop(&result);
+            }
+            StopStage::PaymentConflict => {
+                let p = self.procurement.as_ref().ok_or(REFUSED)?;
+                if p.invoice.is_none() || p.payment.is_some() || p.target.is_some() {
+                    return Err(REFUSED.into());
+                }
+                let vm = id(p.vm.as_ref().ok_or(REFUSED)?)?;
+                let checked_at = api.now();
+                let (status, value) = self
+                    .provider_response(api, self.procurement_vendor().invoice_history(vm))
+                    .await
+                    .map_err(protocol::ReadError::message)?;
+                let history = initial_history(self.procurement.as_ref().ok_or(REFUSED)?, &value)?;
+                self.offer_payment_stop(history, status, checked_at)?;
+            }
+        }
+        self.check_api(api)?;
+        let stop = self.procurement_recovery.stop.clone().ok_or(REFUSED)?;
+        self.procurement_commit(Record::PurchaseStopped(stop)).await
+    }
+    fn offer_payment_stop(
+        &mut self,
+        history: Vec<Value>,
+        read_status: u16,
+        checked_at: u64,
+    ) -> Result<(), String> {
+        let p = self.procurement.as_ref().ok_or(REFUSED)?;
+        let failing_ids = failing_payments(p, &history)?;
+        if (200..300).contains(&read_status)
+            && p.invoice.is_some()
+            && p.payment.is_none()
+            && !failing_ids.is_empty()
+        {
+            self.procurement_recovery.stop = Some(Stopped {
+                checked_at,
+                stage: StopStage::PaymentConflict,
+                read_status,
+                failing_ids,
+                history,
+            });
+        }
+        Ok(())
+    }
     async fn initial_billing_quote(&mut self, api: &mut impl Api) -> Result<Billing, String> {
         let p = self.procurement.clone().ok_or(REFUSED)?;
         let vm_id = id(p.vm.as_ref().ok_or(REFUSED)?)?;
@@ -1156,34 +1606,68 @@ impl<S: Storage> Store<S> {
         let p = self.procurement.clone().ok_or(REFUSED)?;
         let vm = p.vm.as_ref().ok_or(REFUSED)?;
         let vm_id = id(vm)?;
-        let history = self.history(api, vm_id).await?;
+        self.procurement_recovery.stop = None;
+        let checked_at = api.now();
+        let value = self
+            .provider_read(api, p.vendor.invoice_history(vm_id))
+            .await?;
+        let history = initial_history(&p, &value)?;
+        let history_status = api.response_status();
+        if !(200..300).contains(&history_status) {
+            return Err(REFUSED.into());
+        }
         if !history.is_empty() {
-            if history.len() != 1 {
+            if p.invoice.is_none() && history.len() != 1 {
                 return Err(
                     "Initial payment evidence conflicts or is ambiguous; no invoice issued.".into(),
                 );
             }
-            let billing = match p.billing {
-                Some(billing) => billing,
-                None => {
-                    let billing = self.initial_billing_quote(api).await?;
-                    self.procurement_commit(Record::BillingQuoted(billing.clone()))
-                        .await?;
-                    billing
-                }
-            };
-            if !p
-                .vendor
-                .suitable_payment(&history[0], vm_id, &billing.terms, p.vendor.created(vm)?)
-            {
+            if p.billing.is_none() {
+                let billing = self.initial_billing_quote(api).await?;
+                self.procurement_commit(Record::BillingQuoted(billing))
+                    .await?;
+            }
+            let saved = self.procurement.as_ref().ok_or(REFUSED)?;
+            if !failing_payments(saved, &history)?.is_empty() {
+                self.offer_payment_stop(history, history_status, checked_at)?;
                 return Err("Initial payment evidence conflicts or cannot be established from the saved one-period quote; no invoice issued.".into());
             }
-            return self
-                .procurement_commit(self.payment_record(history[0].clone(), api.now()))
-                .await;
+            let paid = history.iter().filter(|row| p.vendor.paid(row)).count();
+            let mut ranked = Vec::new();
+            for row in &history {
+                if paid == 0 || p.vendor.paid(row) {
+                    let made = protocol::text(row, "created", 40)?;
+                    let fraction = made
+                        .split_once('.')
+                        .map_or("", |(_, fraction)| fraction.trim_end_matches('Z'));
+                    ranked.push((
+                        (
+                            p.vendor.created(row)?,
+                            format!("{fraction:0<9}"),
+                            p.vendor.payment_id(row)?.to_ascii_lowercase(),
+                        ),
+                        row,
+                    ));
+                }
+            }
+            ranked.sort_by(|left, right| left.0.cmp(&right.0));
+            let payment = ranked.first().ok_or(REFUSED)?.1.clone();
+            self.procurement_commit(self.payment_record(payment, api.now()))
+                .await?;
+            self.procurement_recovery.payment_notice = if paid >= 2 {
+                Some(PAID_TWICE)
+            } else if history.len() >= 2 {
+                Some(SECOND_INVOICE)
+            } else {
+                None
+            };
+            return Ok(());
         }
         if p.invoice.is_some() {
             return Err("Initial invoice outcome unknown; Refresh payment history later. It will never be reissued.".into());
+        }
+        if p.vendor.is_lnvps() && self.provider_account_entered() {
+            return Err(ENTERED_ISSUANCE_REFUSED.into());
         }
         let fresh = self.initial_billing_quote(api).await?;
         if p.billing.as_ref() != Some(&fresh) {
@@ -1306,45 +1790,17 @@ impl<S: Storage> Store<S> {
                 let request = p
                     .vendor
                     .create(&p.selected, id(p.ssh_key.as_ref().ok_or(REFUSED)?)?);
-                let vm = match self.provider_read(api, request).await {
+                match self.provider_read(api, request).await {
                     Err(why) if why == protocol::EMAIL_REQUIRED => {
                         self.procurement_commit(Record::CreateEmailRefused).await?;
                         return Ok(());
                     }
-                    result => result?,
-                };
-                self.procurement_commit(Record::Associated(vm)).await?;
-            } else {
-                let intent = p.create.as_ref().ok_or(REFUSED)?;
-                let after = self.provider_read(api, p.vendor.list()).await?;
-                unique_ids(&after)?;
-                if array(&after)?.len() > 8 {
-                    return Err("Create inventory exceeds the bounded reconciliation limit; no order is retried.".into());
-                }
-                let mut candidates = Vec::new();
-                for vm in array(&after)? {
-                    if !intent.before.iter().any(|old| p.vendor.same_vm_id(old, vm)) {
-                        // Require complete matching list and detail evidence, never uniqueness alone.
-                        let detail = self.provider_read(api, p.vendor.get(id(vm)?)).await?;
-                        let key = id(p.ssh_key.as_ref().ok_or(REFUSED)?)?;
-                        if !p.vendor.matches(&p.selected, vm, key, intent.started)
-                            || !p.vendor.matches(&p.selected, &detail, key, intent.started)
-                            || !p.vendor.same_vm_identity(vm, &detail)
-                        {
-                            return Err(
-                                "Create evidence incomplete or conflicting; no order is retried."
-                                    .into(),
-                            );
-                        }
-                        candidates.push(detail);
+                    result => {
+                        result?;
                     }
                 }
-                if candidates.len() != 1 {
-                    return Err("Create outcome unknown: zero or multiple evidenced machines. Refresh later; no order is retried.".into());
-                }
-                self.procurement_commit(Record::Associated(candidates.remove(0)))
-                    .await?;
             }
+            self.associate_create(api, None).await?;
             #[cfg(all(feature = "tracer", target_arch = "wasm32"))]
             crate::testonly::session_point("procurement_associated").await;
             p = self.procurement.clone().ok_or(REFUSED)?;

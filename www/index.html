@@ -132,6 +132,9 @@ section section { min-width: 0; }
 <h2>3 Your machine</h2>
 <p id="tau-step-machine-status" class="step-status"></p>
 <p id="tau-step-machine-error" class="step-error" role="status"></p>
+<p id="tau-provider-entered-note" hidden>This is a provider account you entered yourself. This page can't see or stop what the account pays by itself, such as a saved payment method or credit the provider applies automatically.</p>
+<div id="tau-provider-stop-notice" hidden></div>
+<button id="tau-provider-stop" type="button" hidden>Stop this purchase</button>
 <div id="tau-step-machine-action"></div>
 <div id="tau-provider-progress" aria-live="polite"></div>
 <div id="tau-purchase-review-slot"></div>
@@ -148,12 +151,12 @@ section section { min-width: 0; }
 <h3>New machine</h3>
 
 
-<details id="tau-provider-existing"><summary>Use an existing provider account</summary>
+<details id="tau-provider-existing" hidden inert><summary>Use an existing provider account</summary>
 <p>Enter a dedicated provider account before this store records an account or purchase. It stays encrypted in this browser after Lock or reload.</p>
 <p id="tau-provider-account-fixed" hidden>This store’s provider account is fixed. Existing-account entry is unavailable.</p>
 <form id="tau-provider-key-form" novalidate>
 <label>Provider HTTPS origin <input id="tau-provider-origin" type="text" value="https://api.lnvps.net" autocomplete="off" spellcheck="false" autocapitalize="none"></label>
-<label>Provider account private key (64 hex) <input id="tau-provider-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="none"></label>
+<label>Provider account private key (64 hex) <input id="tau-provider-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="none" disabled></label>
 <button type="submit">Set provider account</button>
 </form>
 </details>
@@ -179,12 +182,11 @@ section section { min-width: 0; }
 <p><label>Class answer <select id="tau-provider-class" required><option value="">Choose an answer</option><option value="yes">Yes</option><option value="no">No, only me and people I know</option><option value="not_sure">Not sure</option></select></label></p>
 <p><label><input id="tau-provider-approve-charge" type="checkbox" required>I approve buying this machine exactly as shown above: its offer, region, system image, resources and recurring charge.</label></p>
 <p><label><input id="tau-provider-approve-access" type="checkbox" required>I let tau-web's AI log in to this machine whenever it needs to, now and later, as the image's login user, and run whole scripts on it as administrator without a password (sudo -n).</label></p>
-<p id="tau-provider-approval-note">Approving orders this machine from the provider now. With an account this page made for you, nothing is charged until you pay its first invoice yourself, in your wallet.</p>
-<p id="tau-provider-approval-limits">If you don't pay, the provider deletes the machine after about an hour. Once paid, this page can't cancel or refund it: the machine runs for the period you paid unless the provider ends it early. If you entered your own provider account, it may also pay automatically: see below.</p>
-<details id="tau-provider-approval-more" data-fold-key='["purchase-change-mind"]'><summary>What if I change my mind, or use my own account?</summary>
-<p id="tau-provider-approval-own">If you entered your own provider account above and it holds account credit set to be spent automatically, requesting the invoice may pay it from that credit, with no wallet step. If credit pays all of it, this page can't finish setting up the machine, so turn that setting off at the provider before you request the invoice. The provider also turns on automatic renewal for new machines, so that account's saved payment method or such credit can pay each later period without asking; you can turn renewal off at the provider once the machine exists.</p>
+<p id="tau-provider-approval-note">Approving orders this machine from the provider now. Nothing is charged until you pay its first invoice yourself, in your wallet.</p>
+<p id="tau-provider-approval-limits">If you don't pay, the provider deletes the machine after about an hour. Once paid, this page can't cancel or refund it: the machine runs for the period you paid unless the provider ends it early.</p>
+<details id="tau-provider-approval-more" data-fold-key='["purchase-change-mind"]'><summary>What if I change my mind?</summary>
 <p id="tau-provider-approval-unpaid">The invoice you request is valid for about 10 minutes, and this page can't issue another. If it expires unpaid, wait until the provider has deleted the machine (about an hour after the order, or once the invoice expires if that is later), then press Close purchase and start again.</p>
-<p id="tau-provider-approval-paid">With an account this page made for you, you have no way to delete a paid machine early: it runs until its paid period ends unless the provider ends it, and if the provider then returns the unused time as account credit, this page can't use or return it. If you entered your own provider account above, you can delete the machine at the provider yourself, unless an abuse case is open against it; the provider returns the unused time as credit on that account, not as money back.</p>
+<p id="tau-provider-approval-paid">You have no way to delete a paid machine early: it runs until its paid period ends unless the provider ends it, and if the provider then returns the unused time as account credit, this page can't use or return it.</p>
 </details>
 <button type="submit">Approve and order this machine</button>
 </form>

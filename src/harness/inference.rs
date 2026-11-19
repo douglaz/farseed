@@ -223,6 +223,7 @@ async fn publication(
         value["provider_configuration"] = if let Some(store) = local.store() {
             let mut fallback = provider_configuration;
             fallback["recorded"] = store.provider_account().is_some().into();
+            fallback["entered"] = store.provider_account_entered().into();
             measure(cycle, Mark::PublishProtect, || {
                 store.protect_publication(
                     &json!({
@@ -230,6 +231,7 @@ async fn publication(
                         "origin":store.procurement_origin(),
                         "account":store.provider_account().map(|a| a.public()),
                         "recorded":store.provider_account().is_some(),
+                        "entered":store.provider_account_entered(),
                         "relay_deployed":store.deployment_relay_present(),
                     }),
                     &[],

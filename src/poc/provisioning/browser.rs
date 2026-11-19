@@ -173,6 +173,12 @@ enum Action {
     },
     EmailReissue,
     Close,
+    Stop {
+        stage: crate::store::provisioning::StopStage,
+    },
+    Choose {
+        vm_id: u64,
+    },
     InitialInvoice {
         billing: crate::store::provisioning::Billing,
     },
@@ -264,6 +270,8 @@ pub async fn provider_request(request: String) -> String {
             Action::EmailReissue => store.procurement_email_send(&mut api, None).await.map(|_| None),
             Action::PaymentCheck => store.procurement_payment_check(&mut api).await.map(|_| None),
             Action::Close => store.procurement_close(&mut api).await.map(|_| None),
+            Action::Stop { stage } => store.procurement_stop(&mut api, stage).await.map(|_| None),
+            Action::Choose { vm_id } => store.procurement_choose(&mut api, vm_id).await.map(|_| None),
             Action::Resume => store
                 .procurement_resume(&mut api, false)
                 .await
