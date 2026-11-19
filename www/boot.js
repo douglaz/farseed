@@ -1159,6 +1159,32 @@ function* visibleTasks(store, slot) {
     if (taskDetails.has(task.id) || taskHistoryPage !== null && index >= start && index < start + taskHistoryPageSize) yield task;
   }
 }
+// These names follow the playbook's 12 steps of version 1.
+const controlCenterLabels = {
+  steps: {
+    1: 'look at the machine',
+    2: 'prepare the settings folder',
+    3: 'apply the base system',
+    4: 'create the keys',
+    5: 'install the AI agent and its dashboard',
+    6: 'let the agent install more later',
+    7: 'install T3 Code',
+    8: 'link T3 Code to your T3 account',
+    9: 'set up private access (WireGuard)',
+    10: 'set up Tor',
+    11: 'write your two files',
+    12: 'save everything and run the final check',
+  },
+  blocks: {Do: '', Wait: 'wait for the build', Check: 'check', Later: 'link later', R2: 'fix a problem (recovery)'},
+};
+const controlCenterOrigin = (task, id) => task.template === 'control-center@1' ? task.block_origins?.[id] : undefined;
+const playbookCommand = origin => {
+  if (!origin) return;
+  if (origin.step === 0 && origin.block === 'R2') return controlCenterLabels.blocks.R2;
+  const name = controlCenterLabels.steps[origin.step];
+  const suffix = controlCenterLabels.blocks[origin.block];
+  if (name && suffix !== undefined) return `step ${origin.step}, ${suffix || name}`;
+};
 const renderTasks = (store) => {
   if (store.state !== 'unlocked' || store.lifecycle_generation !== taskHistoryGeneration) {
     taskHistoryPage = null;
@@ -1232,6 +1258,12 @@ const renderTasks = (store) => {
       paragraph(card, shortLine(firstSentence, 120));
       rawDetails(card, {goal: task.goal}, ['task', task.id, 'goal']);
     }
+    if (!['complete', 'abandoned'].includes(task.status)) {
+      const latestCommand = task.completed.filter(([, tool]) => tool.name === 'exec').at(-1);
+      const origin = controlCenterOrigin(task, task.proposal?.call_id) ?? controlCenterOrigin(task, latestCommand?.[0]);
+      if (origin?.step === 0 && origin.block === 'R2') paragraph(card, 'Now: fixing a problem (recovery)');
+      else if (origin && controlCenterLabels.steps[origin.step]) paragraph(card, `Now: step ${origin.step} of 12, ${controlCenterLabels.steps[origin.step]}`);
+    }
     if (task.inference_retry) {
       paragraph(card, 'Waiting before trying the AI connection again.');
       rawDetails(card, {retry: task.inference_retry}, ['task', task.id, 'retry']);
@@ -1256,7 +1288,7 @@ const renderTasks = (store) => {
         const application = shortLine(tool.arguments.application, 64);
         const line = paragraph(card, created ? `Created an AI key for ${application} on this machine (limit 0.25 USD, expires in 30 days)` : declined ? `Didn't create an AI key for ${application}.` : `Couldn't create an AI key: ${shortLine(outcome?.content?.reason ?? 'the outcome is unavailable', 160)}.`);
         line.dataset[created ? 'aiKeyCreated' : declined ? 'aiKeyDeclined' : 'aiKeyFailed'] = '';
-      } else paragraph(card, id.startsWith('$before:') ? 'Read the listening ports before setup.' : tool.name === 'exec' ? `Ran: ${commandSummary(tool.arguments.command)} (${commandResultWord(outcome)})` : tool.name === 'propose_declaration' ? 'The AI proposed requirements.' : tool.name === 'done' ? 'The AI handed the work over for checks.' : 'Completed a step.');
+      } else paragraph(card, id.startsWith('$before:') ? 'Read the listening ports before setup.' : tool.name === 'exec' ? `Ran: ${(!id.startsWith('$rerun:') && playbookCommand(controlCenterOrigin(task, id))) || commandSummary(tool.arguments.command)} (${commandResultWord(outcome)})` : tool.name === 'propose_declaration' ? 'The AI proposed requirements.' : tool.name === 'done' ? 'The AI handed the work over for checks.' : 'Completed a step.');
       const machineKey = tool.name === 'request_ai_key' ? (store.poc_targets ?? []).find(target => target.machine === task.machine)?.application_inference_keys?.find(key => key.path === outcome?.content?.path) : undefined;
       rawDetails(card, {tool: tool.name === 'done' ? {name: tool.name, arguments: {machine: tool.arguments.machine}} : tool, outcome, ...(machineKey ? {application_inference_key: machineKey} : {})}, ['task', task.id, 'completed', id]);
     }
@@ -1349,7 +1381,7 @@ const renderTasks = (store) => {
       } else if (task.proposal.call_id.startsWith('$rerun:')) {
         const label = task.pending ? task.status === 'paused' ? 'Re-issued command' : 'Running again' : 'Ready to send once more';
         paragraph(card, `${label}: ${commandSummary(task.proposal.tool.arguments.command)}`);
-      } else if (!missingRecord) paragraph(card, task.proposal.call_id.startsWith('$before:') ? 'Next: read the listening ports before setup.' : task.proposal.call_id.startsWith('$verify:') || task.proposal.call_id.startsWith('$verify-batch') ? 'Next: check the machine setup.' : task.proposal.tool.name === 'exec' ? `Next: ${commandSummary(task.proposal.tool.arguments.command)}` : task.proposal.tool.name === 'propose_declaration' ? 'Next: a requirements proposal from the AI.' : task.proposal.tool.name === 'done' ? 'Next: the handover from the AI.' : task.proposal.tool.name === 'request_ai_key' ? `Creating an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} and saving it on the machine.` : 'Next: a step.');
+      } else if (!missingRecord) paragraph(card, task.proposal.call_id.startsWith('$before:') ? 'Next: read the listening ports before setup.' : task.proposal.call_id.startsWith('$verify:') || task.proposal.call_id.startsWith('$verify-batch') ? 'Next: check the machine setup.' : task.proposal.tool.name === 'exec' ? `Next: ${playbookCommand(controlCenterOrigin(task, task.proposal.call_id)) || commandSummary(task.proposal.tool.arguments.command)}` : task.proposal.tool.name === 'propose_declaration' ? 'Next: a requirements proposal from the AI.' : task.proposal.tool.name === 'done' ? 'Next: the handover from the AI.' : task.proposal.tool.name === 'request_ai_key' ? `Creating an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} and saving it on the machine.` : 'Next: a step.');
       rawDetails(card, task.proposal.tool, ['task', task.id, 'proposal', task.proposal.call_id]);
     }
     if (task.pending && task.proposal?.report == null) {
