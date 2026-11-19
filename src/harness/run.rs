@@ -17,6 +17,11 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use ws_stream_wasm::{WsEvent, WsMessage, WsMeta, WsStream};
 
+#[path = "probe.rs"]
+mod probe;
+pub use probe::probe_attest;
+pub(crate) use probe::stop_probe;
+
 type RelayGate = Arc<tokio::sync::Mutex<Option<f64>>>;
 thread_local! {
     // Destination host only: the relay shares its pace across ports. Worker memory only.
@@ -301,7 +306,7 @@ struct PinCheck {
     attest_refusal: Arc<Mutex<Option<String>>>,
     presented: Arc<Mutex<Option<String>>>,
     generation: u64,
-    session: String,
+    session: super::ConnectionAuthority,
     cycle: Option<u64>,
     handshake_started: Option<f64>,
 }
@@ -1504,12 +1509,45 @@ async fn exec_record(
     delivered.record()
 }
 
-async fn connect(
+struct HandshakeAuthority {
+    identity: super::ConnectionAuthority,
+}
+trait HandshakeJournal {
+    async fn current(&self, authority: &HandshakeAuthority) -> Result<(), String>;
+    async fn relay_key(&self, machine: &str) -> Option<crate::credential::RelayKey>;
+    fn credentials_available(&self) -> bool;
+    fn command_cycle(&self) -> Option<u64>;
+    async fn relay_admitted(&self, _authority: &HandshakeAuthority) -> Result<(), String> {
+        Ok(())
+    }
+}
+struct SessionHandshake<'a, J> {
+    journal: &'a J,
+    session: &'a Session,
+}
+impl<J: BoundJournal> HandshakeJournal for SessionHandshake<'_, J> {
+    async fn current(&self, _: &HandshakeAuthority) -> Result<(), String> {
+        self.journal.current(self.session).await
+    }
+    async fn relay_key(&self, machine: &str) -> Option<crate::credential::RelayKey> {
+        self.journal.relay_key(machine).await
+    }
+    fn credentials_available(&self) -> bool {
+        self.journal.credentials_available()
+    }
+    fn command_cycle(&self) -> Option<u64> {
+        self.journal.command_cycle()
+    }
+}
+
+/// The sole relay and host-key handshake. It returns before authentication.
+async fn handshake<K>(
     pins: &impl PinSource,
-    journal: &impl BoundJournal,
-    session: &Session,
+    journal: &impl HandshakeJournal,
+    session: &HandshakeAuthority,
     target: &Target,
     stop: &std::rc::Rc<wait::Stop>,
+    prepare: impl FnOnce(&Target) -> Result<K, Refusal>,
     #[cfg(feature = "tracer")] tamper_auth: bool,
 ) -> Result<
     (
@@ -1517,10 +1555,12 @@ async fn connect(
         String,
         String,
         wait::SocketRegistration,
+        web_sys::WebSocket,
+        Target,
+        K,
     ),
     Refusal,
 > {
-    stop.associate(&session.identity);
     let resolved = access(target).await;
     let introduction = if target.stored {
         let local = crate::worker::local();
@@ -1561,18 +1601,8 @@ async fn connect(
     let Some(relay_key) = journal.relay_key(&target.machine).await else {
         return Err(Refusal::NoCredentials);
     };
-    // Borrow the holding only while deriving the transport key, before any network wait.
-    let ssh_key = {
-        let ssh_key = session
-            .client_key(&target.machine)
-            .ok_or(Refusal::NoCredentials)?;
-        PrivateKey::new(
-            KeypairData::Ed25519(Ed25519Keypair::from_seed(&ssh_key.0)),
-            "",
-        )
-        .map_err(|e| Refusal::Failed(format!("ssh client key: {e}")))?
-    };
 
+    let prepared = prepare(target)?;
     let url = if let Some(introduction) = &introduction {
         target.attest_contact_url(
             introduction,
@@ -1681,6 +1711,10 @@ async fn connect(
             }
             return Err(Refusal::Relay { reason, close_code });
         }
+        journal
+            .relay_admitted(session)
+            .await
+            .map_err(Refusal::Journal)?;
         break (ws, socket, meta.wrapped().clone());
     };
 
@@ -1715,6 +1749,7 @@ async fn connect(
         handshake_started: cycle.and_then(|_| timings::now()),
         ..handler
     };
+    #[allow(unused_mut, reason = "retain the extracted handshake verbatim")]
     let mut ssh =
         match client::connect_stream(config, super::relay_io::RelayIo(ws.into_io()), handler).await
         {
@@ -1770,6 +1805,65 @@ async fn connect(
         .unwrap_or_default();
     // A successful first handshake has durably pinned exactly this inner key.
     let pinned = if attest { host_key.clone() } else { pinned };
+
+    journal.current(session).await.map_err(Refusal::Journal)?;
+    Ok((
+        ssh,
+        pinned,
+        host_key,
+        socket,
+        websocket,
+        target.clone(),
+        prepared,
+    ))
+}
+
+async fn connect(
+    pins: &impl PinSource,
+    journal: &impl BoundJournal,
+    session: &Session,
+    target: &Target,
+    stop: &std::rc::Rc<wait::Stop>,
+    #[cfg(feature = "tracer")] tamper_auth: bool,
+) -> Result<
+    (
+        client::Handle<PinCheck>,
+        String,
+        String,
+        wait::SocketRegistration,
+    ),
+    Refusal,
+> {
+    stop.associate(&session.identity);
+    let authority = HandshakeAuthority {
+        identity: super::ConnectionAuthority::Session(session.identity.clone()),
+    };
+    let admission = SessionHandshake { journal, session };
+    let (mut ssh, pinned, host_key, socket, websocket, target, ssh_key) = handshake(
+        pins,
+        &admission,
+        &authority,
+        target,
+        stop,
+        |target| {
+            // Borrow the holding only while deriving the transport key, before any network wait.
+            let ssh_key = {
+                let ssh_key = session
+                    .client_key(&target.machine)
+                    .ok_or(Refusal::NoCredentials)?;
+                PrivateKey::new(
+                    KeypairData::Ed25519(Ed25519Keypair::from_seed(&ssh_key.0)),
+                    "",
+                )
+                .map_err(|e| Refusal::Failed(format!("ssh client key: {e}")))?
+            };
+            Ok(ssh_key)
+        },
+        #[cfg(feature = "tracer")]
+        tamper_auth,
+    )
+    .await?;
+    let cycle = journal.command_cycle();
 
     journal.current(session).await.map_err(Refusal::Journal)?;
     let login_timing = Timer::new(cycle, Mark::Login);

@@ -165,10 +165,21 @@ impl<S: Storage> Store<S> {
         self.goals.push(goal);
     }
 
-    pub fn live_goal_session(&self, session: &str) -> Result<Rc<Session>, String> {
+    pub fn live_goal_session<A: crate::harness::ConnectionAdmission + ?Sized>(
+        &self,
+        session: &A,
+    ) -> Result<A::Admitted, String> {
+        session.admit(self)
+    }
+    pub(crate) fn live_goal_session_id(&self, session: &str) -> Result<Rc<Session>, String> {
         self.check_session_authority(session, self.session_pair(session))?;
         if self.inference.ended {
             return Err(crate::poc::wait::SESSIONS_ENDED.into());
+        }
+        if let Some(live) = self.stored_session(session) {
+            for machine in &live.bound_set {
+                self.vpsbg_session_ready(machine)?;
+            }
         }
         self.stored_session(session)
             .cloned()

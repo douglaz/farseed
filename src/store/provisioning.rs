@@ -369,7 +369,7 @@ impl<S: Storage> Store<S> {
         if self
             .procurement
             .as_ref()
-            .is_some_and(|p| p.account != account)
+            .is_some_and(|p| p.vendor == Vendor::Lnvps && p.account != account)
         {
             return Err("The recorded provider account does not match this purchase.".into());
         }
@@ -378,7 +378,9 @@ impl<S: Storage> Store<S> {
     pub(crate) fn procurement_vendor(&self) -> Vendor {
         self.procurement
             .as_ref()
-            .filter(|p| p.vendor == Vendor::Vpsbg || p.target.is_none())
+            .filter(|p| {
+                p.target.is_none() || (p.vendor == Vendor::Vpsbg && !self.vpsbg_is_ready(p))
+            })
             .map_or(self.vendor_choice.unwrap_or(Vendor::Lnvps), |p| p.vendor)
     }
     pub(crate) fn procurement_origin(&self) -> &str {
@@ -400,6 +402,14 @@ impl<S: Storage> Store<S> {
     }
     fn check_api(&self, api: &impl Api) -> Result<(), String> {
         api.current()?;
+        if let Some(context) = api.vpsbg_context() {
+            self.vpsbg_context_current(context)?;
+            if api.account() != context.account {
+                return Err(REFUSED.into());
+            }
+            api.check_vendor(context.vendor)?;
+            return self.procurement_ready();
+        }
         api.check_vendor(self.procurement_vendor())?;
         if self.procurement_vendor() == Vendor::Vpsbg {
             self.procurement_ready()?;
@@ -421,16 +431,20 @@ impl<S: Storage> Store<S> {
         request: VendorRequest,
     ) -> Result<(u16, Value), protocol::ReadError> {
         self.check_api(api)?;
-        let url = self
-            .procurement_vendor()
-            .request_url(self.procurement_origin(), &request.path)?;
+        let vendor = api
+            .vpsbg_context()
+            .map_or(self.procurement_vendor(), |c| c.vendor);
+        let origin = api
+            .vpsbg_context()
+            .map_or(self.procurement_origin(), |c| c.origin.as_str());
+        let url = vendor.request_url(origin, &request.path)?;
         self.check_api(api)?;
         let result = api.request(request.method, &url, request.body).await;
         self.check_api(api)?;
         let mut value = result?;
-        if self.procurement_vendor() == Vendor::Vpsbg {
+        if vendor == Vendor::Vpsbg {
             let raw = api.take_vpsbg_response().ok_or(REFUSED)?;
-            value = self.procurement_vendor().reduce_response(
+            value = vendor.reduce_response(
                 request.method,
                 &request.path,
                 api.response_status(),
@@ -656,12 +670,24 @@ impl<S: Storage> Store<S> {
     }
     // Only completed procurements may precede another purchase in this store.
     pub(super) fn procurement_can_start(&self) -> bool {
-        self.procurement.as_ref().is_none_or(|p| p.target.is_some())
+        self.procurement.as_ref().is_none_or(|p| {
+            if p.vendor == Vendor::Vpsbg {
+                self.vpsbg_is_ready(p)
+            } else {
+                p.target.is_some()
+            }
+        }) && self
+            .completed_purchases
+            .iter()
+            .all(|p| p.vendor != Vendor::Vpsbg || self.vpsbg_is_ready(p))
             && self
                 .dispatch
                 .approved_entries
                 .iter()
                 .all(|(machine, entry)| {
+                    if self.vpsbg_tombstoned_entry(machine, &entry.approved.identity) {
+                        return true;
+                    }
                     self.completed_purchases
                         .iter()
                         .chain(self.procurement.iter())
@@ -670,18 +696,24 @@ impl<S: Storage> Store<S> {
                                 && p.identity == entry.approved.identity
                                 && p.target.as_ref() == self.poc_target(machine)
                                 && p.target.is_some()
+                                && (p.vendor != Vendor::Vpsbg || self.vpsbg_is_ready(p))
                         })
                 })
-            && self
-                .poc_targets
-                .keys()
-                .all(|machine| self.dispatch.approved_entries.contains_key(machine))
+            && self.poc_targets.keys().all(|machine| {
+                self.dispatch.approved_entries.contains_key(machine)
+                    || self.closed_purchases.iter().any(|p| {
+                        p.vendor == Vendor::Vpsbg
+                            && p.machine == *machine
+                            && self.vpsbg_tombstoned_entry(machine, &p.identity)
+                    })
+            })
     }
     pub(crate) fn procurement_review_selection(&self) -> Option<&Selection> {
         if self.procurement_vendor() == Vendor::Vpsbg {
             return self.procurement_selection.as_ref().or_else(|| {
                 self.procurement
                     .as_ref()
+                    .filter(|p| !self.vpsbg_is_ready(p))
                     .and_then(|p| p.pending_selection.as_ref().or(Some(&p.selected)))
             });
         }
@@ -697,15 +729,15 @@ impl<S: Storage> Store<S> {
         let mut view = self.procurement_current_view();
         view["archive"] = json!(self.closed_purchases.iter().map(|p| json!({"machine":p.machine,"vm_id":p.vm.as_ref().map(|vm|p.vendor.raw_id(vm)),"message":closed_message(p, self.provider_account_entered())})).collect::<Vec<_>>());
         self.vpsbg_view(&mut view);
-        let handed_off = self
-            .procurement
-            .as_ref()
-            .filter(|p| p.target.is_some() && p.vendor != self.procurement_vendor());
+        let handed_off = self.procurement.as_ref().filter(|p| {
+            self.vpsbg_is_ready(p) || (p.target.is_some() && p.vendor != self.procurement_vendor())
+        });
         if !self.completed_purchases.is_empty() || handed_off.is_some() {
             view["completed"] = self.completed_purchases.iter().chain(handed_off).map(|p| {
                 let mut completed = json!({"machine":p.machine,"origin":p.origin,"vm_id":p.vm.as_ref().map(|vm|p.vendor.raw_id(vm)),"payment_id":p.payment.as_ref().map(|pay|p.vendor.raw_id(pay)),"is_paid":p.payment.as_ref().is_some_and(|pay|p.vendor.paid(pay)),"target_saved":p.target.is_some()});
                 if p.vendor == Vendor::Vpsbg {
                     completed["vendor"] = p.vendor.describe();
+                    self.vpsbg_machine_view(&mut completed, p, crate::hostcert::now_unix().unwrap_or(u64::MAX));
                 }
                 completed
             }).collect();
@@ -714,16 +746,14 @@ impl<S: Storage> Store<S> {
     }
     fn procurement_current_view(&self) -> Value {
         // A new vendor's draft must not inherit the previous purchase's facts.
-        let Some(p) = self
-            .procurement
-            .as_ref()
-            .filter(|p| p.target.is_none() || p.vendor == self.procurement_vendor())
-        else {
+        let Some(p) = self.procurement.as_ref().filter(|p| {
+            !self.vpsbg_is_ready(p) && (p.target.is_none() || p.vendor == self.procurement_vendor())
+        }) else {
             return json!({"origin":self.procurement_origin(),"selection":self.procurement_selection,"closed":self.closed_purchases.last().map(|p| closed_message(p, self.provider_account_entered()))});
         };
         let phase = if p.pending_selection.is_some() {
             "terms_changed"
-        } else if p.target.is_some() {
+        } else if p.target.is_some() && (p.vendor != Vendor::Vpsbg || self.vpsbg_is_ready(p)) {
             "handed_off"
         } else if p.payment.is_some() {
             "payment_readiness"
@@ -792,6 +822,7 @@ impl<S: Storage> Store<S> {
     ) -> Result<(), String> {
         if self.procurement.as_ref().is_some_and(|p| {
             p.vendor == Vendor::Vpsbg
+                && !self.vpsbg_is_ready(p)
                 && p.vpsbg.as_ref().is_some_and(|v| {
                     self.vpsbg_purchases
                         .get(&v.purchase)

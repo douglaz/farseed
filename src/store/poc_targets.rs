@@ -302,6 +302,7 @@ impl<S: Storage> Store<S> {
 
     pub async fn poc_bind(&mut self, machine: &str) -> Result<String, String> {
         self.authority.ordinary()?;
+        self.vpsbg_session_ready(machine)?;
         if let Some(session) = self.sessions.iter().find(|session| {
             !session.ended.get() && session.bound_set.iter().any(|name| name == machine)
         }) {
@@ -415,6 +416,23 @@ impl<S: Storage> Store<S> {
             application_inference_keys: Vec::new(),
             key_card_class: None,
         }
+    }
+
+    /// Only the typed VPSBG AttestTarget projection may call this unpinned path.
+    pub(super) fn vpsbg_apply_target(
+        &mut self,
+        p: &super::provisioning::Purchase,
+        target: TargetRecord,
+    ) {
+        self.poc_targets.insert(
+            p.machine.clone(),
+            Self::purchase_target_record(
+                target,
+                p.identity.clone(),
+                p.relay_identity.clone(),
+                p.class_answer,
+            ),
+        );
     }
 }
 

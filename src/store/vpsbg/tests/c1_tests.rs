@@ -1,6 +1,9 @@
 //! Invented, secret-free provider shapes. Never retain a create body in the fake call log.
 use super::*;
 
+#[path = "e1_tests.rs"]
+mod e1_tests;
+
 #[derive(Clone, Copy)]
 enum Reply {
     Accepted,
