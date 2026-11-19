@@ -3203,7 +3203,7 @@ fn provisioning_close_local_refusals_write_and_send_nothing() {
         api.calls.clear();
         let error = block_on(s.procurement_close(&mut api)).unwrap_err();
         if case != "wrong-account" {
-            assert_eq!(error, CLOSE_REFUSED, "{case}");
+            assert_eq!(error, Vendor::Lnvps.close_refused(), "{case}");
         }
         assert!(api.calls.is_empty(), "{case}");
         assert_eq!(s.storage.files(), files, "{case}");
@@ -3446,7 +3446,7 @@ fn provisioning_close_post_read_recheck_uses_current_time() {
     let p = s.procurement.clone();
     assert_eq!(
         block_on(s.procurement_close(&mut api)).unwrap_err(),
-        CLOSE_REFUSED
+        Vendor::Lnvps.close_refused()
     );
     assert_eq!(s.next, before);
     assert_eq!(s.procurement, p);
@@ -3471,7 +3471,7 @@ fn provisioning_missing_refresh_keeps_earlier_paid_reading() {
             .insert(route.into(), protocol::ReadError::NotFound);
         let before = s.next;
         let error = block_on(s.procurement_resume(&mut api, false)).unwrap_err();
-        assert_eq!(error, missing_pause(11));
+        assert_eq!(error, Vendor::Lnvps.missing_pause(11));
         assert_eq!(s.next, before + u64::from(route == "/api/v1/vm/11"));
         if route == "/api/v1/vm/11" {
             assert_eq!(
