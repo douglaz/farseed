@@ -1449,6 +1449,17 @@ const renderTasks = (store) => {
         rawDetails(parent, outcome, ['task', task.id, 'unknown', id]);
       }
     }
+    if (task.status === 'complete' && task.verdict && session && store.lifecycle_state !== 'ended') {
+      paragraph(card, "Finished? End session stops tau-web's AI and cancels its session key. Your machine keeps running, and billing, until you delete it.");
+      for (const [, tool, outcome] of task.completed) {
+        if (tool.name === 'request_ai_key' && outcome?.content?.status === 'created') paragraph(card, `The AI key made for ${shortLine(tool.arguments.application, 64)} keeps working, up to its limit, until it expires or is revoked.`);
+      }
+      const identity = session.identity;
+      const end = document.createElement('button');
+      end.type = 'button'; end.textContent = 'End session'; end.dataset.endSession = identity;
+      end.addEventListener('click', () => { end.disabled = true; worker.postMessage({task: {action: 'end-session', session: identity}}); });
+      card.append(end);
+    }
     if (['complete', 'abandoned'].includes(task.status)) { slot.append(card); continue; }
     paragraph(card, 'If you close this page, work that can continue picks up after you unlock and resupply any requested key. The task keeps the same session, machine, approvals and limits. Use Resume if it stays paused.');
     const action = (text, request) => {
