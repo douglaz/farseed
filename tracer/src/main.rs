@@ -2851,9 +2851,12 @@ async fn run_cases(
             &format!("permission {setting}: the browser holds the store persisted: {persisted}"),
             persisted == (setting == "granted"),
         );
-        case.check("main.a100",
-            &format!("permission {setting}: the page's storage note says {says:?} and {statement:?}"),
-            view.persistence(state,says,statement),
+        case.check(
+            "main.a100",
+            &format!(
+                "permission {setting}: the page's storage note says {says:?} and {statement:?}"
+            ),
+            view.persistence(state, says, statement),
         );
     }
     browser
