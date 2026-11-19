@@ -1,5 +1,7 @@
 use super::*;
 
+mod render_fixtures;
+
 struct B947Api {
     inner: Fixture,
     duplicate_create: bool,
