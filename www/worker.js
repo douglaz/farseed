@@ -3,7 +3,7 @@
 import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, accept_page_goal, TaskPublication, requirements_answer, delivery_request, retire_runtime, sweep_inference, lifecycle_transition, publication_generation, publish_report, verify_inference_clock, withdraw_reinstall } from './pkg/tau_web.js';
 import { identify_execution, wake_tasks, task_presence, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_download, publish_task_details, publish_delivery_details } from './pkg/tau_web.js';
 import { credit_request, retry_ended_credit } from './pkg/tau_web.js';
-import { deployment_configure, provider_configure, provider_key_is_set, provider_visibility, provider_action_delay, provider_request } from './pkg/tau_web.js';
+import { deployment_configure, provider_configure, provider_token_configure, provider_key_is_set, provider_visibility, provider_action_delay, provider_request } from './pkg/tau_web.js';
 import { publish_unlock_worker_timings } from './pkg/tau_web.js';
 
 const unlockNow = performance.now.bind(performance);
@@ -17,6 +17,7 @@ const unlockJson = (marks, operation, value) => {
 };
 
 const clearInput = request => {
+  if (request?.provider_token?.token instanceof Uint8Array) request.provider_token.token.fill(0);
   if (request?.provider_request && Object.hasOwn(request.provider_request, 'email')) delete request.provider_request.email;
   for (const field of ['create','unlock','seed_backup_redisplay','seed_backup_reentry']) {
     if (request?.[field] instanceof Uint8Array) request[field].fill(0);
@@ -514,7 +515,7 @@ onmessage = async ({ data: envelope }) => {
   const generation = publication_generation();
   let report;
   const step = data.poc_configure || data.credit_request ? 'credit'
-    : data.provider_configure || data.provider_request || data.poc_enroll || data.setup_approve || data.setup_answer ? 'machine'
+    : data.provider_token || data.provider_configure || data.provider_request || data.poc_enroll || data.setup_approve || data.setup_answer ? 'machine'
     : data.poc_bind || data.poc_public_keys || data.poc_accept || data.bind || data.verify_clock || data.withdraw_reinstall || data.task || data.goal || data.requirements_answer || data.delivery || data.goal_accept ? 'task' : 'store';
   const session = data.task?.action === 'end-session' ? '' : data.goal?.session ?? data.goal_accept?.session ?? data.requirements_answer?.session ?? data.delivery?.session ?? data.task?.session ?? '';
   if (data.create instanceof Uint8Array) report = await create(data.create);
@@ -559,6 +560,16 @@ onmessage = async ({ data: envelope }) => {
     if (data.credit_request.action === 'start' && !value.credit_error) value.credit_started_machine = data.credit_request.machine;
     report = JSON.stringify(value);
   }
+  else if (data.provider_token !== undefined) {
+    const config = data.provider_token;
+    try {
+      if (exactMembers(config, ["vendor", "token"]) && config.vendor === "vpsbg" && config.token instanceof Uint8Array) report = await provider_token_configure(config.token);
+      else { const current = JSON.parse(await open()); current.error = "Invalid VPSBG token entry."; report = JSON.stringify(current); }
+    } finally {
+      if (config?.token instanceof Uint8Array) config.token.fill(0);
+      if (config && typeof config === "object") delete config.token;
+    }
+  }
   else if (data.provider_configure !== undefined) {
     const config = data.provider_configure;
     try {
@@ -572,6 +583,7 @@ onmessage = async ({ data: envelope }) => {
   else if (data.provider_request && typeof data.provider_request === 'object') {
     try {
       const value = JSON.parse(await provider_request(JSON.stringify(data.provider_request)));
+      if (data.provider_request.action === 'vendor') value.provider_selection_reviewed = false;
       if (data.provider_request.action === 'select' && !value.error) value.provider_selection_reviewed = true;
       report = JSON.stringify(value);
     } finally { delete data.provider_request.email; }
