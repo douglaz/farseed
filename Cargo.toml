@@ -50,6 +50,8 @@ aes-gcm = { version = "0.11", default-features = false, features = ["aes", "allo
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 zeroize = "1"
+# Host-certificate verification and role-6 OpenSSH encoding on both host and browser.
+ssh-key = { version = "=0.7.0-rc.11", default-features = false, features = ["std", "ed25519"] }
 
 # ADR-0024's configuration, as it compiled. `scripts/check-adr-0024.sh` refuses what it keeps
 # out: tokio `net` and `rt-multi-thread`, and any russh crypto backend but `ring`.

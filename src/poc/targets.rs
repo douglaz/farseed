@@ -38,6 +38,36 @@ impl Target {
         }
         .relay_url()
     }
+
+    /// Explicit first-contact admission, backed by a committed open introduction.
+    pub(crate) fn attest_contact_url(
+        &self,
+        introduction: &crate::store::attest::Introduction,
+        now: u64,
+    ) -> Result<String, String> {
+        let ca = ssh_key::PublicKey::from_openssh(&introduction.ca_public)
+            .map_err(|_| "invalid attest authority")?;
+        if !self.stored
+            || introduction.machine != self.machine
+            || introduction.principal != crate::store::attest::attest_principal(&ca)?
+            || now < introduction.begun_unix
+            || now >= introduction.deadline_unix
+        {
+            return Err("attest introduction unavailable".into());
+        }
+        let record = TargetRecord {
+            machine: self.machine.clone(),
+            relay: self.relay.clone(),
+            profile: self.profile.clone(),
+            host: self.host.clone(),
+            port: self.port,
+            user: self.user.clone(),
+            elevation: Elevation::None,
+            pin: String::new(),
+        };
+        record.validate_access()?;
+        record.access_url()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,7 +144,7 @@ pub fn valid_relay(value: &str) -> bool {
 }
 
 impl TargetRecord {
-    pub fn validate(&self) -> Result<(), String> {
+    fn validate_access(&self) -> Result<(), String> {
         if !token(&self.machine, 64) {
             return Err("invalid machine name".into());
         }
@@ -134,6 +164,11 @@ impl TargetRecord {
         if !token(&self.user, 64) && !valid_login_user(&self.user) {
             return Err("invalid target user".into());
         }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        self.validate_access()?;
         let valid_pin = self.pin.strip_prefix("SHA256:").is_some_and(|encoded| {
             STANDARD_NO_PAD
                 .decode(encoded)
@@ -148,6 +183,10 @@ impl TargetRecord {
     /// Admission occurs before the transport may contact a relay.
     pub fn relay_url(&self) -> Result<String, String> {
         self.validate()?;
+        self.access_url()
+    }
+
+    fn access_url(&self) -> Result<String, String> {
         if self.profile != "v1" {
             return Err(format!("unsupported relay profile: {}", self.profile));
         }
@@ -163,7 +202,7 @@ impl TargetRecord {
         reason = "the stored transport pin source is used by the browser and host tests"
     )
 )]
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct StoredPins(std::collections::BTreeMap<String, String>);
 impl PinSource for StoredPins {
     fn pin(&self, machine: &str) -> Option<HostKeyPin> {
@@ -189,9 +228,19 @@ pub fn resolve<S: crate::store::Storage>(
     machine: &str,
 ) -> Result<(crate::harness::Target, StoredPins), String> {
     let record = store
-        .poc_target(machine)
+        .attest_target(machine)
         .ok_or("machine has no stored target or pin")?;
-    let pins = StoredPins::from_record(record)?;
+    let introduction = if record.pin.is_empty() {
+        store.attest_introduction(machine, crate::hostcert::now_unix()?)
+    } else {
+        None
+    };
+    let pins = if record.pin.is_empty() && introduction.is_some() {
+        record.validate_access()?;
+        StoredPins::default()
+    } else {
+        StoredPins::from_record(&record)?
+    };
     let target = Target {
         machine: record.machine.clone(),
         relay: record.relay.clone(),
@@ -201,7 +250,11 @@ pub fn resolve<S: crate::store::Storage>(
         user: record.user.clone(),
         stored: true,
     };
-    target.contact_url(pins.pin(machine).as_ref().map(|pin| pin.0.as_str()))?;
+    if let Some(introduction) = introduction {
+        target.attest_contact_url(introduction, crate::hostcert::now_unix()?)?;
+    } else {
+        target.contact_url(pins.pin(machine).as_ref().map(|pin| pin.0.as_str()))?;
+    }
     Ok((target, pins))
 }
 
