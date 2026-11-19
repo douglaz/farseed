@@ -1,5 +1,7 @@
 //! Offline readiness fixtures: generated test authorities and invented provider responses only.
 use super::*;
+#[path = "g1_tests.rs"]
+mod g1_tests;
 use crate::harness::{AttestProbe, PinSource};
 use crate::store::vpsbg::readiness::{AttestPace, probe_budget_ms};
 use ssh_key::{
@@ -458,7 +460,7 @@ fn vpsbg_poll_contexts_survive_handoff() {
         s.vpsbg_admit_addressed(action).unwrap();
     }
     for action in ["delete", "delete_check"] {
-        assert!(s.vpsbg_admit_addressed(action).is_err());
+        assert!(s.vpsbg_admit_addressed(action).is_ok());
     }
     assert!(
         block_on(s.vpsbg_pay_order(&mut api, &id)).is_err(),

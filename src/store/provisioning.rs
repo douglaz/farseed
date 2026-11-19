@@ -71,7 +71,7 @@ fn stop_prompt(p: &Purchase, stop: &Stopped, entered: bool) -> String {
 }
 fn closed_message(p: &Purchase, entered: bool) -> String {
     if p.vendor == Vendor::Vpsbg {
-        return "VPSBG purchase abandoned before create. Earlier top-ups may still settle as VPSBG credit.".into();
+        return "VPSBG purchase closed. Earlier top-ups may still settle as VPSBG credit.".into();
     }
     if let Some(stop) = &p.stopped {
         return stopped_message(p, stop.stage, entered);
@@ -729,6 +729,29 @@ impl<S: Storage> Store<S> {
         let mut view = self.procurement_current_view();
         view["archive"] = json!(self.closed_purchases.iter().map(|p| json!({"machine":p.machine,"vm_id":p.vm.as_ref().map(|vm|p.vendor.raw_id(vm)),"message":closed_message(p, self.provider_account_entered())})).collect::<Vec<_>>());
         self.vpsbg_view(&mut view);
+        let archived_vpsbg: Vec<_> = self.closed_purchases.iter().filter(|p| p.vendor == Vendor::Vpsbg).map(|p| {
+            let mut card = json!({"machine":p.machine,"origin":p.origin,"vendor":p.vendor.describe(),"closed":true});
+            self.vpsbg_machine_view(&mut card, p, crate::hostcert::now_unix().unwrap_or(u64::MAX));
+            if let Some(reason) = p.vpsbg.as_ref().and_then(|v| self.vpsbg_purchases.get(&v.purchase)).and_then(|s| s.closure.as_ref()) {
+                card["closure"] = json!(reason);
+            }
+            card
+        }).collect();
+        if !archived_vpsbg.is_empty() {
+            if view.get("closed").is_some()
+                && self
+                    .closed_purchases
+                    .last()
+                    .is_some_and(|p| p.vendor == Vendor::Vpsbg)
+            {
+                view["closed"] = archived_vpsbg.last().cloned().unwrap_or(Value::Null);
+            }
+            if let Some(archive) = view["archive"].as_array_mut() {
+                archive.extend(archived_vpsbg);
+            } else {
+                view["archive"] = json!(archived_vpsbg);
+            }
+        }
         let handed_off = self.procurement.as_ref().filter(|p| {
             self.vpsbg_is_ready(p) || (p.target.is_some() && p.vendor != self.procurement_vendor())
         });

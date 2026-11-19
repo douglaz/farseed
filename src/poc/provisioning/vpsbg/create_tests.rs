@@ -65,11 +65,12 @@ fn vpsbg_create_route_reductions_and_observed_detail() {
     let mut wrong = value;
     wrong["state"] = json!({"cloud_init_failed":"false"});
     assert!(decoded("GET", "/v1/servers/51", 200, json!({"data":wrong})).is_err());
-    for path in [
-        "/v1/servers/51/startup-script",
-        "/v1/servers/51/refund-quote",
-        "/v1/servers/01",
-    ] {
+    assert!(request_method_allowed(
+        ORIGIN,
+        "GET",
+        &format!("{ORIGIN}/v1/servers/51/refund-quote")
+    ));
+    for path in ["/v1/servers/51/startup-script", "/v1/servers/01"] {
         assert!(!request_method_allowed(
             ORIGIN,
             "GET",

@@ -278,6 +278,14 @@ enum Action {
     Choose {
         vm_id: u64,
     },
+    Delete {
+        machine: String,
+        #[serde(default)]
+        confirmed: bool,
+    },
+    DeleteCheck {
+        machine: String,
+    },
     InitialInvoice {
         billing: crate::store::provisioning::Billing,
     },
@@ -332,6 +340,7 @@ pub async fn provider_request(request: String) -> String {
             Action::Approve { .. } => "approve", Action::Resume { .. } => "resume", Action::PaymentCheck { .. } => "payment_check", Action::PayOrder { .. } => "pay_order",
             Action::EmailCheck => "email_check", Action::InitialInvoice { .. } => "initial_invoice",
             Action::Close => "close", Action::EmailSend { .. } => "email_send", Action::EmailReissue => "email_reissue",
+            Action::Delete {..} => "delete", Action::DeleteCheck {..} => "delete_check",
             _ => "read",
         };
         let addressed = match &action {
@@ -339,7 +348,10 @@ pub async fn provider_request(request: String) -> String {
                 | Action::PayOrder { purchase } | Action::ReadinessCheck { purchase } => purchase.as_deref(),
             _ => None,
         };
-        let addressed_context = addressed.map(|id| store.vpsbg_action_context(id)).transpose()?;
+        let addressed_context = match &action {
+            Action::Delete {machine,..} | Action::DeleteCheck {machine} => Some(store.vpsbg_machine_context(machine)?),
+            _ => addressed.map(|id| store.vpsbg_action_context(id)).transpose()?,
+        };
         let vendor = addressed_context.as_ref().map_or(store.procurement_vendor(), |c| c.vendor);
         if addressed_context.is_some() {
             store.vpsbg_admit_addressed(action_name)?;
@@ -437,6 +449,14 @@ pub async fn provider_request(request: String) -> String {
             Action::Close => store.procurement_close(&mut api).await.map(|_| None),
             Action::Stop { stage } => store.procurement_stop(&mut api, stage).await.map(|_| None),
             Action::Choose { vm_id } => store.procurement_choose(&mut api, vm_id).await.map(|_| None),
+            Action::Delete {confirmed,..} => {
+                let purchase = api.context.as_ref().ok_or(REFUSED)?.purchase.clone();
+                store.vpsbg_delete_once(&mut api, &purchase, confirmed).await.map(|_| None)
+            }
+            Action::DeleteCheck {..} => {
+                let purchase = api.context.as_ref().ok_or(REFUSED)?.purchase.clone();
+                store.vpsbg_delete_check(&mut api, &purchase).await.map(|_| None)
+            }
             Action::Resume { .. } if api.vendor == Vendor::Vpsbg => {
                 let purchase = api.context.as_ref().ok_or(REFUSED)?.purchase.clone();
                 store.vpsbg_progress(&mut api, &purchase, false).await.map(|_| None)
@@ -555,6 +575,10 @@ pub async fn vpsbg_poll(purchase: String, kind: String) -> String {
         };
         if kind == crate::store::vpsbg::PollKind::Deposit {
             store.vpsbg_poll_deposit(&mut api, &purchase).await?;
+            api.current()?;
+            store.vpsbg_context_current(api.context.as_ref().ok_or(REFUSED)?)
+        } else if kind == crate::store::vpsbg::PollKind::Delete {
+            store.vpsbg_delete_check(&mut api, &purchase).await?;
             api.current()?;
             store.vpsbg_context_current(api.context.as_ref().ok_or(REFUSED)?)
         } else {
@@ -878,11 +902,21 @@ impl Api for Browser {
             if self.vendor == Vendor::Vpsbg
                 && !(200..300).contains(&status)
                 && !matches!(status, 400 | 403)
+                && !(status == 404
+                    && method == "GET"
+                    && url
+                        .strip_prefix(vpsbg::ORIGIN)
+                        .is_some_and(vpsbg::server_detail_path))
                 && !(status == 422
                     && method == "POST"
                     && url == format!("{}/v1/servers", vpsbg::ORIGIN))
             {
                 return Err(refused());
+            }
+            if self.vendor == Vendor::Vpsbg && method == "DELETE" && status == 204 {
+                // Fetch exposes a null body for 204. It is only an acknowledgment.
+                self.raw_response = Some(Zeroizing::new(Vec::new()));
+                return Ok(Value::Null);
             }
             if self.vendor != Vendor::Vpsbg
                 && (!(200..300).contains(&status)

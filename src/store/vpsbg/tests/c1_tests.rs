@@ -22,6 +22,7 @@ struct CreateApi {
     pays: usize,
     lose_registration: bool,
     lose_pay: bool,
+    apply_pay: bool,
     refuse_key: bool,
     fallback: Vec<bool>,
     finished_windows: Vec<usize>,
@@ -89,6 +90,7 @@ fn fresh(covered: bool) -> (Store<MemoryStorage>, String, CreateApi) {
             pays: 0,
             lose_registration: false,
             lose_pay: false,
+            apply_pay: true,
             refuse_key: false,
             fallback: vec![],
             finished_windows: vec![],
@@ -300,7 +302,9 @@ impl Api for CreateApi {
             "/v1/orders/pay" => {
                 self.pays += 1;
                 assert_eq!(body.0, json!({"ids":[71]}));
-                self.orders("paid");
+                if self.apply_pay {
+                    self.orders("paid");
+                }
                 if self.lose_pay {
                     return Err("Fake lost pay response".into());
                 }
