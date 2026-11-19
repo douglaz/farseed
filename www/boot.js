@@ -235,16 +235,21 @@ const renderSteps = store => {
   emphasize('machine', [machineAction, $('setup-approve')]);
   const taskControls = selector => [...document.querySelector('[data-step="task"]').querySelectorAll(selector)];
   const needsDeclaration = (store.setup ?? []).some(machine => !machine.declaration);
+  const workingTasks = new Set((store.tasks ?? []).filter(task => !task.summary &&
+    !['complete', 'abandoned', 'paused'].includes(task.status) && !awaitingAiKey(task) && !awaitingOperator(task) &&
+    sessions.some(session => session.identity === task.start_session && session.bound_set.length === 1 &&
+      session.bound_set[0] === task.machine)).map(task => task.id));
   emphasize('task', [
     ...taskControls('[data-verify-clock]'),
     ...taskControls('[data-requirements-decision="approve"]'),
     ...(needsDeclaration ? taskControls('[data-poc-propose]') : []),
     ...taskControls('[data-pending-retry]'),
-    ...taskControls('[data-task] button').filter(button => button.textContent === 'Resume'),
+    ...taskControls('[data-task] button').filter(button => button.textContent === 'Resume' &&
+      !workingTasks.has(button.closest('[data-task]').dataset.task)),
     ...taskControls('[data-start-accepted-goal], [data-goal-enter], [data-bind]'),
     ...taskControls('#tau-poc-targets button').filter(button => button.textContent.startsWith('Start session ') &&
       !sessions.some(session => session.bound_set.some(machine => button.textContent === `Start session ${machine}`))),
-    ...taskControls('[data-poc-propose], [data-end-session], [data-delivery-check], [data-task] button, #tau-poc-targets button'),
+    ...(!workingTasks.size ? taskControls('[data-poc-propose], [data-end-session], [data-delivery-check], [data-task] button, #tau-poc-targets button') : []),
   ]);
   restoreMainActions(retained);
 };
