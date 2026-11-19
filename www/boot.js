@@ -1695,18 +1695,38 @@ const bolt11AmountTenths = invoice => {
   return BigInt(amount[1]) * multiplier[amount[2]];
 };
 const roundedInvoiceSats = tenths => ((tenths + 9999n) / 10000n).toLocaleString('en-US');
-const invoiceControls = (parent, savedInvoice, expires, totalMillisats) => {
+// The invoice's own amount, exactly: whole sats grouped, any fraction of a sat kept (tenths of a millisat).
+const exactInvoiceSats = tenths => {
+  const whole = (tenths / 10000n).toLocaleString('en-US');
+  const fraction = (tenths % 10000n).toString().padStart(4, '0').replace(/0+$/, '');
+  return fraction ? `${whole}.${fraction}` : whole;
+};
+const lightningMillisats = invoice => {
+  if (invoice.currency !== 'BTC' || ![invoice.amount, invoice.tax].every(part => Number.isSafeInteger(part) && part >= 0)) return null;
+  return {millisats: BigInt(invoice.amount) + BigInt(invoice.tax), currency: invoice.currency};
+};
+const invoiceControls = (parent, savedInvoice, expires, total) => {
   const wallet = document.createElement('a'); wallet.textContent = 'Open in wallet'; wallet.href = `lightning:${savedInvoice}`;
-  const bound = Number.isSafeInteger(totalMillisats) && totalMillisats >= 0 ? BigInt(totalMillisats)
-    : typeof totalMillisats === 'string' && /^[0-9]+$/.test(totalMillisats) ? BigInt(totalMillisats) : null;
+  const bound = total?.currency === 'BTC' && typeof total.millisats === 'bigint' && total.millisats >= 0n ? total.millisats : null;
   const requested = bolt11AmountTenths(savedInvoice);
   let guidance = null;
-  if (bound === null) guidance = 'Check the amount shown here in your wallet.';
-  else {
-    const expected = roundedInvoiceSats(bound * 10n);
-    if (requested === bound * 10n) wallet.textContent = `Pay ${expected} sat in your wallet`;
+  if (bound === null) {
+    if (requested === null) guidance = 'The provider converted this charge at its own rate. Check the amount in your wallet.';
+    else {
+      const actual = exactInvoiceSats(requested);
+      wallet.textContent = `Pay ${actual} sat in your wallet`;
+      guidance = `The provider converted this charge into ${actual} sat at its own rate.`;
+    }
+  } else {
+    const expectedTenths = ((bound + 999n) / 1000n) * 10000n;
+    const expected = roundedInvoiceSats(expectedTenths);
+    if (requested === expectedTenths) wallet.textContent = `Pay ${expected} sat in your wallet`;
     else if (requested === null) guidance = `Check that your wallet asks for ${expected} sat.`;
-    else guidance = `This invoice asks for ${roundedInvoiceSats(requested)} sat, not the ${expected} sat shown here. Don't pay it.`;
+    else if (requested < expectedTenths) {
+      const actual = exactInvoiceSats(requested);
+      wallet.textContent = `Pay ${actual} sat in your wallet`;
+      guidance = `This invoice asks for ${actual} sat, less than the ${expected} sat price shown above.`;
+    } else guidance = `This invoice asks for ${exactInvoiceSats(requested)} sat, more than the ${expected} sat shown here. Don't pay it.`;
   }
   const copy = document.createElement('button'); copy.type = 'button'; copy.textContent = 'Copy';
   copy.addEventListener('click', async () => {
@@ -1748,7 +1768,7 @@ const renderCredit = (store, enabled) => {
   for (const invoice of invoices) {
     const row = document.createElement('section'); row.dataset.creditInvoice = invoice.id;
     paragraph(row, `${invoice.amount_sat} sat. ${({abandoned:'Invoice marked abandoned.',pending:'Waiting for external payment.',paid:'Payment seen; inference credit read.',expired_unpaid:'This invoice expired unpaid, according to the credit service.',unknown:'Payment status unknown.',seen:'Payment seen; balance not read yet.'})[invoice.outcome]}`);
-    if (!['paid', 'seen'].includes(invoice.outcome)) invoiceControls(row, invoice.bolt11, invoice.expires_at, invoice.amount_sat * 1000);
+    if (!['paid', 'seen'].includes(invoice.outcome)) invoiceControls(row, invoice.bolt11, invoice.expires_at, {millisats: BigInt(invoice.amount_sat) * 1000n, currency: 'BTC'});
     slot.append(row);
   }
 };
@@ -1775,7 +1795,7 @@ const updateProviderResources = () => {
 const readableMoney = (amount, currency) => {
   const unit = currency === 'BTC' ? 'millisats' : `${currency} cents`;
   const raw = `${amount} ${unit}`;
-  if (!Number.isSafeInteger(amount)) return raw;
+  if (!Number.isSafeInteger(amount) && typeof amount !== 'bigint') return raw;
   const value = BigInt(amount);
   if (currency === 'BTC') {
     const sat = value / 1000n + (value % 1000n > 0n ? 1n : 0n);
@@ -1786,10 +1806,9 @@ const readableMoney = (amount, currency) => {
   return `${decimal} ${currency} (${raw})`;
 };
 const boundInvoiceTotal = invoice => {
-  const parts = [invoice.amount, invoice.tax, invoice.processing_fee];
+  const parts = [invoice.amount, invoice.tax];
   if (!parts.every(Number.isSafeInteger)) return parts.join(' + ');
-  const total = parts.reduce((sum, part) => sum + BigInt(part), 0n);
-  return total <= BigInt(Number.MAX_SAFE_INTEGER) && total >= BigInt(Number.MIN_SAFE_INTEGER) ? Number(total) : String(total);
+  return parts.reduce((sum, part) => sum + BigInt(part), 0n);
 };
 const readableInterval = (amount, type) => {
   if (['month', 'day', 'hour'].includes(type) && Number.isSafeInteger(amount) && amount >= 1) {
@@ -1942,15 +1961,18 @@ const renderProvider = (store, enabled) => {
     paragraph(progress, `Automatic renewal: ${purchase.auto_renewal_enabled === true ? 'on' : purchase.auto_renewal_enabled === false ? 'off' : 'unknown'}. This page does not change it.`);
     if (purchase.billing) {
       const quote = purchase.billing.terms;
-      paragraph(progress, `Initial invoice: ${readableMoney(boundInvoiceTotal(quote), quote.currency)} for ${readableDuration(quote.time)} (${readableMoney(quote.amount, quote.currency)}, tax ${readableMoney(quote.tax, quote.currency)}, processing fee ${readableMoney(quote.processing_fee, quote.currency)}).`);
+      paragraph(progress, `Price for the first period, before any account credit: ${readableMoney(boundInvoiceTotal(quote), quote.currency)} for ${readableDuration(quote.time)} (${readableMoney(quote.amount, quote.currency)}, tax ${readableMoney(quote.tax, quote.currency)}).`);
+      if (quote.processing_fee !== 0) paragraph(progress, `Its processing fee of ${readableMoney(quote.processing_fee, quote.currency)} is not part of the Lightning invoice.`);
+      if (purchase.selection && purchase.selection.charge.currency !== quote.currency) paragraph(progress, `This machine is priced in ${purchase.selection.charge.currency}: the provider converted the price into the sat amounts above at its own rate.`);
       paragraph(progress, `Initial Lightning quote: ${quote.amount}, plus tax ${quote.tax} and processing fee ${quote.processing_fee} (${quote.currency === 'BTC' ? 'millisats' : quote.currency + ' cents'}), covering ${quote.time} seconds. Review these terms before requesting the invoice. Refresh may update the quote.`);
     }
     if (purchase.payment) {
       const pay = purchase.payment;
-      paragraph(progress, `To pay: ${readableMoney(boundInvoiceTotal(pay), pay.currency)} (amount ${readableMoney(pay.amount, pay.currency)}, tax ${readableMoney(pay.tax, pay.currency)}, processing fee ${readableMoney(pay.processing_fee, pay.currency)}).`);
+      paragraph(progress, `Price, before any account credit: ${readableMoney(boundInvoiceTotal(pay), pay.currency)} (amount ${readableMoney(pay.amount, pay.currency)}, tax ${readableMoney(pay.tax, pay.currency)}).`);
+      if (pay.processing_fee !== 0) paragraph(progress, `Its processing fee of ${readableMoney(pay.processing_fee, pay.currency)} is not part of the Lightning invoice.`);
       paragraph(progress, `Invoice ${pay.is_paid ? 'paid' : 'awaiting payment'}; expires ${pay.expires}. Amount ${pay.amount}, tax ${pay.tax}, processing fee ${pay.processing_fee} (${pay.currency === 'BTC' ? 'millisats' : pay.currency + ' cents'}).`);
       if (!pay.is_paid) {
-        invoiceControls(progress, pay.data.lightning, Math.floor(Date.parse(pay.expires) / 1000), boundInvoiceTotal(pay));
+        invoiceControls(progress, pay.data.lightning, Math.floor(Date.parse(pay.expires) / 1000), lightningMillisats(pay));
         const check = document.createElement('button'); check.type = 'button'; check.textContent = 'Check now'; check.disabled = !enabled;
         check.addEventListener('click', () => providerRequest({action:'payment_check'})); progress.append(check);
       }
