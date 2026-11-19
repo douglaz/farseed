@@ -378,10 +378,6 @@ fn assert_poc_echoes_absent(value: &Value, keys: &[&[u8]]) {
     }
 }
 
-fn assert_poc_decrypted_journal_private(store: &Store<MemoryStorage>, keys: &[&[u8]]) {
-    assert_poc_decrypted_journal_private_counts(store, keys, 1);
-}
-
 fn assert_poc_decrypted_journal_private_counts(
     store: &Store<MemoryStorage>,
     keys: &[&[u8]],
@@ -425,6 +421,8 @@ fn poc_targets_access_snapshot_revision_is_preserved_and_conflicts_refuse() {
         machine_identity: store.allocation().issue(Family::Machines).unwrap(),
         relay_identity: store.allocation().issue(Family::Passes).unwrap(),
         class_answer: ClassAnswer::No,
+        application_inference_keys: Vec::new(),
+        key_card_class: None,
         access: access.clone(),
     };
     block_on(store.commit(&Event::PocTarget(record.clone()))).unwrap();
@@ -463,6 +461,8 @@ fn poc_targets_access_snapshot_rejects_unapproved_model_or_profile() {
             machine_identity: store.allocation().issue(Family::Machines).unwrap(),
             relay_identity: store.allocation().issue(Family::Passes).unwrap(),
             class_answer: ClassAnswer::No,
+            application_inference_keys: Vec::new(),
+            key_card_class: None,
             access,
         };
         let before = store.storage.files();
@@ -620,7 +620,15 @@ fn poc_comparison_collision_replays_the_committed_projection() {
     let mut store = ready();
     let evidence = poc_pending_job(&mut store, b"ordinary package output");
     let command = store.dispatch.calls[&evidence.call].intent.command.clone();
-    store.remember_poc_credential(b"true");
+    store.hold_test_credential(b"true");
+    assert_eq!(
+        store.protect_output(&json!("true")).unwrap(),
+        json!(crate::redaction::MARKER)
+    );
+    assert_eq!(
+        store.protect_output(&json!(command)).unwrap(),
+        json!(command)
+    );
     let report = block_on(store.job_evidence(&evidence)).unwrap();
     let recovered = reopen(&store).unwrap();
     assert_eq!(store.dispatch.jobs, recovered.dispatch.jobs);
@@ -629,7 +637,7 @@ fn poc_comparison_collision_replays_the_committed_projection() {
     assert_eq!(command, hex::encode("true"));
     assert!(matches!(
         report.comparison,
-        crate::jobs::Comparison::Finding { .. }
+        crate::jobs::Comparison::AdvisoryMatch
     ));
     assert_eq!(block_on(store.collectable("machine-a")).unwrap().len(), 0);
     assert_eq!(
@@ -637,7 +645,7 @@ fn poc_comparison_collision_replays_the_committed_projection() {
         0
     );
     let mut recovered = recovered;
-    recovered.remember_poc_credential(b"true");
+    recovered.hold_test_credential(b"true");
     let live = block_on(crate::harness::BoundJournal::release(
         &store,
         serde_json::to_value(&report).unwrap(),
@@ -649,12 +657,19 @@ fn poc_comparison_collision_replays_the_committed_projection() {
     ))
     .unwrap();
     assert_eq!(live, replayed);
-    assert_eq!(live["agreement"], "finding");
-    assert_eq!(live["journal"], hex::encode(crate::redaction::MARKER));
-    assert_eq!(
-        live["record"]["command"],
-        hex::encode(crate::redaction::MARKER)
-    );
+    assert_eq!(live["agreement"], "advisory_match");
+    assert!(live.get("journal").is_none());
+    assert_eq!(live["record"]["command"], command);
+    for current in [&store, &recovered] {
+        let released = block_on(crate::harness::BoundJournal::release(
+            current,
+            json!({"journal":"true","encoded":command}),
+        ))
+        .unwrap();
+        assert_eq!(released["journal"], crate::redaction::MARKER);
+        assert_eq!(released["encoded"], command);
+        assert!(!released.to_string().contains("true"));
+    }
     let files = store.storage.files();
     assert!(block_on(store.job_evidence(&evidence)).is_err());
     assert_eq!(store.storage.files(), files);
@@ -665,7 +680,7 @@ fn poc_comparison_collision_replays_the_committed_projection() {
 fn poc_comparison_collision_failed_append_keeps_projection_and_hold() {
     let mut store = ready();
     let evidence = poc_pending_job(&mut store, b"ordinary package output");
-    store.remember_poc_credential(b"true");
+    store.hold_test_credential(b"true");
     let files = store.storage.files();
     let calls = store.dispatch.calls.clone();
     store.storage.fault(Fault::Fail(1));
@@ -726,12 +741,12 @@ fn poc_assert_release_invariant(size: usize, long: bool) {
     };
     let mut evidence = poc_pending_command(&mut store, output.as_bytes(), command.as_bytes());
     if long {
-        store.remember_poc_credential(b"previous-normal-key-482700");
+        store.hold_test_credential(b"previous-normal-key-482700");
         if let crate::jobs::Record::Present { stderr, .. } = &mut evidence.record {
             *stderr = hex::encode(poc_package_output(24576));
         }
     }
-    store.remember_poc_credential(b"normal-synthetic-key-482700");
+    store.hold_test_credential(b"normal-synthetic-key-482700");
     let files = store.storage.files();
     let calls = store.dispatch.calls.clone();
     match block_on(store.job_evidence(&evidence)) {
@@ -809,10 +824,10 @@ fn assert_normal_job_settlement(
         *field = hex::encode(&stderr);
     }
     if rotated {
-        store.remember_poc_credential(b"previous-normal-key-482700");
+        store.hold_test_credential(b"previous-normal-key-482700");
     }
     if key {
-        store.remember_poc_credential(b"normal-synthetic-key-482700");
+        store.hold_test_credential(b"normal-synthetic-key-482700");
     }
     assert_eq!(block_on(store.collectable("machine-a")).unwrap().len(), 1);
     assert!(block_on(store.check("machine-a")).is_err());
@@ -1021,6 +1036,7 @@ fn completion_target_proposal_approval_rejection_and_goal_only_start() {
                 machine: "machine-a".into(),
                 declaration: json!(crate::declaration::ad_hoc_minimum()),
             },
+            None,
         ))
         .unwrap();
         let why = store.poc_prepare_execution(&task, &session).unwrap_err();
@@ -1075,7 +1091,22 @@ fn completion_target_proposal_approval_rejection_and_goal_only_start() {
     )
     .unwrap();
     let body: Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(body["tools"].as_array().unwrap().len(), 2);
+    assert_eq!(body["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "exec",
+            "done",
+            "request_ai_key",
+            "offer_file",
+            "ask_operator"
+        ]
+    );
     assert!(
         body["tools"]
             .as_array()

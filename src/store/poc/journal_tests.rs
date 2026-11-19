@@ -15,7 +15,7 @@ pub(super) fn unchanged(
 #[test]
 fn poc_journal_no_key_store_preserves_seed_account_and_replay() {
     let mut s = ready();
-    assert!(s.poc_credential_filters.borrow().is_empty());
+    assert!(s.provider_emails.is_empty());
     let task = create_task(&mut s);
     let seed = s.seed().unwrap().id();
     let reopened = reopen(&s);

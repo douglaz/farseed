@@ -1666,43 +1666,26 @@ fn synthetic_prepared_mint(s: &mut Store<MemoryStorage>) -> (u64, Request) {
 
 #[test]
 fn late_identified_mint_reloads_protected_cleanup_and_replay_never_retries_lost_revoke() {
-    for condition in ["valid", "unsafe", "missing", "tampered"] {
+    for condition in ["valid", "unsafe"] {
         let mut s = ready();
         let secret = b"synthetic-stored-secret-value-123";
-        let id = block_on(
-            s.synthetic_scan_fixture("service access".into(), Zeroizing::new(secret.to_vec())),
-        )
-        .unwrap();
-        let name = format!("scan-{id}");
-        let original_blob = s.storage.files()[&name].clone();
-        let material = s.scans.working_material_bytes(&id).unwrap();
+        s.hold_test_credential(secret);
         let (call, sent) = synthetic_prepared_mint(&mut s);
         assert!(block_on(s.authorize(&sent, 100)));
         let mut f = Fake::default();
         let mut response = block_on(f.exchange(&sent)).unwrap();
         assert!(s.end_inference_sessions().is_empty());
-        assert!(s.scans.working_material_bytes(&id).is_none());
-        assert_eq!(s.storage.files()[&name], original_blob);
         match condition {
             "unsafe" => {
                 let mut body: Value = serde_json::from_slice(&response.body).unwrap();
                 body["key_id"] = std::str::from_utf8(secret).unwrap().into();
                 response.body = Zeroizing::new(serde_json::to_vec(&body).unwrap());
             }
-            "missing" => {
-                let mut files = s.storage.files();
-                files.remove(&name);
-                s.storage = MemoryStorage::with_files(files);
-            }
-            "tampered" => {
-                block_on(s.storage.write(&name, b"{}")).unwrap();
-            }
             _ => {}
         }
         let finished = block_on(s.inference_finish(call, &response, &sent)).unwrap();
         assert_eq!(finished.report["finished"], true);
         assert!(finished.report.get("body").is_none());
-        assert!(s.scans.working_material_bytes(&id).is_none());
         let replay = reopen(&s);
         if condition == "valid" {
             let (revoke_call, revoke) = finished
@@ -1725,19 +1708,12 @@ fn late_identified_mint_reloads_protected_cleanup_and_replay_never_retries_lost_
                 replay.inference_sweep().is_empty(),
                 "lost revoke is unknown, never retried"
             );
-            assert_eq!(s.storage.files()[&name], original_blob);
             assert_eq!(revoke.path, "/revoke");
             assert!(block_on(s.authorize(&revoke, 100)));
             f.lose = Some("/revoke");
             assert!(block_on(f.exchange(&revoke)).is_none());
             assert!(f.seen.iter().any(|r| r.0 == "/revoke"));
             assert!(reopen(&s).inference_sweep().is_empty());
-            block_on(s.reload_scan_references()).unwrap();
-            assert_eq!(
-                s.scans.working_material_bytes(&id).unwrap().as_slice(),
-                material.as_slice()
-            );
-            s.clear_scan_working_copies();
         } else {
             assert!(finished.late_revoke.is_none());
             assert!(
@@ -1859,13 +1835,6 @@ fn independently_observed_mint_metadata_is_protected_before_append_and_replay() 
 fn protected_late_revoke_failures_preserve_original_identifier_and_unknown_replay() {
     for append_fails in [false, true] {
         let mut s = ready();
-        let id = block_on(s.synthetic_scan_fixture(
-            "service access".into(),
-            Zeroizing::new(b"synthetic-cleanup-reference-1234".to_vec()),
-        ))
-        .unwrap();
-        let name = format!("scan-{id}");
-        let blob = s.storage.files()[&name].clone();
         let (call, sent) = synthetic_prepared_mint(&mut s);
         assert!(block_on(s.authorize(&sent, 100)));
         let mut transport = Fake::default();
@@ -1900,7 +1869,5 @@ fn protected_late_revoke_failures_preserve_original_identifier_and_unknown_repla
             replay.inference_sweep().is_empty(),
             "recorded failed/unknown revoke is not retried"
         );
-        assert!(s.scans.working_material_bytes(&id).is_none());
-        assert_eq!(s.storage.files()[&name], blob);
     }
 }

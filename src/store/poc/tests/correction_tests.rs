@@ -92,7 +92,7 @@ fn correction_first_two_continue_limits_apply_and_refused_proposal_resets() {
     assert_eq!(task.malformed.as_ref().unwrap().count, 1);
     assert_eq!(reopen(&store).poc_task(&task.id).unwrap(), task);
     let text = body(&store, &task);
-    assert!(text.contains("If your reply was cut off, make it shorter."));
+    assert!(text.contains("Your last reply was cut off. The reply limit has been raised where possible; your reply may be complete now. Reply with exactly one call to an offered tool."));
     let task = completion_tests::finish_request(
         &mut store,
         &task,
@@ -146,7 +146,7 @@ fn correction_fact_append_is_atomic_bounded_and_protected() {
         assert_eq!(store.storage.files(), files);
         assert_eq!(store.poc_task(&task.id).unwrap(), task);
     }
-    store.remember_poc_credential(b"protected-correction-token");
+    store.hold_test_credential(b"protected-correction-token");
     assert!(
         block_on(store.poc_change(
             &task.id,
@@ -335,7 +335,7 @@ fn before_setup_stock_socket_remains_a_delivery_finding_and_protection_is_preser
     let mut store = ready_without_requirements();
     let task = before(&mut store);
     let task = change(&mut store, &task, Change::SkipRead("unavailable".into()));
-    store.remember_poc_credential(b"protected-proposal-field");
+    store.hold_test_credential(b"protected-proposal-field");
     let requested = change(&mut store, &task, Change::Request);
     let mut declaration = crate::poc::proposal::example();
     declaration["services"][0]["protected-proposal-field"] = json!("neutral");
@@ -348,7 +348,8 @@ fn before_setup_stock_socket_remains_a_delivery_finding_and_protection_is_preser
             Tool::ProposeDeclaration {
                 machine: "fixture".into(),
                 declaration
-            }
+            },
+            None
         ))
         .is_err()
     );

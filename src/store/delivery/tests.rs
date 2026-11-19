@@ -30,6 +30,7 @@ fn approve(s: &mut Store<MemoryStorage>, session: &str, d: Declaration, n: u64) 
         },
         &Tool::Done {
             machine: "fixture".into(),
+            urls: vec![],
             checks: vec![],
         },
     )
@@ -49,13 +50,7 @@ fn check(s: &mut Store<MemoryStorage>, session: &str, m: Measurements) {
     block_on(s.delivery_check(session, a, m)).unwrap();
 }
 fn view(s: &Store<MemoryStorage>) -> Value {
-    s.delivery_view()
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|v| v["machine"] == "fixture")
-        .unwrap()
-        .clone()
+    s.delivery_entry_view("fixture", false).unwrap()
 }
 fn stopped() -> (Declaration, Measurements) {
     let mut d = ad_hoc_minimum();
@@ -143,7 +138,9 @@ fn delivery_appends_fail_closed_and_landed_error_replays_without_current_authori
         let (d, m) = stopped();
         approve(&mut s, &session, d, 1);
         check(&mut s, &session, m);
-        let before = view(&s);
+        let mut before = view(&s);
+        before["verdict_is_historical"] = true.into();
+        before["placement_eligible"] = false.into();
         let mut fixed = clean();
         if let Field::Value(services) = &s.dispatch.approved_entries["fixture"]
             .declaration
@@ -360,6 +357,7 @@ fn delivery_historical_clean_check_never_hides_unknown_new_findings_or_changed_a
                     },
                     &Tool::Done {
                         machine: "fixture".into(),
+                        urls: vec![],
                         checks: vec![],
                     },
                 )
@@ -521,9 +519,10 @@ fn delivery_display_rechecks_current_credential_holdings() {
     )
     .unwrap();
     let shown = view(&s);
-    assert!(
-        shown.get("applications").is_none(),
-        "current credential holdings withhold a previously safe application name"
+    assert_eq!(
+        shown["applications"],
+        json!([crate::redaction::MARKER]),
+        "current credential holdings redact a previously safe application name"
     );
     assert!(!shown.to_string().contains("later-held-fixture-value"));
 }
@@ -610,6 +609,7 @@ fn delivery_forbidden_amendments_refuse_approval_append_and_replay() {
             },
             &Tool::Done {
                 machine: "fixture".into(),
+                urls: vec![],
                 checks: vec![],
             },
         )
@@ -635,6 +635,7 @@ fn delivery_forbidden_amendments_refuse_approval_append_and_replay() {
                 proposal.clone(),
                 &Tool::Done {
                     machine: "fixture".into(),
+                    urls: vec![],
                     checks: vec![]
                 }
             )

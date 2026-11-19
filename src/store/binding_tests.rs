@@ -371,7 +371,6 @@ fn tombstone_binding_refuses_without_effects(status: allocation::Status) {
                 );
             }
             assert_eq!(store.dispatch.check_binding("fixture"), Ok(()));
-            assert_eq!(store.scan_readiness(), Ok(()));
             assert_eq!(
                 store.check_binding_modes("fixture", &[Mode::NoArtifactPin]),
                 Ok(())
@@ -550,7 +549,6 @@ fn tombstone_before_exposure_refuses_replay(status: allocation::Status) {
         }
         let mut store = reopen(&store);
         assert_eq!(store.dispatch.check_binding("fixture"), Ok(()));
-        assert_eq!(store.scan_readiness(), Ok(()));
         assert_eq!(
             store.check_binding_modes("fixture", &[Mode::NoArtifactPin]),
             Ok(())

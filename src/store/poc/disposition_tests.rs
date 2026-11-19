@@ -26,9 +26,48 @@ fn accept(
 ) -> Task {
     block_on(store.poc_dispose(offer, continuation)).unwrap()
 }
+/// Decrypt one committed record with a separate reader chained to its stored predecessor,
+/// as replay does; the live store's own chain position is the journal's end.
+fn decrypt_record(store: &Store<MemoryStorage>, number: u64) -> Event {
+    let files = store.storage.files();
+    let mut reader = Store::new(
+        store.storage.clone(),
+        DataKey(store.key.0),
+        store.id.clone(),
+    );
+    if let Some(prior) = number
+        .checked_sub(1)
+        .and_then(|prior| files.get(&prior.to_string()))
+    {
+        reader.previous = Address(Sha256::digest(prior).into());
+    }
+    reader
+        .open_record(number, &files[&number.to_string()])
+        .unwrap()
+        .0
+}
 fn assert_result(task: &Task, offer: &Confirmation, number: u64, continuation: Continuation) {
     assert!(task.pending.is_none());
-    assert!(task.proposal.is_none());
+    if continuation == Continuation::AsIfNotDone {
+        let proposal = task.proposal.as_ref().unwrap();
+        assert_eq!(
+            proposal.call_id,
+            format!("$rerun:{number}:{}", offer.pending.call)
+        );
+        assert_eq!(proposal.tool, task.completed[0].1);
+        assert_eq!(proposal.check, None);
+        assert_eq!(proposal.report, None);
+        assert_eq!(task.unmet_commands.len(), 1);
+        let command = &task.unmet_commands[0];
+        assert_eq!(command.created, number);
+        assert_eq!(command.call, offer.pending.call);
+        assert_eq!(command.machine, offer.machine);
+        assert_eq!(command.command, "install-example-service");
+    } else {
+        assert!(task.proposal.is_none());
+        assert!(task.unmet_commands.is_empty());
+    }
+    assert!(task.commands_recorded_as_run.is_empty());
     assert_eq!(task.revision, offer.revision + 1);
     assert_eq!(task.completed.len(), 1);
     let result = &task.completed[0].2;
@@ -78,25 +117,38 @@ fn poc_disposition_both_assumptions_live_equal_replay_and_late_evidence() {
             CallState::Disposed { .. }
         ));
         assert!(block_on(store.poc_change(&task.id, task.revision, Change::Settle)).is_err());
-        let next = change(&mut store, &task, Change::Request);
-        assert!(next.requesting && next.pending.is_none() && next.proposal.is_none());
-        assert_eq!(reopen(&store).poc_task(&task.id).unwrap(), next);
+        let next = if continuation == Continuation::AsIfNotDone {
+            assert_eq!(task.steps, before.steps + 1);
+            assert_eq!(task.requests, before.requests);
+            let files = store.storage.files();
+            assert!(block_on(store.poc_change(&task.id, task.revision, Change::Request)).is_err());
+            assert_eq!(store.storage.files(), files);
+            assert_eq!(store.poc_task(&task.id).unwrap(), task);
+            task
+        } else {
+            assert_eq!(task.steps, before.steps);
+            let next = change(&mut store, &task, Change::Request);
+            assert!(next.requesting && next.pending.is_none() && next.proposal.is_none());
+            next
+        };
+        assert_eq!(reopen(&store).poc_task(&next.id).unwrap(), next);
         assert_eq!(
             store.commands.len(),
             1,
-            "only a new proposal may arm another command"
+            "disposition queues at most a proposal; it does not transmit"
         );
     }
 }
 
 #[test]
 fn poc_disposition_exact_crash_points_complete_without_another_record() {
+    // These suspension points belong to the continuing disposition path.
     for point in [1, 2] {
         let (mut store, _, offer) = pending();
         let number = store.next;
         CRASH.set(point);
         {
-            let mut future = std::pin::pin!(store.poc_dispose(&offer, Continuation::AsIfNotDone));
+            let mut future = std::pin::pin!(store.poc_dispose(&offer, Continuation::AsIfDone));
             assert!(
                 future
                     .as_mut()
@@ -112,11 +164,92 @@ fn poc_disposition_exact_crash_points_complete_without_another_record() {
         assert_eq!(store.dispatch.dispositions.len(), usize::from(point == 2));
         let replay = reopen(&store);
         let task = replay.poc_task(&offer.task).unwrap();
-        assert_result(&task, &offer, number, Continuation::AsIfNotDone);
+        assert_result(&task, &offer, number, Continuation::AsIfDone);
         assert_eq!(replay.dispatch.dispositions.len(), 1);
         assert_eq!(replay.commands.len(), 1);
         assert_eq!(replay.next, number + 1, "recovery appends nothing");
         assert_eq!(reopen(&replay).poc_task(&offer.task).unwrap(), task);
+    }
+    // Rerun applies synchronously after commit. Reconstruct both prefixes of that
+    // projection: before dispatch application and before task installation.
+    for point in [1, 2] {
+        let (mut store, before, offer) = pending();
+        let number = store.next;
+        let disposition = Disposition {
+            machine: offer.machine.clone(),
+            calls: vec![offer.pending.call],
+            continuation: Continuation::AsIfNotDone,
+            uncertainty: "The owner accepted an unknown outcome; the earlier command may arrive or run late, overlap later commands, and the page will never show it.".into(),
+        };
+        let expected = store
+            .project_rerun(number, &offer, &disposition, true)
+            .unwrap();
+        let record = Record::Rerun {
+            confirmation: offer.clone(),
+            disposition: disposition.clone(),
+            track_command: true,
+        };
+        block_on(store.commit(&Event::Poc(record.clone()))).unwrap();
+        if point == 2 {
+            assert!(matches!(
+                store.dispatch.disposition(number, disposition),
+                DispositionReport::Accepted { .. }
+            ));
+        }
+        assert_eq!(store.poc_task(&offer.task).unwrap(), before);
+        assert_eq!(store.dispatch.dispositions.len(), usize::from(point == 2));
+        let mut replay = reopen(&store);
+        let task = replay.poc_task(&offer.task).unwrap();
+        assert_result(&task, &offer, number, Continuation::AsIfNotDone);
+        assert_eq!(task, expected);
+        assert_eq!(replay.dispatch.dispositions.len(), 1);
+        assert_eq!(replay.commands.len(), 1);
+        assert_eq!(replay.next, number + 1, "recovery appends nothing");
+        assert_eq!(reopen(&replay).poc_task(&offer.task).unwrap(), task);
+        fresh(&mut replay);
+        let files = replay.storage.files();
+        assert!(block_on(replay.poc_dispose(&offer, Continuation::AsIfNotDone)).is_err());
+        assert_eq!(replay.storage.files(), files);
+        assert_eq!(replay.poc_task(&offer.task).unwrap(), task);
+        let mut duplicate = reopen(&replay);
+        block_on(duplicate.commit(&Event::Poc(record))).unwrap();
+        let why = block_on(unlock(
+            MemoryStorage::with_files(duplicate.storage.files()),
+            &Fixed,
+            pass(),
+        ))
+        .err()
+        .expect("a duplicate rerun record must refuse replay");
+        assert!(why.contains("replay stopped"), "{why}");
+    }
+    // Exercise the actual rerun writer too, including a commit whose reply is lost.
+    for fault in [
+        Fault::Fail(1),
+        Fault::Fail(2),
+        Fault::Fail(3),
+        Fault::LandThenFail(3),
+    ] {
+        let (mut store, before, offer) = pending();
+        let number = store.next;
+        store.storage.fault(fault);
+        assert!(block_on(store.poc_dispose(&offer, Continuation::AsIfNotDone)).is_err());
+        assert_eq!(store.poc_task(&offer.task).unwrap(), before);
+        assert!(store.failed.is_some());
+        let replay = reopen(&store);
+        if matches!(fault, Fault::LandThenFail(_)) {
+            assert_result(
+                &replay.poc_task(&offer.task).unwrap(),
+                &offer,
+                number,
+                Continuation::AsIfNotDone,
+            );
+            assert_eq!(replay.next, number + 1);
+        } else {
+            assert_eq!(replay.poc_task(&offer.task).unwrap(), before);
+            assert_eq!(replay.next, number);
+            assert!(replay.dispatch.dispositions.is_empty());
+        }
+        assert_eq!(replay.commands.len(), 1);
     }
 }
 
@@ -444,7 +577,7 @@ fn poc_disposition_preflight_revision_proposal_and_output_protection() {
                     .unwrap()
                     .tool = exec("different")
             }
-            3 => store.remember_poc_credential(b"The owner accepted an unknown outcome"),
+            3 => store.hold_test_credential(b"The owner accepted an unknown outcome"),
             _ => unreachable!(),
         }
         let offer = store
@@ -497,23 +630,272 @@ fn poc_disposition_active_inspection_refuses_even_with_eligible_history() {
 
 #[test]
 fn poc_disposition_next_resume_requests_a_fresh_decision_without_resending() {
-    let (mut store, task, offer) = pending();
-    let disposed = accept(&mut store, &offer, Continuation::AsIfNotDone);
-    let (mut fixture, _, _) = Fixture::new();
-    *fixture.store.borrow_mut() = store;
-    let mut model = Script::one("fresh-decision", done());
-    let result = block_on(run::resume(
-        &mut fixture,
-        &mut model,
-        &task.id,
-        &task.start_session,
-    ))
-    .unwrap();
-    assert_eq!(model.seen, [disposed.completed]);
-    assert!(fixture.remote.borrow().sends.is_empty());
-    assert_eq!(fixture.store.borrow().commands.len(), 1);
-    assert_eq!(result.requests, task.requests + 1);
-    assert!(result.verifying && result.pending.is_none());
+    for reload in [false, true] {
+        for (read, continuation) in [
+            (crate::jobs::State::Missing, Continuation::AsIfDone),
+            (crate::jobs::State::Incomplete, Continuation::AsIfDone),
+            (crate::jobs::State::Incomplete, Continuation::AsIfNotDone),
+            (crate::jobs::State::Ended, Continuation::AsIfDone),
+            (crate::jobs::State::Ended, Continuation::AsIfNotDone),
+        ] {
+            let (mut store, task, _) = pending();
+            match read {
+                crate::jobs::State::Missing => {}
+                crate::jobs::State::Incomplete => {
+                    evidence(
+                        &mut store,
+                        &task,
+                        crate::jobs::Record::Incomplete {
+                            machine: Some(hex::encode(&task.machine)),
+                            command: Some(hex::encode("install-example-service")),
+                        },
+                    );
+                }
+                crate::jobs::State::Ended => {
+                    let mut ended = record(&task, None, "partial");
+                    if let crate::jobs::Record::Present { alive, .. } = &mut ended {
+                        *alive = false;
+                    }
+                    evidence(&mut store, &task, ended);
+                }
+                _ => unreachable!(),
+            }
+            let offer = store
+                .poc_disposition_offer(&task.id, &task.start_session)
+                .unwrap();
+            assert_eq!(offer.read, read);
+            let disposed = accept(&mut store, &offer, continuation);
+            assert!(disposed.pending.is_none() && disposed.proposal.is_none());
+            assert!(disposed.unmet_commands.is_empty());
+            assert_eq!(disposed.completed[0].2["content"]["outcome"], "unknown");
+            assert_eq!(
+                disposed.completed[0].2["content"]["continuation"],
+                serde_json::to_value(continuation).unwrap()
+            );
+            let (mut fixture, _, _) = Fixture::new();
+            *fixture.store.borrow_mut() = store;
+            if reload {
+                fixture.reload();
+                assert_eq!(fixture.task(&task.id), disposed);
+            }
+            let mut model = Script::one("fresh-decision", done());
+            let result = block_on(run::resume(
+                &mut fixture,
+                &mut model,
+                &task.id,
+                &task.start_session,
+            ))
+            .unwrap();
+            assert_eq!(model.seen, [disposed.completed]);
+            assert!(fixture.remote.borrow().sends.is_empty());
+            assert_eq!(fixture.store.borrow().commands.len(), 1);
+            assert_eq!(result.requests, task.requests + 1);
+            assert!(result.verifying && result.pending.is_none());
+        }
+    }
+    for reload in [false, true] {
+        for (window, lost_record) in [
+            (Window::Normal, false),
+            (Window::BeforeSend, false),
+            (Window::AfterSend, false),
+            (Window::AfterSend, true),
+            (Window::AfterEvidence, false),
+        ] {
+            let (mut store, task, offer) = pending();
+            let number = store.next;
+            let disposed = accept(&mut store, &offer, Continuation::AsIfNotDone);
+            assert_result(&disposed, &offer, number, Continuation::AsIfNotDone);
+            let (mut fixture, _, _) = Fixture::new();
+            *fixture.store.borrow_mut() = store;
+            if reload {
+                fixture.reload();
+            }
+            fixture.window = window;
+            let release = Rc::new(Cell::new(false));
+            fixture.publish_release = Some(release.clone());
+            let control = fixture.store.clone();
+            let remote = fixture.remote.clone();
+            let mut model = Script::default();
+            let replacement;
+            {
+                let mut future = std::pin::pin!(run::resume(
+                    &mut fixture,
+                    &mut model,
+                    &task.id,
+                    &task.start_session,
+                ));
+                assert!(
+                    future
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                // Publication waits after the real command append, before any send.
+                assert!(remote.borrow().sends.is_empty());
+                let mut store = control.borrow_mut();
+                let pending = store.poc_task(&task.id).unwrap();
+                replacement = pending.pending.clone().unwrap();
+                assert_ne!(replacement.call, offer.pending.call);
+                assert_ne!(replacement.job, offer.pending.job);
+                assert_eq!(pending.proposal, disposed.proposal);
+                assert_eq!(pending.requests, task.requests);
+                assert_eq!(store.commands.len(), 2);
+                assert_eq!(store.commands[0].1.command, store.commands[1].1.command);
+                assert_eq!(store.commands[1].1.command, b"install-example-service");
+                let event = decrypt_record(&store, number);
+                assert!(
+                    matches!(&event, Event::Poc(Record::Rerun { confirmation, track_command: true, .. }) if confirmation == &offer)
+                );
+                let event = decrypt_record(&store, replacement.call);
+                assert!(
+                    matches!(&event, Event::Poc(Record::Command { intent, launch: Some(_), .. }) if intent.call == replacement.call && intent.job.as_ref() == Some(&replacement.job))
+                );
+                assert_eq!(reopen(&store).poc_task(&task.id).unwrap(), pending);
+                // Mirror the page's reservation using the real event and admission;
+                // the native transport fixture does not call the browser adapter.
+                let attempt = crate::dispatch::LaunchAttempt {
+                    call: replacement.call,
+                    job: replacement.job.clone(),
+                };
+                let mut dispatch = store.dispatch.clone();
+                dispatch.launch_attempt(&attempt, false).unwrap();
+                block_on(store.commit(&Event::LaunchTransmission(attempt.clone()))).unwrap();
+                store.dispatch = dispatch;
+                assert!(reopen(&store).dispatch.launches[&replacement.call].attempted);
+                assert!(store.dispatch.launch_attempt(&attempt, false).is_err());
+                drop(store);
+                release.set(true);
+                let result = future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()));
+                if matches!(window, Window::Normal) {
+                    let Poll::Ready(result) = result else {
+                        panic!("normal send must settle")
+                    };
+                    let result = result.unwrap();
+                    assert!(result.pending.is_none() && result.proposal.is_none());
+                    assert_eq!(result.completed.len(), 2);
+                    assert_eq!(
+                        result.completed[1].0,
+                        disposed.proposal.as_ref().unwrap().call_id
+                    );
+                    assert_eq!(result.completed[1].2["content"]["exit_status"], 0);
+                    assert!(result.unmet_commands.is_empty());
+                } else {
+                    assert!(result.is_pending());
+                }
+            }
+            assert!(
+                model.seen.is_empty(),
+                "the queued command precedes a fresh decision"
+            );
+            let sent = u32::from(!matches!(window, Window::BeforeSend));
+            assert_eq!(remote.borrow().sends.values().sum::<u32>(), sent);
+            assert_eq!(
+                remote
+                    .borrow()
+                    .sends
+                    .get(&replacement.job)
+                    .copied()
+                    .unwrap_or(0),
+                sent
+            );
+            assert!(!remote.borrow().sends.contains_key(&offer.pending.job));
+            if lost_record {
+                assert!(
+                    remote
+                        .borrow_mut()
+                        .records
+                        .remove(&replacement.job)
+                        .is_some()
+                );
+            }
+            fixture.publish_release = None;
+            for _ in 0..3 {
+                let before_reload = fixture.task(&task.id);
+                let session = fixture.reload();
+                assert_eq!(fixture.task(&task.id), before_reload);
+                let current =
+                    block_on(run::resume(&mut fixture, &mut model, &task.id, &session)).unwrap();
+                assert_eq!(fixture.store.borrow().commands.len(), 2);
+                assert_eq!(fixture.store.borrow().dispatch.calls.len(), 2);
+                assert_eq!(remote.borrow().sends.values().sum::<u32>(), sent);
+                assert!(!remote.borrow().sends.contains_key(&offer.pending.job));
+                if matches!(window, Window::BeforeSend) || lost_record {
+                    assert_eq!(current.pending, Some(replacement.clone()));
+                    assert_eq!(current.status, Status::Paused);
+                    assert!(
+                        current
+                            .pause_reason
+                            .as_ref()
+                            .is_some_and(|why| !why.is_empty())
+                    );
+                    assert!(model.seen.is_empty());
+                } else {
+                    assert!(current.pending.is_none());
+                    assert_eq!(current.completed.len(), 2);
+                    assert_eq!(current.completed[1].2["content"]["exit_status"], 0);
+                    assert!(current.unmet_commands.is_empty());
+                }
+            }
+            if matches!(window, Window::BeforeSend) || lost_record {
+                // A reserved transmission with no result stays unknown. Neither
+                // continuing choice may queue a second product re-issue.
+                let saved = fixture.store.borrow().storage.files();
+                for continuation in [Continuation::AsIfDone, Continuation::AsIfNotDone] {
+                    let mut store = block_on(unlock(
+                        MemoryStorage::with_files(saved.clone()),
+                        &Fixed,
+                        pass(),
+                    ))
+                    .unwrap();
+                    fresh(&mut store);
+                    let offer = store
+                        .poc_disposition_offer(&task.id, &task.start_session)
+                        .unwrap();
+                    let continued = accept(&mut store, &offer, continuation);
+                    assert!(continued.pending.is_none() && continued.proposal.is_none());
+                    assert_eq!(continued.completed.len(), 2);
+                    assert_eq!(continued.completed[1].2["content"]["outcome"], "unknown");
+                    assert_eq!(
+                        continued.unmet_commands.len(),
+                        usize::from(continuation == Continuation::AsIfNotDone)
+                    );
+                    assert_eq!(
+                        continued.commands_recorded_as_run.len(),
+                        usize::from(continuation == Continuation::AsIfDone)
+                    );
+                    assert_eq!(store.commands.len(), 2);
+                    assert_eq!(reopen(&store).poc_task(&task.id).unwrap(), continued);
+                    *fixture.store.borrow_mut() = store;
+                    block_on(run::resume(
+                        &mut fixture,
+                        &mut Script::default(),
+                        &task.id,
+                        &task.start_session,
+                    ))
+                    .unwrap();
+                    assert_eq!(remote.borrow().sends.values().sum::<u32>(), sent);
+                    assert_eq!(fixture.store.borrow().commands.len(), 2);
+                }
+            } else {
+                let before = fixture.task(&task.id);
+                let mut model = Script::one("fresh-decision", done());
+                let result = block_on(run::resume(
+                    &mut fixture,
+                    &mut model,
+                    &task.id,
+                    &task.start_session,
+                ))
+                .unwrap();
+                assert_eq!(model.seen, [before.completed]);
+                assert_eq!(result.requests, before.requests + 1);
+                assert!(result.verifying && result.pending.is_none());
+                assert_eq!(fixture.store.borrow().commands.len(), 2);
+                assert_eq!(remote.borrow().sends.values().sum::<u32>(), 1);
+            }
+        }
+    }
 }
 
 #[test]

@@ -43,7 +43,7 @@ fn poc_credit_uncertain_account_append_holds_writes_until_replay() {
         assert!(block_on(store.credit_install(&account())).is_err());
         assert!(store.credit_ready().is_err());
         assert!(store.credit_account().is_none());
-        assert!(store.poc_credential_filters.borrow().is_empty());
+        assert_eq!(store.protect_output(&json!(KEY)).unwrap(), json!(KEY));
         assert!(
             block_on(store.commit(&Event::Command {
                 machine: "fixture".into(),

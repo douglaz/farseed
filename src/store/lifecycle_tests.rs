@@ -166,8 +166,8 @@ fn repaired_never_transmitted_mint_keeps_original_call_body_and_consumed_slot() 
 }
 
 #[test]
-fn stale_binding_and_changed_scan_revision_cannot_authorize_a_real_completion() {
-    let mut store = ready();
+fn stale_binding_cannot_authorize_a_real_completion() {
+    let store = ready();
     let live = store.sessions[0].clone();
     let stale = Session::new(
         live.identity.clone(),
@@ -179,36 +179,6 @@ fn stale_binding_and_changed_scan_revision_cannot_authorize_a_real_completion() 
         store.check_current_session(&stale).is_err(),
         "original ownership, not a copied identity"
     );
-    let mut transport = Fake::default();
-    crate::store::inference::tests::infer(&mut store, &mut transport);
-    let (call, request) = block_on(store.inference_prepare(
-        &live.identity,
-        inference::Intent::Completion {
-            call: 0,
-            session: live.identity.clone(),
-            key_id: String::new(),
-            model: "fixture-model".into(),
-            requested_provider: "fixture-provider".into(),
-            zdr: true,
-        },
-        "https://127.0.0.1:1",
-        json!({"messages":[{"content":"safe"}]}),
-    ))
-    .unwrap();
-    store.clear_scan_working_copies();
-    assert!(
-        !block_on(store.authorize(&request, 100)),
-        "release is bound to reference revision even when the set is empty"
-    );
-    assert!(
-        store
-            .inference_calls()
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|c| c["call"] == call && c["state"] == "unresolved")
-    );
-    assert!(!block_on(store.actionable(&request, 100)));
 }
 
 #[test]
@@ -296,17 +266,9 @@ fn confirmed_profile_rates_and_historical_choice_generation_are_not_invented() {
 }
 
 #[test]
-fn poc_withheld_predecessor_keeps_binding_until_durable_end_and_scan_reload() {
+fn poc_withheld_predecessor_keeps_binding_until_durable_end() {
     for reason in ["expiry", "exhaustion", "end"] {
         let mut store = ready();
-        let secret = b"original-rebind-scan-value-1234";
-        let identity = block_on(
-            store.synthetic_scan_fixture("service access".into(), Zeroizing::new(secret.to_vec())),
-        )
-        .unwrap();
-        let name = format!("scan-{identity}");
-        let blob = store.storage.files()[&name].clone();
-        let material = store.scans.working_material_bytes(&identity).unwrap();
         let old = store.sessions[0].clone();
         assert!(
             block_on(store.admit_fixture("fixture")).is_err(),
@@ -335,7 +297,6 @@ fn poc_withheld_predecessor_keeps_binding_until_durable_end_and_scan_reload() {
         assert!(block_on(store.connection_session_for("fixture", Some(&old))).is_err());
         assert_eq!(store.storage.files(), files);
         assert!(old.ended.get());
-        assert!(store.scans.working_material_bytes(&identity).is_none());
         assert_eq!(
             block_on(store.admit_fixture("fixture")),
             Err("already bound".into()),
@@ -358,21 +319,6 @@ fn poc_withheld_predecessor_keeps_binding_until_durable_end_and_scan_reload() {
         assert_eq!(store.storage.files(), files);
         assert!(store.goal(&fresh).is_none());
         assert_eq!(store.limit_state(&fresh)["observed_spend"], "0");
-        assert_eq!(
-            store
-                .scans
-                .working_material_bytes(&identity)
-                .unwrap()
-                .as_slice(),
-            material.as_slice()
-        );
-        assert_eq!(store.storage.files()[&name], blob);
-        assert_eq!(
-            store
-                .protect_output(&json!(std::str::from_utf8(secret).unwrap()))
-                .unwrap(),
-            "<redacted secret: service access>"
-        );
         transport.key_id = Some("fresh-key-id");
         assert_eq!(
             crate::store::inference::tests::infer(&mut store, &mut transport)["finished"],
@@ -429,7 +375,6 @@ fn established_late_exhaustion_ends_while_clock_and_worker_authority_are_withhel
         let response = block_on(transport.exchange(&request)).unwrap();
         store.authority.suspend();
         store.suspend_clocks();
-        store.clear_scan_working_copies();
         let report = block_on(store.inference_finish(call, &response, &request)).unwrap();
         assert!(report.report.get("body").is_none());
         assert!(

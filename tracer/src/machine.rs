@@ -718,12 +718,10 @@ mod tests {
             output.stdout.is_empty(),
             "failed read printed fields: {output:?}"
         );
-        let mut delivered = jobs::ReadDelivery {
-            stdout: output.stdout,
-            status: Some(output.status.code().unwrap() as u32),
-            closed: true,
-            ..Default::default()
-        };
+        let mut delivered = jobs::ReadDelivery::default();
+        delivered.stdout = output.stdout;
+        delivered.status = Some(output.status.code().unwrap() as u32);
+        delivered.closed = true;
         delivered.extended_data(&output.stderr);
         let why = delivered.record().unwrap_err();
         assert!(
@@ -985,12 +983,10 @@ mod tests {
         let (repeat, _guard) = start(&machine, &text);
         let output = repeat.wait_with_output().await.unwrap();
         assert!(!output.status.success(), "existing job id must be refused");
-        let mut delivered = jobs::ReadDelivery {
-            stdout: output.stdout,
-            status: Some(output.status.code().unwrap() as u32),
-            closed: true,
-            ..Default::default()
-        };
+        let mut delivered = jobs::ReadDelivery::default();
+        delivered.stdout = output.stdout;
+        delivered.status = Some(output.status.code().unwrap() as u32);
+        delivered.closed = true;
         delivered.extended_data(&output.stderr);
         let why = delivered.record().unwrap_err();
         assert!(

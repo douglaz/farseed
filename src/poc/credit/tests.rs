@@ -204,7 +204,7 @@ fn poc_credit_returned_limits_are_exact_and_closed() {
         returned_cap: None,
         returned_expiry: None,
     };
-    let good = json!({"status":"success","data":{"_id":"key-1","name":mint.name,"api_key":"session-synthetic-value","usage_limit_usd":0.25,"expire_at":"2026-11-11T00:00:00Z","reset_period":null}});
+    let good = json!({"status":"success","data":{"_id":"key-1","name":mint.name,"api_key":"session-synthetic-value","usage_limit_usd":1.0,"expire_at":"2026-11-11T00:00:00Z","reset_period":null}});
     assert_eq!(
         returned_mint(&good, &mint).unwrap(),
         ("key-1".into(), "2026-11-11T00:00:00Z".into())

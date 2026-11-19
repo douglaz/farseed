@@ -62,7 +62,7 @@ fn append_plaintext(store: &mut Store<MemoryStorage>, plaintext: &[u8]) {
 fn provider_custody_commits_then_protects_and_replays_canonical_account() {
     let mut store = ready();
     assert!(store.provider_account().is_none());
-    assert!(store.provider_filters.is_empty());
+    assert_eq!(store.protect_output(&json!(KEY)).unwrap(), json!(KEY));
     let before = store.next;
     install(&mut store).unwrap();
     assert_eq!(store.next, before + 1);
@@ -74,11 +74,7 @@ fn provider_custody_commits_then_protects_and_replays_canonical_account() {
             install(&mut current).unwrap_err(),
             "Provider account already recorded"
         );
-        for text in [
-            KEY.to_string(),
-            KEY.to_uppercase(),
-            hex::encode(hex::decode(KEY).unwrap()),
-        ] {
+        for text in [KEY.to_string(), hex::encode(hex::decode(KEY).unwrap())] {
             assert!(
                 block_on(current.commit(&Event::Command {
                     machine: "fixture".into(),
@@ -89,6 +85,22 @@ fn provider_custody_commits_then_protects_and_replays_canonical_account() {
             assert_ne!(current.protect_output(&json!(text)).unwrap(), json!(text));
             assert!(!crate::poc::inference::safe(&current, &json!(text), &[]));
         }
+        let transformed = KEY.to_uppercase();
+        assert_ne!(current.protect_output(&json!(KEY)).unwrap(), json!(KEY));
+        assert_eq!(
+            current.protect_output(&json!(transformed)).unwrap(),
+            json!(transformed)
+        );
+        assert!(crate::poc::inference::safe(
+            &current,
+            &json!(transformed),
+            &[]
+        ));
+        block_on(current.commit(&Event::Command {
+            machine: "fixture".into(),
+            command: transformed,
+        }))
+        .unwrap();
         let account = Account::parse(&[b'3'; 64]).unwrap();
         assert_eq!(
             block_on(current.commit(&Event::PocProviderAccount(
@@ -113,7 +125,7 @@ fn provider_custody_failed_append_installs_nothing() {
         store.storage.fault(fault);
         assert!(block_on(store.provider_generate()).is_err());
         assert!(store.provider_account().is_none());
-        assert!(store.provider_filters.is_empty());
+        assert_eq!(store.protect_output(&json!(KEY)).unwrap(), json!(KEY));
         assert!(store.failed.is_some());
         if matches!(fault, Fault::LandThenFail(_)) {
             assert!(reopen(&store).unwrap().provider_account().is_some());
@@ -121,22 +133,168 @@ fn provider_custody_failed_append_installs_nothing() {
     }
 }
 
+fn assert_append_refuses_held_copy(store: &mut Store<MemoryStorage>, event: &Event) {
+    let files = store.storage.files();
+    let next = store.next;
+    let previous = store.previous.0;
+    let failed = store.failed.clone();
+    let result = block_on(store.commit(event));
+    assert_eq!(result, Err(crate::poc::wait::JOURNAL_REFUSED.into()));
+    assert_eq!(store.storage.files(), files);
+    assert_eq!(store.next, next);
+    assert_eq!(store.previous.0, previous);
+    assert_eq!(store.failed, failed);
+}
+
+fn assert_replayed_data_is_protected(
+    store: &Store<MemoryStorage>,
+    value: Value,
+    held_text: &str,
+    pointer: &str,
+) {
+    let original = value.pointer(pointer).unwrap().as_str().unwrap();
+    assert!(original.contains(held_text));
+    let expected = json!(original.replace(held_text, crate::redaction::MARKER));
+
+    let report = store.protect_page_publication(&value).unwrap();
+    let bytes = serde_json::to_vec(&report).unwrap();
+    store.check_output_bytes(&bytes).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(!text.contains(held_text));
+    assert!(text.contains(crate::redaction::MARKER));
+    let encoded: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(encoded.pointer(pointer), Some(&expected));
+
+    let config = crate::poc::inference::Configuration::new(
+        "https://fixture.invalid/v1/chat/completions".into(),
+        "fixture".into(),
+    )
+    .unwrap();
+    let bytes = crate::poc::inference::request(
+        store,
+        &config,
+        "inspect recorded outcome",
+        "fixture",
+        &[(
+            "recorded_outcome".into(),
+            crate::goals::Tool::Exec {
+                machine: "fixture".into(),
+                command: "true".into(),
+            },
+            value,
+        )],
+        &[],
+    )
+    .unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(!text.contains(held_text));
+    assert!(text.contains(crate::redaction::MARKER));
+    let encoded: Value = serde_json::from_slice(&bytes).unwrap();
+    let outcome: Value = serde_json::from_str(
+        encoded["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["tool_call_id"] == "recorded_outcome")
+            .unwrap()["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(outcome.pointer(pointer), Some(&expected));
+}
+
+// Formerly provider_custody_later_encrypted_occurrence_refuses_unlock:
+// expected Unlock to refuse with "protected provider material". 4b2bd48 removed
+// that replay refusal; require append refusal and protected publication instead.
 #[test]
-fn provider_custody_later_encrypted_occurrence_refuses_unlock() {
+fn provider_custody_exact_copy_refuses_append_and_replayed_data_is_protected() {
     for event in [
         json!({"command":{"machine":"fixture","command":KEY}}),
         json!({"poc_credit_account":{"credit_id":KEY,"default_key":"synthetic-other-account-482700"}}),
     ] {
         let mut store = ready();
         install(&mut store).unwrap();
+        let append_event: Event = serde_json::from_value(event.clone()).unwrap();
+        let number = store.next;
         append(&mut store, event);
-        assert!(
-            reopen(&store)
-                .err()
-                .unwrap()
-                .contains("protected provider material")
+        let restored = reopen(&store).unwrap();
+        let (value, pointer) = match &append_event {
+            Event::Command { .. } => (
+                json!({"command":restored.dispatch.calls[&number].intent}),
+                "/command/command",
+            ),
+            Event::PocCreditAccount(_) => {
+                let account = restored.credit_account().unwrap();
+                // The ordinary credit view exposes account presence only. Include the
+                // replayed custody too, so omission cannot satisfy the boundary check.
+                (
+                    json!({"credit":restored.credit_view(),"credit_record":{
+                        "credit_id":std::str::from_utf8(&account.credit_id.0).unwrap(),
+                        "default_key":std::str::from_utf8(&account.default_key.0).unwrap(),
+                    }}),
+                    "/credit_record/credit_id",
+                )
+            }
+            _ => unreachable!(),
+        };
+        assert_replayed_data_is_protected(&restored, value, KEY, pointer);
+
+        let mut writer = ready();
+        install(&mut writer).unwrap();
+        if matches!(append_event, Event::PocCreditAccount(_)) {
+            assert_custody_append_is_held_and_unpublished(writer, &append_event, KEY);
+        } else {
+            assert_append_refuses_held_copy(&mut writer, &append_event);
+        }
+    }
+}
+
+// "Never write" applies to non-custody records. A custody record exists to store its own
+// credential, so its append is accepted; its values are then held, and neither a page report
+// nor an AI request carries them, and the final byte check still refuses an unprotected copy.
+fn assert_custody_append_is_held_and_unpublished(
+    mut store: Store<MemoryStorage>,
+    event: &Event,
+    held_text: &str,
+) {
+    let Event::PocCreditAccount(account) = event else {
+        panic!("custody event expected")
+    };
+    let other = account.default_key.0.as_str().to_owned();
+    assert_eq!(
+        store.protect_output(&json!(other)).unwrap(),
+        json!(other),
+        "the custody value is not held before its record"
+    );
+    let next = store.next;
+    assert_eq!(block_on(store.commit(event)), Ok(next));
+    assert_eq!(store.next, next + 1);
+    let restored = reopen(&store).unwrap();
+    for value in [held_text, other.as_str()] {
+        assert_ne!(
+            restored.protect_output(&json!(value)).unwrap(),
+            json!(value),
+            "a custody value is held after its record"
+        );
+        let raw = json!({"credit_record":{"credit_id":value}}).to_string();
+        assert_eq!(
+            restored.check_output_bytes(raw.as_bytes()),
+            Err(crate::poc::wait::PROTECTED_UNAVAILABLE.into())
         );
     }
+    let account = restored.credit_account().unwrap();
+    let value = json!({"credit":restored.credit_view(),"credit_record":{
+        "credit_id":std::str::from_utf8(&account.credit_id.0).unwrap(),
+        "default_key":std::str::from_utf8(&account.default_key.0).unwrap(),
+    }});
+    assert_replayed_data_is_protected(
+        &restored,
+        value.clone(),
+        held_text,
+        "/credit_record/credit_id",
+    );
+    assert_replayed_data_is_protected(&restored, value, &other, "/credit_record/default_key");
 }
 
 #[test]
@@ -256,17 +414,25 @@ fn deployment_defaults_refuse_relay_overlap_before_configuration() {
             let mut local = Local::new(MemoryStorage::default(), Fixed);
             let mut public = fields.clone();
             public[field] = text.into();
-            assert!(
-                !local
+            let exact = public.to_string().contains(KEY);
+            assert_eq!(
+                local
                     .deployment_configure(
                         Some("https://fixture.invalid".into()),
                         KEY.as_bytes(),
                         &public.to_string()
                     )
-                    .unwrap()
+                    .unwrap(),
+                !exact
             );
-            assert!(local.deployment_origin.is_none());
-            assert!(local.deployment_relay.is_none());
+            assert_eq!(local.deployment_origin.is_none(), exact);
+            assert_eq!(local.deployment_relay.is_none(), exact);
+            let mut store = ready();
+            store.deployment_relay = crate::credential::RelayKey::from_deployment(KEY.as_bytes());
+            assert_ne!(store.protect_output(&json!(KEY)).unwrap(), json!(KEY));
+            if !exact {
+                assert_eq!(store.protect_output(&json!(form)).unwrap(), json!(form));
+            }
         }
     }
     let mut local = Local::new(MemoryStorage::default(), Fixed);
@@ -313,22 +479,29 @@ fn deployment_relay_scalar_validation_gating_and_held_redaction() {
         store.relay_key().is_none(),
         "override retains allocation gating"
     );
-    // Raw and hexadecimal protection must come from held custody, even without a pass.
+    // Deployment custody holds the canonical hexadecimal spelling, even without a pass.
     let raw = hex::decode(KEY).unwrap();
-    let safe = crate::redaction::Redacted::decoded(&store, &raw).unwrap();
-    assert_ne!(safe.as_bytes(), raw.as_slice());
+    let safe = crate::redaction::Redacted::for_store(&store, &raw, &[]).unwrap();
+    assert_ne!(store.protect_output(&json!(KEY)).unwrap(), json!(KEY));
+    assert_eq!(safe.as_bytes(), raw.as_slice());
     for text in relay_forms(KEY)
         .into_iter()
         .chain([format!("before {KEY} after")])
     {
-        assert_ne!(store.protect_output(&json!(text)).unwrap(), json!(text));
-        assert!(
-            block_on(store.commit(&Event::Command {
-                machine: "fixture".into(),
-                command: text
-            }))
-            .is_err()
-        );
+        assert_ne!(store.protect_output(&json!(KEY)).unwrap(), json!(KEY));
+        if text.contains(KEY) {
+            assert_ne!(store.protect_output(&json!(text)).unwrap(), json!(text));
+            assert!(
+                block_on(store.commit(&Event::Command {
+                    machine: "fixture".into(),
+                    command: text
+                }))
+                .is_err()
+            );
+        } else {
+            assert_eq!(store.protect_output(&json!(text)).unwrap(), json!(text));
+            assert!(crate::poc::inference::safe(&store, &json!(text), &[]));
+        }
     }
     let identity = block_on(store.allocate(Family::Passes)).unwrap();
     let key = store.relay_key().unwrap();
@@ -343,7 +516,7 @@ fn deployment_relay_scalar_validation_gating_and_held_redaction() {
         .unwrap();
     assert_ne!(seed_key.public_key(), key.public_key());
     assert_ne!(
-        crate::redaction::Redacted::decoded(&store, &seed_key.0)
+        crate::redaction::Redacted::for_store(&store, &seed_key.0, &[])
             .unwrap()
             .as_bytes(),
         seed_key.0
@@ -403,14 +576,17 @@ fn provider_entry_invalid_origin_is_atomic_before_custody() {
     ] {
         assert!(block_on(store.procurement_configure(&account, KEY.as_bytes(), origin)).is_err());
         assert!(store.provider_account().is_none());
-        assert!(store.provider_filters.is_empty());
+        assert_eq!(store.protect_output(&json!(KEY)).unwrap(), json!(KEY));
         assert_eq!(store.storage.files(), before);
         assert_eq!(store.provider_origin, crate::poc::provisioning::ORIGIN);
     }
 }
 
+// Formerly provider_custody_replay_checks_original_plaintext_before_numeric_normalization:
+// expected Unlock to refuse original bytes with "protected provider material".
+// 4b2bd48 removed that refusal; keep the spelling proof and assert the live refusal.
 #[test]
-fn provider_custody_replay_checks_original_plaintext_before_numeric_normalization() {
+fn provider_custody_numeric_spelling_refuses_append_and_replay_failure_is_protected() {
     let mut store = ready();
     let key = "12".repeat(32);
     let account = Account::parse(key.as_bytes()).unwrap();
@@ -422,6 +598,13 @@ fn provider_custody_replay_checks_original_plaintext_before_numeric_normalizatio
         "}}}}",
     ]
     .concat();
+    // A typed numeric value cannot preserve its pre-parse spelling. Carry that
+    // exact spelling as text through the real observation append instead.
+    assert_append_refuses_held_copy(
+        &mut store,
+        &Event::Procurement(provisioning::Record::Observation(json!({"amount":key}))),
+    );
+    let last_good = reopen(&store).unwrap();
     let number = store.next;
     let previous = store.previous.0;
     append_plaintext(&mut store, text.as_bytes());
@@ -442,11 +625,20 @@ fn provider_custody_replay_checks_original_plaintext_before_numeric_normalizatio
         !serde_json::to_string(&event).unwrap().contains(&key),
         "fixture actually changes spelling when parsed"
     );
-    assert!(
-        reopen(&store)
-            .err()
-            .unwrap()
-            .contains("protected provider material")
+    let why = reopen(&store).err().unwrap();
+    assert_eq!(
+        why,
+        journal::refusal(crate::poc::provisioning::REFUSED.into()),
+        "an observation without an approved purchase refuses replay"
+    );
+    assert!(!why.contains(&key));
+    // No rejected record is installed. Stress both publication boundaries with
+    // its authenticated original bytes under the last successfully replayed holdings.
+    assert_replayed_data_is_protected(
+        &last_good,
+        json!({"replay_refusal":why,"original_plaintext":std::str::from_utf8(&plaintext).unwrap()}),
+        &key,
+        "/original_plaintext",
     );
 }
 

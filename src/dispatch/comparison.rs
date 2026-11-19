@@ -893,6 +893,7 @@ impl Driver {
                         approved,
                         state: match state {
                             CallState::Unresolved => "unresolved",
+                            CallState::Background { .. } => "background",
                             CallState::NoEffect => "no_effect",
                             CallState::Disposed { .. }
                             | CallState::Finished { .. }

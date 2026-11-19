@@ -50,6 +50,7 @@ fn begin(store: &mut Store<MemoryStorage>, checks: Vec<String>) -> Task {
         &task,
         Tool::Done {
             machine: "fixture".into(),
+            urls: vec![],
             checks,
         },
     )
@@ -77,6 +78,9 @@ fn measure(
                 match task.read_plan[index] {
                     Read::Running { .. } => (3, running),
                     Read::Enabled { .. } => (1, enabled),
+                    Read::SignIn { .. } | Read::ControlCenter { .. } => {
+                        unreachable!("service-only declaration")
+                    }
                     Read::Listeners => (0, sockets),
                 }
             } else {
@@ -291,6 +295,9 @@ fn completion_duplicate_services_require_every_lifecycle_read_to_settle_good() {
                     match read {
                         Read::Running { .. } => "active",
                         Read::Enabled { .. } => "enabled",
+                        Read::SignIn { .. } | Read::ControlCenter { .. } => {
+                            unreachable!("service-only declaration")
+                        }
                         Read::Listeners => "",
                     },
                 ))
@@ -328,6 +335,9 @@ fn completion_duplicate_services_require_every_lifecycle_read_to_settle_good() {
                 match read {
                     Read::Running { .. } => "active",
                     Read::Enabled { .. } => "enabled",
+                    Read::SignIn { .. } | Read::ControlCenter { .. } => {
+                        unreachable!("service-only declaration")
+                    }
                     Read::Listeners => unreachable!(),
                 },
             );
@@ -370,6 +380,9 @@ fn completion_duplicate_services_preserve_failures_while_other_reads_unsettled()
                     match read {
                         Read::Running { .. } => "active",
                         Read::Enabled { .. } => "enabled",
+                        Read::SignIn { .. } | Read::ControlCenter { .. } => {
+                            unreachable!("service-only declaration")
+                        }
                         Read::Listeners => "",
                     },
                 ))
@@ -704,6 +717,9 @@ fn completion_unknown_reads_never_clear_findings_and_full_retry_can() {
                 Some(match read {
                     Read::Running { .. } => ReadObservation::Running(true),
                     Read::Enabled { .. } => ReadObservation::Enabled(true),
+                    Read::SignIn { .. } | Read::ControlCenter { .. } => {
+                        unreachable!("service-only declaration")
+                    }
                     Read::Listeners => ReadObservation::Sockets(vec![]),
                 })
             })

@@ -180,12 +180,12 @@ mod tests {
         let a = Authority::default();
         let id = "11223344-5566-7788-99aa-bbccddeeff00";
         a.identify(id.into()).unwrap();
-        assert!(a.references().iter().any(|r| r == id));
+        assert_eq!(a.page_incarnation.borrow().as_deref(), Some(id));
         assert!(a.identify(id.into()).is_err());
         let b = Authority::default();
         b.seal_identity();
         assert!(b.identify(id.into()).is_err());
-        assert_ne!(a.references()[0], b.references()[0]);
+        assert!(a.incarnation != b.incarnation);
     }
     #[test]
     fn suspended_continuation_never_revives_and_end_is_irreversible() {

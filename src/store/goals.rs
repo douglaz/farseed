@@ -488,6 +488,7 @@ mod tests {
                 &session(&s),
                 &Tool::Done {
                     machine: "fixture-other".into(),
+                    urls: vec![],
                     checks: vec![]
                 }
             )
@@ -711,7 +712,10 @@ mod tests {
             }
             match tool {
                 Tool::Done { .. } => json!({"done":true}),
-                Tool::ProposeDeclaration { .. } => {
+                Tool::ProposeDeclaration { .. }
+                | Tool::AskOperator { .. }
+                | Tool::RequestAiKey { .. }
+                | Tool::OfferFile { .. } => {
                     json!({"refused":"operation unavailable in this runner"})
                 }
                 Tool::Exec { command, machine } => {
@@ -844,7 +848,7 @@ mod tests {
         assert_eq!(result, json!({"done":true}));
         assert_eq!(h.script.bodies.len(), 2);
         for body in &h.script.bodies {
-            assert_eq!(body["tools"].as_array().unwrap().len(), 4);
+            assert_eq!(body["tools"].as_array().unwrap().len(), 5);
             assert_eq!(
                 body["tools"]
                     .as_array()
@@ -854,6 +858,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [
                     "exec",
+                    "offer_file",
                     "request_harness_job",
                     "request_typed_operation",
                     "done"

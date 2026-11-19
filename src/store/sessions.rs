@@ -374,6 +374,7 @@ mod tests {
                 proposal.clone(),
                 &crate::goals::Tool::Done {
                     machine: "fixture".into(),
+                    urls: vec![],
                     checks: vec![],
                 },
             )

@@ -3272,6 +3272,14 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, HashMap};
 
+    impl<S: Storage> Store<S> {
+        pub(crate) fn hold_test_credential(&mut self, value: &[u8]) {
+            self.provider_emails.push(Zeroizing::new(
+                std::str::from_utf8(value).unwrap().to_owned(),
+            ));
+        }
+    }
+
     const PASS: &str = "correct horse battery staple";
     const OTHER: &str = "a different passphrase entirely";
 

@@ -369,6 +369,10 @@ mod tests {
             "ExecutionIdentity",
             "a public random execution discriminator, included in reference admission checks; never used as a signing/encryption key or a credential",
         ),
+        (
+            "LegacyPattern",
+            "legacy fingerprint lengths, prefilters and one-way digests; retained only to decode old journal records, never used as a credential or key",
+        ),
     ];
 
     /// Every type implementing `Credential`: its bare name, row and `NAME`.
@@ -391,7 +395,6 @@ mod tests {
             entry::<DataKey>(),
             entry::<InferenceAccountCredential>(),
             entry::<SessionInferenceKey>(),
-            entry::<crate::scan::ScanMaterial>(),
         ]
     }
 

@@ -49,7 +49,14 @@ impl Runtime for ProducerRuntime {
         }
         result
     }
-    async fn propose(&mut self, _: &Task, _: &str, _: String, _: Tool) -> Result<Task, String> {
+    async fn propose(
+        &mut self,
+        _: &Task,
+        _: &str,
+        _: String,
+        _: Tool,
+        _: Option<BlockOrigin>,
+    ) -> Result<Task, String> {
         panic!("pending work must be inspected before inference")
     }
     async fn execute(&mut self, _: Binding, _: &Task) -> Result<(), String> {
@@ -69,55 +76,14 @@ impl Runtime for ProducerRuntime {
 fn producer_regression(mismatched: bool) {
     // Fix the seed and every subsequent identifier used by configuration and task adoption.
     let _identifiers = FixedIdentifiers::new();
-    let probe = if mismatched {
-        "remain\",\"running\":false}}}}}"
-    } else {
-        "checkpoint\",\"running\":false}}}}}"
-    };
-    assert!((16..=4096).contains(&probe.len()));
-    assert!(probe.bytes().all(|byte| (0x21..=0x7e).contains(&byte)));
-    let mut unsafe_admissions = 0;
     let mut stranded = 0;
-    for unsafe_probe in [true, false] {
+    {
         let mut store = ready();
         let task = create_task(&mut store);
         let proposed = proposal(&mut store, &task);
         append(&mut store, &proposed, &task.start_session);
         let pending = store.poc_task(&task.id).unwrap();
         let original_pending = pending.pending.clone();
-        let safe_key = b"safe~resume~credential~QZ";
-        store.poc_configuration_key(safe_key).unwrap();
-        store.remember_poc_credential(safe_key);
-        // Admission precedes terminal evidence, while configuration is actually eligible.
-        store.poc_configuration_ready().unwrap();
-        let files = store.storage.files();
-        let next = store.next;
-        let previous = store.previous.0;
-        let tasks = store.poc.clone();
-        let inventory = store.poc_credential_filters.borrow().len();
-        let prior_protection = store
-            .protect_output(&json!(String::from_utf8_lossy(safe_key)))
-            .unwrap();
-        assert_ne!(prior_protection, json!(String::from_utf8_lossy(safe_key)));
-        let admission = store.poc_configuration_key(probe.as_bytes());
-        assert_eq!(store.storage.files(), files);
-        assert_eq!(store.next, next);
-        assert_eq!(store.previous.0, previous);
-        assert_eq!(store.poc, tasks);
-        assert_eq!(store.poc_credential_filters.borrow().len(), inventory);
-        assert_eq!(
-            store
-                .protect_output(&json!(String::from_utf8_lossy(safe_key)))
-                .unwrap(),
-            prior_protection
-        );
-        assert!(store.failed.is_none());
-        if let Err(error) = &admission {
-            assert!(!error.contains(probe));
-        } else if unsafe_probe {
-            unsafe_admissions += 1;
-            store.remember_poc_credential(probe.as_bytes());
-        }
         let output = "later-sensitive-output-value";
         let mut received = record(&pending, Some(0), output);
         if mismatched && let crate::jobs::Record::Present { command, .. } = &mut received {
@@ -135,12 +101,7 @@ fn producer_regression(mismatched: bool) {
         assert!(store.poc_configuration_ready().is_err());
         let command_admission = format!("{:?}", store.dispatch.check_command("fixture"));
         if !mismatched {
-            // The real Settle projection refuses output that now needs transient protection.
-            block_on(store.synthetic_scan_fixture(
-                "later-value".into(),
-                Zeroizing::new(output.as_bytes().to_vec()),
-            ))
-            .unwrap();
+            store.hold_test_credential(output.as_bytes());
         }
         let mut runtime = ProducerRuntime {
             store,
@@ -162,13 +123,6 @@ fn producer_regression(mismatched: bool) {
         assert_eq!(current.pending, original_pending);
         assert!(current.completed.is_empty());
         assert_eq!(runtime.store.dispatch.calls.len(), 1);
-        eprintln!(
-            "producer mismatched={mismatched} unsafe_probe={unsafe_probe} admitted={} settle_errors={:?} resume_error={:?} wait_writes={}",
-            admission.is_ok(),
-            runtime.settle_errors,
-            result.as_ref().err(),
-            runtime.store.next - next
-        );
         if let Err(error) = result {
             stranded += 1;
             assert_eq!(error, "task credential boundary");
@@ -206,10 +160,6 @@ fn producer_regression(mismatched: bool) {
             abandoned
         );
     }
-    assert_eq!(
-        unsafe_admissions, 0,
-        "unsafe producer envelope admitted; stranded Waits={stranded}"
-    );
     assert_eq!(stranded, 0);
 }
 

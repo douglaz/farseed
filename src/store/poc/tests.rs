@@ -15,7 +15,42 @@ pub(super) fn ready() -> Store<MemoryStorage> {
     s
 }
 fn ready_without_requirements() -> Store<MemoryStorage> {
-    let mut s = crate::store::inference::tests::ready();
+    goal_ready(enrolled())
+}
+fn enrolled() -> Store<MemoryStorage> {
+    use base64::Engine;
+    let mut s = block_on(create(MemoryStorage::default(), &Fixed, pass())).unwrap();
+    block_on(s.seed_backup(allocation::Completion::Skipped)).unwrap();
+    block_on(s.poc_enroll(crate::store::poc_targets::Enrollment {
+        target: crate::poc::targets::TargetRecord {
+            machine: "fixture".into(),
+            relay: "wss://relay.invalid/".into(),
+            profile: "v1".into(),
+            host: "192.0.2.1".into(),
+            port: 22,
+            user: "arch".into(),
+            elevation: crate::jobs::Elevation::None,
+            pin: format!(
+                "SHA256:{}",
+                base64::engine::general_purpose::STANDARD_NO_PAD.encode([3; 32])
+            ),
+        },
+        approve_existing: true,
+        class_answer: crate::dispatch::ClassAnswer::No,
+        approve_maintained_access: true,
+    }))
+    .unwrap();
+    block_on(s.admit_fixture("fixture")).unwrap();
+    block_on(
+        s.set_inference_account(crate::credential::InferenceAccountCredential::new(
+            b"fixture-account-private-value".to_vec(),
+        )),
+    )
+    .unwrap();
+    s.synthetic_confirm_limits(100).unwrap();
+    s
+}
+fn goal_ready(mut s: Store<MemoryStorage>) -> Store<MemoryStorage> {
     let session = s.sessions[0].identity.clone();
     block_on(s.enter_goal(&session, "install and run a small service".into(), None)).unwrap();
     block_on(s.accept_mode(&session, Mode::NoBrief)).unwrap();
@@ -56,9 +91,21 @@ fn exec(command: &str) -> Tool {
         command: command.into(),
     }
 }
+async fn wait_release(release: &Cell<bool>) {
+    std::future::poll_fn(|_| {
+        if release.get() {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
+}
+
 fn done() -> Tool {
     Tool::Done {
         machine: "fixture".into(),
+        urls: vec![],
         checks: vec![],
     }
 }
@@ -177,7 +224,7 @@ fn poc_request_restores_useful_facts_without_seed_allocation_associations() {
     }
     let request: Value = serde_json::from_slice(&body).unwrap();
     let facts: Value =
-        serde_json::from_str(request["messages"][2]["content"].as_str().unwrap()).unwrap();
+        serde_json::from_str(request["messages"][4]["content"].as_str().unwrap()).unwrap();
     assert_eq!(facts["session"], task.start_session);
     assert_eq!(facts["task"], task.id);
     assert_eq!(facts["goal_source"], json!(s.goal(&task.start_session)));
@@ -233,7 +280,7 @@ impl Model for Script {
         &mut self,
         task: &Task,
         _session: &str,
-    ) -> Result<(String, Tool), crate::poc::inference::ReplyError> {
+    ) -> Result<crate::poc::inference::ModelReply, crate::poc::inference::ReplyError> {
         assert_eq!(task.goal, "install and run a small service");
         assert_eq!(task.machine, "fixture");
         self.seen.push(task.completed.to_vec());
@@ -251,9 +298,11 @@ impl Model for Script {
                 std::future::pending::<()>().await;
             }
         }
+        // Scripted replies are free-form calls, never named playbook blocks.
         self.calls
             .pop_front()
             .unwrap_or(Err("fixture has no further call".into()))
+            .map(|(id, tool)| (id, tool, None))
     }
 }
 #[derive(Default)]
@@ -297,7 +346,9 @@ impl Fixture {
         })
     }
     fn with_limits(limits: Limits) -> (Self, Task, String) {
-        let mut store = ready();
+        Self::with_store(ready(), limits)
+    }
+    fn with_store(mut store: Store<MemoryStorage>, limits: Limits) -> (Self, Task, String) {
         let session = store.sessions[0].identity.clone();
         let record = Record::Create {
             id: hex::encode(random::<24>().unwrap()),
@@ -389,9 +440,10 @@ impl Runtime for Fixture {
         session: &str,
         call_id: String,
         tool: Tool,
+        origin: Option<crate::store::poc::BlockOrigin>,
     ) -> Result<Task, String> {
         let mut store = self.store.borrow_mut();
-        block_on(store.poc_propose(task, session, call_id, tool))
+        block_on(store.poc_propose(task, session, call_id, tool, origin))
     }
 
     async fn execute(&mut self, binding: Binding, task: &Task) -> Result<(), String> {
@@ -419,13 +471,24 @@ impl Runtime for Fixture {
         let pending = self.task(&task.id);
         assert_eq!(pending.pending.as_ref().unwrap().call, call);
         let job = pending.pending.as_ref().unwrap().job.clone();
-        let output =
-            if pending.proposal.as_ref().unwrap().check.is_some() || pending.preparing_read() {
-                ""
-            } else {
-                "service active"
-            };
-        let record = record(&pending, Some(self.exit), output);
+        let proposal = pending.proposal.as_ref().unwrap();
+        let (exit, output) = if proposal.check_batch() {
+            let mut output = Vec::new();
+            let start = proposal.check.unwrap();
+            for index in start..proposal.check_batch_end(pending.checks.len()) {
+                assert!(matches!(
+                    pending.read_plan[index],
+                    crate::poc::completion::Read::Listeners
+                ));
+                crate::poc::check_batch::frame(&mut output, index, self.exit, b"");
+            }
+            (0, String::from_utf8(output).unwrap())
+        } else if proposal.check.is_some() || pending.preparing_read() {
+            (self.exit, String::new())
+        } else {
+            (self.exit, "service active".into())
+        };
+        let record = record(&pending, Some(exit), &output);
         {
             let mut remote = self.remote.borrow_mut();
             *remote.sends.entry(job.clone()).or_default() += 1;
@@ -636,7 +699,7 @@ fn poc_three_crash_windows_collect_original_job_and_committed_evidence() {
 
 #[test]
 fn poc_observes_running_missing_ended_mismatch_and_failed_reads_without_resend() {
-    for case in 0..5 {
+    for case in 0..6 {
         let (mut f, task, session) = Fixture::new();
         let proposed = proposal(&mut f.store.borrow_mut(), &task);
         append(&mut f.store.borrow_mut(), &proposed, &session);
@@ -689,6 +752,13 @@ fn poc_observes_running_missing_ended_mismatch_and_failed_reads_without_resend()
             assert!(observed.completed.is_empty());
             assert!(observed.pause_reason.is_some());
             assert_eq!(f.remote.borrow().sends[&job], 1);
+            if case == 5 {
+                assert_eq!(
+                    observed.pause_reason.as_deref(),
+                    Some("record read failed; pending identity retained")
+                );
+                assert!(f.remote.borrow().reads.is_empty());
+            }
         }
     }
 }
@@ -1169,7 +1239,9 @@ fn poc_credential_boundaries_cover_creation_commands_results_pauses_transcripts_
 
 #[test]
 fn poc_no_fresh_acceptance_or_lost_authority_sends_nothing() {
-    let (mut f, task, session) = Fixture::new();
+    let mut store = goal_ready(crate::store::inference::tests::ready());
+    store.fixture_requirements("fixture");
+    let (mut f, task, session) = Fixture::with_store(store, Limits::default());
     f.store.borrow().sessions[0].ended.set(true);
     let result = block_on(run::resume(
         &mut f,
@@ -1508,8 +1580,8 @@ fn poc_protected_progress_precedes_command_and_check_results_and_allows_abandon(
                     .position(|r| !r["tasks"][0]["pending"].is_null())
                     .unwrap();
                 assert!(
-                    proposal_at < pending_at,
-                    "proposal is published before intent commit"
+                    proposal_at == pending_at,
+                    "the committed intent publishes its proposal before sending"
                 );
                 let shown = &reports[pending_at]["tasks"][0];
                 assert_eq!(
@@ -1599,8 +1671,8 @@ fn poc_raise_request_cannot_invalidate_an_active_model_execute_or_collection() {
         }
         let control = f.clone();
         let limits = Limits {
-            requests: 112,
-            steps: 225,
+            requests: 262,
+            steps: 525,
         };
         let pending;
         {
@@ -2156,7 +2228,11 @@ fn assert_continuation_page(s: &Store<MemoryStorage>, task: &Task) {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let mut probe = Command::new("node")
-        .args(["-e", include_str!("page-probe.cjs")])
+        .args([
+            "--experimental-vm-modules",
+            "-e",
+            include_str!("page-probe.cjs"),
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2281,7 +2357,7 @@ fn poc_start_acceptance_and_inputs_replay_atomically_even_when_append_reply_is_l
         Some(Fault::LandThenFail(3)),
         None,
     ] {
-        let mut store = crate::store::inference::tests::ready();
+        let mut store = enrolled();
         store.fixture_requirements("fixture");
         let session = store.sessions[0].identity.clone();
         block_on(store.enter_goal(&session, "install and run a small service".into(), None))
@@ -2406,7 +2482,7 @@ fn poc_production_collector_reports_preserve_observed_causes_and_uncertainty() {
         let expected = match case {
             0 => {
                 observed = crate::jobs::Record::Missing;
-                "no record found"
+                "could not confirm whether the command reached the machine; Resume will check again without running it twice"
             }
             1 => {
                 if let crate::jobs::Record::Present { alive, .. } = &mut observed {
@@ -2762,7 +2838,12 @@ fn poc_page_task_excerpts_do_not_change_durable_or_command_evidence() {
         record(&pending, Some(0), &output),
     );
     let settled = change(&mut fixture.store.borrow_mut(), &pending, Change::Settle);
-    let view = settled.view();
+    let view = fixture
+        .store
+        .borrow()
+        .protect_page_publication(&json!({"tasks":[settled.view()]}))
+        .unwrap()["tasks"][0]
+        .clone();
     assert_eq!(
         view["completed"][0][2]["content"]["stdout"],
         output.chars().take(1024).collect::<String>()
@@ -2955,7 +3036,7 @@ fn poc_credit_mint_failure_preserves_collection_continuations_and_verification()
 #[test]
 fn poc_payment_scheduler_checks_dispatch_time_state() {
     let output = std::process::Command::new("node")
-        .arg("scripts/check-payment-scheduler.mjs")
+        .arg("tests/payment-scheduler.mjs")
         .output()
         .unwrap();
     assert!(
@@ -2977,8 +3058,8 @@ fn poc_new_start_records_higher_defaults_and_retains_brake() {
     assert_eq!(
         task.limits,
         Limits {
-            requests: 100,
-            steps: 200
+            requests: 250,
+            steps: 500
         }
     );
     assert_eq!(
@@ -2989,7 +3070,7 @@ fn poc_new_start_records_higher_defaults_and_retains_brake() {
 
 #[test]
 fn poc_requirements_approval_releases_only_its_declaration_pause_and_replays() {
-    let mut store = ready_without_requirements();
+    let mut store = goal_ready(crate::store::inference::tests::ready());
     let session = store.sessions[0].identity.clone();
     let task = block_on(store.poc_page_start(&session)).unwrap();
     let other_session = block_on(store.admit_fixture("fixture-other")).unwrap();

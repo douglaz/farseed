@@ -28,6 +28,7 @@ fn proposal(d: Value) -> Proposal {
 fn done() -> Tool {
     Tool::Done {
         machine: "fixture".into(),
+        urls: vec![],
         checks: vec![],
     }
 }
@@ -823,6 +824,9 @@ fn declaration_loop_checks_end_after_approval_before_invoking_the_companion() {
         text: "goal".into(),
         source: crate::goals::SOURCE.into(),
         document_source: None,
+        template: None,
+        options: None,
+        inputs: None,
     };
     assert_eq!(
         block_on(crate::goals::run(&mut driver, &goal, "fixture", None))["refused"],

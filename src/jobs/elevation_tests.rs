@@ -8,7 +8,7 @@ const ID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 #[test]
 fn poc_none_preserves_recorded_wire_bytes() {
-    // Digests of the pre-elevation launch/read arguments, including the original scripts.
+    // Pin the current unelevated launch/read arguments, including the supervisor scripts.
     let launch = launch_with_elevation(
         ID,
         "machine with 'quotes' and 日本語",
@@ -17,13 +17,13 @@ fn poc_none_preserves_recorded_wire_bytes() {
     );
     assert_eq!(
         hex::encode(Sha256::digest(launch.as_bytes())),
-        "9a74ddeb5cd367c3bc322ce3f4490cc0a50e92dd48b5ca101ca955e7c165ce0e"
+        "969d57b69b9bc137a190c17585611005bf25a6cd8b86455d98304eba37aa2fad"
     );
     assert_eq!(
         hex::encode(Sha256::digest(
             collect_with_elevation(ID, Elevation::None).as_bytes()
         )),
-        "1e9733fb35a217458499f18479e272ae5317ef6bbf3690a88eb4367bfb46bf74"
+        "921a5581b32de4770dfdee6368d2115aefb32afc4b30ec6b0efb2bed5259dd6c"
     );
 }
 

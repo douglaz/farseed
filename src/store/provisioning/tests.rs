@@ -30,10 +30,6 @@ struct Fixture {
     returned_popularity: Option<f64>,
     billing_terms: BillingTerms,
     fail_quote: bool,
-    protection_fault: Option<(String, MemoryStorage, Fault)>,
-    prepared_protection: Option<crate::poc::inference::EchoFingerprints>,
-    response_filter: Option<crate::poc::inference::EchoFilter>,
-    observe_dispatch: Option<Box<dyn Fn()>>,
     after_read_clock: Option<(String, u64)>,
     response_echo: Option<String>,
     vm_change: Option<(String, Value)>,
@@ -70,10 +66,6 @@ impl Fixture {
             returned_popularity: None,
             billing_terms: fixtures::billing_terms(),
             fail_quote: false,
-            protection_fault: None,
-            prepared_protection: None,
-            response_filter: None,
-            observe_dispatch: None,
             after_read_clock: None,
             response_echo: None,
             vm_change: None,
@@ -110,60 +102,8 @@ impl Api for Fixture {
     fn response_status(&self) -> u16 {
         self.status
     }
-    fn prepare(
-        &mut self,
-        method: &str,
-        path: &str,
-        body: Option<&Value>,
-    ) -> Result<Option<crate::poc::inference::EchoFingerprints>, String> {
-        if self.record_signatures {
-            let auth = protocol::Account::parse(hex::encode([7; 32]).as_bytes())
-                .unwrap()
-                .authorization(
-                    path,
-                    method,
-                    body.map(Value::to_string).as_deref().map(str::as_bytes),
-                    self.clock,
-                    &[5; 32],
-                )
-                .unwrap();
-            self.signed_requests.push(
-                serde_json::from_slice(
-                    &base64::engine::general_purpose::STANDARD
-                        .decode(auth.strip_prefix("Nostr ").unwrap())
-                        .unwrap(),
-                )
-                .unwrap(),
-            );
-        }
-        let path = path
-            .split_once("/api/v1/")
-            .map(|(_, p)| format!("/api/v1/{p}"))
-            .ok_or(REFUSED)?;
-        if self
-            .protection_fault
-            .as_ref()
-            .is_some_and(|(route, _, _)| *route == format!("{method} {path}"))
-        {
-            let (_, storage, fault) = self.protection_fault.take().unwrap();
-            storage.fault(fault);
-            return Ok(Some(
-                crate::poc::inference::EchoFilter::new(&[b"synthetic request scan material"])
-                    .fingerprints(),
-            ));
-        }
-        Ok(if self.observe_dispatch.is_some() {
-            self.prepared_protection.clone()
-        } else {
-            self.prepared_protection.take()
-        })
-    }
-
     fn account(&self) -> String {
         self.account.clone()
-    }
-    fn take_filter(&mut self) -> Option<crate::poc::inference::EchoFilter> {
-        self.response_filter.take()
     }
     fn now(&self) -> u64 {
         self.clock
@@ -177,6 +117,29 @@ impl Api for Fixture {
         path: &str,
         body: Option<Value>,
     ) -> Result<Value, protocol::ReadError> {
+        if self.record_signatures {
+            let auth = protocol::Account::parse(hex::encode([7; 32]).as_bytes())
+                .unwrap()
+                .authorization(
+                    path,
+                    method,
+                    body.as_ref()
+                        .map(Value::to_string)
+                        .as_deref()
+                        .map(str::as_bytes),
+                    self.clock,
+                    &[5; 32],
+                )
+                .unwrap();
+            self.signed_requests.push(
+                serde_json::from_slice(
+                    &base64::engine::general_purpose::STANDARD
+                        .decode(auth.strip_prefix("Nostr ").unwrap())
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+        }
         self.urls.push(path.into());
         if self.record_signatures {
             assert_eq!(
@@ -189,9 +152,6 @@ impl Api for Fixture {
             .map(|(_, p)| format!("/api/v1/{p}"))
             .ok_or(REFUSED)?;
         self.calls.push(format!("{method} {path}"));
-        if let Some(observe) = &self.observe_dispatch {
-            observe();
-        }
         let result = if let Some(error) = self.read_errors.remove(&path) {
             Err(error)
         } else if let Some(value) = self.read_values.remove(&path) {
@@ -2200,49 +2160,6 @@ fn provisioning_missing_limits_refuse_before_approval_and_authenticated_replay()
     }
 }
 
-#[test]
-fn provisioning_failed_mutation_protection_keeps_intent_without_dispatch_or_retry() {
-    for route in [
-        "POST /api/v1/ssh-key",
-        "POST /api/v1/vm",
-        "GET /api/v1/vm/11/renew?method=lightning&intervals=1",
-    ] {
-        for fault in [Fault::Fail(1), Fault::LandThenFail(3)] {
-            let mut s = ready();
-            let mut api = Fixture::new(false);
-            approve(&mut s, &mut api);
-            let invoice = route.contains("/renew?");
-            if invoice {
-                assert!(
-                    block_on(s.procurement_resume(&mut api, false))
-                        .unwrap_err()
-                        .contains("Review the current initial Lightning quote")
-                );
-                assert!(s.procurement.as_ref().unwrap().billing.is_some());
-                assert!(s.procurement.as_ref().unwrap().invoice.is_none());
-            }
-            api.protection_fault = Some((route.into(), s.storage.clone(), fault));
-            assert!(block_on(s.procurement_resume(&mut api, invoice)).is_err());
-            assert_eq!(
-                api.count(route),
-                0,
-                "failed protection append sends no mutation"
-            );
-            let purchase = s.procurement.clone();
-            let mut loaded = reopen(&s);
-            for _ in 0..2 {
-                assert!(block_on(loaded.procurement_resume(&mut api, invoice)).is_err());
-                assert_eq!(
-                    api.count(route),
-                    0,
-                    "persisted intent never dispatches after recovery"
-                );
-                assert_eq!(loaded.procurement, purchase);
-            }
-        }
-    }
-}
-
 fn configure_origin(s: &mut Store<MemoryStorage>, origin: &str) {
     let secret = hex::encode([7; 32]);
     let account = protocol::Account::parse(secret.as_bytes()).unwrap();
@@ -2264,9 +2181,7 @@ fn provisioning_origin_invalid_configuration_is_atomic_and_credential_safe() {
     let secret = hex::encode([7; 32]);
     let account = protocol::Account::parse(secret.as_bytes()).unwrap();
     let mut api = Fixture::new(false);
-    s.poc_credential_filters
-        .borrow_mut()
-        .push(crate::poc::inference::EchoFilter::new(&[b"guarded-origin"]));
+    s.hold_test_credential(b"guarded-origin");
     let origin = "https://guarded-origin.invalid";
     assert_eq!(protocol::provider_origin(origin).unwrap(), origin);
     let initial_origin = s.procurement_origin().to_string();
@@ -2280,7 +2195,7 @@ fn provisioning_origin_invalid_configuration_is_atomic_and_credential_safe() {
         "Provider origin contains protected or unscannable material."
     );
     assert!(s.provider_account().is_none());
-    assert!(s.provider_filters.is_empty());
+    assert_eq!(s.protect_output(&json!(secret)).unwrap(), json!(secret));
     assert_eq!(s.procurement_origin(), initial_origin);
     assert_eq!(s.procurement_selection, initial_selection);
     assert_eq!(s.storage.files(), initial_files);
@@ -2289,14 +2204,7 @@ fn provisioning_origin_invalid_configuration_is_atomic_and_credential_safe() {
     assert_eq!(s.previous.0, initial_previous);
     assert!(api.calls.is_empty());
     assert!(s.procurement.is_none());
-    assert_eq!(s.poc_credential_filters.borrow().len(), 1);
-    assert_ne!(
-        s.poc_credential_filters.borrow()[0]
-            .protect_bytes(origin.as_bytes())
-            .unwrap()
-            .as_slice(),
-        origin.as_bytes()
-    );
+    assert_ne!(s.protect_output(&json!(origin)).unwrap(), json!(origin));
     configure_origin(&mut s, "https://first.invalid:8443/");
     api.account = account.public();
     block_on(s.procurement_select(
@@ -2602,18 +2510,30 @@ fn provisioning_origin_normalization_cannot_introduce_candidate_key_material() {
         .unwrap();
     let secret = hex::encode(&raw);
     let account = protocol::Account::parse(secret.as_bytes()).unwrap();
+    s.hold_test_credential(alias.as_bytes());
     let input = format!("https://{}.invalid", alias.to_uppercase());
     assert_eq!(
         protocol::provider_origin(&input).unwrap(),
         format!("https://{alias}.invalid")
     );
     let reason = block_on(s.procurement_configure(&account, secret.as_bytes(), &input))
-        .expect_err("normalized origin must not introduce an encoded provider scalar");
+        .expect_err("normalized origin must not introduce an exact held value");
     assert!(reason.contains("protected or unscannable"));
     assert_eq!(s.procurement_origin(), "https://first.invalid:8443");
     assert_eq!(s.storage.files(), before);
     assert_eq!(s.allocation(), &allocation);
     assert!(s.procurement.is_none());
+    let mut s = ready();
+    let input = format!("https://{}.invalid", alias.to_uppercase());
+    assert_eq!(
+        protocol::provider_origin(&input).unwrap(),
+        format!("https://{alias}.invalid")
+    );
+    block_on(s.procurement_configure(&account, secret.as_bytes(), &input)).unwrap();
+    assert_eq!(s.procurement_origin(), format!("https://{alias}.invalid"));
+    assert_eq!(s.protect_output(&json!(alias)).unwrap(), json!(alias));
+    assert_ne!(s.protect_output(&json!(secret)).unwrap(), json!(secret));
+    assert_eq!(reopen(&s).procurement_origin(), s.procurement_origin());
 }
 
 #[test]
@@ -3063,10 +2983,19 @@ fn provisioning_i49_old_journal_without_email_records_replays_unchanged() {
     assert!(i49_email_records(&s).is_empty());
     i49_assert_ordered(&s, &api);
     let mut loaded = i49_assert_replay(&s);
+    let live_reason = block_on(s.procurement_resume(&mut api, false)).unwrap_err();
     let why = block_on(loaded.procurement_resume(&mut api, false)).unwrap_err();
     assert!(
-        why.contains("Review the current initial Lightning quote"),
+        why.contains("Approve issuance of the initial Lightning invoice"),
         "{why}"
+    );
+    assert_eq!(
+        why, live_reason,
+        "live and replayed purchases ask for the same approval"
+    );
+    assert_eq!(
+        api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        0
     );
     assert_eq!(api.count("POST /api/v1/vm"), 1);
     assert_eq!(loaded.procurement, s.procurement);
@@ -3141,40 +3070,6 @@ fn disappear(api: &mut Fixture) {
     api.calls.clear();
     api.urls.clear();
 }
-fn observe_protection(s: &Store<MemoryStorage>, api: &mut Fixture) {
-    let storage = s.storage.clone();
-    let key = s.key.0;
-    let id = s.id.clone();
-    let baseline = s.next;
-    let dispatches = std::cell::Cell::new(0u64);
-    api.prepared_protection = Some(
-        crate::poc::inference::EchoFilter::new(&[b"synthetic close request material"])
-            .fingerprints(),
-    );
-    api.observe_dispatch = Some(Box::new(move || {
-        let mut reader = Store::new(storage.clone(), DataKey(key), id.clone());
-        let files = storage.files();
-        let mut protections = 0;
-        let mut last_protection = false;
-        for n in 0..baseline + dispatches.get() + 1 {
-            let bytes = &files[&n.to_string()];
-            let event = reader.open(n, bytes).unwrap();
-            last_protection = matches!(event, Event::ProviderProtection(_));
-            if n >= baseline {
-                assert!(last_protection);
-                protections += 1;
-            }
-            reader.previous = Address(Sha256::digest(bytes).into());
-        }
-        assert!(
-            last_protection,
-            "dispatch requires a committed protection event"
-        );
-        dispatches.set(dispatches.get() + 1);
-        assert_eq!(protections, dispatches.get());
-    }));
-}
-
 #[test]
 fn provisioning_close_success_releases_setup_and_consumes_identities() {
     for stage in 0..3 {
@@ -3198,7 +3093,6 @@ fn provisioning_close_success_releases_setup_and_consumes_identities() {
         let prior_files = s.storage.files();
         let before = s.next;
         disappear(&mut api);
-        observe_protection(&s, &mut api);
         block_on(s.procurement_close(&mut api)).unwrap();
         assert_eq!(
             api.calls,
@@ -3209,7 +3103,7 @@ fn provisioning_close_success_releases_setup_and_consumes_identities() {
             ]
         );
         assert!(api.urls.iter().all(|u| u.starts_with(&old.origin)));
-        assert_eq!(s.next, before + 4);
+        assert_eq!(s.next, before + 1);
         let events = purchase_events(&s);
         for (name, bytes) in prior_files {
             assert_eq!(s.storage.files()[&name], bytes);
@@ -3218,9 +3112,6 @@ fn provisioning_close_success_releases_setup_and_consumes_identities() {
             serde_json::to_value(&events[..prior.len()]).unwrap(),
             serde_json::to_value(&prior).unwrap()
         );
-        for event in &events[prior.len()..prior.len() + 3] {
-            assert!(matches!(event, Event::ProviderProtection(_)));
-        }
         assert!(
             matches!(events.last().unwrap(), Event::Procurement(Record::Closed {vm_id:11, inventory_status:200, detail_status:404, history_status:404, checked_at}) if *checked_at == api.clock)
         );
@@ -3249,8 +3140,6 @@ fn provisioning_close_success_releases_setup_and_consumes_identities() {
             block_on(loaded.procurement_close(&mut api)).is_err(),
             "closure is final"
         );
-        api.observe_dispatch = None;
-        api.prepared_protection = None;
         approve(&mut loaded, &mut api);
         let new = loaded.procurement.as_ref().unwrap();
         assert_ne!(new.identity, old.identity);
@@ -3392,16 +3281,9 @@ fn provisioning_close_provider_refusals_keep_only_dispatched_protections() {
         let setup = s.dispatch.setup_view();
         let allocation = s.allocation().clone();
         let before = s.next;
-        observe_protection(&s, &mut api);
         assert!(block_on(s.procurement_close(&mut api)).is_err(), "{case}");
         assert_eq!(api.calls.len(), expected, "{case}");
-        assert_eq!(s.next, before + expected as u64);
-        assert!(
-            purchase_events(&s)
-                .iter()
-                .skip(before as usize)
-                .all(|e| matches!(e, Event::ProviderProtection(_)))
-        );
+        assert_eq!(s.next, before);
         assert_eq!(s.procurement, p);
         assert_eq!(s.dispatch.setup_view(), setup);
         assert_eq!(s.allocation(), &allocation);
@@ -3411,28 +3293,22 @@ fn provisioning_close_provider_refusals_keep_only_dispatched_protections() {
 
 #[test]
 fn provisioning_close_append_failures_do_not_release_purchase() {
-    for close_fault in [false, true] {
-        for fault in [Fault::Fail(1), Fault::LandThenFail(3)] {
-            let (mut s, mut api) = associated_purchase();
-            disappear(&mut api);
-            let p = s.procurement.clone();
-            let setup = s.dispatch.setup_view();
-            let allocation = s.allocation().clone();
-            if close_fault {
-                api.fault_after = Some((
-                    "GET /api/v1/vm/11/payments?limit=100&offset=0".into(),
-                    s.storage.clone(),
-                    fault,
-                ));
-            } else {
-                api.protection_fault = Some(("GET /api/v1/vm".into(), s.storage.clone(), fault));
-            }
-            assert!(block_on(s.procurement_close(&mut api)).is_err());
-            assert_eq!(s.procurement, p);
-            assert_eq!(s.dispatch.setup_view(), setup);
-            assert_eq!(s.allocation(), &allocation);
-            assert_eq!(api.calls.len(), if close_fault { 3 } else { 0 });
-        }
+    for fault in [Fault::Fail(1), Fault::LandThenFail(3)] {
+        let (mut s, mut api) = associated_purchase();
+        disappear(&mut api);
+        let p = s.procurement.clone();
+        let setup = s.dispatch.setup_view();
+        let allocation = s.allocation().clone();
+        api.fault_after = Some((
+            "GET /api/v1/vm/11/payments?limit=100&offset=0".into(),
+            s.storage.clone(),
+            fault,
+        ));
+        assert!(block_on(s.procurement_close(&mut api)).is_err());
+        assert_eq!(s.procurement, p);
+        assert_eq!(s.dispatch.setup_view(), setup);
+        assert_eq!(s.allocation(), &allocation);
+        assert_eq!(api.calls.len(), 3);
     }
 }
 
@@ -3566,14 +3442,13 @@ fn provisioning_close_post_read_recheck_uses_current_time() {
         "/api/v1/vm/11/payments?limit=100&offset=0".into(),
         api.clock - 1,
     ));
-    observe_protection(&s, &mut api);
     let before = s.next;
     let p = s.procurement.clone();
     assert_eq!(
         block_on(s.procurement_close(&mut api)).unwrap_err(),
         CLOSE_REFUSED
     );
-    assert_eq!(s.next, before + 3);
+    assert_eq!(s.next, before);
     assert_eq!(s.procurement, p);
 }
 
@@ -3821,13 +3696,7 @@ fn provisioning_readiness_clock_ignores_invoice_dates_and_lost_append_reply() {
 #[test]
 fn provisioning_readiness_suppresses_only_valid_unchanged_observations_and_keeps_protection() {
     let (mut store, mut api) = paid_wait();
-    let mut protected = Vec::new();
-    observe_readiness_protection(&store, &mut api);
-    let mut read = |store: &mut Store<MemoryStorage>, api: &mut Fixture| {
-        let material = format!("synthetic readiness authorization {}", protected.len());
-        api.prepared_protection =
-            Some(crate::poc::inference::EchoFilter::new(&[material.as_bytes()]).fingerprints());
-        protected.push(material);
+    let read = |store: &mut Store<MemoryStorage>, api: &mut Fixture| {
         block_on(store.procurement_readiness_check(api)).unwrap_err()
     };
     api.machines[0]["host_ssh_keys"] = json!([]);
@@ -3865,36 +3734,7 @@ fn provisioning_readiness_suppresses_only_valid_unchanged_observations_and_keeps
         "matching status/key/address cannot conceal invalid complete response"
     );
     let restored = reopen(&store);
-    let protections = |store: &Store<MemoryStorage>| {
-        purchase_events(store)
-            .into_iter()
-            .filter_map(|event| match event {
-                Event::ProviderProtection(ref fingerprints) => Some(fingerprints.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    };
-    let recorded = protections(&store);
-    assert_eq!(
-        recorded.len(),
-        api.calls.len(),
-        "one protection per dispatched request"
-    );
-    assert_eq!(
-        protections(&restored),
-        recorded,
-        "each protection record restores by type"
-    );
     assert_eq!(observations(&restored), observations(&store));
-    for material in protected {
-        let value = json!({"name":material});
-        assert_ne!(store.protect_output(&value).unwrap(), value);
-        assert_ne!(
-            restored.protect_output(&value).unwrap(),
-            value,
-            "every request remains protected after replay"
-        );
-    }
     assert_eq!(
         purchase_events(&restored)
             .iter()
@@ -3902,17 +3742,6 @@ fn provisioning_readiness_suppresses_only_valid_unchanged_observations_and_keeps
             .count(),
         0,
         "Handoff is counted separately from observations"
-    );
-    let (mut failed, mut api) = paid_wait();
-    api.protection_fault = Some((
-        "GET /api/v1/vm/11".into(),
-        failed.storage.clone(),
-        Fault::Fail(1),
-    ));
-    assert!(block_on(failed.procurement_readiness_check(&mut api)).is_err());
-    assert!(
-        api.calls.is_empty(),
-        "failed protection append sends no request"
     );
 }
 
@@ -3959,36 +3788,21 @@ fn provisioning_readiness_skips_reordered_keys_and_handoff_uses_recorded_publica
     );
 }
 
-fn observe_readiness_protection(store: &Store<MemoryStorage>, api: &mut Fixture) {
-    let storage = store.storage.clone();
-    let key = store.key.0;
-    let id = store.id.clone();
-    let dispatches = std::cell::Cell::new(0usize);
-    api.prepared_protection = Some(
-        crate::poc::inference::EchoFilter::new(&[b"synthetic readiness protection"]).fingerprints(),
+#[test]
+fn provisioning_legacy_request_fingerprints_replay_without_changing_purchase() {
+    let (mut store, _) = associated_purchase();
+    let before = store.procurement.clone();
+    let fingerprints = serde_json::from_value(json!({
+        "patterns": [[16, null, vec![0; 32], vec![0; 32], null]]
+    }))
+    .unwrap();
+    let event = Event::ProviderProtection(fingerprints);
+    block_on(store.commit(&event)).unwrap();
+    let restored = reopen(&store);
+    assert_eq!(restored.procurement, before);
+    assert_eq!(store.procurement, before);
+    assert_eq!(
+        serde_json::to_value(purchase_events(&restored).last().unwrap()).unwrap(),
+        serde_json::to_value(&event).unwrap()
     );
-    api.observe_dispatch = Some(Box::new(move || {
-        let files = storage.files();
-        let mut reader = Store::new(storage.clone(), DataKey(key), id.clone());
-        let mut protections = 0;
-        let mut last = false;
-        for number in 0..files.len() as u64 {
-            let Some(bytes) = files.get(&number.to_string()) else {
-                break;
-            };
-            last = matches!(
-                reader.open(number, bytes).unwrap(),
-                Event::ProviderProtection(_)
-            );
-            protections += usize::from(last);
-            reader.previous = Address(Sha256::digest(bytes).into());
-        }
-        dispatches.set(dispatches.get() + 1);
-        assert!(last, "a protection record precedes each dispatch");
-        assert_eq!(
-            protections,
-            dispatches.get(),
-            "exactly one fresh protection record per request"
-        );
-    }));
 }
