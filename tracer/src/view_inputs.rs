@@ -127,19 +127,22 @@ impl View {
         let expected = match *n {
             1 => (
                 "refused",
-                "Persistent storage: the browser refused the request.",
+                "Chrome hasn't promised to keep tau-web's data on this phone.",
+                "If the phone runs short of space, Chrome may delete it, and with it your AI credit and your provider account.",
             ),
-            2 => ("granted", "Persistent storage is granted."),
-            _ => ("", ""),
+            2 => (
+                "granted",
+                "Chrome has agreed to keep tau-web's data on this phone.",
+                "It can still be lost if the phone is lost or reset, or its browser data is cleared.",
+            ),
+            _ => ("", "", ""),
         };
         let original = self["persist"] == state
+            && (state != "refused" || self["persist_visible"] == true)
             && self["persist_text"]
                 .as_str()
                 .is_some_and(|t| t.contains(says) && t.contains(statement));
-        let ok = state == expected.0
-            && says == expected.1
-            && statement
-                == "This is a request, not a guarantee: eviction, device loss or corruption can still lose the local store, so the seed backup and recovery remain necessary.";
+        let ok = state == expected.0 && says == expected.1 && statement == expected.2;
         let index = used("main.a100", None, Some(*n), &[self], original, ok);
         Predicate {
             holds: original,

@@ -299,8 +299,8 @@
     {"id":"passphrase_cases.c001.p001","site_id":"passphrase_cases.c001","label":"empty passphrase create, reload, lock and seed re-display; short create in a second fresh origin","scenario_id":"passphrase_cases.serial","predicates":[["passphrase_cases.a001",1],["passphrase_cases.a002",1],["passphrase_cases.a003",1],["passphrase_cases.a004",1],["passphrase_cases.a005",1],["passphrase_cases.a006",1],["passphrase_cases.a007",1],["passphrase_cases.a008",1],["passphrase_cases.a009",1],["passphrase_cases.a010",1],["passphrase_cases.a011",1],["passphrase_cases.a012",1],["passphrase_cases.a013",1]],"invocation":1}
   ],
   "dynamic_prerequisites": {
-    "runtime.worker.ready": {"instance_template":"runtime.worker.ready.i{ordinal}","rule":"Full cardinality is fixed in prerequisites. Targeted helper request domains correspond to their reviewed selected/support callgraph; conditional readiness predicates complete once per logical request. These domains cannot promote targeted execution to full.","poll_bound":300,"full_count":709},
-    "runtime.store.ready_nontransient": {"instance_template":"runtime.store.ready_nontransient.i{ordinal}","rule":"Full cardinality is fixed in prerequisites. Targeted helper request domains correspond to their reviewed selected/support callgraph; conditional readiness predicates complete once per logical request. These domains cannot promote targeted execution to full.","poll_bound":300,"full_count":1322},
+    "runtime.worker.ready": {"instance_template":"runtime.worker.ready.i{ordinal}","rule":"Full cardinality is fixed in prerequisites. Targeted helper request domains correspond to their reviewed selected/support callgraph; conditional readiness predicates complete once per logical request. These domains cannot promote targeted execution to full.","poll_bound":300,"full_count":710},
+    "runtime.store.ready_nontransient": {"instance_template":"runtime.store.ready_nontransient.i{ordinal}","rule":"Full cardinality is fixed in prerequisites. Targeted helper request domains correspond to their reviewed selected/support callgraph; conditional readiness predicates complete once per logical request. These domains cannot promote targeted execution to full.","poll_bound":300,"full_count":1325},
     "runtime.store.not_failed": {"instance_template":"runtime.store.not_failed.i{ordinal}","rule":"One completion at the actual source predicate per separately counted logical helper request; predicates and callers are bound by assertion-source contracts. Conditional contract reloads and asynchronous readiness make cardinality data dependent.","poll_bound":300},
     "binding.fixture_class.ready": {"instance_template":"binding.fixture_class.ready.i{ordinal}","rule":"Full cardinality is fixed in prerequisites. Targeted helper request domains correspond to their reviewed selected/support callgraph; conditional readiness predicates complete once per logical request. These domains cannot promote targeted execution to full.","poll_bound":300,"full_count":95},
     "binding.page.bound": {"instance_template":"binding.page.bound.i{ordinal}","rule":"Full cardinality is fixed in prerequisites. Targeted helper request domains correspond to their reviewed selected/support callgraph; conditional readiness predicates complete once per logical request. These domains cannot promote targeted execution to full.","poll_bound":300,"full_count":442}
@@ -846,7 +846,7 @@
     [["full","setup.existing"],"main.run",1,"inside","main.c018.p001",[100,12,7,9],[]],
     [["full","setup.existing"],"main.run",1,"inside","main.c019.p001",[101,12,7,9],[]],
     [["full","setup.existing"],"main.run",1,"inside","main.c020.p001",[102,15,7],[5,6]],
-    [["full","setup.existing"],"main.run",1,"inside","main.c021.p001",[103,103],[7,8]],
+    [["full","setup.existing"],"main.run",1,"inside","main.c021.p001",[103,7,103,7,100],[7,8]],
     [["full","seed.*","hold.*","setup.*","mode.*"],"main.run",1,"after","main.c001.p001",[101],[]],
     [["full"],"main.run",1,"after","seed_cases.c007.p002",[104,105,7],[]],
     [["full"],"main.run",1,"after","setup_cases.c004.p002",[104,7,17],[9]],
@@ -2412,7 +2412,7 @@
     "goal.status.other_done_visible": "true",
     "delivery.card.applications_visible": "two"
   },
-  "view_query_sha256": "b3fcb06de02c51f1de7b6ae29ac2a4609481057a5e650df0c60c27c748428a2e",
+  "view_query_sha256": "d0f4bb338df3491c791ca806592c0d80196b6bab574b28ce990a05d2e9794e66",
   "view_direct_sources": {
     "view.main.initial_served": ["main.c001","served","main.a004"],
     "view.main.initial_tracer": ["main.c002","tracer","main.a014"],

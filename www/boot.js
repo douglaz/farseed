@@ -324,6 +324,8 @@ const render = (store, forceRender = false) => {
   $('store-state').dataset.lifecycle = store.lifecycle_state ?? '';
   if (store.seed_backup_stage !== undefined) ceremony = state === 'unlocked' && store.seed_backup_stage !== 'inactive';
   if (['locked', 'none', 'refused'].includes(state)) ceremony = false;
+  // The storage note belongs to an open store, after the seed words: nothing on the create or locked screens.
+  $('persist').hidden = state !== 'unlocked' || ceremony;
   $('session-controls').replaceChildren();
   renderSetup(store);
   renderPoc(store);
@@ -2560,9 +2562,13 @@ let persistGeneration = 0;
 const renderPersistence = (generation, granted) => {
   if (generation !== persistGeneration) return;
   persist.dataset.state = granted ? 'granted' : 'refused';
-  persist.textContent = `${granted
-    ? 'Persistent storage is granted.'
-    : "Persistent storage: the browser refused the request. The browser may clear this site's data under storage pressure."} This is a request, not a guarantee: eviction, device loss or corruption can still lose the local store, so the seed backup and recovery remain necessary.`;
+  persist.textContent = granted
+    ? "Chrome has agreed to keep tau-web's data on this phone. It can still be lost if the phone is lost or reset, or its browser data is cleared."
+    : "Chrome hasn't promised to keep tau-web's data on this phone. If the phone runs short of space, Chrome may delete it, and with it your AI credit and your provider account. Your machines would keep running, but this page could no longer reach them. Using tau-web regularly makes Chrome more likely to keep it.";
+  // A refusal stays visible in the store step (STA-23: visibly report a refusal); the granted line sits in Store options.
+  const fold = $('step-store-fold');
+  if (granted) fold.append(persist);
+  else fold.after(persist);
 };
 const request = async () => {
   try {

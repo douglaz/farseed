@@ -1592,12 +1592,14 @@ the host tests run.
 
 **Persistent storage.** On every load, the page checks `navigator.storage.persisted()` and calls
 `navigator.storage.persist()` if false. It requests again inside the Create/Unlock click, before
-any await. The API exists in the page and not in the worker. It shows a refusal, including API
-absence or an exception, as "Persistent storage: the browser refused the request. The browser may
-clear this site's data under storage pressure." A grant, requested in that load or not, reads
-"Persistent storage is granted." Both say "This is a request, not
-a guarantee: eviction, device loss or corruption can still lose the local store, so the seed
-backup and recovery remain necessary." Nothing on the page promises the store cannot be lost.
+any await. The API exists in the page and not in the worker. The answer shows only on an open store,
+after the seed words, never on the create or locked screens. A refusal, including API absence or an
+exception, stays visible in the store step: "Chrome hasn't promised to keep tau-web's data on this
+phone. If the phone runs short of space, Chrome may delete it, and with it your AI credit and your
+provider account. Your machines would keep running, but this page could no longer reach them. Using
+tau-web regularly makes Chrome more likely to keep it." A grant, requested in that load or not, reads
+"Chrome has agreed to keep tau-web's data on this phone. It can still be lost if the phone is lost or reset, or its browser data is cleared." inside Store options. Nothing on
+the page promises the store cannot be lost.
 
 **Limits.**
 
@@ -2532,7 +2534,7 @@ The cases:
 | typed reset bars commands before contact until durable confirmation (twr-ggw.8, `STA-24`) | an independently written unresolved reset refuses a command, names its intent and makes no relay or SSH contact or append; a confirming observation permits the command |
 | typed running-system disposition: pinned attempt and collection stay permitted, four cases (twr-ggw.8, `CNF-110`) | one disposed reset per continuation: commands through `run_command` obey the choice before and after collection; a bare pinned attempt reaches the relay and sshd, collects no jobs and appends no intent; the typed call stays disposed with unknown outcome and the choice stays in force |
 | one writer (twr-ggw.5, `STA-1`, `STA-7`) | a second tab opens and hides the first; the first retains its worker and exclusive lease. The holder is the tab that offers Unlock while the other says it is waiting. The holder unlocks. The other says it is waiting for the store and offers neither Create nor Unlock; its worker has not read the store, runs nothing and appends nothing. Once the holder's tab closes, the other offers Unlock and unlocks the same store |
-| persistent storage (twr-ggw.5 AC6, `STA-23`) | the page checks persistence on every load, requesting if not already granted, and requests again inside Create/Unlock. With the `persistent-storage` permission denied, then granted, through `Browser.setPermission`: `navigator.storage.persisted()` reads false, then true, and the page shows "Persistent storage: the browser refused the request. The browser may clear this site's data under storage pressure.", then "Persistent storage is granted." (`persisted()` already reads true, so that load makes no request), each with the statement that this is a request, not a guarantee |
+| persistent storage (twr-ggw.5 AC6, `STA-23`) | the page checks persistence on every load, requesting if not already granted, and requests again inside Create/Unlock. With the `persistent-storage` permission denied, then granted, through `Browser.setPermission`: `navigator.storage.persisted()` reads false, then true, and the page's storage note says "Chrome hasn't promised to keep tau-web's data on this phone." with the loss it risks, then "Chrome has agreed to keep tau-web's data on this phone. It can still be lost if the phone is lost or reset, or its browser data is cleared." (`persisted()` already reads true, so that load makes no request) |
 | job drop (`CNF-40`) | lock drops a several-second command after launch; `collect_jobs` waits until its observed end, reads the finished record, records no intent and launches nothing |
 | held request on a dropped running command (`CNF-40`) | a separate dropped command remains alive; a held request waits until its observed end, reads the finished record, records no intent and launches nothing |
 | completed drop (`CNF-54`) | the job finishes while disconnected; collection immediately reads both streams and a nonzero exit from its persistent files |

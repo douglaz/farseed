@@ -574,6 +574,7 @@ const VIEW: &str = "(() => {
         lock: !$('lock').hidden,
         persist: $('persist').dataset.state ?? '',
         persist_text: $('persist').textContent,
+        persist_visible: $('persist').closest('[hidden]') === null && $('persist').closest('details:not([open])') === null,
         visibility: document.visibilityState,
     };
 })()";
@@ -2801,14 +2802,19 @@ async fn run_cases(
     // twr-ggw.5 AC6: the persistent-storage request, refused; then the permission granted, where
     // `persisted()` already reads true and the page makes no request.
     let mut case = Case::new("main.c021", "persistent storage (twr-ggw.5 AC6, STA-23)");
-    let statement = "This is a request, not a guarantee: eviction, device loss or corruption can still lose the local store, so the seed backup and recovery remain necessary.";
-    for (setting, state, says) in [
+    for (setting, state, says, statement) in [
         (
             "denied",
             "refused",
-            "Persistent storage: the browser refused the request.",
+            "Chrome hasn't promised to keep tau-web's data on this phone.",
+            "If the phone runs short of space, Chrome may delete it, and with it your AI credit and your provider account.",
         ),
-        ("granted", "granted", "Persistent storage is granted."),
+        (
+            "granted",
+            "granted",
+            "Chrome has agreed to keep tau-web's data on this phone.",
+            "It can still be lost if the phone is lost or reset, or its browser data is cleared.",
+        ),
     ] {
         browser
             .call(
@@ -2818,6 +2824,7 @@ async fn run_cases(
             )
             .await?;
         worker = run.reload("main.rs::reload#17", &tab, &worker).await?;
+        run.submit(&tab, "unlock", PASSPHRASE).await?;
         let mut view = observer::original_view("main.persistence.shown", run, &tab).await?;
         {
             let observation = observer::Call::begin(
@@ -2845,13 +2852,18 @@ async fn run_cases(
             persisted == (setting == "granted"),
         );
         case.check("main.a100",
-            &format!("permission {setting}: the page shows that {says}, and that this is a request, not a guarantee"),
+            &format!("permission {setting}: the page's storage note says {says:?} and {statement:?}"),
             view.persistence(state,says,statement),
         );
     }
     browser
         .call(None, "Browser.resetPermissions", json!({}))
         .await?;
+    // The typed cases replace the store files, so release the unlocked store first.
+    browser
+        .evaluate(&tab.session, "document.getElementById('tau-lock').click()")
+        .await?;
+    worker = run.worker(&tab, Some(&worker), false).await?;
     case.finish(cases);
 
     worker = typed_cases::run(run, &tab, worker, &args, cases).await?;
