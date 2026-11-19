@@ -1580,8 +1580,10 @@ the host tests run.
   BYO retirement invokes no global End or paid-key revocation cleanup.
 - **The single writer.** `worker.js` takes an exclusive Web Lock, `tau-web-store`, before the
   module reads the store, and holds it for the worker's whole life (`STA-1`, `STA-7`).
-  - A worker that cannot get the lock queues for it, and the page says "Waiting for the local
-    store: another tab, or this page's previous harness worker, still holds it."
+  - A worker that cannot get the lock queues for it, and the page says "tau-web may be open in
+    another tab or window of this browser. If it is, use that one or close it. Otherwise wait a
+    moment: this page carries on by itself." When the holder ends, the queued worker takes the
+    lock and opens the store; the holder may be this page's own previous worker (below).
   - Chromium releases a terminated worker's lock asynchronously, so a fresh worker queues
     behind it.
 - **Session workers.** None exists yet.
