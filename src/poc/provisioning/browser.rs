@@ -11,6 +11,7 @@ use zeroize::Zeroize;
 const UNKNOWN_MUTATION: &str = "Provider mutation outcome unknown or browser access unavailable; the saved intent is retained. Use read-only Refresh/Resume to reconcile or remain paused; never retry the mutation.";
 
 thread_local! {
+    static VPSBG_TOKEN: RefCell<Option<crate::store::vpsbg::TokenRecord>> = const {RefCell::new(None)};
     static ACCOUNT: RefCell<Option<Account>> = const {RefCell::new(None)};
     static ACTIVE: Cell<bool> = const {Cell::new(false)};
     static PENDING: RefCell<Option<Rc<Pending>>> = const {RefCell::new(None)};
@@ -31,9 +32,13 @@ pub(crate) fn freeze() {
 pub(crate) fn end() {
     freeze();
     ACCOUNT.with_borrow_mut(|a| *a = None);
+    VPSBG_TOKEN.with_borrow_mut(|a| *a = None);
 }
 pub(crate) fn restore(account: Option<&Account>) {
     ACCOUNT.with_borrow_mut(|a| *a = account.map(Account::copy));
+}
+pub(crate) fn restore_vpsbg(record: Option<&crate::store::vpsbg::TokenRecord>) {
+    VPSBG_TOKEN.with_borrow_mut(|a| *a = record.map(|r| r.copy()));
 }
 pub(crate) fn key_is_set() -> bool {
     ACCOUNT.with_borrow(Option::is_some)
@@ -153,9 +158,40 @@ pub async fn provider_configure(bytes: js_sys::Uint8Array, origin: String) -> St
         .to_string()
 }
 
+#[wasm_bindgen]
+pub async fn provider_token_configure(bytes: js_sys::Uint8Array) -> String {
+    let mut input = Zeroizing::new(bytes.to_vec());
+    bytes.fill(0, 0, bytes.length());
+    let result = async {
+        let _active = Active::acquire()?;
+        let continuation = crate::lifecycle::owner().continuation()?;
+        let local = crate::worker::local();
+        let mut local = local.lock().await;
+        continuation.check()?;
+        if local.dispatch_refusal().is_some() {
+            return Err("Unlock before setting the VPSBG token.".into());
+        }
+        let store = local
+            .store()
+            .ok_or("Unlock before setting the VPSBG token.")?;
+        store.vpsbg_token_install(&input).await?;
+        continuation.check()?;
+        restore_vpsbg(store.vpsbg_token());
+        Ok::<(), String>(())
+    }
+    .await;
+    input.zeroize();
+    let local = crate::worker::local();
+    let local = local.lock().await;
+    local.encode_report(local.report(result.as_ref().err().map(String::as_str)))
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
+    Vendor {
+        vendor: Vendor,
+    },
     Catalogue,
     Select {
         choice: crate::store::provisioning::Choice,
@@ -211,22 +247,39 @@ pub async fn provider_request(request: String) -> String {
             return Err("Unlock before provisioning.".into());
         }
         let store = local.store().ok_or("Unlock before provisioning.")?;
+        if let Action::Vendor { vendor } = &action {
+            store.procurement_choose_vendor(*vendor)?;
+            return Ok(None);
+        }
+        let action_name = match &action {
+            Action::Approve { .. } => "approve", Action::Resume => "resume", Action::PaymentCheck => "payment_check",
+            Action::EmailCheck => "email_check", Action::InitialInvoice { .. } => "initial_invoice",
+            Action::Close => "close", Action::EmailSend { .. } => "email_send", Action::EmailReissue => "email_reissue",
+            _ => "read",
+        };
+        store.procurement_vendor().admit_action(action_name)?;
         let automatic = matches!(action, Action::ReadinessCheck | Action::EmailCheck);
         let eligible = if matches!(action, Action::EmailCheck) {
             store.procurement_email_eligible()
         } else {
             store.procurement_readiness_eligible()
         };
-        if automatic && (!VISIBLE.get() || !key_is_set() || !eligible) {
+        if automatic && (!VISIBLE.get() || if store.procurement_vendor() == Vendor::Vpsbg { store.vpsbg_token().is_none() } else { !key_is_set() || !eligible }) {
             return Ok(None);
         }
-        if !automatic { store.provider_generate().await?; }
+        if !automatic && store.procurement_vendor() == Vendor::Lnvps { store.provider_generate().await?; }
         continuation.check()?;
         restore(store.provider_account());
+        restore_vpsbg(store.vpsbg_token());
+        let credential = match store.procurement_vendor() {
+            Vendor::Lnvps => Credential::Lnvps(store.provider_account().ok_or("Provider account unavailable.")?.copy()),
+            Vendor::Vpsbg => Credential::VpsbgToken(store.vpsbg_token().ok_or("Enter the VPSBG token first.")?.copy()),
+        };
         let mut api = Browser {
             vendor: store.procurement_vendor(),
             origin: store.procurement_origin().into(),
-            account: store.provider_account().ok_or("Provider account unavailable.")?.copy(),
+            credential,
+            raw_response: None,
             continuation,
             automatic_visibility: automatic.then(|| VISIBILITY.get()),
             started: now,
@@ -237,13 +290,14 @@ pub async fn provider_request(request: String) -> String {
         let observe_readiness = matches!(action, Action::ReadinessCheck | Action::Resume | Action::InitialInvoice { .. });
         let identity = store.procurement_view()["identity"].clone();
         let result = match action {
+            Action::Vendor { .. } => unreachable!(),
             Action::Catalogue => store.procurement_catalogue(&mut api).await.map(Some),
             Action::Select { choice } => store
                 .procurement_select(&mut api, choice)
                 .await
                 .map(|_| None),
             Action::Approve { approval, selection } => {
-                if !store.procurement_review_selection().is_some_and(|current| current.same_terms(&selection)) {
+                if !store.procurement_review_selection().is_some_and(|current| store.procurement_vendor().same_terms(current, &selection)) {
                     return Err("The displayed configuration is stale or missing; review the current selection and approve it again.".into());
                 }
                 let fresh = matches!(store.procurement_view()["phase"].as_str(), None | Some("handed_off"));
@@ -258,6 +312,7 @@ pub async fn provider_request(request: String) -> String {
                     Ok(None)
                 }
             }
+            Action::ReadinessCheck if api.vendor == Vendor::Vpsbg => store.vpsbg_read_account(&mut api).await.map(|_| None),
             Action::ReadinessCheck => store.procurement_readiness_check(&mut api).await.map(|_| None),
             Action::EmailCheck => store.procurement_resume(&mut api, false).await.map(|_| None),
             Action::EmailSend { email } => store.procurement_email_send(&mut api, Some(email)).await.map(|_| None),
@@ -320,11 +375,36 @@ impl Drop for Wait {
     }
 }
 
+enum Credential {
+    Lnvps(Account),
+    VpsbgToken(crate::store::vpsbg::TokenRecord),
+}
+impl Credential {
+    fn account(&self) -> String {
+        match self {
+            Self::Lnvps(a) => a.public(),
+            Self::VpsbgToken(r) => r.account.clone(),
+        }
+    }
+    fn current(&self) -> bool {
+        match self {
+            Self::Lnvps(account) => {
+                ACCOUNT.with_borrow(|a| a.as_ref().is_some_and(|a| a.public() == account.public()))
+            }
+            Self::VpsbgToken(record) => VPSBG_TOKEN.with_borrow(|a| {
+                a.as_ref().is_some_and(|a| {
+                    a.account == record.account && a.generation == record.generation
+                })
+            }),
+        }
+    }
+}
 struct Browser {
     vendor: Vendor,
     origin: String,
     automatic_visibility: Option<u64>,
-    account: Account,
+    credential: Credential,
+    raw_response: Option<Zeroizing<Vec<u8>>>,
     continuation: crate::lifecycle::Continuation,
     started: f64,
     requests: u8,
@@ -345,6 +425,9 @@ impl Browser {
     }
 }
 impl Api for Browser {
+    fn take_vpsbg_response(&mut self) -> Option<Zeroizing<Vec<u8>>> {
+        self.raw_response.take()
+    }
     fn check_vendor(&self, vendor: Vendor) -> Result<(), String> {
         if self.vendor != vendor {
             return Err(REFUSED.into());
@@ -355,7 +438,7 @@ impl Api for Browser {
         self.response_status
     }
     fn account(&self) -> String {
-        self.account.public()
+        self.credential.account()
     }
     fn now(&self) -> u64 {
         (js_sys::Date::now() / 1000.0) as u64
@@ -369,10 +452,7 @@ impl Api for Browser {
             return Err("Readiness reads are not running while the page is hidden.".into());
         }
         self.remaining_ms()?;
-        if ACCOUNT.with_borrow(|a| {
-            a.as_ref()
-                .is_none_or(|a| a.public() != self.account.public())
-        }) {
+        if !self.credential.current() {
             return Err(INCOMPLETE.into());
         }
         Ok(())
@@ -385,6 +465,7 @@ impl Api for Browser {
     ) -> Result<Value, ReadError> {
         self.current()?;
         self.response_status = 0;
+        self.raw_response = None;
         self.requests += 1;
         if self.requests > 16 {
             return Err("Provider work paused at the local read bound; Refresh later.".into());
@@ -426,14 +507,23 @@ impl Api for Browser {
         let body = body.map(|b| Zeroizing::new(b.to_string()));
         let mut nonce = [0; 32];
         getrandom::fill(&mut nonce).map_err(|_| REFUSED)?;
-        let auth = self.vendor.authorization(
-            &self.account,
-            url,
-            method,
-            body.as_ref().map(|b| b.as_bytes()),
-            self.now(),
-            &nonce,
-        )?;
+        let auth = match &self.credential {
+            Credential::Lnvps(account) if self.vendor == Vendor::Lnvps => {
+                self.vendor.authorization(
+                    account,
+                    url,
+                    method,
+                    body.as_ref().map(|b| b.as_bytes()),
+                    self.now(),
+                    &nonce,
+                )?
+            }
+            Credential::VpsbgToken(record) if self.vendor == Vendor::Vpsbg && body.is_none() => {
+                vpsbg::token_text(record.token.0.as_bytes())?;
+                Zeroizing::new(format!("Bearer {}", record.token.0.as_str()))
+            }
+            _ => return Err(REFUSED.into()),
+        };
         let init = web_sys::RequestInit::new();
         init.set_method(method);
         init.set_mode(web_sys::RequestMode::Cors);
@@ -477,9 +567,10 @@ impl Api for Browser {
                     READ_REFUSED
                 })
             };
-            if !(200..300).contains(&status)
-                && !(status == 404 && policy.missing_read && !mutation)
-                && !(status == 403 && email_refusal)
+            if self.vendor != Vendor::Vpsbg
+                && (!(200..300).contains(&status)
+                    && !(status == 404 && policy.missing_read && !mutation)
+                    && !(status == 403 && email_refusal))
             {
                 return Err(refused());
             }
@@ -519,8 +610,14 @@ impl Api for Browser {
                         "Provider response exceeded the local body bound.".into()
                     });
                 }
-                output.extend_from_slice(&bytes.to_vec());
+                let part = Zeroizing::new(bytes.to_vec());
+                output.extend_from_slice(&part);
                 bytes.fill(0, 0, bytes.length());
+            }
+            if self.vendor == Vendor::Vpsbg {
+                self.current()?;
+                self.raw_response = Some(output);
+                return Ok(Value::Null);
             }
             if status == 404 {
                 return Err(

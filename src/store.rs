@@ -69,6 +69,7 @@ pub(crate) mod credit;
 pub mod delivery;
 mod goals;
 mod journal;
+pub(crate) use journal::unique_json as unique_provider_json;
 #[cfg_attr(
     not(target_arch = "wasm32"),
     allow(
@@ -95,6 +96,14 @@ pub mod poc_targets;
 pub mod provisioning;
 pub mod reinstall;
 pub(crate) mod unlock_marks;
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    allow(
+        dead_code,
+        reason = "VPSBG custody and reads are driven by the browser worker"
+    )
+)]
+pub(crate) mod vpsbg;
 
 /// The directory the store owns in the origin-private file system.
 pub const DIRECTORY: &str = "tau-web-store";
@@ -281,6 +290,7 @@ pub(crate) enum Event {
     Procurement(provisioning::Record),
     ProviderProtection(crate::poc::inference::EchoFingerprints),
     PocProviderAccount(crate::poc::provisioning::AccountRecord),
+    VpsbgTokenEntered(vpsbg::TokenRecord),
     PocCreditAccount(crate::poc::credit::AccountRecord),
     PocCredit(credit::Record),
     PocAiKey(ai_keys::Record),
@@ -445,6 +455,9 @@ pub struct Store<S> {
     closed_purchases: Vec<provisioning::Purchase>,
     completed_purchases: Vec<provisioning::Purchase>,
     procurement_selection: Option<crate::poc::provisioning::Selection>,
+    vendor_choice: Option<crate::poc::provisioning::Vendor>,
+    vpsbg_token: Option<vpsbg::TokenRecord>,
+    vpsbg_reads: vpsbg::ReadState,
     provider_origin: String,
     provider_account: Option<crate::poc::provisioning::Account>,
     deployment_origin: Option<String>,
@@ -623,6 +636,9 @@ impl<S: Storage> Store<S> {
             closed_purchases: Vec::new(),
             completed_purchases: Vec::new(),
             procurement_selection: None,
+            vendor_choice: None,
+            vpsbg_token: None,
+            vpsbg_reads: Default::default(),
             provider_origin: crate::poc::provisioning::default_origin(),
             provider_account: None,
             deployment_origin: None,
@@ -1613,6 +1629,9 @@ impl<S: Storage> Store<S> {
                 account.bytes(),
             ))));
         }
+        if let Some(record) = &self.vpsbg_token {
+            borrowed.push(record.token.0.as_bytes());
+        }
         for email in &self.provider_emails {
             borrowed.push(email.as_bytes());
         }
@@ -1841,6 +1860,7 @@ impl<S: Storage> Store<S> {
                     self.apply_inference(number, &event)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::VpsbgTokenEntered(record)) => self.replay_vpsbg_token(record)?,
                 (_, Event::PocProviderAccount(account)) => self.replay_provider_account(account)?,
                 (_, Event::PocCreditAccount(account)) => self.replay_credit_account(account)?,
                 (_, Event::PocCredit(record)) => self.replay_credit(record)?,
@@ -2235,7 +2255,8 @@ impl<S: Storage> Store<S> {
         }
         if matches!(
             event,
-            Event::PocProviderAccount(_)
+            Event::VpsbgTokenEntered(_)
+                | Event::PocProviderAccount(_)
                 | Event::PocCreditAccount(_)
                 | Event::PocCredit(_)
                 | Event::PocAiKey(_)
@@ -2357,6 +2378,10 @@ impl<S: Storage> Store<S> {
             self.provider_entry_ready()?;
             record.account()?;
         }
+        if let Event::VpsbgTokenEntered(record) = event {
+            self.vpsbg_token_entry_ready()?;
+            record.validate()?;
+        }
         let number = self.next;
         // Credential format v1: "Never perform 2^32 encryptions under one data key". Record 0 is
         // the first, so record 2^32 - 1 would be the 2^32nd. Nothing is written, so no move can
@@ -2370,6 +2395,9 @@ impl<S: Storage> Store<S> {
                 | Event::InferenceAccount { .. }
                 | Event::PocCreditAccount(_) => Value::Null,
                 Event::Procurement(provisioning::Record::EmailEntered { .. }) => Value::Null,
+                Event::VpsbgTokenEntered(record) => {
+                    json!({"account":record.account,"generation":record.generation})
+                }
                 Event::PocProviderAccount(account) => {
                     json!({"origin":account.origin,"source":account.source})
                 }
@@ -2705,6 +2733,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         #[cfg(target_arch = "wasm32")]
         if let State::Unlocked(store) = &self.state {
             crate::poc::provisioning::browser::restore(store.provider_account.as_ref());
+            crate::poc::provisioning::browser::restore_vpsbg(store.vpsbg_token.as_ref());
         }
         #[cfg(target_arch = "wasm32")]
         if let State::Unlocked(store) = &self.state
@@ -2937,7 +2966,8 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             if store.credit.account.is_some() {
                 report["credit"] = store.credit_view();
             }
-            if store.procurement.is_some()
+            if store.procurement_ready().is_ok()
+                || store.procurement.is_some()
                 || store.procurement_selection.is_some()
                 || !store.closed_purchases.is_empty()
             {

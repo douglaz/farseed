@@ -44,11 +44,13 @@ fn valid_email(email: &str) -> bool {
         && !email.chars().any(|c| c.is_control() || c.is_whitespace())
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Purchase {
     #[serde(default, skip_serializing_if = "Vendor::is_lnvps")]
     pub vendor: Vendor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpsbg: Option<super::vpsbg::VpsbgPurchase>,
     pub origin: String,
     pub machine: String,
     pub identity: Identity,
@@ -74,6 +76,77 @@ pub struct Purchase {
     pub publication: Option<Value>,
     pub target: Option<TargetRecord>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PurchaseShape {
+    #[serde(default, skip_serializing_if = "Vendor::is_lnvps")]
+    pub vendor: Vendor,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vpsbg: Option<super::vpsbg::VpsbgPurchase>,
+    pub origin: String,
+    pub machine: String,
+    pub identity: Identity,
+    pub relay_identity: Identity,
+    pub class_answer: ClassAnswer,
+    pub account: String,
+    pub relay: String,
+    pub selected: Selection,
+    #[serde(default = "default_purchase_user")]
+    pub user: String,
+    pub approved_at: u64,
+    #[serde(default)]
+    pub pending_selection: Option<Selection>,
+    pub registration_sent: bool,
+    pub ssh_key: Option<Value>,
+    pub create: Option<Create>,
+    pub vm: Option<Value>,
+    pub invoice: Option<Invoice>,
+    #[serde(default)]
+    pub billing: Option<Billing>,
+    pub payment: Option<Value>,
+    pub paid_at: Option<u64>,
+    pub publication: Option<Value>,
+    pub target: Option<TargetRecord>,
+}
+impl<'de> Deserialize<'de> for Purchase {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let shape = PurchaseShape::deserialize(d)?;
+        let p = Self {
+            vendor: shape.vendor,
+            vpsbg: shape.vpsbg,
+            origin: shape.origin,
+            machine: shape.machine,
+            identity: shape.identity,
+            relay_identity: shape.relay_identity,
+            class_answer: shape.class_answer,
+            account: shape.account,
+            relay: shape.relay,
+            selected: shape.selected,
+            user: shape.user,
+            approved_at: shape.approved_at,
+            pending_selection: shape.pending_selection,
+            registration_sent: shape.registration_sent,
+            ssh_key: shape.ssh_key,
+            create: shape.create,
+            vm: shape.vm,
+            invoice: shape.invoice,
+            billing: shape.billing,
+            payment: shape.payment,
+            paid_at: shape.paid_at,
+            publication: shape.publication,
+            target: shape.target,
+        };
+        match (p.vendor, &p.vpsbg) {
+            (Vendor::Lnvps, None) => (),
+            (Vendor::Vpsbg, Some(extension)) => extension
+                .validate(&p)
+                .map_err(|_| serde::de::Error::custom("invalid VPSBG purchase"))?,
+            _ => return Err(serde::de::Error::custom("inconsistent purchase vendor")),
+        }
+        Ok(p)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Create {
@@ -171,12 +244,16 @@ impl<S: Storage> Store<S> {
     pub(crate) fn procurement_vendor(&self) -> Vendor {
         self.procurement
             .as_ref()
-            .filter(|p| p.target.is_none())
-            .map_or(Vendor::Lnvps, |p| p.vendor)
+            .filter(|p| p.vendor == Vendor::Vpsbg || p.target.is_none())
+            .map_or(self.vendor_choice.unwrap_or(Vendor::Lnvps), |p| p.vendor)
     }
     pub(crate) fn procurement_origin(&self) -> &str {
+        if self.procurement_vendor() == Vendor::Vpsbg {
+            return protocol::vpsbg::ORIGIN;
+        }
         self.procurement
             .as_ref()
+            .filter(|p| p.target.is_none())
             .map_or(&self.provider_origin, |p| &p.origin)
     }
     pub(crate) async fn procurement_configure(
@@ -191,7 +268,19 @@ impl<S: Storage> Store<S> {
     fn check_api(&self, api: &impl Api) -> Result<(), String> {
         api.current()?;
         api.check_vendor(self.procurement_vendor())?;
-        self.procurement_account(&api.account())
+        if self.procurement_vendor() == Vendor::Vpsbg {
+            self.procurement_ready()?;
+            if self
+                .vpsbg_token
+                .as_ref()
+                .is_none_or(|r| r.account != api.account())
+            {
+                return Err(REFUSED.into());
+            }
+            Ok(())
+        } else {
+            self.procurement_account(&api.account())
+        }
     }
     async fn provider_response(
         &mut self,
@@ -205,13 +294,24 @@ impl<S: Storage> Store<S> {
         self.check_api(api)?;
         let result = api.request(request.method, &url, request.body).await;
         self.check_api(api)?;
-        let value = result?;
+        let mut value = result?;
+        if self.procurement_vendor() == Vendor::Vpsbg {
+            let raw = api.take_vpsbg_response().ok_or(REFUSED)?;
+            value = self.procurement_vendor().reduce_response(
+                request.method,
+                &request.path,
+                api.response_status(),
+                &raw,
+                |bytes| self.check_output_bytes(bytes),
+                |value| self.vpsbg_value_safe(value),
+            )?;
+        }
         if !crate::poc::inference::safe(self, &value, &[]) {
             return Err(REFUSED.into());
         }
         Ok((api.response_status(), value))
     }
-    async fn provider_read(
+    pub(super) async fn provider_read(
         &mut self,
         api: &mut impl Api,
         request: VendorRequest,
@@ -223,13 +323,10 @@ impl<S: Storage> Store<S> {
             Err(protocol::ReadError::NotFound) => {
                 let p = self.procurement.as_ref();
                 if let Some(vm) = p.and_then(|p| p.vm.as_ref()).and_then(|vm| id(vm).ok()) {
-                    let own = self.procurement_vendor().owns_read(
-                        &path,
-                        vm,
-                        p.and_then(|p| p.payment.as_ref()),
-                    );
+                    let vendor = p.map_or(self.procurement_vendor(), |p| p.vendor);
+                    let own = vendor.owns_read(&path, vm, p.and_then(|p| p.payment.as_ref()));
                     if method == "GET" && own {
-                        return Err(self.procurement_vendor().missing_pause(vm));
+                        return Err(vendor.missing_pause(vm));
                     }
                 }
                 Err(protocol::READ_REFUSED.into())
@@ -332,6 +429,7 @@ impl<S: Storage> Store<S> {
         api: &mut impl Api,
         entered: Option<String>,
     ) -> Result<(), String> {
+        self.procurement_no_money()?;
         self.check_api(api)?;
         if !self.procurement_email_eligible() {
             return Err("Email entry is only available before the machine order.".into());
@@ -365,30 +463,29 @@ impl<S: Storage> Store<S> {
     }
     /// Fresh absence evidence is usable only by this explicit action.
     pub(crate) async fn procurement_close(&mut self, api: &mut impl Api) -> Result<(), String> {
+        self.procurement_no_money()?;
         self.check_api(api)?;
         let p = self
             .procurement
             .as_ref()
             .filter(|p| close_eligible(p, api.now()))
             .ok_or(self.procurement_vendor().close_refused())?;
+        let vendor = p.vendor;
         let vm_id = id(p
             .vm
             .as_ref()
             .ok_or(self.procurement_vendor().close_refused())?)?;
         let (inventory_status, inventory) = self
-            .provider_response(api, self.procurement_vendor().list())
+            .provider_response(api, vendor.list())
             .await
             .map_err(protocol::ReadError::message)?;
         if !(200..300).contains(&inventory_status) || unique_ids(&inventory)?.contains(&vm_id) {
             return Err(REFUSED.into());
         }
         for vm in array(&inventory)? {
-            self.procurement_vendor().validate_vm(vm)?;
+            vendor.validate_vm(vm)?;
         }
-        for request in [
-            self.procurement_vendor().get(vm_id),
-            self.procurement_vendor().invoice_history(vm_id),
-        ] {
+        for request in [vendor.get(vm_id), vendor.invoice_history(vm_id)] {
             match self.provider_response(api, request).await {
                 Err(protocol::ReadError::NotFound) => (),
                 _ => return Err(REFUSED.into()),
@@ -413,7 +510,7 @@ impl<S: Storage> Store<S> {
         .await
     }
     // Only completed procurements may precede another purchase in this store.
-    fn procurement_can_start(&self) -> bool {
+    pub(super) fn procurement_can_start(&self) -> bool {
         self.procurement.as_ref().is_none_or(|p| p.target.is_some())
             && self
                 .dispatch
@@ -446,15 +543,29 @@ impl<S: Storage> Store<S> {
     }
     pub(crate) fn procurement_view(&self) -> Value {
         let mut view = self.procurement_current_view();
-        if !self.completed_purchases.is_empty() {
-            view["completed"] = self.completed_purchases.iter().map(|p| {
-                json!({"machine":p.machine,"origin":p.origin,"vm_id":p.vm.as_ref().map(|vm|p.vendor.raw_id(vm)),"payment_id":p.payment.as_ref().map(|pay|p.vendor.raw_id(pay)),"is_paid":p.payment.as_ref().is_some_and(|pay|p.vendor.paid(pay)),"target_saved":p.target.is_some()})
+        self.vpsbg_view(&mut view);
+        let handed_off = self
+            .procurement
+            .as_ref()
+            .filter(|p| p.target.is_some() && p.vendor != self.procurement_vendor());
+        if !self.completed_purchases.is_empty() || handed_off.is_some() {
+            view["completed"] = self.completed_purchases.iter().chain(handed_off).map(|p| {
+                let mut completed = json!({"machine":p.machine,"origin":p.origin,"vm_id":p.vm.as_ref().map(|vm|p.vendor.raw_id(vm)),"payment_id":p.payment.as_ref().map(|pay|p.vendor.raw_id(pay)),"is_paid":p.payment.as_ref().is_some_and(|pay|p.vendor.paid(pay)),"target_saved":p.target.is_some()});
+                if p.vendor == Vendor::Vpsbg {
+                    completed["vendor"] = p.vendor.describe();
+                }
+                completed
             }).collect();
         }
         view
     }
     fn procurement_current_view(&self) -> Value {
-        let Some(p) = &self.procurement else {
+        // A new vendor's draft must not inherit the previous purchase's facts.
+        let Some(p) = self
+            .procurement
+            .as_ref()
+            .filter(|p| p.target.is_none() || p.vendor == self.procurement_vendor())
+        else {
             return json!({"origin":self.procurement_origin(),"selection":self.procurement_selection,"closed":self.closed_purchases.last().map(closed_message)});
         };
         let phase = if p.pending_selection.is_some() {
@@ -494,6 +605,9 @@ impl<S: Storage> Store<S> {
         api: &mut impl Api,
     ) -> Result<Value, String> {
         self.check_api(api)?;
+        if self.procurement_vendor() == Vendor::Vpsbg {
+            return self.vpsbg_read_catalogue(api).await;
+        }
         let catalogue = self
             .provider_read(api, self.procurement_vendor().catalogue())
             .await?;
@@ -568,6 +682,7 @@ impl<S: Storage> Store<S> {
         api: &mut impl Api,
         approval: Approval,
     ) -> Result<(), String> {
+        self.procurement_no_money()?;
         self.check_api(api)?;
         if approval.origin != self.procurement_origin() {
             return Err("The displayed provider origin is stale; review the current origin and selection again.".into());
@@ -646,6 +761,7 @@ impl<S: Storage> Store<S> {
         }
         let record = Purchase {
             vendor: self.procurement_vendor(),
+            vpsbg: None,
             origin: self.procurement_origin().into(),
             machine: approval.machine,
             identity: self
@@ -683,9 +799,25 @@ impl<S: Storage> Store<S> {
         self.procurement_commit(Record::Approved(Box::new(record)))
             .await?;
         self.procurement_selection = None;
+        self.vendor_choice = None;
         Ok(())
     }
     fn procurement_projection(&self, record: &Record) -> Result<Purchase, String> {
+        let purchase = if let Record::Approved(p) = record {
+            Some(p.as_ref())
+        } else {
+            self.procurement.as_ref()
+        };
+        if let Some(p) = purchase {
+            match (p.vendor, &p.vpsbg) {
+                (Vendor::Lnvps, None) => (),
+                (Vendor::Vpsbg, Some(extension)) => {
+                    extension.validate(p)?;
+                    return Err(protocol::vpsbg::READ_ONLY.into());
+                }
+                _ => return Err(REFUSED.into()),
+            }
+        }
         if let Record::Approved(p) = record {
             if !self.procurement_can_start()
                 || self.dispatch.approved_entries.contains_key(&p.machine)
@@ -705,14 +837,12 @@ impl<S: Storage> Store<S> {
                         .iter()
                         .any(|bound| bound.machine == p.machine)
                 })
-                || self
-                    .procurement
-                    .as_ref()
-                    .is_some_and(|old| old.origin != p.origin || old.account != p.account)
-                || self
-                    .completed_purchases
-                    .iter()
-                    .any(|old| old.origin != p.origin || old.account != p.account)
+                || self.procurement.as_ref().is_some_and(|old| {
+                    old.vendor == p.vendor && (old.origin != p.origin || old.account != p.account)
+                })
+                || self.completed_purchases.iter().any(|old| {
+                    old.vendor == p.vendor && (old.origin != p.origin || old.account != p.account)
+                })
             {
                 return Err(REFUSED.into());
             }
@@ -775,20 +905,24 @@ impl<S: Storage> Store<S> {
             .iter()
             .chain(&self.completed_purchases)
         {
+            if closed.vendor != p.vendor || closed.account != p.account || closed.origin != p.origin
+            {
+                continue;
+            }
             let reused = match record {
                 Record::Associated(vm) => closed
                     .vm
                     .as_ref()
-                    .is_some_and(|old| p.vendor.same_vm_id(old, vm)),
+                    .is_some_and(|old| closed.vendor.same_vm_id(old, vm)),
                 Record::Payment { payment, .. } => closed
                     .payment
                     .as_ref()
-                    .and_then(|old| self.procurement_vendor().payment_id(old).ok())
-                    .zip(self.procurement_vendor().payment_id(payment).ok())
+                    .and_then(|old| closed.vendor.payment_id(old).ok())
+                    .zip(p.vendor.payment_id(payment).ok())
                     .is_some_and(|(old, new)| old.eq_ignore_ascii_case(new)),
                 _ => false,
             };
-            if closed.origin == p.origin && reused {
+            if reused {
                 return Err(REFUSED.into());
             }
         }
@@ -882,7 +1016,7 @@ impl<S: Storage> Store<S> {
                     return Err(REFUSED.into());
                 }
                 for vm in &intent.before {
-                    self.procurement_vendor().validate_vm(vm)?;
+                    p.vendor.validate_vm(vm)?;
                 }
                 p.create = Some(intent.clone());
             }
@@ -1131,18 +1265,15 @@ impl<S: Storage> Store<S> {
         self.apply_procurement(number, &record, next)
     }
     async fn history(&mut self, api: &mut impl Api, vm: u64) -> Result<Vec<Value>, String> {
-        let result = self
-            .provider_read(api, self.procurement_vendor().invoice_history(vm))
-            .await?;
-        self.procurement_vendor().parse_history(&result, vm)
+        let vendor = self.procurement.as_ref().ok_or(REFUSED)?.vendor;
+        let result = self.provider_read(api, vendor.invoice_history(vm)).await?;
+        vendor.parse_history(&result, vm)
     }
     async fn initial_billing_quote(&mut self, api: &mut impl Api) -> Result<Billing, String> {
         let p = self.procurement.clone().ok_or(REFUSED)?;
         let vm_id = id(p.vm.as_ref().ok_or(REFUSED)?)?;
         // The quote is for this same approved machine, not an unverified current configuration.
-        let vm = self
-            .provider_read(api, self.procurement_vendor().get(vm_id))
-            .await?;
+        let vm = self.provider_read(api, p.vendor.get(vm_id)).await?;
         self.procurement_commit(Record::Observation(vm)).await?;
         let value = self
             .provider_read(api, p.vendor.invoice_quote(vm_id))
@@ -1217,6 +1348,7 @@ impl<S: Storage> Store<S> {
         &mut self,
         api: &mut impl Api,
     ) -> Result<(), String> {
+        self.procurement_no_money()?;
         self.check_api(api)?;
         let purchase = self.procurement.as_ref().ok_or(REFUSED)?;
         if purchase.target.is_some() {
@@ -1231,7 +1363,7 @@ impl<S: Storage> Store<S> {
         }
         let request = purchase
             .vendor
-            .payment(self.procurement_vendor().payment_id(payment)?);
+            .payment(purchase.vendor.payment_id(payment)?);
         let updated = self.provider_read(api, request).await?;
         self.procurement_commit(self.payment_record(updated, api.now()))
             .await
@@ -1242,6 +1374,7 @@ impl<S: Storage> Store<S> {
         api: &mut impl Api,
         issue_invoice: bool,
     ) -> Result<(), String> {
+        self.procurement_no_money()?;
         self.check_api(api)?;
         let mut p = self
             .procurement
@@ -1294,7 +1427,7 @@ impl<S: Storage> Store<S> {
                 let before = self.provider_read(api, p.vendor.list()).await?;
                 unique_ids(&before)?;
                 for vm in array(&before)? {
-                    self.procurement_vendor().validate_vm(vm)?;
+                    p.vendor.validate_vm(vm)?;
                 }
                 let before = array(&before)?.clone();
                 let started = api.now();
@@ -1372,12 +1505,16 @@ impl<S: Storage> Store<S> {
     }
 
     fn payment_record(&self, payment: Value, now: u64) -> Record {
-        let paid_at = self.procurement_vendor().paid(&payment).then(|| {
-            self.procurement
-                .as_ref()
-                .and_then(|p| p.paid_at)
-                .unwrap_or(now)
-        });
+        let paid_at = self
+            .procurement
+            .as_ref()
+            .is_some_and(|p| p.vendor.paid(&payment))
+            .then(|| {
+                self.procurement
+                    .as_ref()
+                    .and_then(|p| p.paid_at)
+                    .unwrap_or(now)
+            });
         Record::Payment { payment, paid_at }
     }
 
@@ -1430,9 +1567,7 @@ impl<S: Storage> Store<S> {
         let p = self.procurement.clone().ok_or(REFUSED)?;
         self.readiness_current(api, &p)?;
         let vm_id = id(p.vm.as_ref().ok_or(REFUSED)?)?;
-        let fresh = self
-            .provider_read(api, self.procurement_vendor().get(vm_id))
-            .await?;
+        let fresh = self.provider_read(api, p.vendor.get(vm_id)).await?;
         self.readiness_current(api, &p)?;
         let observation = Record::Observation(fresh.clone());
         // Validate the complete fresh response before considering suppression.
