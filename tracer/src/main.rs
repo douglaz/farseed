@@ -2724,7 +2724,7 @@ async fn run_cases(
         "the other tab says it is waiting for the store, and offers neither Create nor Unlock",
         other_view["store"] == "in-use"
             && other_view["text"].as_str().is_some_and(|t| {
-                t.contains("another tab, or this page's previous harness worker, still holds it")
+                t.contains("tau-web may be open in another tab or window of this browser")
             })
             && other_view["create"] == false
             && other_view["unlock"] == false

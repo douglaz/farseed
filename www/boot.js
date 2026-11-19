@@ -104,7 +104,7 @@ const defaultsReady = loadDefaults();
 const texts = {
   starting: 'Opening the local store…',
   working: 'Working…',
-  'in-use': 'Waiting for the local store: another tab, or this page\'s previous harness worker, still holds it.',
+  'in-use': 'tau-web may be open in another tab or window of this browser. If it is, use that one or close it. Otherwise wait a moment: this page carries on by itself.',
   none: 'There is no local store yet.',
   locked: 'The local store is locked.',
   locking: 'Locking: waiting for the worker to finish any begun write and clear working secrets…',
