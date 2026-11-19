@@ -1,6 +1,7 @@
-//! VPS.BG's bounded read protocol. This slice has no mutation recipes.
+//! VPS.BG's bounded protocol. Only image-add and deposit mutations are enabled.
 use super::*;
 use serde_json::json;
+pub(crate) mod bolt11;
 
 #[cfg(test)]
 mod tests;
@@ -9,6 +10,126 @@ pub const ORIGIN: &str = "https://api.vpsbg.eu";
 pub const READ_ONLY: &str =
     "VPSBG purchases are read-only in this build; no money or provider changes were sent.";
 pub type Cents = u64;
+pub const LATE_CREDIT: &str = "The earlier top-up invoice may still have been paid. If both are paid, the extra stays at VPSBG as credit for later.";
+pub const DISCLOSURES: [&str; 4] = [
+    "Use this VPS.BG token in this browser only. A top-up asked for anywhere else (another browser, the VPS.BG console) cancels the invoice shown here, and an order placed elsewhere is charged separately.",
+    "Asking for a top-up cancels any other unpaid VPS.BG top-up invoice.",
+    "Pay only the newest invoice shown here.",
+    "If this VPSBG account has a saved card or other payment method, VPSBG can charge it when the balance runs short; this page can't stop that.",
+];
+
+/// Reviewed public image, fixed for this build. VPSBG accepts no checksum.
+// SHA-256: 7ac507f82a5a47a35286b755793737f4ef69296ab1d4fa415d68e068a012f61b
+pub(crate) const IMAGE_URL: &str =
+    "https://app.poc.asf0.org/images/nixos-tau-26.05-f1e5c35-3.qcow2";
+pub(crate) const IMAGE_SIZE: u64 = 745_465_344;
+
+pub(crate) fn mutation_budget(requests: usize, remaining_ms: f64) -> Result<(), String> {
+    if requests >= 16 || !remaining_ms.is_finite() || remaining_ms < 15_000.0 {
+        return Err("VPSBG work paused before sending; refresh for a fresh request budget.".into());
+    }
+    Ok(())
+}
+pub(crate) fn validate_image_url(url: &str) -> Result<(), String> {
+    let rest = url.strip_prefix("https://").ok_or(REFUSED)?;
+    if url.len() > 2048
+        || rest.is_empty()
+        || !rest.contains('/')
+        || url
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        || rest.contains(['@', '#', '?', '\\'])
+    {
+        return Err(REFUSED.into());
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageFact {
+    pub id: u64,
+    pub status: String,
+    pub name: String,
+    pub url: String,
+    pub size: u64,
+    pub created_at: u64,
+    pub deletion_at: u64,
+    pub deleted_at: Option<u64>,
+}
+impl ImageFact {
+    pub fn ready(&self, url: &str, now: u64) -> bool {
+        self.id > 0
+            && self.url == url
+            && self.status == "downloaded"
+            && self.size > 0
+            && self.deleted_at.is_none()
+            && self.created_at <= now
+            && now
+                .checked_add(3600)
+                .is_some_and(|end| self.deletion_at >= end)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DepositInvoice {
+    pub order: u64,
+    pub amount: Cents,
+    pub currency: Currency,
+    pub bolt11: String,
+    pub payment_hash: String,
+    pub amount_msat: u64,
+    pub provider_expiry: u64,
+    pub bolt11_expiry: u64,
+    pub expires: u64,
+}
+impl std::fmt::Debug for DepositInvoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DepositInvoice(<redacted>)")
+    }
+}
+impl Drop for DepositInvoice {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.bolt11.zeroize();
+    }
+}
+impl DepositInvoice {
+    pub fn validate(&self) -> Result<(), String> {
+        let invoice = bolt11::decode(&self.bolt11)?;
+        if self.amount == 0
+            || self.order != invoice.order
+            || self.payment_hash != invoice.payment_hash
+            || self.amount_msat != invoice.amount_msat
+            || self.bolt11_expiry != invoice.expires
+            || self.provider_expiry <= invoice.timestamp
+            || self.expires != self.provider_expiry.min(self.bolt11_expiry)
+        {
+            return Err(REFUSED.into());
+        }
+        Ok(())
+    }
+}
+pub(crate) fn post_image(url: &str) -> VendorRequest {
+    VendorRequest {
+        method: "POST",
+        path: "/v1/custom-server-images".into(),
+        body: Some(json!({"name":"tau-web-attest","url":url})),
+    }
+}
+pub(crate) fn post_deposit(amount: Cents) -> Result<VendorRequest, String> {
+    if amount == 0 || amount > 50_000 {
+        return Err(REFUSED.into());
+    }
+    let decimal = format!("{}.{:02}", amount / 100, amount % 100);
+    let number: Value = serde_json::from_str(&decimal).map_err(|_| REFUSED)?;
+    Ok(VendorRequest {
+        method: "POST",
+        path: "/v1/balance".into(),
+        body: Some(json!({"payment_method":"bitcoin-ln","amount":number})),
+    })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -218,7 +339,7 @@ pub(super) fn path_allowed(path: &str) -> bool {
     page.is_some()
         && matches!(
             base,
-            "/v1/balance/transactions" | "/v1/orders" | "/v1/servers"
+            "/v1/balance/transactions" | "/v1/orders" | "/v1/servers" | "/v1/custom-server-images"
         )
 }
 fn canonical_page(s: &str) -> bool {
@@ -233,7 +354,11 @@ pub(super) fn request_url(origin: &str, path: &str) -> Result<String, String> {
     Ok(format!("{ORIGIN}{path}"))
 }
 pub(super) fn request_method_allowed(origin: &str, method: &str, url: &str) -> bool {
-    origin == ORIGIN && method == "GET" && url.strip_prefix(ORIGIN).is_some_and(path_allowed)
+    origin == ORIGIN
+        && url.strip_prefix(ORIGIN).is_some_and(|path| {
+            (method == "GET" && path_allowed(path))
+                || (method == "POST" && matches!(path, "/v1/balance" | "/v1/custom-server-images"))
+        })
 }
 
 pub(crate) fn token_text(input: &[u8]) -> Result<&str, String> {
@@ -347,7 +472,7 @@ pub(crate) fn reduce_response(
     let value = crate::poc::credit::decode(&exact).map_err(|_| REFUSED)?;
     bounded(&value.0, 0)?;
     if !scan_value(&value.0)
-        || method != "GET"
+        || !request_method_allowed(ORIGIN, method, &format!("{ORIGIN}{path}"))
         || !path_allowed(path)
         || !(200..300).contains(&status)
     {
@@ -355,6 +480,42 @@ pub(crate) fn reduce_response(
     }
     let raw = &value.0;
     let base = path.split('?').next().ok_or(REFUSED)?;
+    if method == "POST" {
+        let v = raw.get("data").unwrap_or(raw);
+        return match base {
+            "/v1/custom-server-images" => {
+                let status = text(v, "status", 64)?;
+                if !matches!(status, "downloading" | "downloaded" | "pending" | "failed") {
+                    return Err(REFUSED.into());
+                }
+                // An add acknowledgment is not a ready-image fact; only a complete list is.
+                Ok(json!({"id":id(v)?,"status":status}))
+            }
+            "/v1/balance" => {
+                if v["currency"] != "EUR" || v["payment_method"] != "bitcoin-ln" {
+                    return Err(REFUSED.into());
+                }
+                let bolt11 = text(&v["payment_information"], "payment_request", 4096)?.to_string();
+                let decoded = bolt11::decode(&bolt11)?;
+                let provider_expiry =
+                    vpsbg_timestamp(text(&v["payment_information"], "expiry_at", 64)?)?;
+                let invoice = DepositInvoice {
+                    order: decoded.order,
+                    amount: money(&v["amount"])?,
+                    currency: Currency::Eur,
+                    bolt11,
+                    payment_hash: decoded.payment_hash,
+                    amount_msat: decoded.amount_msat,
+                    provider_expiry,
+                    bolt11_expiry: decoded.expires,
+                    expires: provider_expiry.min(decoded.expires),
+                };
+                invoice.validate()?;
+                Ok(json!(invoice))
+            }
+            _ => Err(REFUSED.into()),
+        };
+    }
     match base {
         "/v1/servers/plans" => {
             if raw.get("meta").is_some() {
@@ -383,8 +544,39 @@ pub(crate) fn reduce_response(
         "/v1/balance/transactions" => page(raw, path, transaction),
         "/v1/orders" => page(raw, path, order),
         "/v1/servers" => page(raw, path, server),
+        "/v1/custom-server-images" => page(raw, path, image_fact),
         _ => Err(REFUSED.into()),
     }
+}
+fn image_fact(v: &Value) -> Result<ImageFact, String> {
+    let url = text(v, "url", 2048)?.to_string();
+    validate_image_url(&url)?;
+    let status = text(v, "status", 64)?.to_string();
+    if !matches!(
+        status.as_str(),
+        "downloading" | "downloaded" | "failed" | "pending"
+    ) {
+        return Err(REFUSED.into());
+    }
+    let deletion_at = vpsbg_timestamp(text(v, "deletion_at", 64)?)?;
+    let created_at = vpsbg_timestamp(text(v, "created_at", 64)?)?;
+    if deletion_at <= created_at {
+        return Err(REFUSED.into());
+    }
+    Ok(ImageFact {
+        id: id(v)?,
+        status,
+        name: text(v, "name", 128)?.into(),
+        url,
+        size: number(v, "size")?,
+        created_at,
+        deletion_at,
+        deleted_at: match v.get("deleted_at") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(vpsbg_timestamp(s)?),
+            _ => return Err(REFUSED.into()),
+        },
+    })
 }
 fn page<T: Serialize>(
     raw: &Value,
@@ -502,10 +694,11 @@ fn transaction(v: &Value) -> Result<TransactionFact, String> {
     })
 }
 fn order(v: &Value) -> Result<OrderFact, String> {
-    // Orders dates and association have no reviewed wire fixture yet. Empty lists are usable;
-    // nonempty lists pause rather than inventing the unverified account contract (B963).
-    let _ = v;
-    Err("Check this order at VPSBG".into())
+    Ok(OrderFact {
+        id: id(v)?,
+        created_at: vpsbg_timestamp(text(v, "created_at", 40)?)?,
+        status: text(v, "status", 64)?.into(),
+    })
 }
 pub(crate) fn preflight_order_allowed(row: &OrderFact) -> bool {
     row.status == "paid"

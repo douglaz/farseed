@@ -4,6 +4,7 @@ import init, { spec_commit, open, create, unlock, seed_backup_display, seed_back
 import { identify_execution, wake_tasks, task_presence, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_download, publish_task_details, publish_delivery_details } from './pkg/tau_web.js';
 import { credit_request, retry_ended_credit } from './pkg/tau_web.js';
 import { deployment_configure, provider_configure, provider_token_configure, provider_key_is_set, provider_visibility, provider_action_delay, provider_request } from './pkg/tau_web.js';
+import { vpsbg_poll_contexts, vpsbg_poll, vpsbg_presence } from './pkg/tau_web.js';
 import { publish_unlock_worker_timings } from './pkg/tau_web.js';
 
 const unlockNow = performance.now.bind(performance);
@@ -145,11 +146,68 @@ if (retirementRequested) {
 }
 let paymentTimer = null;
 let pageVisible = true;
+let pageOnline = initialPresence?.online === true;
+let vpsbgVisible = initialPresence?.visible === true;
 let lastReport = null;
 // The newest session list from either a store report or a task publication (End publishes only through the latter),
 // so a fresh key submitted after End is compared with the sessions the page shows, not with a stale store report.
 let latestSessions = null;
 const paymentsEligible = () => !retirementRequested && pageVisible && lastReport?.state === 'unlocked' && !['suspended','reconciling','ended'].includes(lastReport?.lifecycle_state);
+// VPSBG never consults LNVPS's account flag, payment fields or target presence.
+let vpsbgDepositTimer = null;
+let vpsbgDepositBusy = false;
+let vpsbgScheduling = false;
+let vpsbgEpoch = 0;
+let vpsbgProviderQueue = Promise.resolve();
+const vpsbgEligible = () => paymentsEligible() && pageOnline && vpsbgVisible;
+const stopVpsbg = () => {
+  vpsbgEpoch++;
+  clearTimeout(vpsbgDepositTimer); vpsbgDepositTimer = null;
+};
+const queueVpsbg = operation => {
+  const work = vpsbgProviderQueue.then(async () => {
+    const delay = provider_action_delay();
+    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    return operation();
+  });
+  vpsbgProviderQueue = work.catch(() => {});
+  return work;
+};
+const scheduleVpsbg = async () => {
+  if (!vpsbgEligible()) { stopVpsbg(); return; }
+  if (vpsbgDepositTimer || vpsbgDepositBusy || vpsbgScheduling) return;
+  const epoch = vpsbgEpoch;
+  vpsbgScheduling = true;
+  let contexts;
+  try { contexts = JSON.parse(await vpsbg_poll_contexts()); }
+  finally { vpsbgScheduling = false; }
+  if (!vpsbgEligible() || epoch !== vpsbgEpoch) {
+    if (vpsbgEligible()) queueMicrotask(() => { void scheduleVpsbg(); });
+    return;
+  }
+  if (!contexts.length) return;
+  const generation = publication_generation();
+  vpsbgDepositTimer = setTimeout(async () => {
+    vpsbgDepositTimer = null;
+    if (!vpsbgEligible() || epoch !== vpsbgEpoch || generation !== publication_generation()) return;
+    vpsbgDepositBusy = true;
+    try {
+      for (const context of contexts) {
+        await queueVpsbg(async () => {
+          if (!vpsbgEligible() || epoch !== vpsbgEpoch || generation !== publication_generation()) return;
+          const current = JSON.parse(await vpsbg_poll_contexts());
+          if (!current.some(item => JSON.stringify(item) === JSON.stringify(context))) return;
+          const report = await vpsbg_poll(context.purchase);
+          if (!vpsbgEligible() || epoch !== vpsbgEpoch || generation !== publication_generation()) return;
+          await reportStore(report, generation, '', 'machine', true);
+        });
+      }
+    } finally {
+      vpsbgDepositBusy = false;
+      void scheduleVpsbg();
+    }
+  }, Math.max(5000, provider_action_delay()));
+};
 const pendingCredit = () => {
   const invoice = lastReport?.credit?.invoices?.at(-1);
   return paymentsEligible() && invoice && !['paid','expired_unpaid','abandoned'].includes(invoice.outcome) && Date.now()/1000 <= invoice.expires_at + 60 ? invoice.id : null;
@@ -280,6 +338,7 @@ const reportStore = (report, generation = publication_generation(), session = ''
   schedulePayments();
   scheduleReadiness();
   scheduleEmail();
+  void scheduleVpsbg();
   value.poc_configuration = { key_set: poc_key_is_set() };
   value.provider_configuration = { key_set: provider_key_is_set() };
   if (paymentTimerReport) value.payment_timer = true;
@@ -448,6 +507,7 @@ onmessage = async ({ data: envelope }) => {
     clearPendingPocConfiguration();
     clearTimeout(paymentTimer); paymentTimer = null;
     stopReadiness(); stopEmail(); provider_visibility(false);
+    stopVpsbg(); vpsbg_presence(false);
     await retire_runtime();
     postMessage({ runtime_retired: true });
     return;
@@ -456,7 +516,7 @@ onmessage = async ({ data: envelope }) => {
     const configurationLifecycle = ++pocConfigurationLifecycle;
     pocConfigurationRevalidating = true;
     clearTimeout(pocConfigurationTimer); pocConfigurationTimer = null;
-    if (data.lifecycle === 'hidden' || data.lifecycle === 'freeze') { readinessLifecycle++; pageVisible = false; clearTimeout(paymentTimer); paymentTimer = null; stopReadiness(); stopEmail(); provider_visibility(false); }
+    if (data.lifecycle === 'hidden' || data.lifecycle === 'freeze') { readinessLifecycle++; pageVisible = false; clearTimeout(paymentTimer); paymentTimer = null; stopReadiness(); stopEmail(); provider_visibility(false); stopVpsbg(); }
     if (data.lifecycle === 'visible' || data.lifecycle === 'resume') { pageVisible = true; provider_visibility(true); }
     const report = await lifecycle_transition(data.lifecycle);
     Object.assign(wake, {generation:publication_generation(), identity:JSON.stringify(JSON.parse(report).procurement?.identity)});
@@ -471,6 +531,11 @@ onmessage = async ({ data: envelope }) => {
   if (data.task_presence && exactMembers(data.task_presence, ['visible', 'online']) &&
       typeof data.task_presence.visible === 'boolean' && typeof data.task_presence.online === 'boolean') {
     task_presence(data.task_presence.visible, data.task_presence.online);
+    pageOnline = data.task_presence.online;
+    vpsbgVisible = data.task_presence.visible;
+    vpsbg_presence(pageOnline);
+    if (!pageOnline || !data.task_presence.visible) stopVpsbg();
+    else void scheduleVpsbg();
     return;
   }
   if (data.task_details) {
@@ -582,7 +647,8 @@ onmessage = async ({ data: envelope }) => {
   }
   else if (data.provider_request && typeof data.provider_request === 'object') {
     try {
-      const value = JSON.parse(await provider_request(JSON.stringify(data.provider_request)));
+      const request = () => provider_request(JSON.stringify(data.provider_request));
+      const value = JSON.parse(await (lastReport?.procurement?.vendor?.id === 'vpsbg' ? queueVpsbg(request) : request()));
       if (data.provider_request.action === 'vendor') value.provider_selection_reviewed = false;
       if (data.provider_request.action === 'select' && !value.error) value.provider_selection_reviewed = true;
       report = JSON.stringify(value);
@@ -694,4 +760,5 @@ onmessage = async ({ data: envelope }) => {
   }
 };
 task_presence(initialPresence?.visible === true, initialPresence?.online === true);
+vpsbg_presence(pageOnline);
 await reportStore(await open());

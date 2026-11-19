@@ -17,6 +17,8 @@ thread_local! {
     static PENDING: RefCell<Option<Rc<Pending>>> = const {RefCell::new(None)};
     static READINESS_CHECKED: RefCell<Option<(Value, u64, &'static str)>> = const {RefCell::new(None)};
     static VISIBLE: Cell<bool> = const {Cell::new(true)};
+    static VPSBG_ONLINE: Cell<bool> = const {Cell::new(true)};
+    static VPSBG_EPOCH: Cell<u64> = const {Cell::new(0)};
     static VISIBILITY: Cell<u64> = const {Cell::new(0)};
     static LAST: Cell<Option<f64>> = const {Cell::new(None)};
     #[cfg(feature="tracer")]
@@ -52,6 +54,13 @@ pub fn provider_key_is_set() -> bool {
 pub fn provider_visibility(visible: bool) {
     if VISIBLE.replace(visible) != visible {
         VISIBILITY.set(VISIBILITY.get().wrapping_add(1));
+    }
+}
+
+#[wasm_bindgen]
+pub fn vpsbg_presence(online: bool) {
+    if VPSBG_ONLINE.replace(online) != online {
+        VPSBG_EPOCH.set(VPSBG_EPOCH.get().wrapping_add(1));
     }
 }
 
@@ -199,6 +208,8 @@ enum Action {
     Approve {
         approval: crate::store::provisioning::Approval,
         selection: Selection,
+        #[serde(default, deserialize_with = "money_review_input")]
+        vpsbg: Option<crate::store::vpsbg::MoneyReview>,
     },
     Resume,
     PaymentCheck,
@@ -218,6 +229,11 @@ enum Action {
     InitialInvoice {
         billing: crate::store::provisioning::Billing,
     },
+}
+fn money_review_input<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<crate::store::vpsbg::MoneyReview>, D::Error> {
+    crate::store::vpsbg::MoneyReview::deserialize(d).map(Some)
 }
 
 #[wasm_bindgen]
@@ -253,6 +269,9 @@ pub async fn provider_request(request: String) -> String {
             return Err("Unlock before provisioning.".into());
         }
         let store = local.store().ok_or("Unlock before provisioning.")?;
+        if matches!(&action, Action::Approve { vpsbg: Some(_), .. }) && store.procurement_vendor() != Vendor::Vpsbg {
+            return Err("Invalid provisioning request.".into());
+        }
         if let Action::Vendor { vendor } = &action {
             store.procurement_choose_vendor(*vendor)?;
             return Ok(None);
@@ -263,7 +282,7 @@ pub async fn provider_request(request: String) -> String {
             Action::Close => "close", Action::EmailSend { .. } => "email_send", Action::EmailReissue => "email_reissue",
             _ => "read",
         };
-        store.procurement_vendor().admit_action(action_name)?;
+        store.procurement_admit_action(action_name)?;
         let automatic = matches!(action, Action::ReadinessCheck | Action::EmailCheck);
         let eligible = if matches!(action, Action::EmailCheck) {
             store.procurement_email_eligible()
@@ -287,7 +306,8 @@ pub async fn provider_request(request: String) -> String {
             credential,
             raw_response: None,
             continuation,
-            automatic_visibility: automatic.then(|| VISIBILITY.get()),
+            automatic_visibility: (automatic || store.procurement_vendor() == Vendor::Vpsbg).then(|| VISIBILITY.get()),
+            vpsbg_epoch: VPSBG_EPOCH.get(),
             started: now,
             requests: 0,
             response_status: 0,
@@ -295,6 +315,9 @@ pub async fn provider_request(request: String) -> String {
         api.current()?;
         let observe_readiness = matches!(action, Action::ReadinessCheck | Action::Resume | Action::InitialInvoice { .. });
         let identity = store.procurement_view()["identity"].clone();
+        let closing_purchase = if matches!(action, Action::Close) && api.vendor == Vendor::Vpsbg {
+            store.procurement_view()["purchase"].as_str().map(str::to_string)
+        } else { None };
         let result = match action {
             Action::Vendor { .. } => unreachable!(),
             Action::Catalogue => store.procurement_catalogue(&mut api).await.map(Some),
@@ -302,9 +325,13 @@ pub async fn provider_request(request: String) -> String {
                 .procurement_select(&mut api, choice)
                 .await
                 .map(|_| None),
-            Action::Approve { approval, selection } => {
+            Action::Approve { approval, selection, vpsbg } => {
                 if !store.procurement_review_selection().is_some_and(|current| store.procurement_vendor().same_terms(current, &selection)) {
                     return Err("The displayed configuration is stale or missing; review the current selection and approve it again.".into());
+                }
+                if api.vendor == Vendor::Vpsbg {
+                    store.vpsbg_approve(&mut api, approval, vpsbg.ok_or("Review and explicitly approve the VPSBG money plan first.")?).await?;
+                    return Ok(None);
                 }
                 let fresh = matches!(store.procurement_view()["phase"].as_str(), None | Some("handed_off"));
                 store.procurement_approve(&mut api, approval).await?;
@@ -318,7 +345,11 @@ pub async fn provider_request(request: String) -> String {
                     Ok(None)
                 }
             }
-            Action::ReadinessCheck if api.vendor == Vendor::Vpsbg => store.vpsbg_read_account(&mut api).await.map(|_| None),
+            Action::ReadinessCheck if api.vendor == Vendor::Vpsbg => {
+                let purchase = store.procurement_view()["purchase"].as_str().map(str::to_string);
+                if let Some(purchase) = purchase { store.vpsbg_progress(&mut api, &purchase, false).await.map(|_| None) }
+                else { store.vpsbg_read_account(&mut api).await.map(|_| None) }
+            },
             Action::ReadinessCheck => store.procurement_readiness_check(&mut api).await.map(|_| None),
             Action::EmailCheck => store.procurement_resume(&mut api, false).await.map(|_| None),
             Action::EmailSend { email } => store.procurement_email_send(&mut api, Some(email)).await.map(|_| None),
@@ -338,7 +369,9 @@ pub async fn provider_request(request: String) -> String {
                 store.procurement_resume(&mut api, true).await.map(|_| None)
             }
         };
-        if api.vendor != store.procurement_vendor() {
+        if api.vendor != store.procurement_vendor()
+            && !(result.is_ok() && closing_purchase.as_deref().is_some_and(|purchase|
+                store.vpsbg_closed_dispatch(api.vendor, purchase))) {
             return Err(REFUSED.into());
         }
         if observe_readiness && api.requests > 0 && api.current().is_ok() && store.procurement_readiness_eligible() && store.procurement_view()["identity"] == identity {
@@ -355,6 +388,82 @@ pub async fn provider_request(request: String) -> String {
         report["provider_catalogue"] = catalogue;
     }
     local.encode_report(report)
+}
+
+/// Worker-only deposit contexts come from retained journal projections, including closed ones.
+#[wasm_bindgen]
+pub async fn vpsbg_poll_contexts() -> String {
+    if !VISIBLE.get() || !VPSBG_ONLINE.get() || crate::lifecycle::owner().ordinary().is_err() {
+        return "[]".into();
+    }
+    let shared = crate::worker::local();
+    let mut local = shared.lock().await;
+    if local.dispatch_refusal().is_some() {
+        return "[]".into();
+    }
+    local.store().map_or_else(
+        || "[]".into(),
+        |store| json!(store.vpsbg_poll_contexts()).to_string(),
+    )
+}
+
+#[wasm_bindgen]
+pub async fn vpsbg_poll(purchase: String) -> String {
+    let result = async {
+        let _active = Active::acquire()?;
+        if !VISIBLE.get() || !VPSBG_ONLINE.get() || crate::poc::inference::response_pending() {
+            return Err(REFUSED.into());
+        }
+        let now = monotonic_ms()?;
+        if provider_action_delay() > 0 {
+            return Err("Provider reads paused briefly; Refresh after one second.".into());
+        }
+        LAST.set(Some(now));
+        let continuation = crate::lifecycle::owner().continuation()?;
+        let shared = crate::worker::local();
+        let mut local = shared.lock().await;
+        continuation.check()?;
+        if local.dispatch_refusal().is_some() {
+            return Err(REFUSED.into());
+        }
+        let store = local.store().ok_or(REFUSED)?;
+        if !store
+            .vpsbg_poll_contexts()
+            .iter()
+            .any(|c| c.purchase == purchase)
+        {
+            return Err(REFUSED.into());
+        }
+        // Resolve the addressed purchase before constructing the transport. Draft vendor is irrelevant.
+        let p = store.vpsbg_purchase(&purchase).ok_or(REFUSED)?;
+        let record = store
+            .vpsbg_token()
+            .filter(|r| r.account == p.account)
+            .ok_or(REFUSED)?
+            .copy();
+        let mut api = Browser {
+            vendor: Vendor::Vpsbg,
+            origin: vpsbg::ORIGIN.into(),
+            credential: Credential::VpsbgToken(record),
+            raw_response: None,
+            continuation,
+            automatic_visibility: Some(VISIBILITY.get()),
+            vpsbg_epoch: VPSBG_EPOCH.get(),
+            started: now,
+            requests: 0,
+            response_status: 0,
+        };
+        let current = store.procurement_view()["purchase"].as_str() == Some(purchase.as_str());
+        if current {
+            store.vpsbg_progress(&mut api, &purchase, false).await
+        } else {
+            store.vpsbg_deposit_check(&mut api, &purchase).await
+        }
+    }
+    .await;
+    let shared = crate::worker::local();
+    let local = shared.lock().await;
+    local.encode_report(local.report(result.as_ref().err().map(String::as_str)))
 }
 
 struct Pending {
@@ -411,6 +520,7 @@ struct Browser {
     vendor: Vendor,
     origin: String,
     automatic_visibility: Option<u64>,
+    vpsbg_epoch: u64,
     credential: Credential,
     raw_response: Option<Zeroizing<Vec<u8>>>,
     continuation: crate::lifecycle::Continuation,
@@ -433,6 +543,10 @@ impl Browser {
     }
 }
 impl Api for Browser {
+    fn vpsbg_mutation_budget(&self) -> Result<(), String> {
+        self.current()?;
+        vpsbg::mutation_budget(usize::from(self.requests), self.remaining_ms()?)
+    }
     fn take_vpsbg_response(&mut self) -> Option<Zeroizing<Vec<u8>>> {
         self.raw_response.take()
     }
@@ -453,6 +567,11 @@ impl Api for Browser {
     }
     fn current(&self) -> Result<(), String> {
         self.continuation.check()?;
+        if self.vendor == Vendor::Vpsbg
+            && (!VPSBG_ONLINE.get() || self.vpsbg_epoch != VPSBG_EPOCH.get())
+        {
+            return Err("VPSBG work paused while offline; only reconcile on the next wake.".into());
+        }
         if self
             .automatic_visibility
             .is_some_and(|epoch| !VISIBLE.get() || VISIBILITY.get() != epoch)
@@ -526,7 +645,7 @@ impl Api for Browser {
                     &nonce,
                 )?
             }
-            Credential::VpsbgToken(record) if self.vendor == Vendor::Vpsbg && body.is_none() => {
+            Credential::VpsbgToken(record) if self.vendor == Vendor::Vpsbg => {
                 vpsbg::token_text(record.token.0.as_bytes())?;
                 Zeroizing::new(format!("Bearer {}", record.token.0.as_str()))
             }

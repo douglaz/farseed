@@ -695,6 +695,10 @@ pub(crate) trait Api {
     fn take_vpsbg_response(&mut self) -> Option<Zeroizing<Vec<u8>>> {
         None
     }
+    /// Check a full exchange's request/time budget before a durable VPSBG intent.
+    fn vpsbg_mutation_budget(&self) -> Result<(), String> {
+        Err(REFUSED.into())
+    }
     fn response_status(&self) -> u16 {
         200
     }
