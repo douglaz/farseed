@@ -226,10 +226,12 @@ const renderSteps = store => {
   emphasize('store', [$('create'), $('unlock'), $('seed-backup-answer'), $('seed-backup-check'), $('redisplay')]);
   emphasize('credit', [$('credit-invoice'), $('credit-check'), $('credit-configure'), $('poc-inference-form').querySelector('button')]);
   const purchase = store.procurement;
+  const choiceNeeded = providerChoiceNeeded(purchase);
   // A purchase that may be stopped offers Stop first. After a refusal the page offers no other purchase action: the
   // way on is a new machine.
   const machineAction = purchase?.stop ? $('provider-stop')
     : purchase?.phase && providerWait(purchase)?.kind === 'refused' ? null
+    : choiceNeeded ? null
     : !store.provider_configuration?.key_set ? $('provider-catalogue')
     : purchase?.phase === 'email_verification' ? (purchase.email_entered ? $('provider-email-check') : $('provider-email-form').querySelector('button'))
     : purchase?.phase === 'initial_invoice' ? $('provider-invoice')
@@ -1976,6 +1978,8 @@ $('credit-configure').addEventListener('click', () => worker.postMessage({credit
 
 let providerCatalogue = null;
 let providerCompletedMachine = null;
+let providerVendorChoice = null;
+let providerChangingVendor = false;
 let providerMachineTyped = false;
 $('provider-machine').addEventListener('input', () => { providerMachineTyped = true; });
 let providerSelectionDirty = true;
@@ -1984,6 +1988,50 @@ let providerDisplayedBilling = null;
 let providerDisplayedSelection = null;
 let providerDisplayedOrigin = null;
 const providerRequest = action => worker.postMessage({provider_request: action});
+const providerChoiceOpen = purchase => purchase?.vendor_choice_open === true &&
+  Array.isArray(purchase.vendors_available) && ['vpsbg', 'lnvps'].every(vendor => purchase.vendors_available.includes(vendor));
+// Anything other than a known vendor id counts as no choice yet.
+const providerChoice = purchase => ['vpsbg', 'lnvps'].includes(purchase?.vendor_choice) ? purchase.vendor_choice : null;
+const providerChoiceNeeded = purchase => providerChoiceOpen(purchase) && providerChoice(purchase) === null;
+const renderProviderChoice = (purchase, enabled) => {
+  const slot = $('provider-choice');
+  slot.replaceChildren();
+  slot.hidden = !providerChoiceOpen(purchase);
+  if (slot.hidden) return;
+  const smallNote = text => {
+    const line = paragraph(slot, '');
+    const small = document.createElement('small'); small.textContent = text; line.append(small);
+  };
+  if (providerChoiceNeeded(purchase) || providerChangingVendor) {
+    const heading = document.createElement('h3'); heading.textContent = 'Where to rent the machine'; slot.append(heading);
+    for (const [vendor, label, helper] of [
+      ['vpsbg', 'VPSBG (VPS.BG Ltd, Bulgaria)', "You open your own VPSBG account and give this page its API token. You pay into the account's balance over Lightning."],
+      ['lnvps', 'Our own LNVPS', "This page makes a provider account for you. Its key is in this page's saved data, not in your seed backup. You pay each machine's invoice over Lightning."],
+    ]) {
+      const button = document.createElement('button'); button.type = 'button'; button.dataset.vendor = vendor;
+      button.textContent = label; button.disabled = !enabled;
+      button.addEventListener('click', () => {
+        if (vendor === providerChoice(purchase)) {
+          providerChangingVendor = false;
+          renderProviderChoice(purchase, enabled);
+        } else providerRequest({action: 'vendor', vendor});
+      });
+      slot.append(button);
+      smallNote(helper);
+    }
+  } else {
+    const chosen = paragraph(slot, providerChoice(purchase) === 'vpsbg' ? 'Provider: VPSBG.' : 'Provider: our own LNVPS.');
+    chosen.dataset.vendorChosen = providerChoice(purchase);
+    const change = document.createElement('button'); change.type = 'button'; change.dataset.vendorChange = '';
+    change.textContent = 'Change'; change.disabled = !enabled;
+    change.addEventListener('click', () => {
+      providerChangingVendor = true;
+      renderProviderChoice(purchase, enabled);
+    });
+    const small = document.createElement('small'); small.append(change); slot.append(small);
+    smallNote('This choice is saved when you approve a machine. If you reload the page before that, choose again.');
+  }
+};
 const updateProviderResources = () => {
   $('provider-resources-field').hidden = !$('provider-offer').value.startsWith('custom:');
 };
@@ -2076,6 +2124,19 @@ const renderProvider = (store, enabled) => {
     providerMachineTyped = false;
     $('provider-class').value = '';
   }
+  const vendorChoice = providerChoice(purchase);
+  const vendorChoiceChanged = providerVendorChoice !== vendorChoice;
+  providerVendorChoice = vendorChoice;
+  if (!providerChoiceOpen(purchase) || vendorChoiceChanged) providerChangingVendor = false;
+  if (vendorChoiceChanged) {
+    providerCatalogue = null;
+    providerSelectionDirty = true;
+    $('provider-catalogue-view').replaceChildren();
+    $('provider-offer').replaceChildren(new Option('Choose a fetched offer', ''));
+    $('provider-image').replaceChildren(new Option('Choose a fetched image', ''));
+  }
+  renderProviderChoice(purchase, enabled);
+  if (providerChoiceNeeded(purchase)) $('provider-catalogue').disabled = true;
   if ((!purchase.phase || purchase.phase === 'handed_off') && store.state === 'unlocked' &&
       !$('provider-machine').value && !providerMachineTyped) {
     const names = new Set([
