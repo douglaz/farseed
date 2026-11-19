@@ -15,6 +15,7 @@ pub mod delivery;
 pub mod dispatch;
 pub mod goals;
 pub mod harness;
+pub mod hostcert;
 pub mod inference;
 pub mod inference_limits;
 pub mod jobs;
