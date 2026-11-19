@@ -21,8 +21,23 @@ pub const URL: &str = "wss://relay.example.net/";
 pub const HOST: &str = "service.example.net";
 pub const NOW: u64 = 1_800_000_000;
 pub fn signed(challenge: &str, host: &str, port: u16, now: u64, secret: u8) -> Value {
-    tau_web::relay_auth::auth_event(&[secret; 32], URL, challenge, host, port, now, &[0; 32])
-        .unwrap()
+    use k256::schnorr::SigningKey;
+    use sha2::{Digest, Sha256};
+    let key = SigningKey::from_bytes(&[secret; 32]).unwrap();
+    let pubkey = hex::encode(key.verifying_key().to_bytes());
+    let tags = json!([
+        ["relay", URL],
+        ["challenge", challenge],
+        ["destination", host, port.to_string()],
+    ]);
+    let canonical = json!([0, pubkey, now, 22242, tags, ""]);
+    let id: [u8; 32] = Sha256::digest(canonical.to_string().as_bytes()).into();
+    let signature = key.sign_raw(&id, &[0; 32]).unwrap();
+    json!({
+        "id": hex::encode(id), "pubkey": pubkey, "created_at": now,
+        "kind": 22242, "tags": tags, "content": "",
+        "sig": hex::encode(signature.to_bytes()),
+    })
 }
 pub fn key(secret: u8) -> String {
     signed("", HOST, 22, NOW, secret)["pubkey"]
@@ -130,7 +145,7 @@ impl Fixture {
         let relay = Relay {
             url: URL.to_string(),
             policy: policy::Policy::default(),
-            passes: HashMap::from([(pass.key.clone(), pass)]),
+            passes: std::sync::RwLock::new(Arc::new(HashMap::from([(pass.key.clone(), pass)]))),
             resolver: resolver.clone(),
             dialer: dialer.clone(),
             clock: clock.clone(),

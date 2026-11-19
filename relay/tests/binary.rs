@@ -50,7 +50,11 @@ impl Files {
             format!(
                 "[[passes]]\nkey={:?}\nhosts=[{:?}]\nexpiry={expiry}\nrevoked={revoked}\n",
                 key(secret),
-                hosts
+                if secret == 7 {
+                    hosts.to_owned()
+                } else {
+                    format!("pass-{secret}.example.net")
+                }
             )
         })
         .collect::<String>();
@@ -91,6 +95,16 @@ async fn dns() -> (
     Arc<AtomicUsize>,
     JoinHandle<()>,
 ) {
+    dns_with_startup_gate(None).await
+}
+async fn dns_with_startup_gate(
+    gate: Option<Arc<tokio::sync::Notify>>,
+) -> (
+    std::net::SocketAddr,
+    Arc<AtomicBool>,
+    Arc<AtomicUsize>,
+    JoinHandle<()>,
+) {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let address = socket.local_addr().unwrap();
     let private = Arc::new(AtomicBool::new(false));
@@ -102,7 +116,11 @@ async fn dns() -> (
             let mut packet = [0; 4096];
             loop {
                 let (n, peer) = socket.recv_from(&mut packet).await.unwrap();
-                queries.fetch_add(1, Ordering::SeqCst);
+                if queries.fetch_add(1, Ordering::SeqCst) == 0
+                    && let Some(gate) = &gate
+                {
+                    gate.notified().await;
+                }
                 let mut reply = packet[..n].to_vec();
                 reply[2] = 0x81;
                 reply[3] = 0x80;
@@ -295,4 +313,230 @@ fn fixture_json_contracts() {
     assert_eq!(dial, refused("dial"));
     let challenge: Value = serde_json::from_str(include_str!("vectors/challenge.json")).unwrap();
     assert_eq!(challenge["relay"], URL);
+}
+
+#[tokio::test]
+async fn sighup_reads_bounded_files_preserves_old_passes_and_logs_exact_outcomes() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dns, private, _queries, dns_task) = dns().await;
+    let files = Files::new("127.0.0.1:0", dns, HOST);
+    let child = Command::new(env!("CARGO_BIN_EXE_tau-relay"))
+        .arg(&files.config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut process = Process { child };
+    let stdout = process.child.stdout.take().unwrap();
+    let (mut stdout, line) = tokio::task::spawn_blocking(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        (reader, line)
+    })
+    .await
+    .unwrap();
+    let address = line.strip_prefix("listening ").unwrap().trim();
+    let stderr = process.child.stderr.take().unwrap();
+    let (lines, mut logged) = tokio::sync::mpsc::unbounded_channel();
+    let log_task = tokio::task::spawn_blocking(move || {
+        let mut all = String::new();
+        for line in BufReader::new(stderr).lines() {
+            let line = line.unwrap();
+            all.push_str(&line);
+            all.push('\n');
+            lines.send(line).unwrap();
+        }
+        all
+    });
+    let hup = || {
+        // SAFETY: signal only the child owned by this fixture, which is not reaped yet.
+        assert_eq!(
+            unsafe { libc::kill(process.child.id() as libc::pid_t, libc::SIGHUP) },
+            0
+        );
+    };
+    let record = |host: &str| {
+        format!(
+            "[[passes]]\nkey={:?}\nhosts=[{host:?}]\nexpiry={}\n",
+            key(7),
+            now() + 10000
+        )
+    };
+    hup();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), logged.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "pass reload applied: 3 passes, 1 in force"
+    );
+    let new_host = "new.example.net";
+    std::fs::write(&files.passes, record(new_host)).unwrap();
+    hup();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), logged.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "pass reload applied: 1 passes, 1 in force"
+    );
+    std::fs::write(&files.passes, "[[passes]").unwrap();
+    hup();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), logged.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        tau_relay::RELOAD_REFUSED
+    );
+    private.store(true, Ordering::SeqCst);
+    for (host, reason) in [(HOST, "destination"), (new_host, "address")] {
+        let (mut ws, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/v1/tcp/{host}/22"))
+                .await
+                .unwrap();
+        let c = challenge(&mut ws).await;
+        send(&mut ws, signed(&c, host, 22, now(), 7)).await;
+        verdict(&mut ws, refused(reason)).await;
+        closed(&mut ws, 1008).await;
+    }
+    let bad_files = [
+        record("10.1.2.3"),
+        record("1.1.1.1"),
+        record("9.9.9.9") + &record("8.8.8.8"),
+        record("9.9.9.9") + &record("9.9.9.9").replace(&key(7), &key(8)),
+        String::from_utf8(vec![b' '; tau_relay::PocLimits::FILE as usize + 1]).unwrap(),
+    ];
+    let mut refusals = 1;
+    for contents in bad_files {
+        std::fs::write(&files.passes, contents).unwrap();
+        hup();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), logged.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            tau_relay::RELOAD_REFUSED
+        );
+        refusals += 1;
+    }
+    std::fs::write(&files.passes, [0xff]).unwrap();
+    hup();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), logged.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        tau_relay::RELOAD_REFUSED
+    );
+    refusals += 1;
+    std::fs::remove_file(&files.passes).unwrap();
+    hup();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(3), logged.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        tau_relay::RELOAD_REFUSED
+    );
+    refusals += 1;
+    // Restore the fixture for cleanup, with ordinary fixture permissions.
+    std::fs::write(&files.passes, "passes=[]").unwrap();
+    std::fs::set_permissions(&files.passes, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (mut ws, _) =
+        tokio_tungstenite::connect_async(format!("ws://{address}/v1/tcp/{new_host}/22"))
+            .await
+            .unwrap();
+    let c = challenge(&mut ws).await;
+    send(&mut ws, signed(&c, new_host, 22, now(), 7)).await;
+    verdict(&mut ws, refused("address")).await;
+    closed(&mut ws, 1008).await;
+    process.child.kill().unwrap();
+    process.child.wait().unwrap();
+    let mut rest = String::new();
+    stdout.read_to_string(&mut rest).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(
+        log_task.await.unwrap(),
+        "pass reload applied: 3 passes, 1 in force\npass reload applied: 1 passes, 1 in force\n"
+            .to_owned()
+            + &format!("{}\n", tau_relay::RELOAD_REFUSED).repeat(refusals)
+    );
+    dns_task.abort();
+    let _ = dns_task.await;
+}
+
+#[tokio::test]
+async fn sighup_during_startup_dns_is_held_until_listening_and_applied_once() {
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let (dns, _private, queries, dns_task) = dns_with_startup_gate(Some(gate.clone())).await;
+    let files = Files::new("127.0.0.1:0", dns, HOST);
+    let child = Command::new(env!("CARGO_BIN_EXE_tau-relay"))
+        .arg(&files.config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut process = Process { child };
+    let stdout = process.child.stdout.take().unwrap();
+    let stdout_task = tokio::task::spawn_blocking(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        (reader, line)
+    });
+    let stderr = process.child.stderr.take().unwrap();
+    let stderr_task = tokio::task::spawn_blocking(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        (reader, line)
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while queries.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !stdout_task.is_finished(),
+        "startup DNS must precede listening"
+    );
+    // SAFETY: signal only the child owned by this fixture, before it is reaped.
+    assert_eq!(
+        unsafe { libc::kill(process.child.id() as libc::pid_t, libc::SIGHUP) },
+        0
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(process.child.try_wait().unwrap().is_none());
+    assert!(!stdout_task.is_finished());
+    assert!(!stderr_task.is_finished());
+    gate.notify_one();
+    let (mut stdout, listening) = tokio::time::timeout(Duration::from_secs(3), stdout_task)
+        .await
+        .unwrap()
+        .unwrap();
+    let address = listening.strip_prefix("listening ").unwrap().trim();
+    let (mut stderr, outcome) = tokio::time::timeout(Duration::from_secs(3), stderr_task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome, "pass reload applied: 3 passes, 1 in force\n");
+    assert_eq!(queries.load(Ordering::SeqCst), 12);
+    assert!(process.child.try_wait().unwrap().is_none());
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{address}/v1/tcp/{HOST}/22"))
+        .await
+        .unwrap();
+    challenge(&mut ws).await;
+    process.child.kill().unwrap();
+    process.child.wait().unwrap();
+    let mut rest = String::new();
+    stdout.read_to_string(&mut rest).unwrap();
+    assert!(rest.is_empty());
+    stderr.read_to_string(&mut rest).unwrap();
+    assert!(rest.is_empty(), "exactly one startup reload outcome");
+    dns_task.abort();
+    let _ = dns_task.await;
 }

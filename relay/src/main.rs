@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
-use tau_relay::{PocLimits, Relay};
+use tau_relay::{Relay, read_bounded};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,20 +15,9 @@ struct Config {
     dns_server: SocketAddr,
     own_public: Vec<IpAddr>,
 }
-fn read_bounded(path: &std::path::Path) -> Result<String, &'static str> {
-    use std::io::Read;
-    let mut text = String::new();
-    std::fs::File::open(path)
-        .map_err(|_| "cannot read configuration")?
-        .take(PocLimits::FILE + 1)
-        .read_to_string(&mut text)
-        .map_err(|_| "cannot read configuration")?;
-    if text.len() as u64 > PocLimits::FILE {
-        return Err("configuration too large");
-    }
-    Ok(text)
-}
 async fn run() -> Result<(), &'static str> {
+    let hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        .map_err(|_| "cannot register reload signal")?;
     let mut args = std::env::args_os().skip(1);
     let path = args.next().ok_or("usage: tau-relay CONFIG.toml")?;
     if args.next().is_some() {
@@ -75,7 +64,7 @@ async fn run() -> Result<(), &'static str> {
     let relay = Arc::new(Relay {
         url: config.public_url,
         policy,
-        passes,
+        passes: std::sync::RwLock::new(Arc::new(passes)),
         resolver,
         dialer: Arc::new(tau_relay::NetworkDialer),
         clock: Arc::new(tau_relay::SystemClock::default()),
@@ -85,13 +74,17 @@ async fn run() -> Result<(), &'static str> {
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .map_err(|_| "cannot bind listener")?;
+    let (files, receiver) = tokio::sync::mpsc::channel(tau_relay::PocLimits::RELOAD_QUEUE);
+    let reload = tau_relay::reload_pass_files(relay.clone(), receiver);
+    let signals = tau_relay::capture_pass_files(hangup, config.pass_file, files);
     println!(
         "listening {}",
         listener.local_addr().map_err(|_| "cannot read listener")?
     );
-    tau_relay::serve(listener, relay)
-        .await
-        .map_err(|_| "listener failed")
+    tokio::select! {
+        result = tau_relay::serve(listener, relay) => result.map_err(|_| "listener failed"),
+        _ = async { tokio::join!(signals, reload); } => Err("reload signal failed"),
+    }
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() {

@@ -14,7 +14,7 @@ use std::{
     io,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -79,6 +79,7 @@ impl PocLimits {
     pub const SWEEP: Duration = Duration::from_secs(1);
     pub const CLOSE: Duration = Duration::from_secs(1);
     pub const QUEUE: usize = 4;
+    pub const RELOAD_QUEUE: usize = 4;
     pub const DNS_PACKET: usize = 4096;
     pub const DNS_ANSWERS: u16 = 64;
     pub const DNS_POINTER_STEPS: usize = 128;
@@ -125,7 +126,7 @@ impl Default for Timing {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pass {
     pub key: String,
@@ -149,6 +150,7 @@ pub async fn load_passes(
         return Err("too many passes");
     }
     let mut passes = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
     for pass in file.passes {
         if pass.key.len() != 64
             || !pass
@@ -165,9 +167,8 @@ pub async fn load_passes(
         {
             return Err("invalid pass record");
         }
-        let mut seen = std::collections::HashSet::new();
         for host in &pass.hosts {
-            if !policy::host_valid(host) || !seen.insert(host) {
+            if !policy::host_valid(host) || !seen.insert(host.clone()) {
                 return Err("invalid recorded host");
             }
             checked_address(host, 1, policy, resolver)
@@ -179,6 +180,64 @@ pub async fn load_passes(
         }
     }
     Ok(passes)
+}
+
+pub fn read_bounded(path: &std::path::Path) -> Result<String, &'static str> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .map_err(|_| "cannot read configuration")?
+        .take(PocLimits::FILE + 1)
+        .read_to_string(&mut text)
+        .map_err(|_| "cannot read configuration")?;
+    if text.len() as u64 > PocLimits::FILE {
+        return Err("configuration too large");
+    }
+    Ok(text)
+}
+
+pub const RELOAD_REFUSED: &str = "pass reload refused";
+
+/// Wait for queue space before reading a revision; pending signals may coalesce.
+pub async fn capture_pass_files(
+    mut hangup: tokio::signal::unix::Signal,
+    path: std::path::PathBuf,
+    files: tokio::sync::mpsc::Sender<Result<String, &'static str>>,
+) {
+    while hangup.recv().await.is_some() {
+        let Ok(slot) = files.reserve().await else {
+            return;
+        };
+        slot.send(read_bounded(&path));
+    }
+}
+
+/// Validate queued file snapshots completely and in receipt order.
+pub async fn reload_pass_files(
+    relay: Arc<Relay>,
+    mut files: tokio::sync::mpsc::Receiver<Result<String, &'static str>>,
+) {
+    while let Some(file) = files.recv().await {
+        let result = match file {
+            Ok(text) => relay.reload_passes(&text).await,
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => {
+                let passes = relay.passes.read().expect("passes lock");
+                let now = relay.clock.wall();
+                let in_force = passes
+                    .values()
+                    .filter(|pass| !pass.revoked && now < pass.expiry)
+                    .count();
+                eprintln!(
+                    "pass reload applied: {} passes, {in_force} in force",
+                    passes.len()
+                );
+            }
+            Err(_) => eprintln!("{RELOAD_REFUSED}"),
+        }
+    }
 }
 async fn checked_address(
     host: &str,
@@ -229,7 +288,7 @@ impl Pace {
 pub struct Relay {
     pub url: String,
     pub policy: Policy,
-    pub passes: HashMap<String, Pass>,
+    pub passes: RwLock<Arc<HashMap<String, Pass>>>,
     pub resolver: Arc<dyn Resolver>,
     pub dialer: Arc<dyn Dialer>,
     pub clock: Arc<dyn Clock>,
@@ -237,6 +296,12 @@ pub struct Relay {
     pub pace: Mutex<Pace>,
 }
 impl Relay {
+    pub async fn reload_passes(&self, text: &str) -> Result<(), &'static str> {
+        let passes = load_passes(text, &self.policy, self.resolver.as_ref()).await?;
+        *self.passes.write().expect("passes lock") = Arc::new(passes);
+        Ok(())
+    }
+
     pub async fn admit(
         &self,
         auth: &auth::Auth,
@@ -249,8 +314,8 @@ impl Relay {
         {
             return Err("auth");
         }
-        let pass = self
-            .passes
+        let passes = self.passes.read().expect("passes lock").clone();
+        let pass = passes
             .get(&auth.pubkey)
             .filter(|p| !p.revoked && self.clock.wall() < p.expiry)
             .ok_or("pass")?;

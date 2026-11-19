@@ -19,7 +19,8 @@ own_public = ["203.0.113.10"]
 The exact URL, including its slash, appears in the challenge and must match AUTH.
 The listener must be loopback. The one startup line reports its actual address,
 including when port zero is requested. Configuration errors contain no record
-values. Connections write nothing to stdout, stderr or files.
+values. Connections write nothing to stdout, stderr or files. Each completed pass
+reload writes one outcome line to stderr, as described below.
 
 The pass file is TOML:
 
@@ -32,12 +33,41 @@ revoked = false
 ```
 
 Expiry is a required Unix timestamp in seconds. Keys must be valid curve points;
-unknown fields, duplicate keys/hosts and invalid hosts are refused. Every host is
-admitted at registration, even in an expired or revoked record, and checked again
+unknown fields, duplicate keys/hosts (including a host on two passes) and invalid
+hosts are refused. Every host is admitted at registration, even in an expired or
+revoked record, and checked again
 on every attempt. Empty files use `passes = []`. Registration of a forbidden
 literal, failing DNS, or any forbidden DNS answer prevents startup. All ports on a
-recorded host are eligible. Restart to apply pass changes; a restart ends existing
-sessions. There are no purchase, recording or signed revocation endpoints.
+recorded host are eligible. There are no purchase, recording or signed revocation
+endpoints.
+
+Replace the configured pass file atomically (write a temporary file, then rename
+it over the configured file) and send SIGHUP (`systemctl reload tau-relay`) to
+apply pass changes. File snapshots are bounded to 256 KiB. The FIFO queue holds at
+most four snapshots, plus the one being validated. When full, the signal task
+waits for space before reading the file; further signals can coalesce meanwhile.
+Already queued snapshots are never dropped. Snapshots are validated fully and in
+order using the startup TOML schema,
+curve-point keys, required expiry, duplicate checks, 128-pass/16-host caps and the
+same address policy and DNS registration checks, including own-address exclusions.
+A read or validation failure keeps the previous complete set and writes only
+`pass reload refused` to stderr, with no record values or paths. Success atomically
+replaces the whole set and writes exactly `pass reload applied: N passes, M in force`,
+where N is the number of loaded records and M excludes revoked records and records
+expired at that moment. Neither outcome includes keys, hosts or paths. An expired
+or revoked pass may load, but admits no new session. A SIGHUP received during startup
+is held and processed as one reload after startup.
+
+Admissions take one complete pass-set snapshot; admissions already checking DNS
+may finish against their earlier snapshot. New admissions use the published set.
+Open sessions keep relaying under their original limits even when their pass is
+dropped, revoked or expires: /v1 has no signed revocation mechanism. To cut existing
+sessions, restart the relay; a restart ends existing sessions. Pacing for
+each (pass key, host) survives reloads, including unsuccessful reloads; timestamps
+continue to expire by the normal sweep. Updating interface or NAT inventory still
+requires a restart. As with other Unix standard signals, the OS can coalesce
+SIGHUPs before they are observed; wait for the reload outcome line before replacing
+the file again when every intermediate revision must be applied.
 
 The numeric DNS endpoint is an explicit operator choice; a loopback stub resolver
 is supported. The bounded UDP stub queries A, then AAAA, with fresh transaction
@@ -99,9 +129,9 @@ Build and test from the workspace root with `cargo test --locked -p tau-relay`.
 Tests honor `TMPDIR` when supplied; otherwise scratch uses Cargo's target test
 directory. Each test creates and removes its own randomly named directory. All network
 fixtures stay on loopback; public addresses are synthetic policy/dialer inputs.
-The root package is a test-only signing dependency. The release dependency graph
-has no TLS stack or C build step; libc supplies interface enumeration through the
-target runtime.
+Test fixtures sign with the crate's existing crypto dependency. The release
+dependency graph has no TLS stack or C build step; libc supplies interface
+enumeration through the target runtime.
 
 For a static release, supply an isolated Rust installation containing the
 `x86_64-unknown-linux-musl` target, and run `relay/build-static.sh`. `CARGO` can

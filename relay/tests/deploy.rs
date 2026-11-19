@@ -148,3 +148,37 @@ fn generated_ssh_options_parse_as_one_literal_known_hosts_file() {
         Some("globalknownhostsfile /dev/null")
     );
 }
+
+#[test]
+fn dry_run_preserves_reload_unit_for_static_validation() {
+    use base64::Engine;
+    let output = Command::new("/usr/bin/python3")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/deploy/deploy.py"))
+        .args(args())
+        .env("PATH", "/nonexistent")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let script = String::from_utf8(output.stdout).unwrap();
+    let mut lines = script.lines();
+    let mut unit = None;
+    while let Some(line) = lines.next() {
+        if line == "base64 -d > /etc/systemd/system/tau-relay.service.new <<'RELAY_PAYLOAD'" {
+            unit = Some(
+                String::from_utf8(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(lines.next().unwrap())
+                        .unwrap(),
+                )
+                .unwrap(),
+            );
+            break;
+        }
+    }
+    let unit = unit.expect("service payload");
+    assert!(
+        unit.lines()
+            .any(|line| line == "ExecReload=/bin/kill -HUP $MAINPID")
+    );
+    assert!(script.contains("systemd-analyze verify /etc/systemd/system/tau-relay.service"));
+}

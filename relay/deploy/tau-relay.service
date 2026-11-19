@@ -8,6 +8,7 @@ Wants=network-online.target
 User=tau-relay
 Group=tau-relay
 ExecStart=/usr/local/bin/tau-relay /etc/tau-relay/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes

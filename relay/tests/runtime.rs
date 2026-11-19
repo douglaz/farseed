@@ -66,10 +66,14 @@ async fn every_admission_refusal_stops_before_later_stages() {
     ] {
         let mut f = Fixture::new();
         if reason == "pass" {
-            f.relay.passes.clear();
+            Arc::make_mut(f.relay.passes.get_mut().unwrap()).clear();
         }
         if reason == "destination" {
-            f.relay.passes.get_mut(&key(7)).unwrap().hosts.clear();
+            Arc::make_mut(f.relay.passes.get_mut().unwrap())
+                .get_mut(&key(7))
+                .unwrap()
+                .hosts
+                .clear();
         }
         if reason == "address" {
             *f.resolver.ips.lock().unwrap() = Some(vec!["127.0.0.1".parse().unwrap()]);
@@ -127,14 +131,23 @@ async fn signature_shape_skew_expiry_and_first_failure_boundaries() {
             .prune(Duration::MAX, &f.relay.timing);
     }
     let auth: auth::Auth = serde_json::from_value(signed("c", HOST, 22, NOW, 7)).unwrap();
-    f.relay.passes.get_mut(&key(7)).unwrap().expiry = NOW;
+    Arc::make_mut(f.relay.passes.get_mut().unwrap())
+        .get_mut(&key(7))
+        .unwrap()
+        .expiry = NOW;
     assert_eq!(f.relay.admit(&auth, "c", &dest).await, Err("pass"));
-    f.relay.passes.get_mut(&key(7)).unwrap().expiry = NOW + 1;
-    f.relay.passes.get_mut(&key(7)).unwrap().revoked = true;
+    Arc::make_mut(f.relay.passes.get_mut().unwrap())
+        .get_mut(&key(7))
+        .unwrap()
+        .expiry = NOW + 1;
+    Arc::make_mut(f.relay.passes.get_mut().unwrap())
+        .get_mut(&key(7))
+        .unwrap()
+        .revoked = true;
     assert_eq!(f.relay.admit(&auth, "c", &dest).await, Err("pass"));
     let mut bad = auth.clone();
     bad.kind = 0;
-    f.relay.passes.clear();
+    Arc::make_mut(f.relay.passes.get_mut().unwrap()).clear();
     assert_eq!(f.relay.admit(&bad, "wrong", &dest).await, Err("auth"));
     assert_eq!(f.relay.admit(&auth, "wrong", &dest).await, Err("auth"));
     assert!(f.dialer.addresses.lock().unwrap().is_empty());
