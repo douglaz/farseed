@@ -3,7 +3,7 @@
 Goal template 1, "Control center". Generated from the control-center sources; edit those, not this file.
 
 The ways in: **T3 Code with T3 Connect** (main), **WireGuard** (second), **Tor** (optional, off unless the user
-turns it on). tau-web gives the AI the **Header** and **Facts** with every step, the **Declaration** in the
+turns it on). Farseed gives the AI the **Header** and **Facts** with every step, the **Declaration** in the
 declaration phase, and then **one step at a time**. Each step is a **Do** block, sometimes a **Wait** block, and a
 **Check** whose last line is `CHECKS <part> PASS` or `FAIL`.
 
@@ -13,7 +13,7 @@ declaration phase, and then **one step at a time**. Each step is a **Do** block,
 
 You are building the user's control center on this NixOS machine. Follow the step below exactly.
 
-1. Run each block of the step as one command, exactly as written: by name with `run_step_block`, and tau-web then
+1. Run each block of the step as one command, exactly as written: by name with `run_step_block`, and Farseed then
    fills in the words in CAPITALS itself. Only if `run_step_block` isn't offered, copy the block out and replace
    only the CAPITALS words the step names, with their values.
 2. Never print a secret. Don't cat, echo or grep the files in /var/lib/control-center, except files ending in
@@ -25,37 +25,37 @@ You are building the user's control center on this NixOS machine. Follow the ste
    output `control`, in the background). Never change SSH settings or host keys. (Step 3 adding the user's own
    public key from `USER_SSH_KEY` is not an SSH settings change.)
 6. Run every Check block exactly as written and alone: nothing before or after it in the same command, not even
-   an echo. tau-web counts a step as passed only when the check's `CHECKS ... PASS` line is the last line of the
+   an echo. Farseed counts a step as passed only when the check's `CHECKS ... PASS` line is the last line of the
    command's output. On FAIL, do what "If it fails" says, at most twice. If it still fails, stop and report the
    FAIL lines and the step number.
-7. If tau-web sends you the same step again after that step's own Check printed PASS while it was the step
-   tau-web had sent you, run that step's Check block alone, once more, and nothing else. A PASS from before
-   tau-web sent the step doesn't count: do the whole step as written. Never explore instead: don't look for
-   other steps' text, read package sources, check ports, or build anything a step doesn't ask for. tau-web sends
+7. If Farseed sends you the same step again after that step's own Check printed PASS while it was the step
+   Farseed had sent you, run that step's Check block alone, once more, and nothing else. A PASS from before
+   Farseed sent the step doesn't count: do the whole step as written. Never explore instead: don't look for
+   other steps' text, read package sources, check ports, or build anything a step doesn't ask for. Farseed sends
    the next step itself.
 8. Commands already run as root. Keep output short: only the first 8 KiB of output comes back, and the
    scripts print only what matters.
 9. Change the `cc-*.nix` files, the two scripts and the user's files (Step 11 writes them) only by running a
    step's Do block. A FAIL line that ends with `(needs the user: ask_operator)` can only be fixed by the user:
    ask with `ask_operator`, wait for the answer, then run that step's Wait and Check again. Don't work around it.
-10. When tau-web says every step passed, call `done` with `urls`: `https://app.t3.codes` (label `T3 Code`),
+10. When Farseed says every step passed, call `done` with `urls`: `https://app.t3.codes` (label `T3 Code`),
     `http://10.88.0.1:9119/` (label `Hermes dashboard over WireGuard`), and, if Tor is on, the onion address from
     app-url.txt (label `Hermes dashboard over Tor`). If the final check printed `T3 Code: not linked yet`, leave
     `https://app.t3.codes` out of `urls` completely: the machine isn't linked, so that address can't reach it yet.
-11. Do only the step tau-web sent you, as its text says. Never start a later step early, and never write your
-    own version of a step's block or file (a `cc-*.nix` file, for example): tau-web sends each step's exact blocks
+11. Do only the step Farseed sent you, as its text says. Never start a later step early, and never write your
+    own version of a step's block or file (a `cc-*.nix` file, for example): Farseed sends each step's exact blocks
     when that step's turn comes.
 
-## Facts (tau-web fills these in)
+## Facts (Farseed fills these in)
 
 - `MACHINE_ADDRESS`: the public IPv4 address or DNS name the user's devices reach this machine at, the same one
-  tau-web uses for SSH.
+  Farseed uses for SSH.
 - `AI_BASE_URL`: the AI endpoint URL for the agent, ending in `/v1`.
 - `AI_MODEL`: the model name for the agent.
 - `TOR`: `yes` if the user turned on Tor, otherwise `no`. Step 10 runs only on `yes`.
 - `USER_SSH_KEY`: the user's own SSH public key (one line), or empty. It lets the user log in to the machine
   directly.
-- The AI key itself is never a fact: in Step 4 you ask for it with `request_ai_key`, and tau-web saves it in a
+- The AI key itself is never a fact: in Step 4 you ask for it with `request_ai_key`, and Farseed saves it in a
   file on this machine whose path the reply gives.
 
 ## Declaration
@@ -349,7 +349,7 @@ The final check repeats this hash check, so an edited script fails the whole goa
 This writes the flake (pinned to the nixpkgs revision the machine already runs, plus Hermes Agent), the base
 module (tools, and the user's own SSH key if there is one), the `extra/` loader, and empty modules that later
 steps fill in. The first line takes the `USER_SSH_KEY` fact inside its quotes (empty quotes, `KEY=''`, when the
-fact is empty); tau-web fills it in when you run the block by name.
+fact is empty); Farseed fills it in when you run the block by name.
 The base module also turns off the name-resolution extras (LLMNR on port 5355, mDNS), so port 5355 stops
 listening after this step's rebuild; the check confirms it. Nothing else is needed about it.
 
@@ -401,7 +401,7 @@ in
   environment.systemPackages = with pkgs; [ git curl jq wireguard-tools ];
   # No name-resolution listeners beyond the local DNS stub (127.0.0.53 and 127.0.0.54, port 53).
   services.resolved.settings.Resolve = { LLMNR = false; MulticastDNS = false; };
-  # tau-web's binary cache: Hermes Agent and T3 Code prebuilt for these exact pins, signed with this public key.
+  # Farseed's binary cache: Hermes Agent and T3 Code prebuilt for these exact pins, signed with this public key.
   # If the cache can't be reached, nix builds from source instead (slower, never a failure).
   nix.settings = {
     extra-substituters = [ "https://app.poc.asf0.org/images/nix-cache" ];
@@ -462,7 +462,7 @@ minute and run the Do block again. On `REBUILD FAILED`, see **Recovery R1**.
 
 First call `request_ai_key` with application `Hermes Agent` and purpose `The control center's own AI agent`.
 The user approves it on a card. The reply gives the path of the key file on this machine. The Do block's first
-line takes that path in place of `AI_KEY_PATH`; tau-web fills it in when you run the block by name. All values go
+line takes that path in place of `AI_KEY_PATH`; Farseed fills it in when you run the block by name. All values go
 only into files, and nothing here prints them.
 
 **Do**
@@ -494,7 +494,7 @@ sh /etc/nixos/cc-check.sh keys
 Expect `CHECKS keys PASS`.
 
 **If it fails:** `install: cannot stat` means no key file is at that path. Run the Do block again by name, so
-tau-web fills in the path from the `request_ai_key` reply; if it fails the same way, call `request_ai_key` again,
+Farseed fills in the path from the `request_ai_key` reply; if it fails the same way, call `request_ai_key` again,
 then run the Do block again. The block never overwrites a WireGuard key or password that already exists, so
 running it again is safe.
 
@@ -502,7 +502,7 @@ running it again is safe.
 
 ## Step 5: Hermes Agent with its web dashboard
 
-The first two lines take the `AI_BASE_URL` and `AI_MODEL` facts inside their quotes; tau-web fills them in when
+The first two lines take the `AI_BASE_URL` and `AI_MODEL` facts inside their quotes; Farseed fills them in when
 you run the block by name. The first Hermes build downloads and builds a lot: **expect 5 minutes, and up to 40
 on a slow network.** Keep running the Wait block until it says REBUILD OK or REBUILD FAILED. Do nothing else
 meanwhile.
@@ -663,7 +663,7 @@ cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
     # ZMQ is on from the start, so adding Lightning later never changes Core's config (no restart, no re-check).
     # checklevel=1: the startup check still reads the last 6 blocks and checks their validity, but skips the undo
     # and chainstate-disconnect levels, which on a small machine's disk take many minutes.
-    # addnode: one reliable peer that serves blocks at once (tau-web's own node), so a silent peer can't hold the next
+    # addnode: one reliable peer that serves blocks at once (Farseed's own node), so a silent peer can't hold the next
     # block while the node catches up after the copy.
     extraConfig = ''
       rpccookieperms=group
@@ -1216,7 +1216,7 @@ Expect `CHECKS tor PASS`. The check waits up to a minute for Tor to make the oni
 
 ## Step 11: The user's files
 
-The Do block takes the `MACHINE_ADDRESS` fact (an IP address or a name, without a port); tau-web fills it in
+The Do block takes the `MACHINE_ADDRESS` fact (an IP address or a name, without a port); Farseed fills it in
 when you run the block by name.
 
 **Do**
@@ -1339,7 +1339,7 @@ lines that the wait command printed.
   `git -C /etc/nixos add -A`, then start the rebuild again.
 - `syntax error` or `undefined variable` in `cc-*.nix`: the file was mistyped. Run that step's Do block again
   exactly.
-- `assertion ... failed` or `The option ... does not exist`: report the line to tau-web and stop. Don't invent
+- `assertion ... failed` or `The option ... does not exist`: report the line to Farseed and stop. Don't invent
   options.
 - `No space left on device`: run `nix-collect-garbage --delete-older-than 7d`, then start the rebuild again.
 - Anything else: run the step's Do block once more. If it fails again, undo that step's file with
@@ -1387,4 +1387,4 @@ When the user asks for more software or a service:
 
 ## Launching further machines
 
-Not in this version. The decided shape: the agent prepares an order, and the user approves and pays it in tau-web.
+Not in this version. The decided shape: the agent prepares an order, and the user approves and pays it in Farseed.

@@ -502,12 +502,12 @@ pub fn judge_with_files(
                         )
                     } else {
                         format!(
-                            "{url} answered with HTTP {code} instead of the app's page, so tau-web could not check that it asks for sign-in."
+                            "{url} answered with HTTP {code} instead of the app's page, so Farseed could not check that it asks for sign-in."
                         )
                     }
                 }
                 Some(_) => format!(
-                    "{url} could not be visited from the machine, so tau-web could not check that it asks for sign-in."
+                    "{url} could not be visited from the machine, so Farseed could not check that it asks for sign-in."
                 ),
             };
             finding(&mut sign_in, detail);

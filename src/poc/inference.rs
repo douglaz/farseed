@@ -976,7 +976,7 @@ fn request_context<S: Storage>(
             if include_handover {
                 messages.push(json!({"role":"user", "content":handover}));
             }
-            messages.push(json!({"role":"user", "content":format!("For an application the operator asked for that needs its own AI access, call request_ai_key with a short plain application name and purpose, never for your own use and never with a secret; after the operator presses Create key on its card, tau-web creates an application inference key capped at {} USD, expiring in 30 days, and saves it on the machine at the path in the reply, which also gives the chat-completions API base URL to configure the application with. The key outlives this session; use the file, never print the key, and never ask the operator for keys.", super::credit::AI_KEY_CAP)}));
+            messages.push(json!({"role":"user", "content":format!("For an application the operator asked for that needs its own AI access, call request_ai_key with a short plain application name and purpose, never for your own use and never with a secret; after the operator presses Create key on its card, Farseed creates an application inference key capped at {} USD, expiring in 30 days, and saves it on the machine at the path in the reply, which also gives the chat-completions API base URL to configure the application with. The key outlives this session; use the file, never print the key, and never ask the operator for keys.", super::credit::AI_KEY_CAP)}));
             let mut offered: Vec<_> = definitions.as_array().expect("tool definitions").iter()
                 .filter(|d| matches!(d["name"].as_str(), Some("exec" | "done")))
                 .map(|d| {
@@ -1015,7 +1015,7 @@ fn request_context<S: Storage>(
                 .map(|command| json!({"machine":command.machine,"command":command.command}))
                 .collect();
             messages.push(json!({"role":"user","content":format!(
-                "These commands the owner chose to run again still need to run: {}. tau-web already made its one product re-issue and will not send them again by itself. Run the identical command bytes on the same machine to meet each obligation, then call done. Delivered is blocked while any remain unmet.",
+                "These commands the owner chose to run again still need to run: {}. Farseed already made its one product re-issue and will not send them again by itself. Run the identical command bytes on the same machine to meet each obligation, then call done. Delivered is blocked while any remain unmet.",
                 serde_json::to_string(&commands).map_err(|_| "unmet command encoding")?,
             )}));
         }

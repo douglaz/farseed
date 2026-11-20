@@ -3,7 +3,7 @@ use super::*;
 use crate::dispatch::{CallState, Continuation, DispositionRecord};
 use crate::jobs::{Record as JobRecord, State};
 
-pub(crate) const UNSENT_RERUN: &str = "tau-web has not sent this command yet, so It already ran is not available; Resume sends it once.";
+pub(crate) const UNSENT_RERUN: &str = "Farseed has not sent this command yet, so It already ran is not available; Resume sends it once.";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

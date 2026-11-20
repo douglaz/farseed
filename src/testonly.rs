@@ -337,6 +337,7 @@ pub(crate) fn poc_model_next(
             crate::goals::Tool::Done {
                 machine: machine.into(),
                 checks: vec![],
+                urls: vec![],
             }
         };
         Some((format!("fixture-call-{count}"), tool, None))

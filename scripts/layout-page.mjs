@@ -404,7 +404,7 @@ export async function deliveryLayout(c) {
  await inject(clean);await act({action:'check'});
  await act({action:'application',name:'Example application'});
  const baseline=JSON.parse(await readFile(new URL('./layout-controls.json',import.meta.url)));
- const exact=[baseline.fixtureLimit,"Delivered covers the declared machine state and the fixed lockdown checks.","Example application is an AI that acts on this server by itself. tau-web's promises cover what tau-web's AI does, not what Example application does.","It does not mean Example application works","Checks the AI wrote — not part of Delivered"];
+ const exact=[baseline.fixtureLimit,"Delivered covers the declared machine state and the fixed lockdown checks.","Example application is an AI that acts on this server by itself. Farseed's promises cover what Farseed's AI does, not what Example application does.","It does not mean Example application works","Checks the AI wrote — not part of Delivered"];
  const visibleText=()=>c.evaluate("document.querySelector('[data-delivery-card=\"machine-a\"]').innerText");
  c.check(await c.evaluate("document.querySelectorAll('[data-delivery-card=\"machine-a\"] details > pre[data-raw-json]').length>0"),'recorded reports remain present inside Details');
  let text=await visibleText();for(const sentence of exact)assert.ok(text.includes(sentence),`delivery qualification: ${sentence}`);
