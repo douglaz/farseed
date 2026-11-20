@@ -390,6 +390,181 @@ const render = (store, forceRender = false) => {
     focused.focus({preventScroll: true});
     if (Number.isInteger(selection[0])) focused.setSelectionRange(...selection);
   }
+  renderProgress(store);
+};
+
+const renderProgress = (store) => {
+  const list = $('progress');
+  list.replaceChildren();
+  list.hidden = store.state === undefined || ['starting', 'working', 'locking'].includes(store.state);
+  if (list.hidden) return;
+  const rows = [
+    ['store', 'Make your store'],
+    ['credit', 'Buy AI credit'],
+    ['approve', 'Choose and approve the machine'],
+    ['pay', 'Pay for the machine'],
+    ['start', 'Machine starting'],
+    ['setup', 'Setting up'],
+    ['checks', 'Final checks'],
+  ];
+  let done = rows.map(() => false);
+  let skipped = rows.map(() => false);
+  let current = 0;
+  let line = '';
+  let step;
+  if (store.state !== 'unlocked') {
+    line = ({
+      locked: 'Unlock to see where you are.',
+      none: 'Waiting for you: make your store below.',
+      'in-use': 'Waiting for the store to be free. See below.',
+      refused: 'Your store could not be opened. See below.',
+    })[store.state] ?? '';
+  } else {
+    const purchase = store.procurement ?? {};
+    const targets = store.poc_targets ?? [];
+    const target = machine => targets.some(t => t.machine === machine);
+    const liveSessions = (store.sessions ?? []).filter(session => session.session_state !== 'ended');
+    // The list follows one machine: the current purchase's, else a live session's, else the only saved machine.
+    const machine = purchase.machine ?? liveSessions.find(session => session.bound_set?.length === 1)?.bound_set[0]
+      ?? (targets.length === 1 ? targets[0].machine : undefined);
+    const tasks = (store.tasks ?? []).filter(task => machine !== undefined && task.machine === machine)
+      .sort((a, b) => (b.creation_rank ?? -1) - (a.creation_rank ?? -1));
+    const session = liveSessions.find(session => session.bound_set?.length === 1 && session.bound_set[0] === machine);
+    const inLiveSession = task => liveSessions.some(session => session.identity === task.start_session);
+    // The live task, else the machine's newest task: an older success never stands in for newer unfinished work.
+    // A live session on this machine with no task yet is where the user is: an older session's task never stands in.
+    const task = tasks.find(task => !task.summary && inLiveSession(task)) ?? tasks.find(inLiveSession)
+      ?? (session ? undefined : tasks[0]);
+    const live = Boolean(task) && inLiveSession(task);
+    // A machine enrolled here without a purchase was never bought here: approving and paying don't apply to it.
+    const bought = Boolean(purchase.machine);
+    const saved = machine !== undefined ? target(machine) : targets.length > 0;
+    skipped = [false, false, !bought && saved, !bought && saved, false, false, false];
+    const checksPassed = [
+      'Delivered (service and TCP checks only)',
+      'Delivered (service, TCP and sign-in checks only)',
+      'Delivered (service, TCP, sign-in and control-center checks only)',
+    ].includes(task?.verdict);
+    done = [
+      !ceremony && store.seed_backup_stage === 'inactive',
+      store.credit?.can_start === true || store.poc_configuration?.key_set === true,
+      bought && (['approved', 'registration_uncertain', 'registered', 'create_uncertain', 'email_verification',
+        'initial_invoice', 'invoice_uncertain', 'payment_readiness', 'handed_off'].includes(purchase.phase) || target(purchase.machine)),
+      bought && (purchase.payment?.is_paid === true || purchase.phase === 'handed_off' || target(purchase.machine)),
+      bought ? purchase.phase === 'handed_off' || target(purchase.machine) : saved,
+      task?.status === 'verifying' || Boolean(task?.verdict),
+      checksPassed,
+    ];
+    // Once a session or task exists, setup is where the user is: credit doesn't take over as the current step.
+    const settingUp = Boolean(session || task);
+    current = done.findIndex((value, index) => !value && !skipped[index] && !(index === 1 && settingUp));
+    if (!done[0]) {
+      const stage = store.seed_backup_stage;
+      line = stage === 'showing_words' ? 'Waiting for you: write down your 12 words below.'
+        : stage === 'answering' ? 'Waiting for you: type your 12 words below, or skip the check.'
+        : stage === 'append_failed' ? 'Your words could not be saved. See below.'
+        : ceremony ? 'Waiting for you: finish the 12 words below.' : '';
+    } else if (['suspended', 'reconciling'].includes(store.lifecycle_state)) {
+      line = 'Checking the saved session after the interruption; nothing to press yet.';
+    } else if (current === 1) {
+      line = 'Waiting for you: get AI credit below.';
+    } else if (current === 2) {
+      line = purchase.selection ? 'Waiting for you: review the machine and approve it below.'
+        : 'Waiting for you: choose a machine below.';
+    } else if (current === 3) {
+      line = purchase.stop ? 'Waiting for you: decide below whether to stop this purchase.'
+        : purchase.candidates?.length ? 'Waiting for you: choose below which machine this purchase uses.'
+        : purchase.payment?.is_paid === false && Date.parse(purchase.payment.expires) <= Date.now()
+          ? "The machine's invoice has expired. See the machine step below."
+        : ({
+          approved: 'Waiting for you: order the machine below.',
+          registered: 'Waiting for you: order the machine below.',
+          registration_uncertain: 'Waiting for you: check the order again below.',
+          create_uncertain: 'Waiting for you: check the order again below.',
+          invoice_uncertain: 'Waiting for you: check the order again below.',
+          email_verification: 'Waiting for you: confirm your email with the provider.',
+          initial_invoice: "Waiting for you: get the machine's invoice below, then pay it in your wallet.",
+          payment_readiness: "Waiting for you: pay the machine's invoice in your wallet.",
+        })[purchase.phase] ?? 'See the machine step below.';
+    } else if (current === 4) {
+      line = store.readiness?.expired || store.readiness?.inactive || store.readiness?.kind === 'refused'
+        ? 'The machine check stopped. See the machine step below.'
+        : 'Your machine is starting and being checked; nothing to press.';
+    } else if (current === 5) {
+      // The session card then offers only Verify issuer clock (see the goal card), whether or not a task started.
+      line = session?.inference_limits?.state === 'clock-withheld' && !session.credit_backed
+        ? 'Waiting for you: verify the issuer clock below.'
+        : !task ? (!session ? 'Waiting for you: start the session below.'
+          : session.goal ? 'Waiting for you: start the setup with its saved goal below.'
+          : 'Waiting for you: give the session its goal below.')
+        : task.status === 'abandoned' ? 'The setup was stopped. See its task card below.'
+        : !live ? "The setup's session ended before it finished. See its task card below."
+        : awaitingAiKey(task) ? 'Waiting for you: create the AI key below.'
+        : awaitingOperator(task) ? 'Waiting for you: the setup has a question for you below.'
+        : task.status === 'paused' ? 'Waiting for you: the setup is paused. The reason, and how to continue, are below.'
+        : task.inference_retry ? 'Waiting to try the AI connection again; nothing to press.'
+        : task.status === 'waiting' ? 'Waiting for the machine to answer; nothing to press.'
+        : 'The AI is working; nothing to press.';
+    } else if (current === 6) {
+      // End session keeps a verifying task's status, but its checks stop: the ended guard comes first.
+      line = task?.verdict ? (!checksPassed ? 'The setup was handed over with findings. Its task card says what.' : '')
+        : task && !live ? "The setup's session ended before it finished. See its task card below."
+        : session?.inference_limits?.state === 'clock-withheld' && !session.credit_backed ? 'Waiting for you: verify the issuer clock below.'
+        : task?.status === 'verifying' ? 'tau-web is running its own final checks; nothing to press.' : '';
+    }
+    if (current === 5 && task && live && !task.summary && task.status !== 'abandoned') {
+      const latestCommand = (task.completed ?? []).filter(([, tool]) => tool?.name === 'exec').at(-1);
+      const origin = controlCenterOrigin(task, task.proposal?.call_id) ?? controlCenterOrigin(task, latestCommand?.[0]);
+      if (Number.isInteger(origin?.step) && origin.step >= 1 && origin.step <= 12 && controlCenterLabels.steps[origin.step]) {
+        step = origin.step;
+        rows[5][1] = `Setting up — step ${step} of 12`;
+        line = `Step ${step}: ${controlCenterLabels.steps[step]}. ${line}`;
+      } else if (origin?.step === 0 && origin.block === 'R2') {
+        line = `Fixing a problem. ${line}`;
+      }
+    }
+  }
+  // While the store step itself needs the user (create, unlock, the seed words), show only that step, so its controls
+  // stay on a phone's first screen.
+  const compact = current === 0;
+  for (const [index, [key, text]] of rows.entries()) {
+    if (compact && index > 0) continue;
+    const row = document.createElement('li');
+    row.dataset.progressStep = key;
+    row.dataset.progressState = done[index] ? 'done' : skipped[index] ? 'skip' : current === index ? 'current' : 'todo';
+    const mark = document.createElement('span');
+    mark.setAttribute('aria-hidden', 'true');
+    mark.textContent = done[index] ? '✓ ' : skipped[index] ? '– ' : current === index ? '▸ ' : '○ ';
+    const label = document.createElement('span');
+    label.textContent = skipped[index] ? `${text} — not needed for a machine you added yourself` : text;
+    row.append(mark, label);
+    if (current === index || index === 6 && done.every((value, row) => value || skipped[row])) {
+      if (current === index) row.setAttribute('aria-current', 'step');
+      const detail = document.createElement('div');
+      detail.dataset.progressLine = '';
+      detail.textContent = current === index ? line : 'Setup finished and its own checks passed. Its task card has the result.';
+      row.append(detail);
+    }
+    if (index === 5 && current === index && step !== undefined) {
+      const strip = document.createElement('div');
+      strip.dataset.progressStrip = '';
+      strip.setAttribute('role', 'img');
+      strip.setAttribute('aria-label', `Step ${step} of 12`);
+      for (let segment = 1; segment <= 12; segment++) {
+        const box = document.createElement('span');
+        if (segment <= step) box.dataset.filled = '';
+        strip.append(box);
+      }
+      row.append(strip);
+    }
+    list.append(row);
+  }
+  if (compact) {
+    const more = document.createElement('li');
+    more.dataset.progressMore = '';
+    more.textContent = 'Six more steps after this.';
+    list.append(more);
+  }
 };
 
 // Fixture wording until the signed bundle supplies it. No message supplies question text.
@@ -1904,6 +2079,8 @@ const updateProviderClose = () => {
 setInterval(() => {
   for (const node of document.querySelectorAll('[data-invoice-expires]')) node.textContent = `${Math.max(0, Math.ceil((Number(node.dataset.invoiceExpires) - Date.now() / 1000) / 60))} minutes left`;
   updateProviderClose();
+  // Unchanged payment-timer reports skip render, so time-based progress lines (an invoice expiring) refresh here.
+  if (renderedReport !== undefined) renderProgress(renderedReport);
 }, 1000);
 // Measured by the test side on 2026-11-18 with the default model: 0.14-0.17 USD per setup
 // on older builds, 0.07 USD on the build that runs every block by name. Update when that changes.

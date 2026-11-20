@@ -50,6 +50,14 @@ section section { min-width: 0; }
 #tau-session-controls:empty { display: none; }
 #tau-lifecycle-disclosure, [data-start-disclosure] { font-size: .9rem; color: #354d58; }
 #tau-status[data-state="harness-ready"] { font-size: .85rem; color: #536970; }
+#tau-progress { list-style: none; padding-left: 0; width: 100%; max-width: 360px; font-size: 1rem; overflow-wrap: anywhere; }
+#tau-progress > li { padding: 2px 0 2px 8px; border-left: 3px solid transparent; }
+#tau-progress > li[data-progress-state="current"] { font-weight: 700; border-left-color: #176363; }
+#tau-progress > li[data-progress-state="todo"], #tau-progress > li[data-progress-state="skip"], #tau-progress > li[data-progress-more] { color: #5b6b73; }
+#tau-progress [data-progress-line] { font-weight: 400; }
+#tau-progress [data-progress-strip] { display: flex; gap: 3px; max-width: 100%; margin: 4px 0; }
+#tau-progress [data-progress-strip] > span { display: inline-block; width: 12px; height: 8px; border: 1px solid #176363; }
+#tau-progress [data-progress-strip] > span[data-filled] { background: #176363; }
 [hidden] { display: none !important; }
 @media (max-width: 430px) { body { padding: 12px; } .step { padding: 14px; } }
 </style>
@@ -58,6 +66,7 @@ section section { min-width: 0; }
 <h1>Set up your machine</h1>
 <p id="tau-loading" role="status" aria-label="Loading the app"><span id="tau-loading-text">Loading the app…</span></p>
 
+<ol id="tau-progress" aria-label="Where you are" hidden></ol>
 <section id="tau-store" aria-live="polite" inert>
 <div id="tau-lifecycle-line"><p id="tau-store-state"></p>
 <button id="tau-lock" type="button" hidden>Lock</button></div>
