@@ -864,3 +864,30 @@ fn vpsbg_catalogue_checks_token_before_purchase() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn vpsbg_ready_machine_admits_the_control_center_template() {
+    let (mut s, id, api, probe) = pending(false);
+    accept(&mut s, &probe);
+    block_on(s.vpsbg_mark_ready(&id, api.now())).unwrap();
+    let machine = probe.machine.clone();
+    assert_eq!(wire::image()["distribution"], "nixos");
+    assert_eq!(s.poc_machine_distribution(&machine), Some("nixos"));
+    // Credit Start runs this preflight before session admission; it refused VPS.BG machines with NEEDS_NIXOS.
+    let mut goal = crate::goals::Goal {
+        session: String::new(),
+        text: String::new(),
+        source: crate::goals::SOURCE.into(),
+        document_source: None,
+        template: Some(crate::poc::template::ID.into()),
+        options: None,
+        inputs: None,
+    };
+    s.prepare_template_goal(Some(&machine), &mut goal).unwrap();
+    assert_eq!(goal.text, crate::poc::template::goal(None));
+    // The distribution lives in the approved purchase's selected image, so it survives a reload.
+    assert_eq!(
+        money_reopen(&s).poc_machine_distribution(&machine),
+        Some("nixos")
+    );
+}
