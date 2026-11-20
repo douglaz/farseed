@@ -479,7 +479,7 @@ fn deployment_relay_scalar_validation_gating_and_held_redaction() {
     let mut store = ready();
     store.deployment_relay = RelayKey::from_deployment(KEY.as_bytes());
     assert!(
-        store.relay_key().is_none(),
+        store.relay_key("fixture").is_none(),
         "override retains allocation gating"
     );
     // Deployment custody holds the canonical hexadecimal spelling, even without a pass.
@@ -507,7 +507,7 @@ fn deployment_relay_scalar_validation_gating_and_held_redaction() {
         }
     }
     let identity = block_on(store.allocate(Family::Passes)).unwrap();
-    let key = store.relay_key().unwrap();
+    let key = store.relay_key("fixture").unwrap();
     assert_eq!(
         key.public_key(),
         store.deployment_relay.as_ref().unwrap().public_key()
@@ -557,7 +557,7 @@ fn deployment_relay_scalar_validation_gating_and_held_redaction() {
     assert!(records > 0);
     store.deployment_relay = None;
     assert_eq!(
-        store.relay_key().unwrap().public_key(),
+        store.relay_key("fixture").unwrap().public_key(),
         seed_key.public_key()
     );
 }

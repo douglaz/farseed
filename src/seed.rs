@@ -1,14 +1,14 @@
 //! The operator seed and its child keys, credential format v1 (`STA-22`, `STA-22a`, the companion
 //! `spec/docs/design/credential-format-v1.md`, "Seed and child keys"): a 12-word English BIP-39
 //! mnemonic with the empty BIP-39 passphrase, and hardened BIP-32 derivation at
-//! `m/707285'/1'/role'/index'` for roles 0–4.
+//! `m/707285'/1'/role'/index'` for roles 0–4 and 6; role 5 is reserved.
 //!
 //! Built on every target. The local store (`src/store.rs`) generates the seed and keeps its
 //! mnemonic in its first record; allocation (`src/allocation.rs`) issues the indices the child keys
 //! derive at, and binding gives each live session its machine's client key. Only the dedicated seed-backup
 //! ceremony displays or accepts mnemonic words; no export returns a seed or child key.
 //!
-//! Derivation refuses rather than aliases: an unknown version, a role outside 0–4, an index above
+//! Derivation refuses rather than aliases: an unknown version, an unassigned role, an index above
 //! 2^31−1 and an invalid BIP-32 step are each an error, and no step ever moves on to another index
 //! (the companion: it "rejects an invalid BIP-32 master or child rather than silently skipping to
 //! another path"). Chain codes and intermediate keys stay inside `child`; nothing public returns
@@ -49,6 +49,8 @@ pub enum Role {
     Relay = 3,
     /// Role 4, a declared handoff's post-harness credential (row 17).
     PostHarness = 4,
+    /// Role 6, the machine's attest certificate authority (`SEC-5` row 25).
+    AttestCertificateAuthority = 6,
 }
 
 impl TryFrom<u32> for Role {
@@ -61,6 +63,7 @@ impl TryFrom<u32> for Role {
             2 => Role::AttestRecipient,
             3 => Role::Relay,
             4 => Role::PostHarness,
+            6 => Role::AttestCertificateAuthority,
             _ => return Err(DeriveError::UnknownRole(role)),
         })
     }
@@ -71,7 +74,7 @@ impl TryFrom<u32> for Role {
 pub enum DeriveError {
     /// A derivation version other than [`VERSION`]: "Unknown versions are refused" (`STA-22a`).
     UnknownVersion(u32),
-    /// A role number outside 0–4.
+    /// An unassigned role number, including reserved role 5.
     UnknownRole(u32),
     /// An index above [`MAX_INDEX`].
     IndexOutOfRange(u32),
@@ -225,6 +228,16 @@ impl Seed {
     ) -> Result<PostHarnessCredential, DeriveError> {
         self.child(version, Role::PostHarness, handoff)
             .map(PostHarnessCredential)
+    }
+
+    /// Role 6 at the same machine index: the big-endian child scalar is an RFC 8032 seed.
+    pub fn attest_certificate_authority(
+        &self,
+        version: u32,
+        machine: u32,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, DeriveError> {
+        self.child(version, Role::AttestCertificateAuthority, machine)
+            .map(zeroize::Zeroizing::new)
     }
 
     /// The child secret at `m/707285'/1'/role'/index'`. The version and the index are refused
@@ -398,11 +411,48 @@ mod tests {
                 let key = seed.post_harness_credential(version, index)?;
                 (key.0, key.public_key())
             }
+            Role::AttestCertificateAuthority => {
+                let key = seed.attest_certificate_authority(version, index)?;
+                (*key, ed25519_public(&key))
+            }
         })
     }
 
     fn vector_seed() -> Seed {
         Seed::from_words(mnemonic(&[0; 16]))
+    }
+
+    #[test]
+    fn role_6_known_answer_vectors() {
+        use base64::Engine;
+        let seed = vector_seed();
+        let vectors = [
+            (
+                "947a0a2d76f66b32749765c7001297600b14c3549eae8fae68977c01ec643ce1",
+                "9cf4b1177c90417116a663c15ddcf256bcc37c3d615982b114de686040c83b77",
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJz0sRd8kEFxFqZjwV3c8la8w3w9YVmCsRTeaGBAyDt3",
+            ),
+            (
+                "f781c8113301c87ea56fe62fc8f81809ef0018a27507c79d88d8e39aa189ff4e",
+                "9f4c9f56e5b8746917b1518a38dc79e0a901f2e45d86bba9bcbb40fbb453ddb7",
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ9Mn1bluHRpF7FRijjceeCpAfLkXYa7qby7QPu0U923",
+            ),
+        ];
+        for (index, (private, public, openssh)) in vectors.into_iter().enumerate() {
+            let (secret, key) = derive(&seed, VERSION, 6, index as u32).unwrap();
+            assert_eq!(hex::encode(secret), private);
+            assert_eq!(hex::encode(key), public);
+            let mut wire = b"\0\0\0\x0bssh-ed25519\0\0\0\x20".to_vec();
+            wire.extend_from_slice(&key);
+            assert_eq!(
+                format!(
+                    "ssh-ed25519 {}",
+                    base64::engine::general_purpose::STANDARD.encode(wire)
+                ),
+                openssh
+            );
+        }
+        assert_eq!(Role::try_from(5), Err(DeriveError::UnknownRole(5)));
     }
 
     #[test]
@@ -805,7 +855,7 @@ mod tests {
 
     #[test]
     fn an_unknown_role_is_refused() {
-        for role in [5, 6, 255] {
+        for role in [5, 7, 255] {
             assert_eq!(Role::try_from(role), Err(DeriveError::UnknownRole(role)));
         }
         assert_eq!(Role::try_from(4), Ok(Role::PostHarness));

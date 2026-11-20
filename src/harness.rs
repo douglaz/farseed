@@ -31,7 +31,14 @@ pub use wait::Stop;
 #[cfg(target_arch = "wasm32")]
 pub use wait::stop_waits;
 
+mod authority;
 mod result;
+pub(crate) use authority::AttestProbe;
+pub use authority::ConnectionAdmission;
+#[cfg(target_arch = "wasm32")]
+pub(crate) use authority::ConnectionAuthority;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) use authority::identity_only;
 pub use result::Done;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use result::background_report;
@@ -189,7 +196,7 @@ pub trait BoundJournal: Journal {
         machine: &str,
         origin: Option<&std::rc::Rc<crate::binding::Session>>,
     ) -> Result<std::rc::Rc<crate::binding::Session>, crate::binding::AdmissionRefusal>;
-    async fn relay_key(&self) -> Option<crate::credential::RelayKey>;
+    async fn relay_key(&self, machine: &str) -> Option<crate::credential::RelayKey>;
     fn credentials_available(&self) -> bool {
         true
     }

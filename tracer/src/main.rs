@@ -575,6 +575,9 @@ const VIEW: &str = "(() => {
         persist: $('persist').dataset.state ?? '',
         persist_text: $('persist').textContent,
         persist_visible: $('persist').closest('[hidden]') === null && $('persist').closest('details:not([open])') === null,
+        provider_choice_open: $('provider-choice').closest('[hidden]') === null &&
+            $('provider-choice').querySelector('button[data-vendor=\"vpsbg\"]') !== null &&
+            $('provider-choice').querySelector('button[data-vendor=\"lnvps\"]') !== null,
         visibility: document.visibilityState,
     };
 })()";

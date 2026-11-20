@@ -1,0 +1,299 @@
+{
+  "store": {
+    "connection_refusals": [],
+    "delivery": [
+      {
+        "findings_count": 0,
+        "machine": "fake-render-machine",
+        "reports_revision": 0,
+        "summary": true,
+        "verdict": "delivery evidence not yet supplied"
+      }
+    ],
+    "exposure_ledger": [],
+    "goal_templates": [
+      {
+        "id": "control-center@1",
+        "inputs": [
+          {
+            "label": "Your SSH public key (optional): lets you log in to the machine directly",
+            "name": "USER_SSH_KEY"
+          }
+        ],
+        "name": "Control center",
+        "options": [
+          {
+            "default": false,
+            "label": "Also reach it over Tor (an onion address)",
+            "name": "TOR"
+          }
+        ],
+        "text": "Your own private AI machine. It runs NixOS, has an AI agent with a web dashboard, and only you can reach it. It can install more for you later."
+      }
+    ],
+    "goals": [],
+    "installations": [],
+    "lifecycle_generation": "1",
+    "lifecycle_state": "running",
+    "mode_acceptances": [],
+    "poc_configuration": {
+      "configuration": {
+        "endpoint": "https://fake-inference.invalid/chat/completions",
+        "model": "fake-render-model"
+      },
+      "key_set": false
+    },
+    "procurement": {
+      "account": "5dee4dd60ff8d0ba9900fe91e90e0dcf65f0570d42c431f727d0300dd70dc431",
+      "approval_revision": 1,
+      "approved_card": false,
+      "approved_payment_plan": {
+        "balance": 5000,
+        "currency": "eur",
+        "first_period": 3901,
+        "left_as_credit": 1099,
+        "minimum": 1000,
+        "price": 3901,
+        "read_at": 1767225600,
+        "top_up": 0
+      },
+      "approved_selection": {
+        "charge": {
+          "amount": 3901,
+          "currency": "EUR",
+          "interval_amount": 1,
+          "interval_type": "month"
+        },
+        "image": {
+          "default_username": "nixos",
+          "distribution": "nixos",
+          "id": 1,
+          "name": "Deployment image",
+          "source": "deployment"
+        },
+        "offer": {
+          "available": true,
+          "bandwidth": 1000,
+          "billing_cycle": "1",
+          "dedicated_cpu": false,
+          "disk": 20,
+          "id": 7,
+          "key": "fake-plan",
+          "memory": 2048,
+          "minimum_billing_cycle": 1,
+          "name": "Fake plan",
+          "network_speed": 100,
+          "price_with_vat": 3901,
+          "type": "vps",
+          "vcpus": 2
+        },
+        "resources": null
+      },
+      "archive": [],
+      "auto_renewal_enabled": null,
+      "balance": null,
+      "billing": null,
+      "candidates": [],
+      "capabilities": {
+        "auto_renew_switch": false,
+        "billing": "PrepaidBalance",
+        "delete": true,
+        "host_key_route": "AttestCertificate",
+        "renew": false,
+        "user_data": true,
+        "user_data_exposure": {
+          "api_read_back": "yes",
+          "metadata": "unknown"
+        }
+      },
+      "class_answer": "no",
+      "close_allowed": false,
+      "create_pending": false,
+      "delete": {
+        "state": "available"
+      },
+      "deposit": {
+        "covered_from_elsewhere": false,
+        "new_top_up_allowed": false,
+        "state": "unknown"
+      },
+      "disclosures": [
+        "Use this VPS.BG token in this browser only. A top-up asked for anywhere else (another browser, the VPS.BG console) cancels the invoice shown here, and an order placed elsewhere is charged separately.",
+        "Asking for a top-up cancels any other unpaid VPS.BG top-up invoice.",
+        "Pay only the newest invoice shown here.",
+        "If this VPSBG account has a saved card or other payment method, VPSBG can charge it when the balance runs short; this page can't stop that."
+      ],
+      "duplicate_orders": [],
+      "identity": {
+        "derivation_version": 1,
+        "family": "machines",
+        "index": 0,
+        "seed": "867d2dc9307f7f1a3f06be4a4e8bc8993c2fdc29871507f9aa70ee8406502584"
+      },
+      "image": {
+        "state": "ready"
+      },
+      "introduction": null,
+      "late_credit_disclosure": "The earlier top-up invoice may still have been paid. If both are paid, the extra stays at VPSBG as credit for later.",
+      "machine": "fake-render-machine",
+      "origin": "https://api.vpsbg.eu",
+      "paid_at": null,
+      "paid_until": null,
+      "pause": {
+        "kind": "create_unknown",
+        "message": "The create outcome is unknown. Resume only reconciles the saved name."
+      },
+      "payment": null,
+      "payment_notice": null,
+      "payment_plan": {
+        "balance": 5000,
+        "currency": "EUR",
+        "first_period": 3901,
+        "left_as_credit": 1099,
+        "minimum": 1000,
+        "price": 3901,
+        "read_at": 1767225600,
+        "top_up": 0,
+        "top_up_allowed_from": null
+      },
+      "phase": "approved",
+      "provisioning": {
+        "state": "create_unknown"
+      },
+      "public_keys": {
+        "authorized_keys": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM9edDAhZCRg2tLOCWW393M6QkVy4swuV6ZwUDzajUtK",
+        "machine": "fake-render-machine",
+        "relay_pubkey": "04c1c85f7862bb086fa743421464be2409303446a47e469988b830f68d161ca4"
+      },
+      "publication": null,
+      "purchase": "cccccccccccccccccccccccccccccccc",
+      "readiness_poll_seconds": 60,
+      "readiness_state": null,
+      "readiness_wait_seconds": 10800,
+      "relay": "wss://fake-relay.invalid/",
+      "relay_pass": {
+        "expiry": 1769904000,
+        "host": null,
+        "key": "04c1c85f7862bb086fa743421464be2409303446a47e469988b830f68d161ca4",
+        "state": "needed"
+      },
+      "renewal": "unknown",
+      "selection": {
+        "charge": {
+          "amount": 3901,
+          "currency": "EUR",
+          "interval_amount": 1,
+          "interval_type": "month"
+        },
+        "image": {
+          "default_username": "nixos",
+          "distribution": "nixos",
+          "id": 1,
+          "name": "Deployment image",
+          "source": "deployment"
+        },
+        "offer": {
+          "available": true,
+          "bandwidth": 1000,
+          "billing_cycle": "1",
+          "dedicated_cpu": false,
+          "disk": 20,
+          "id": 7,
+          "key": "fake-plan",
+          "memory": 2048,
+          "minimum_billing_cycle": 1,
+          "name": "Fake plan",
+          "network_speed": 100,
+          "price_with_vat": 3901,
+          "type": "vps",
+          "vcpus": 2
+        },
+        "resources": null
+      },
+      "ssh_key_id": null,
+      "stop": null,
+      "stop_after": null,
+      "target": null,
+      "trust": {
+        "residual": "VPS.BG boots the image it downloaded; the page cannot check those bytes.",
+        "route": "AttestCertificate"
+      },
+      "vendor": {
+        "billing": "PrepaidBalance",
+        "host_key_route": "AttestCertificate",
+        "id": "vpsbg",
+        "name": "VPS.BG Ltd (Bulgaria)"
+      },
+      "vendor_account": {
+        "check": "unchecked",
+        "checked_at": null,
+        "entry_allowed": false,
+        "key_set": true,
+        "vendor": "vpsbg"
+      },
+      "vendor_choice": null,
+      "vendor_choice_open": false,
+      "vendors_available": [
+        {
+          "billing": "Invoice",
+          "host_key_route": "ProviderPublication",
+          "id": "lnvps",
+          "name": "LNVPS"
+        },
+        {
+          "billing": "PrepaidBalance",
+          "host_key_route": "AttestCertificate",
+          "id": "vpsbg",
+          "name": "VPS.BG Ltd (Bulgaria)"
+        }
+      ],
+      "vm_id": null
+    },
+    "provider_configuration": {
+      "account": null,
+      "entered": false,
+      "key_set": false,
+      "origin": "https://api.vpsbg.eu",
+      "recorded": false,
+      "relay_deployed": false
+    },
+    "seed_backup_completion": "skipped",
+    "seed_backup_owed": false,
+    "seed_backup_stage": "inactive",
+    "sessions": [],
+    "setup": [
+      {
+        "access": {
+          "model": "maintained",
+          "profile": "ad-hoc",
+          "revision": 3
+        },
+        "answer": "no",
+        "class": "single_purpose",
+        "declaration": null,
+        "entry": {
+          "cost": {
+            "amount": 3901,
+            "period": {
+              "billing": {
+                "count": 1,
+                "interval": "month"
+              }
+            },
+            "unit": "eur_cent"
+          },
+          "machine": "fake-render-machine",
+          "product": "Fake plan",
+          "region": "Bulgaria",
+          "vendor": "VPS.BG Ltd (Bulgaria)"
+        },
+        "family": "machines",
+        "index": 0,
+        "requirements": []
+      }
+    ],
+    "setup_offer": null,
+    "signature_refusals": [],
+    "store_state": "unlocked"
+  }
+}

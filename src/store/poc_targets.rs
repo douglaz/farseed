@@ -302,6 +302,7 @@ impl<S: Storage> Store<S> {
 
     pub async fn poc_bind(&mut self, machine: &str) -> Result<String, String> {
         self.authority.ordinary()?;
+        self.vpsbg_session_ready(machine)?;
         if let Some(session) = self.sessions.iter().find(|session| {
             !session.ended.get() && session.bound_set.iter().any(|name| name == machine)
         }) {
@@ -360,7 +361,15 @@ impl<S: Storage> Store<S> {
             .ok_or("machine has no stored target or pin")?;
         self.check_bindable_identity(&record.machine_identity, "public client key")?;
         self.check_bindable_identity(&record.relay_identity, "public relay key")?;
-        if eligible_pass(self.allocation()) != Some(&record.relay_identity) {
+        if self.vpsbg_machine_known(machine)
+            || self
+                .allocation()
+                .machine_pass_bindings()
+                .iter()
+                .any(|b| b.machine == machine)
+        {
+            self.bound_machine_relay(machine)?;
+        } else if eligible_pass(self.allocation()) != Some(&record.relay_identity) {
             return Err("enrolled relay pass is no longer transport authority".into());
         }
         self.poc_identity_public_keys(machine, &record.machine_identity)
@@ -375,7 +384,9 @@ impl<S: Storage> Store<S> {
         let client = seed
             .ssh_client_key(identity.derivation_version, identity.index)
             .map_err(|_| "client public key unavailable")?;
-        let relay = self.relay_key().ok_or("relay public key unavailable")?;
+        let relay = self
+            .relay_key(machine)
+            .ok_or("relay public key unavailable")?;
         let mut wire = Vec::with_capacity(51);
         wire.extend_from_slice(&11u32.to_be_bytes());
         wire.extend_from_slice(b"ssh-ed25519");
@@ -405,6 +416,23 @@ impl<S: Storage> Store<S> {
             application_inference_keys: Vec::new(),
             key_card_class: None,
         }
+    }
+
+    /// Only the typed VPSBG AttestTarget projection may call this unpinned path.
+    pub(super) fn vpsbg_apply_target(
+        &mut self,
+        p: &super::provisioning::Purchase,
+        target: TargetRecord,
+    ) {
+        self.poc_targets.insert(
+            p.machine.clone(),
+            Self::purchase_target_record(
+                target,
+                p.identity.clone(),
+                p.relay_identity.clone(),
+                p.class_answer,
+            ),
+        );
     }
 }
 

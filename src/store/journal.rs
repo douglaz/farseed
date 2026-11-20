@@ -27,6 +27,7 @@ pub(super) fn public_bytes<'a>(event: &'a Event, bytes: &[u8]) -> Result<PublicB
             ("credit_id", &account.credit_id.0),
             ("default_key", &account.default_key.0),
         ],
+        Event::VpsbgTokenEntered(record) => vec![("token", &record.token.0)],
         Event::PocProviderAccount(account) => vec![("key", &account.key.0)],
         Event::Procurement(provisioning::Record::EmailEntered { email }) => {
             vec![("email", email)]
@@ -115,6 +116,12 @@ impl<'de> Deserialize<'de> for Version {
 
 // Typed event fields may contain maps or arbitrary structured evidence. Check decoded member
 // uniqueness there too, without creating a generic value that could discard duplicates.
+pub(crate) fn unique_json(bytes: &[u8]) -> Result<(), String> {
+    serde_json::from_slice::<Unique>(bytes)
+        .map(|_| ())
+        .map_err(|_| crate::poc::provisioning::REFUSED.into())
+}
+
 struct Unique;
 impl<'de> Deserialize<'de> for Unique {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {

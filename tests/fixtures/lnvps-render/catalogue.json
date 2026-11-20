@@ -1,0 +1,160 @@
+{
+  "store": {
+    "connection_refusals": [],
+    "delivery": [],
+    "exposure_ledger": [],
+    "goal_templates": [
+      {
+        "id": "control-center@1",
+        "inputs": [
+          {
+            "label": "Your SSH public key (optional): lets you log in to the machine directly",
+            "name": "USER_SSH_KEY"
+          }
+        ],
+        "name": "Control center",
+        "options": [
+          {
+            "default": false,
+            "label": "Also reach it over Tor (an onion address)",
+            "name": "TOR"
+          }
+        ],
+        "text": "Your own private AI machine. It runs NixOS, has an AI agent with a web dashboard, and only you can reach it. It can install more for you later."
+      }
+    ],
+    "goals": [],
+    "installations": [],
+    "lifecycle_generation": "1",
+    "lifecycle_state": "running",
+    "mode_acceptances": [],
+    "poc_configuration": {
+      "configuration": {
+        "endpoint": "https://fake-inference.invalid/chat/completions",
+        "model": "fake-render-model"
+      },
+      "key_set": false
+    },
+    "procurement": {
+      "archive": [],
+      "closed": null,
+      "origin": "https://fake-lnvps.invalid",
+      "selection": null,
+      "vendor_choice": null,
+      "vendor_choice_open": true,
+      "vendors_available": [
+        {
+          "billing": "Invoice",
+          "host_key_route": "ProviderPublication",
+          "id": "lnvps",
+          "name": "LNVPS"
+        },
+        {
+          "billing": "PrepaidBalance",
+          "host_key_route": "AttestCertificate",
+          "id": "vpsbg",
+          "name": "VPS.BG Ltd (Bulgaria)"
+        }
+      ]
+    },
+    "provider_catalogue": {
+      "images": [
+        {
+          "cpu_arch": "x86_64",
+          "default_username": "arch",
+          "distribution": "archlinux",
+          "encrypted": false,
+          "flavour": "base",
+          "id": 3,
+          "popularity": 0.1,
+          "release_date": "2026-10-01T00:00:00Z",
+          "version": "rolling"
+        }
+      ],
+      "offers": {
+        "custom_template": [
+          {
+            "cpu_arch": "x86_64",
+            "disks": [
+              {
+                "disk_interface": "scsi",
+                "disk_type": "ssd",
+                "max_disk": 107374182400,
+                "min_disk": 10737418240
+              }
+            ],
+            "id": 2,
+            "interval_amount": 1,
+            "interval_type": "month",
+            "limits": {},
+            "max_cpu": 8,
+            "max_memory": 8589934592,
+            "min_cpu": 1,
+            "min_memory": 1073741824,
+            "name": "Custom fixture",
+            "network": {
+              "default": 500,
+              "max": 1000,
+              "min": 100
+            },
+            "region": {
+              "company_id": 1,
+              "country_code": "GB",
+              "id": 2,
+              "name": "London fixture"
+            },
+            "transfer": {
+              "default": 500,
+              "max": 2000,
+              "min": 100
+            }
+          }
+        ],
+        "templates": [
+          {
+            "cost_plan": {
+              "amount": 1000000,
+              "currency": "BTC",
+              "id": 1,
+              "interval_amount": 1,
+              "interval_type": "month",
+              "name": "Monthly"
+            },
+            "cpu": 1,
+            "cpu_arch": "x86_64",
+            "created": "2026-01-01T00:00:00Z",
+            "disk_interface": "scsi",
+            "disk_size": 10737418240,
+            "disk_type": "ssd",
+            "id": 1,
+            "limits": {},
+            "memory": 1073741824,
+            "name": "Small fixed",
+            "region": {
+              "company_id": 1,
+              "country_code": "IE",
+              "id": 1,
+              "name": "Dublin fixture"
+            }
+          }
+        ]
+      }
+    },
+    "provider_configuration": {
+      "account": "989c0b76cb563971fdc9bef31ec06c3560f3249d6ee9e5d83c57625596e05f6f",
+      "entered": false,
+      "key_set": true,
+      "origin": "https://fake-lnvps.invalid",
+      "recorded": true,
+      "relay_deployed": false
+    },
+    "seed_backup_completion": "skipped",
+    "seed_backup_owed": false,
+    "seed_backup_stage": "inactive",
+    "sessions": [],
+    "setup": [],
+    "setup_offer": null,
+    "signature_refusals": [],
+    "store_state": "unlocked"
+  }
+}

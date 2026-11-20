@@ -125,6 +125,12 @@ pub(super) async fn run(
             .await?
             == true,
     );
+    let view = run.settled(&tab, false).await?;
+    case.check(
+        "passphrase_cases.a014",
+        "the fresh store after seed backup shows both VPSBG and LNVPS provider choices",
+        view["provider_choice_open"] == true,
+    );
     run.browser
         .evaluate(
             &tab.session,

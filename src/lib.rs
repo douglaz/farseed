@@ -15,6 +15,7 @@ pub mod delivery;
 pub mod dispatch;
 pub mod goals;
 pub mod harness;
+pub mod hostcert;
 pub mod inference;
 pub mod inference_limits;
 pub mod jobs;
@@ -846,8 +847,8 @@ mod worker {
                 )),
             }
         }
-        async fn relay_key(&self) -> Option<crate::credential::RelayKey> {
-            self.local.lock().await.store()?.relay_key()
+        async fn relay_key(&self, machine: &str) -> Option<crate::credential::RelayKey> {
+            self.local.lock().await.store()?.relay_key(machine)
         }
         fn credentials_available(&self) -> bool {
             !self.unavailable

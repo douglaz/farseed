@@ -3,7 +3,8 @@
 import init, { spec_commit, open, create, unlock, seed_backup_display, seed_backup_answer, seed_backup_reentry, seed_backup_skip, seed_backup_redisplay, setup_approve, setup_answer, bind, goal_request, accept_page_goal, TaskPublication, requirements_answer, delivery_request, retire_runtime, sweep_inference, lifecycle_transition, publication_generation, publish_report, verify_inference_clock, withdraw_reinstall } from './pkg/tau_web.js';
 import { identify_execution, wake_tasks, task_presence, poc_configure, poc_key_is_set, poc_enroll, poc_bind, poc_public_keys, poc_accept, poc_download, publish_task_details, publish_delivery_details } from './pkg/tau_web.js';
 import { credit_request, retry_ended_credit } from './pkg/tau_web.js';
-import { deployment_configure, provider_configure, provider_key_is_set, provider_visibility, provider_action_delay, provider_request } from './pkg/tau_web.js';
+import { deployment_configure, provider_configure, provider_token_configure, provider_key_is_set, provider_visibility, provider_action_delay, provider_request } from './pkg/tau_web.js';
+import { vpsbg_poll_contexts, vpsbg_poll, vpsbg_presence } from './pkg/tau_web.js';
 import { publish_unlock_worker_timings } from './pkg/tau_web.js';
 
 const unlockNow = performance.now.bind(performance);
@@ -17,6 +18,7 @@ const unlockJson = (marks, operation, value) => {
 };
 
 const clearInput = request => {
+  if (request?.provider_token?.token instanceof Uint8Array) request.provider_token.token.fill(0);
   if (request?.provider_request && Object.hasOwn(request.provider_request, 'email')) delete request.provider_request.email;
   for (const field of ['create','unlock','seed_backup_redisplay','seed_backup_reentry']) {
     if (request?.[field] instanceof Uint8Array) request[field].fill(0);
@@ -144,11 +146,109 @@ if (retirementRequested) {
 }
 let paymentTimer = null;
 let pageVisible = true;
+let pageOnline = initialPresence?.online === true;
+let vpsbgVisible = initialPresence?.visible === true;
 let lastReport = null;
 // The newest session list from either a store report or a task publication (End publishes only through the latter),
 // so a fresh key submitted after End is compared with the sessions the page shows, not with a stale store report.
 let latestSessions = null;
 const paymentsEligible = () => !retirementRequested && pageVisible && lastReport?.state === 'unlocked' && !['suspended','reconciling','ended'].includes(lastReport?.lifecycle_state);
+// Durable VPSBG contexts include first-create continuation after settlement/coverage,
+// including a wake after the settlement append but before any introduction or create.
+// They never consult LNVPS's account flag, payment fields or target presence.
+const vpsbgSchedules = {
+  deposit: { timer: null, busy: false },
+  delete: { timer: null, busy: false },
+  attest: { timer: null, busy: false },
+};
+let vpsbgScheduling = false;
+let vpsbgEpoch = 0;
+let vpsbgProviderQueue = Promise.resolve();
+const vpsbgEligible = () => paymentsEligible() && pageOnline && vpsbgVisible;
+const stopVpsbg = () => {
+  vpsbgEpoch++;
+  for (const schedule of Object.values(vpsbgSchedules)) {
+    clearTimeout(schedule.timer); schedule.timer = null;
+  }
+};
+const queueVpsbg = operation => {
+  const work = vpsbgProviderQueue.then(async () => {
+    const delay = provider_action_delay();
+    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    return operation();
+  });
+  vpsbgProviderQueue = work.catch(() => {});
+  return work;
+};
+const scheduleVpsbg = async () => {
+  if (!vpsbgEligible()) { stopVpsbg(); return; }
+  if (vpsbgScheduling) return;
+  const epoch = vpsbgEpoch;
+  vpsbgScheduling = true;
+  let contexts;
+  try { contexts = JSON.parse(await vpsbg_poll_contexts()); }
+  finally { vpsbgScheduling = false; }
+  if (!vpsbgEligible() || epoch !== vpsbgEpoch) {
+    if (vpsbgEligible()) queueMicrotask(() => { void scheduleVpsbg(); });
+    return;
+  }
+  const generation = publication_generation();
+  const live = () => vpsbgEligible() && epoch === vpsbgEpoch && generation === publication_generation();
+  const expired = entry => entry?.introduction?.state === 'waiting' && Date.now() >= entry.introduction.deadline * 1000;
+  const publishExpiry = async () => {
+    const report = await open();
+    if (live()) await reportStore(report, generation, '', 'machine', true);
+  };
+  // Rust may have dropped the context while the refresh crossed its deadline.
+  // The last published waiting card still needs a terminal local report.
+  if (contexts.some(expired) || [lastReport?.procurement, ...(lastReport?.procurement?.completed || [])].some(expired)) {
+    clearTimeout(vpsbgSchedules.attest.timer); vpsbgSchedules.attest.timer = null;
+    await publishExpiry();
+    return;
+  }
+  const arm = (kind, selected) => {
+    const schedule = vpsbgSchedules[kind];
+    if (!selected.length || schedule.timer || schedule.busy) return;
+    const deadline = kind === 'attest' ? Math.min(...selected.filter(c => !c.accepted).map(c => c.introduction.deadline * 1000)) : Infinity;
+    const accepted = kind === 'attest' && selected.some(c => c.accepted);
+    const delay = Math.min(accepted ? provider_action_delay() : Math.max(5000, provider_action_delay()), Math.max(0, deadline - Date.now()));
+    const timer = setTimeout(async () => {
+      schedule.timer = null;
+      if (!live()) return;
+      schedule.busy = true;
+      try {
+        for (const context of selected) {
+          await queueVpsbg(async () => {
+            if (!live()) return;
+            // Expiry publishes from the original durable deadline without another contact.
+            if (kind === 'attest' && !context.accepted && Date.now() >= context.introduction.deadline * 1000) {
+              await publishExpiry();
+              return;
+            }
+            const current = JSON.parse(await vpsbg_poll_contexts());
+            if (!live()) return;
+            if (kind === 'attest' && !context.accepted && Date.now() >= context.introduction.deadline * 1000) {
+              await publishExpiry();
+              return;
+            }
+            if (!current.some(item => JSON.stringify(item) === JSON.stringify(context))) return;
+            const report = await vpsbg_poll(context.purchase, kind);
+            if (live()) await reportStore(report, generation, '', 'machine', true);
+          });
+        }
+      } finally {
+        schedule.busy = false;
+        void scheduleVpsbg();
+      }
+    }, delay);
+    schedule.timer = timer;
+  };
+  // Deletion never replaces settlement work, including after a refused or failed check.
+  arm('deposit', contexts.filter(c => c.deposit_pending));
+  arm('delete', contexts.filter(c => c.delete_pending));
+  arm('attest', contexts.filter(c => c.attest_pending && c.installation_binding &&
+    (c.accepted || c.introduction?.state === 'waiting')));
+};
 const pendingCredit = () => {
   const invoice = lastReport?.credit?.invoices?.at(-1);
   return paymentsEligible() && invoice && !['paid','expired_unpaid','abandoned'].includes(invoice.outcome) && Date.now()/1000 <= invoice.expires_at + 60 ? invoice.id : null;
@@ -279,6 +379,7 @@ const reportStore = (report, generation = publication_generation(), session = ''
   schedulePayments();
   scheduleReadiness();
   scheduleEmail();
+  void scheduleVpsbg();
   value.poc_configuration = { key_set: poc_key_is_set() };
   value.provider_configuration = { key_set: provider_key_is_set() };
   if (paymentTimerReport) value.payment_timer = true;
@@ -413,6 +514,7 @@ const publishTask = async (request, generation, session, step, automatic = false
   try {
     let report = automatic ? await publication.continue_task(request.id, session) : await publication.request(JSON.stringify(request));
     const published = JSON.parse(report);
+    if (['suspended', 'ended'].includes(published.lifecycle_state)) stopVpsbg();
     if (Array.isArray(published.sessions)) latestSessions = published.sessions;
     discardStalePocConfiguration(published);
     report = presentationReport(report, step);
@@ -447,6 +549,7 @@ onmessage = async ({ data: envelope }) => {
     clearPendingPocConfiguration();
     clearTimeout(paymentTimer); paymentTimer = null;
     stopReadiness(); stopEmail(); provider_visibility(false);
+    stopVpsbg(); vpsbg_presence(false, false);
     await retire_runtime();
     postMessage({ runtime_retired: true });
     return;
@@ -455,7 +558,7 @@ onmessage = async ({ data: envelope }) => {
     const configurationLifecycle = ++pocConfigurationLifecycle;
     pocConfigurationRevalidating = true;
     clearTimeout(pocConfigurationTimer); pocConfigurationTimer = null;
-    if (data.lifecycle === 'hidden' || data.lifecycle === 'freeze') { readinessLifecycle++; pageVisible = false; clearTimeout(paymentTimer); paymentTimer = null; stopReadiness(); stopEmail(); provider_visibility(false); }
+    if (data.lifecycle === 'hidden' || data.lifecycle === 'freeze') { readinessLifecycle++; pageVisible = false; clearTimeout(paymentTimer); paymentTimer = null; stopReadiness(); stopEmail(); provider_visibility(false); stopVpsbg(); }
     if (data.lifecycle === 'visible' || data.lifecycle === 'resume') { pageVisible = true; provider_visibility(true); }
     const report = await lifecycle_transition(data.lifecycle);
     Object.assign(wake, {generation:publication_generation(), identity:JSON.stringify(JSON.parse(report).procurement?.identity)});
@@ -470,6 +573,11 @@ onmessage = async ({ data: envelope }) => {
   if (data.task_presence && exactMembers(data.task_presence, ['visible', 'online']) &&
       typeof data.task_presence.visible === 'boolean' && typeof data.task_presence.online === 'boolean') {
     task_presence(data.task_presence.visible, data.task_presence.online);
+    pageOnline = data.task_presence.online;
+    vpsbgVisible = data.task_presence.visible;
+    vpsbg_presence(vpsbgVisible, pageOnline);
+    if (!pageOnline || !data.task_presence.visible) stopVpsbg();
+    else void scheduleVpsbg();
     return;
   }
   if (data.task_details) {
@@ -514,7 +622,7 @@ onmessage = async ({ data: envelope }) => {
   const generation = publication_generation();
   let report;
   const step = data.poc_configure || data.credit_request ? 'credit'
-    : data.provider_configure || data.provider_request || data.poc_enroll || data.setup_approve || data.setup_answer ? 'machine'
+    : data.provider_token || data.provider_configure || data.provider_request || data.poc_enroll || data.setup_approve || data.setup_answer ? 'machine'
     : data.poc_bind || data.poc_public_keys || data.poc_accept || data.bind || data.verify_clock || data.withdraw_reinstall || data.task || data.goal || data.requirements_answer || data.delivery || data.goal_accept ? 'task' : 'store';
   const session = data.task?.action === 'end-session' ? '' : data.goal?.session ?? data.goal_accept?.session ?? data.requirements_answer?.session ?? data.delivery?.session ?? data.task?.session ?? '';
   if (data.create instanceof Uint8Array) report = await create(data.create);
@@ -559,6 +667,16 @@ onmessage = async ({ data: envelope }) => {
     if (data.credit_request.action === 'start' && !value.credit_error) value.credit_started_machine = data.credit_request.machine;
     report = JSON.stringify(value);
   }
+  else if (data.provider_token !== undefined) {
+    const config = data.provider_token;
+    try {
+      if (exactMembers(config, ["vendor", "token"]) && config.vendor === "vpsbg" && config.token instanceof Uint8Array) report = await provider_token_configure(config.token);
+      else { const current = JSON.parse(await open()); current.error = "Invalid VPSBG token entry."; report = JSON.stringify(current); }
+    } finally {
+      if (config?.token instanceof Uint8Array) config.token.fill(0);
+      if (config && typeof config === "object") delete config.token;
+    }
+  }
   else if (data.provider_configure !== undefined) {
     const config = data.provider_configure;
     try {
@@ -571,7 +689,10 @@ onmessage = async ({ data: envelope }) => {
   }
   else if (data.provider_request && typeof data.provider_request === 'object') {
     try {
-      const value = JSON.parse(await provider_request(JSON.stringify(data.provider_request)));
+      const request = () => provider_request(JSON.stringify(data.provider_request));
+      const addressedVpsbg = typeof data.provider_request.purchase === 'string' || ['delete', 'delete_check'].includes(data.provider_request.action);
+      const value = JSON.parse(await (addressedVpsbg || lastReport?.procurement?.vendor?.id === 'vpsbg' ? queueVpsbg(request) : request()));
+      if (data.provider_request.action === 'vendor') value.provider_selection_reviewed = false;
       if (data.provider_request.action === 'select' && !value.error) value.provider_selection_reviewed = true;
       report = JSON.stringify(value);
     } finally { delete data.provider_request.email; }
@@ -682,4 +803,5 @@ onmessage = async ({ data: envelope }) => {
   }
 };
 task_presence(initialPresence?.visible === true, initialPresence?.online === true);
+vpsbg_presence(vpsbgVisible, pageOnline);
 await reportStore(await open());

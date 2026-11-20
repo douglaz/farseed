@@ -91,6 +91,17 @@ fn emit(out: &mut String, root: &str, doc: &str, name: &str, items: &[(String, S
 }
 
 fn main() {
+    use sha2::{Digest, Sha256};
+    println!("cargo::rerun-if-changed=src/poc/provisioning/vpsbg/hook-body.sh");
+    let hook = include_bytes!("src/poc/provisioning/vpsbg/hook-body.sh");
+    assert_eq!(
+        Sha256::digest(hook)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        "cd835ce3ee4e27436e5a97edeef7cb9bdf7e3bc8271a7c30d237008fbeeca086",
+        "the reviewed VPSBG hook body changed"
+    );
     control_center_template();
     let pin = pinned_spec_commit();
 

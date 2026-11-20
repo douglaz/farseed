@@ -82,7 +82,7 @@ fn poc_targets_atomic_encrypted_enrollment_replay_and_public_identity() {
     assert_eq!(&wire[19..], &key.public_key());
     assert_eq!(
         keys["relay_pubkey"],
-        hex::encode(store.relay_key().unwrap().public_key())
+        hex::encode(store.relay_key("machine-a").unwrap().public_key())
     );
     assert_eq!(keys["relay_pubkey"].as_str().unwrap().len(), 64);
     let mut reopened = reopen(&store).unwrap();
@@ -315,7 +315,7 @@ fn poc_targets_positional_enrollment_and_target_messages_create_no_authority() {
         assert_eq!(store.allocation(), &allocation);
         assert!(store.poc_target("machine-a").is_none());
         assert!(store.dispatch.approved_entries.is_empty());
-        assert!(store.relay_key().is_none());
+        assert!(store.relay_key("machine-a").is_none());
     }
 }
 

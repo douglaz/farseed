@@ -60,6 +60,7 @@ pub mod opfs;
     allow(dead_code, reason = "task keys are driven by the browser worker")
 )]
 pub(crate) mod ai_keys;
+pub mod attest;
 pub(crate) mod authority;
 #[cfg_attr(
     not(target_arch = "wasm32"),
@@ -69,6 +70,7 @@ pub(crate) mod credit;
 pub mod delivery;
 mod goals;
 mod journal;
+pub(crate) use journal::unique_json as unique_provider_json;
 #[cfg_attr(
     not(target_arch = "wasm32"),
     allow(
@@ -95,6 +97,14 @@ pub mod poc_targets;
 pub mod provisioning;
 pub mod reinstall;
 pub(crate) mod unlock_marks;
+#[cfg_attr(
+    not(target_arch = "wasm32"),
+    allow(
+        dead_code,
+        reason = "VPSBG custody and reads are driven by the browser worker"
+    )
+)]
+pub(crate) mod vpsbg;
 
 /// The directory the store owns in the origin-private file system.
 pub const DIRECTORY: &str = "tau-web-store";
@@ -278,9 +288,13 @@ pub(crate) enum Event {
     InferenceTerminal(crate::inference::Terminal),
     DedicatedReinstall(reinstall::Record),
     PocTarget(poc_targets::Record),
+    AttestIntroduction(attest::Introduction),
+    AttestAcceptance(attest::Acceptance),
     Procurement(provisioning::Record),
     ProviderProtection(crate::poc::inference::EchoFingerprints),
     PocProviderAccount(crate::poc::provisioning::AccountRecord),
+    VpsbgTokenEntered(vpsbg::TokenRecord),
+    Vpsbg(vpsbg::Record),
     PocCreditAccount(crate::poc::credit::AccountRecord),
     PocCredit(credit::Record),
     PocAiKey(ai_keys::Record),
@@ -438,6 +452,7 @@ pub struct Store<S> {
     ai_keys: Vec<ai_keys::Entry>,
     reinstall: reinstall::State,
     poc_targets: std::collections::BTreeMap<String, poc_targets::Record>,
+    attest: std::collections::BTreeMap<String, attest::State>,
     procurement: Option<provisioning::Purchase>,
     procurement_recovery: provisioning::Recovery,
     procurement_email: provisioning::EmailState,
@@ -446,6 +461,10 @@ pub struct Store<S> {
     closed_purchases: Vec<provisioning::Purchase>,
     completed_purchases: Vec<provisioning::Purchase>,
     procurement_selection: Option<crate::poc::provisioning::Selection>,
+    vendor_choice: Option<crate::poc::provisioning::Vendor>,
+    vpsbg_token: Option<vpsbg::TokenRecord>,
+    vpsbg_reads: vpsbg::ReadState,
+    vpsbg_purchases: std::collections::BTreeMap<String, vpsbg::PurchaseState>,
     provider_origin: String,
     provider_account: Option<crate::poc::provisioning::Account>,
     provider_account_source: Option<crate::poc::provisioning::AccountSource>,
@@ -619,6 +638,7 @@ impl<S: Storage> Store<S> {
             ai_keys: Vec::new(),
             reinstall: Default::default(),
             poc_targets: Default::default(),
+            attest: Default::default(),
             procurement: None,
             procurement_recovery: Default::default(),
             procurement_email: Default::default(),
@@ -626,6 +646,10 @@ impl<S: Storage> Store<S> {
             closed_purchases: Vec::new(),
             completed_purchases: Vec::new(),
             procurement_selection: None,
+            vendor_choice: None,
+            vpsbg_token: None,
+            vpsbg_reads: Default::default(),
+            vpsbg_purchases: Default::default(),
             provider_origin: crate::poc::provisioning::default_origin(),
             provider_account: None,
             provider_account_source: None,
@@ -864,6 +888,7 @@ impl<S: Storage> Store<S> {
         if credit && !self.credit_can_start() {
             return Err("Read a positive inference credit balance before Start.".into());
         }
+        self.vpsbg_session_ready(machine)?;
         inference_approval.validate()?;
 
         if !crate::poc::inference::safe(
@@ -1217,7 +1242,19 @@ impl<S: Storage> Store<S> {
     }
 
     /// The harness derives this per attempt; no session receives the relay key.
-    pub fn relay_key(&self) -> Option<crate::credential::RelayKey> {
+    pub fn relay_key(&self, machine: &str) -> Option<crate::credential::RelayKey> {
+        // A recorded VPSBG pairing is authoritative, including after retirement or restore.
+        // Purchase history also fences a missing metadata binding; never guess a pass.
+        if self
+            .allocation()
+            .machine_pass_bindings()
+            .iter()
+            .any(|b| b.machine == machine)
+            || self.vpsbg_machine_known(machine)
+        {
+            let bound = self.bound_machine_relay(machine).ok()?;
+            return self.bound_relay_key(&bound);
+        }
         let identity = &self
             .allocation()
             .entries()
@@ -1308,6 +1345,7 @@ impl<S: Storage> Store<S> {
             return Err("invalid exposure ledger entry".into());
         }
         for bound in &exposure.bound_set {
+            self.vpsbg_session_ready(&bound.machine)?;
             self.check_binding_modes(&bound.machine, &exposure.accepted_modes)?;
             let approved = self
                 .dispatch
@@ -1587,6 +1625,11 @@ impl<S: Storage> Store<S> {
         let seed = self.seed.as_ref().ok_or(crate::poc::wait::UNLOCKED_SEED)?;
         let mut borrowed: Vec<&[u8]> = vec![seed.bytes(), &self.key.0];
         let mut derived = Vec::new();
+        derived.extend(
+            self.vpsbg_create_secrets()
+                .into_iter()
+                .map(CheckValue::Text),
+        );
         let mut bindings = Vec::new();
         if let Some(account) = &self.inference.account {
             borrowed.push(&account.0);
@@ -1616,6 +1659,9 @@ impl<S: Storage> Store<S> {
             derived.push(CheckValue::Text(Zeroizing::new(hex::encode(
                 account.bytes(),
             ))));
+        }
+        if let Some(record) = &self.vpsbg_token {
+            borrowed.push(record.token.0.as_bytes());
         }
         for email in &self.provider_emails {
             borrowed.push(email.as_bytes());
@@ -1845,6 +1891,8 @@ impl<S: Storage> Store<S> {
                     self.apply_inference(number, &event)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::VpsbgTokenEntered(record)) => self.replay_vpsbg_token(record)?,
+                (_, Event::Vpsbg(record)) => self.replay_vpsbg(number, record)?,
                 (_, Event::PocProviderAccount(account)) => self.replay_provider_account(account)?,
                 (_, Event::PocCreditAccount(account)) => self.replay_credit_account(account)?,
                 (_, Event::PocCredit(record)) => self.replay_credit(record)?,
@@ -1853,6 +1901,10 @@ impl<S: Storage> Store<S> {
                     self.replay_poc_target(number, record)
                         .map_err(|e| format!("record {number}: {e}; replay stopped"))?;
                 }
+                (_, Event::AttestIntroduction(record)) => {
+                    self.replay_attest_introduction(record)?
+                }
+                (_, Event::AttestAcceptance(record)) => self.replay_attest_acceptance(record)?,
                 (_, Event::Procurement(record)) => self.replay_procurement(number, record)?,
                 (_, Event::ProviderProtection(_)) => {}
                 (_, Event::DedicatedReinstall(record)) => {
@@ -2239,7 +2291,9 @@ impl<S: Storage> Store<S> {
         }
         if matches!(
             event,
-            Event::PocProviderAccount(_)
+            Event::VpsbgTokenEntered(_)
+                | Event::Vpsbg(_)
+                | Event::PocProviderAccount(_)
                 | Event::PocCreditAccount(_)
                 | Event::PocCredit(_)
                 | Event::PocAiKey(_)
@@ -2361,6 +2415,10 @@ impl<S: Storage> Store<S> {
             self.provider_entry_ready()?;
             record.account()?;
         }
+        if let Event::VpsbgTokenEntered(record) = event {
+            self.vpsbg_token_entry_ready()?;
+            record.validate()?;
+        }
         let number = self.next;
         // Credential format v1: "Never perform 2^32 encryptions under one data key". Record 0 is
         // the first, so record 2^32 - 1 would be the 2^32nd. Nothing is written, so no move can
@@ -2374,6 +2432,9 @@ impl<S: Storage> Store<S> {
                 | Event::InferenceAccount { .. }
                 | Event::PocCreditAccount(_) => Value::Null,
                 Event::Procurement(provisioning::Record::EmailEntered { .. }) => Value::Null,
+                Event::VpsbgTokenEntered(record) => {
+                    json!({"account":record.account,"generation":record.generation})
+                }
                 Event::PocProviderAccount(account) => {
                     json!({"origin":account.origin,"source":account.source})
                 }
@@ -2393,6 +2454,9 @@ impl<S: Storage> Store<S> {
                 .is_ok_and(|safe| safe == metadata)
             {
                 return Err(crate::poc::wait::JOURNAL_REFUSED.into());
+            }
+            if matches!(event, Event::Vpsbg(_)) {
+                drop(crate::poc::credit::ClearedValue(metadata));
             }
         }
         let previous = hex::encode(self.previous.0);
@@ -2709,6 +2773,7 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
         #[cfg(target_arch = "wasm32")]
         if let State::Unlocked(store) = &self.state {
             crate::poc::provisioning::browser::restore(store.provider_account.as_ref());
+            crate::poc::provisioning::browser::restore_vpsbg(store.vpsbg_token.as_ref());
         }
         #[cfg(target_arch = "wasm32")]
         if let State::Unlocked(store) = &self.state
@@ -2941,7 +3006,8 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
             if store.credit.account.is_some() {
                 report["credit"] = store.credit_view();
             }
-            if store.procurement.is_some()
+            if store.procurement_ready().is_ok()
+                || store.procurement.is_some()
                 || store.procurement_selection.is_some()
                 || !store.closed_purchases.is_empty()
             {
@@ -5978,8 +6044,8 @@ impl<S: Storage> crate::harness::BoundJournal for Store<S> {
     ) -> Result<Rc<Session>, AdmissionRefusal> {
         Store::connection_session_for(self, machine, origin).await
     }
-    async fn relay_key(&self) -> Option<crate::credential::RelayKey> {
-        Store::relay_key(self)
+    async fn relay_key(&self, machine: &str) -> Option<crate::credential::RelayKey> {
+        Store::relay_key(self, machine)
     }
 }
 

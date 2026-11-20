@@ -1,0 +1,167 @@
+{
+  "store": {
+    "connection_refusals": [],
+    "delivery": [
+      {
+        "findings_count": 0,
+        "machine": "fake-render-machine",
+        "reports_revision": 0,
+        "summary": true,
+        "verdict": "delivery evidence not yet supplied"
+      }
+    ],
+    "exposure_ledger": [],
+    "goal_templates": [
+      {
+        "id": "control-center@1",
+        "inputs": [
+          {
+            "label": "Your SSH public key (optional): lets you log in to the machine directly",
+            "name": "USER_SSH_KEY"
+          }
+        ],
+        "name": "Control center",
+        "options": [
+          {
+            "default": false,
+            "label": "Also reach it over Tor (an onion address)",
+            "name": "TOR"
+          }
+        ],
+        "text": "Your own private AI machine. It runs NixOS, has an AI agent with a web dashboard, and only you can reach it. It can install more for you later."
+      }
+    ],
+    "goals": [],
+    "installations": [],
+    "lifecycle_generation": "1",
+    "lifecycle_state": "running",
+    "mode_acceptances": [],
+    "poc_configuration": {
+      "configuration": {
+        "endpoint": "https://fake-inference.invalid/chat/completions",
+        "model": "fake-render-model"
+      },
+      "key_set": false
+    },
+    "poc_targets": [
+      {
+        "ai_key_needs_class_answer": false,
+        "application_inference_keys": [],
+        "elevation": "sudo -n",
+        "host": "8.8.8.8",
+        "key_card_class": null,
+        "machine": "fake-render-machine",
+        "pin": "",
+        "port": 22,
+        "profile": "v1",
+        "relay": "wss://fake-relay.invalid/",
+        "user": "nixos"
+      }
+    ],
+    "procurement": {
+      "archive": [],
+      "closed": null,
+      "completed": [
+        {
+          "delete": {
+            "state": "available"
+          },
+          "effective_pin": "SHA256:8hEgUtr1YNrSoFp6+8m2o2phk9LGkSq+GAODR5gUSjQ",
+          "introduction": {
+            "deadline": 1767227400,
+            "state": "accepted"
+          },
+          "is_paid": false,
+          "machine": "fake-render-machine",
+          "origin": "https://api.vpsbg.eu",
+          "paid_until": 1796083200,
+          "payment_id": null,
+          "purchase": "cccccccccccccccccccccccccccccccc",
+          "relay_pass": {
+            "expiry": 1769904000,
+            "host": "8.8.8.8",
+            "key": "04c1c85f7862bb086fa743421464be2409303446a47e469988b830f68d161ca4",
+            "state": "needed"
+          },
+          "renewal": "unknown",
+          "target_saved": true,
+          "trust": {
+            "residual": "VPS.BG boots the image it downloaded; the page cannot check those bytes.",
+            "route": "AttestCertificate"
+          },
+          "vendor": {
+            "billing": "PrepaidBalance",
+            "host_key_route": "AttestCertificate",
+            "id": "vpsbg",
+            "name": "VPS.BG Ltd (Bulgaria)"
+          },
+          "vm_id": 51
+        }
+      ],
+      "origin": "https://api.lnvps.net",
+      "selection": null,
+      "vendor_choice": null,
+      "vendor_choice_open": true,
+      "vendors_available": [
+        {
+          "billing": "Invoice",
+          "host_key_route": "ProviderPublication",
+          "id": "lnvps",
+          "name": "LNVPS"
+        },
+        {
+          "billing": "PrepaidBalance",
+          "host_key_route": "AttestCertificate",
+          "id": "vpsbg",
+          "name": "VPS.BG Ltd (Bulgaria)"
+        }
+      ]
+    },
+    "provider_configuration": {
+      "account": null,
+      "entered": false,
+      "key_set": false,
+      "origin": "https://api.lnvps.net",
+      "recorded": false,
+      "relay_deployed": false
+    },
+    "seed_backup_completion": "skipped",
+    "seed_backup_owed": false,
+    "seed_backup_stage": "inactive",
+    "sessions": [],
+    "setup": [
+      {
+        "access": {
+          "model": "maintained",
+          "profile": "ad-hoc",
+          "revision": 3
+        },
+        "answer": "no",
+        "class": "single_purpose",
+        "declaration": null,
+        "entry": {
+          "cost": {
+            "amount": 3901,
+            "period": {
+              "billing": {
+                "count": 1,
+                "interval": "month"
+              }
+            },
+            "unit": "eur_cent"
+          },
+          "machine": "fake-render-machine",
+          "product": "Fake plan",
+          "region": "Bulgaria",
+          "vendor": "VPS.BG Ltd (Bulgaria)"
+        },
+        "family": "machines",
+        "index": 0,
+        "requirements": []
+      }
+    ],
+    "setup_offer": null,
+    "signature_refusals": [],
+    "store_state": "unlocked"
+  }
+}

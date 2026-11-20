@@ -199,7 +199,7 @@ pub(crate) async fn resume_with(
     task: &Task,
     session: &str,
     target: &Target,
-    pins: &impl PinSource,
+    pins: &super::targets::StoredPins,
     model: &mut impl run::Model,
     response: Response,
     continuation: crate::lifecycle::Continuation,
@@ -215,7 +215,7 @@ pub(crate) async fn resume_with(
     }
     let mut runtime = Web {
         target,
-        pins,
+        pins: pins.clone(),
         response,
         session,
         continuation,
@@ -223,14 +223,14 @@ pub(crate) async fn resume_with(
     run::drive(&mut runtime, model, &task.id, session).await
 }
 
-struct Web<'a, P> {
+struct Web<'a> {
     response: Response,
     target: &'a Target,
-    pins: &'a P,
+    pins: super::targets::StoredPins,
     session: &'a str,
     continuation: crate::lifecycle::Continuation,
 }
-impl<P: PinSource> Runtime for Web<'_, P> {
+impl Runtime for Web<'_> {
     async fn progress(&mut self, task: &Task) {
         if self.continuation.check().is_err() {
             return;
@@ -353,7 +353,33 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             return Err(crate::poc::wait::TARGET_REQUIRED.into());
         }
         if self.pins.pin(&task.machine).is_none() {
-            return Err(crate::poc::wait::PIN_REQUIRED.into());
+            let local = local();
+            let mut writer = local.lock().await;
+            let admitted = writer.store().map_or(Ok(false), |store| {
+                if let Ok((_, pins)) = super::targets::resolve(store, &task.machine)
+                    && pins.pin(&task.machine).is_some()
+                {
+                    self.pins = pins;
+                    return Ok(true);
+                }
+                let Ok(now) = crate::hostcert::now_unix() else {
+                    return Ok(false);
+                };
+                if store.attest_introduction(&task.machine, now).is_some() {
+                    return Ok(true);
+                }
+                if store.attest_expired(&task.machine, now) {
+                    return Err(store.poc_refusal(&serde_json::json!({
+                        "refused": "attest",
+                        "why": "attest introduction expired",
+                        "deadline_unix": store.attest_deadline(&task.machine),
+                    })));
+                }
+                Ok(false)
+            })?;
+            if !admitted {
+                return Err(crate::poc::wait::PIN_REQUIRED.into());
+            }
         }
         let origin = local()
             .lock()
@@ -416,7 +442,7 @@ impl<P: PinSource> Runtime for Web<'_, P> {
                 store.poc_prepare_execution(&current, &journal.binding.session)?;
             }
             let result = crate::harness::run_command_input(
-                self.pins,
+                &self.pins,
                 &mut journal,
                 self.target,
                 command.as_bytes(),
@@ -473,7 +499,33 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             return Err(crate::poc::wait::TARGET_REQUIRED.into());
         }
         if self.pins.pin(&task.machine).is_none() {
-            return Err(crate::poc::wait::PIN_REQUIRED.into());
+            let local = local();
+            let mut writer = local.lock().await;
+            let admitted = writer.store().map_or(Ok(false), |store| {
+                if let Ok((_, pins)) = super::targets::resolve(store, &task.machine)
+                    && pins.pin(&task.machine).is_some()
+                {
+                    self.pins = pins;
+                    return Ok(true);
+                }
+                let Ok(now) = crate::hostcert::now_unix() else {
+                    return Ok(false);
+                };
+                if store.attest_introduction(&task.machine, now).is_some() {
+                    return Ok(true);
+                }
+                if store.attest_expired(&task.machine, now) {
+                    return Err(store.poc_refusal(&serde_json::json!({
+                        "refused": "attest",
+                        "why": "attest introduction expired",
+                        "deadline_unix": store.attest_deadline(&task.machine),
+                    })));
+                }
+                Ok(false)
+            })?;
+            if !admitted {
+                return Err(crate::poc::wait::PIN_REQUIRED.into());
+            }
         }
         let origin = local()
             .lock()
@@ -515,7 +567,7 @@ impl<P: PinSource> Runtime for Web<'_, P> {
                 super::timings::Mark::Collect,
             );
             let result = crate::harness::collect_jobs(
-                self.pins,
+                &self.pins,
                 &mut journal,
                 self.target,
                 #[cfg(feature = "tracer")]
@@ -834,8 +886,8 @@ impl BoundJournal for ScopedJournal {
             .connection_session(machine, Some(&self.origin))
             .await
     }
-    async fn relay_key(&self) -> Option<crate::credential::RelayKey> {
-        self.base.relay_key().await
+    async fn relay_key(&self, machine: &str) -> Option<crate::credential::RelayKey> {
+        self.base.relay_key(machine).await
     }
 }
 
@@ -1009,6 +1061,15 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                 match crate::poc::targets::resolve(store, &task.machine) {
                     Ok(resolved) => Ok(resolved),
                     Err(reason) => {
+                        if let Ok(now) = crate::hostcert::now_unix()
+                            && store.attest_expired(&task.machine, now)
+                        {
+                            return Err(store.poc_refusal(&serde_json::json!({
+                                "refused": "attest",
+                                "why": "attest introduction expired",
+                                "deadline_unix": store.attest_deadline(&task.machine),
+                            })));
+                        }
                         let reason = if let Some(profile) =
                             reason.strip_prefix("unsupported relay profile: ")
                         {

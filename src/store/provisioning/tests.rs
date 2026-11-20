@@ -1042,8 +1042,30 @@ fn provisioning_fresh_store_preserves_report_shape_until_selection() {
     let mut local = Local::new(s.storage.clone(), Fixed);
     block_on(local.open());
     block_on(local.unlock(pass()));
-    assert!(local.report(None).get("procurement").is_none());
-    assert!(local.inspect().get("procurement").is_none());
+    // A fresh store's report now offers the vendor choice (b2a). Before any selection it carries only the origin, no
+    // selection, no closed purchase, an empty archive and the vendor-choice fields, with nothing chosen.
+    let fresh = local.report(None)["procurement"].clone();
+    let mut keys: Vec<_> = fresh.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "archive",
+            "closed",
+            "origin",
+            "selection",
+            "vendor_choice",
+            "vendor_choice_open",
+            "vendors_available"
+        ]
+    );
+    assert!(fresh["selection"].is_null());
+    assert!(fresh["closed"].is_null());
+    assert_eq!(fresh["archive"], json!([]));
+    assert!(fresh["vendor_choice"].is_null());
+    assert_eq!(fresh["vendor_choice_open"], json!(true));
+    // Inspection is built on the report, so it shows the same object and nothing more about procurement.
+    assert_eq!(local.inspect()["procurement"], fresh);
     let mut api = Fixture::new(false);
     block_on(local.store().unwrap().procurement_select(
         &mut api,

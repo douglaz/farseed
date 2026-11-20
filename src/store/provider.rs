@@ -17,7 +17,13 @@ impl<S: Storage> Store<S> {
         if self.provider_account.is_some() {
             return Err("Provider account already recorded".into());
         }
-        if self.procurement.is_some() || !self.closed_purchases.is_empty() {
+        if self
+            .procurement
+            .iter()
+            .chain(&self.completed_purchases)
+            .chain(&self.closed_purchases)
+            .any(|p| p.vendor == crate::poc::provisioning::Vendor::Lnvps)
+        {
             return Err("A purchase prevents provider account entry.".into());
         }
         Ok(())
