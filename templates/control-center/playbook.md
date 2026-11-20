@@ -563,11 +563,238 @@ Expect `CHECKS hermes PASS`. The check itself waits up to 90 seconds for the das
 ## Step 6: Let the agent install more
 
 After this step, Hermes can add a module to /etc/nixos/extra and apply it. Every command it flags as risky waits
-for the user's approval in the chat.
+for the user's approval in the chat. The step also puts the recipes Hermes follows for a Bitcoin node,
+Tailscale, a wallet balance and Lightning in /etc/nixos/recipes (public text: no secret is in them).
 
 **Do**
 ```sh
 sh -eu <<'STEP'
+install -d -m 0755 /etc/nixos/recipes
+cat > /etc/nixos/recipes/bitcoin-node.md <<'RECIPE'
+# Recipe: a pruned Bitcoin node, with Tailscale
+
+Use it when the user asks for a Bitcoin node (this disk only fits a pruned one) or for Tailscale.
+
+1. One rebuild for both. Copy the two module templates unchanged with the shell (don't write your own: tailscaled
+   has no --operator flag; tailscale.nix sets the operator with services.tailscale.extraSetFlags), and apply:
+   `cp /etc/nixos/recipes/bitcoin-node.nix /etc/nixos/recipes/tailscale.nix /etc/nixos/extra/ && systemctl start control-center-apply`
+   - bitcoin-node.nix: Bitcoin Core, pruned, as services.bitcoind.main (data in /var/lib/bitcoind-main). Before its
+     first start, a one-shot service streams the published pruned copy into a staging folder, checks its sha256
+     (both read from https://lnvps.poc.asf0.org/snapshots/latest.json; about 12.5 GB, 5-15 minutes), and only then
+     puts it in place.
+   - tailscale.nix: Tailscale, with you (hermes) as its operator.
+2. The Tailscale sign-in link comes first. Don't wait for the rebuild: every 15 seconds, for up to 3 minutes, run
+   `timeout 20 tailscale up --operator=hermes` (keep the flag: a bare `tailscale up` drops you as operator). As
+   soon as it prints a https://login.tailscale.com/... link, write that link as plain text in your reply to the
+   user (not through a message tool, which hides it in a collapsed card), then carry on. Don't wait for them to
+   sign in; `tailscale status` shows the link again.
+3. Wait for the rebuild: `tail -n 5 /var/log/cc-rebuild.log` about once a minute, until it ends with RESULT. If it
+   failed, read `journalctl -u bitcoind-main-snapshot -n 20 --no-pager`.
+4. Use the node from your own shell: `bitcoin-cli -datadir=/var/lib/bitcoind-main getblockchaininfo`. Core runs in
+   your group, so you can read its cookie already: no new groups, ACLs, systemd-run or second rebuild. It catches
+   up from the copy in a few minutes. Check about once a minute until blocks equals headers, then tell the user the
+   latest block (height and time) and that the node is pruned and synced.
+RECIPE
+cat > /etc/nixos/recipes/bitcoin-wallet.md <<'RECIPE'
+# Recipe: the balance of a watch-only wallet
+
+Use it when the user gives an xpub (or output descriptors) and asks for its balance. It needs the Bitcoin node
+recipe done and caught up (blocks equals headers). Only public keys: never ask for a seed or an xprv.
+
+- One command: no wallet, no rescan, no keys. It reads Core's set of unspent outputs, takes about 1-3 minutes, and
+  only one scan can run at a time:
+  `bitcoin-cli -datadir=/var/lib/bitcoind-main scantxoutset start '[{"desc":"wpkh(<xpub>/0/*)","range":[0,1999]},{"desc":"wpkh(<xpub>/1/*)","range":[0,1999]}]'`
+  Put the user's xpub in place of `<xpub>`. Report total_amount in sats (BTC x 100,000,000) as the balance of the
+  wallet's first 2,000 receive and 2,000 change addresses, with the number of unspent outputs and their block
+  heights.
+- Phone wallets mostly use native segwit (wpkh). If the total is 0 but the user expects funds, try the same with
+  sh(wpkh(...)) and with pkh(...), or the descriptors the user gives. Core reads xpub keys only: for a zpub or a
+  ypub, ask the user for the wallet's xpub or its descriptors.
+RECIPE
+cat > /etc/nixos/recipes/lightning-node.md <<'RECIPE'
+# Recipe: a Lightning node (lnd), with a read-only Zeus link over Tailscale
+
+Use it when the user asks for a Lightning node, lnd or a Zeus connection. It needs the Bitcoin node recipe done and
+Tailscale signed in: if `tailscale ip -4` prints no 100.x address, show the user the link from `tailscale status`
+and wait for them to sign in.
+
+This is a demo node that must never hold funds: it has no seed backup, so anything sent to it could be lost. Tell
+the user that in the chat, plainly. You only get its read-only macaroon, so you can't make an address, an invoice
+or a channel, and you must not try.
+
+1. One rebuild. Fill in this machine's Tailscale address in the module template with the shell, changing nothing
+   else, and apply:
+   `sed "s/@tailscale_ip@/$(tailscale ip -4)/" /etc/nixos/recipes/lightning-node.nix > /etc/nixos/extra/lightning-node.nix && systemctl start control-center-apply`
+   The module runs lnd as its own user (lnd) with no seed, peers or channels, adds ZMQ to Core (Core restarts once),
+   and opens lnd's REST port 8080 only on tailscale0. Then `tail -n 5 /var/log/cc-rebuild.log` about once a minute,
+   until it ends with RESULT.
+2. lnd's state, read-only:
+   `lncli --tlscertpath=/var/lib/lnd/tls.cert --macaroonpath=/var/lib/lnd-pub/readonly.macaroon getinfo`
+   Repeat until synced_to_chain is true (usually under a minute once Core is at the tip). Tell the user the
+   version, the block height and synced_to_chain. synced_to_graph stays false, because the node has no peers.
+3. The Zeus link, with the read-only macaroon (it can show the node but never spend or receive):
+   `lndconnect --lnddir=/var/lib/lnd --configfile=/etc/lnd/lnd.conf --tlscertpath=/var/lib/lnd/tls.cert --readonlymacaroonpath=/var/lib/lnd-pub/readonly.macaroon --readonly --host=$(tailscale ip -4) --port=8080 -j`
+   Write it in a code block in your reply as plain text (not through a message tool, which hides it in a collapsed
+   card). In Zeus, the user copies it, accepts IMPORT, then SAVE; certificate verification is off
+   by default. The phone needs the Tailscale app on, in the same tailnet.
+RECIPE
+cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
+{ pkgs, ... }:
+{
+  # Bitcoin Core 32.1, pruned. Its group is hermes, so the agent's own shell can read the RPC cookie at once
+  # (rpccookieperms=group makes the cookie 0640; the data directory is 0770 bitcoind-main:hermes).
+  services.bitcoind.main = {
+    enable = true;
+    # The Core version: this system's nixpkgs (32.1, the latest release on 2026-11-20). To bump, point this one line
+    # at a newer pinned nixpkgs: (builtins.getFlake "github:NixOS/nixpkgs/<rev>?narHash=<hash>").legacyPackages.x86_64-linux.bitcoind
+    package = pkgs.bitcoind;
+    prune = 550;
+    group = "hermes";
+    extraConfig = ''
+      rpccookieperms=group
+      listenonion=0
+    '';
+  };
+
+  # Before Core's first start: stream the published pruned copy into a staging folder, check its sha256, and only
+  # then move blocks/ and chainstate/ into place and write the completion marker (last). The address and the sha256
+  # come from the manifest at run time. Core requires this unit, so it never starts on an unfinished import; an
+  # unfinished one (no marker) is removed and redone on the next start.
+  systemd.services.bitcoind-main-snapshot = {
+    description = "Seed Bitcoin Core from the published pruned copy";
+    requiredBy = [ "bitcoind-main.service" ];
+    before = [ "bitcoind-main.service" ];
+    wants = [ "network-online.target" ];
+    after = [ "network-online.target" ];
+    unitConfig.ConditionPathExists = "!/var/lib/bitcoind-main/.snapshot-complete";
+    path = with pkgs; [ curl jq zstd gnutar coreutils ];
+    environment.MANIFEST_URL = "https://lnvps.poc.asf0.org/snapshots/latest.json";
+    serviceConfig = {
+      Type = "oneshot";
+      User = "bitcoind-main";
+      Group = "hermes";
+      StateDirectory = "bitcoind-main";
+      StateDirectoryMode = "0770";
+      PrivateTmp = true;
+      TimeoutStartSec = "infinity";
+    };
+    script = ''
+      set -euo pipefail
+      cd /var/lib/bitcoind-main
+      # No marker: anything here is an unfinished import. Start clean.
+      rm -rf .snapshot-staging blocks chainstate
+      mkdir .snapshot-staging
+      m=$(curl -fsS --retry 5 --retry-delay 5 --retry-connrefused "$MANIFEST_URL")
+      url=$(printf '%s' "$m" | jq -er .url)
+      want=$(printf '%s' "$m" | jq -er .sha256)
+      echo "snapshot: $url"
+      fifo=$(mktemp -u)
+      mkfifo "$fifo"
+      ( set -o pipefail; zstd -dc < "$fifo" | tar -x -C .snapshot-staging -f - ) &
+      unpack=$!
+      got=$(curl -fsSL "$url" | tee "$fifo" | sha256sum | cut -d' ' -f1)
+      wait "$unpack"
+      if [ "$got" != "$want" ]; then
+        echo "sha256 mismatch: got $got, want $want"
+        rm -rf .snapshot-staging
+        exit 1
+      fi
+      mv .snapshot-staging/blocks .snapshot-staging/chainstate .
+      rm -rf .snapshot-staging
+      sync -f .
+      touch .snapshot-complete
+      sync -f .
+      echo "snapshot ok: sha256 $got"
+    '';
+  };
+}
+RECIPE
+cat > /etc/nixos/recipes/tailscale.nix <<'RECIPE'
+{ ... }:
+{
+  # Tailscale, with the agent's user as operator, so it can run `tailscale up` itself and show the sign-in link.
+  services.tailscale = {
+    enable = true;
+    extraSetFlags = [ "--operator=hermes" ];
+  };
+}
+RECIPE
+cat > /etc/nixos/recipes/lightning-node.nix <<'RECIPE'
+{ pkgs, config, ... }:
+let
+  # The lnd version: one pinned nixpkgs (lnd 0.21.8-beta, the latest release on 2026-11-20). This system's own
+  # nixpkgs has 0.20.8, which refuses Bitcoin Core 32 ("node backend does not support taproot"). To bump, change
+  # this one line to a newer pinned nixpkgs revision and its narHash.
+  lnd = (builtins.getFlake "github:NixOS/nixpkgs/e21fec321d73511849707a7585e4ea155ee4bf40?narHash=sha256-ySrWnmZB5UsZTYGHHnBjllT05O5iFjElCRS%2BmabtfP0%3D").legacyPackages.x86_64-linux.lnd;
+  # This machine's Tailscale address, from `tailscale ip -4` (the recipe fills it in).
+  tailscaleIp = "@tailscale_ip@";
+in
+{
+  # Block and transaction notifications for lnd.
+  services.bitcoind.main.extraConfig = ''
+    zmqpubrawblock=tcp://127.0.0.1:28332
+    zmqpubrawtx=tcp://127.0.0.1:28333
+  '';
+
+  # A demo node that must never hold funds: no seed backup (noseedbackup), no peers, no channels. It runs as its
+  # own user, lnd. The agent (hermes) gets only the read-only macaroon (in /var/lib/lnd-pub) and the TLS certificate
+  # (/var/lib/lnd/tls.cert, public), so neither the agent nor Zeus can make an address or an invoice, or open a channel.
+  # REST on 8080, reachable only over Tailscale.
+  environment.etc."lnd/lnd.conf".text = ''
+    [Application Options]
+    noseedbackup=true
+    nolisten=true
+    nobootstrap=true
+    rpclisten=127.0.0.1:10009
+    restlisten=0.0.0.0:8080
+    tlsextraip=${tailscaleIp}
+    readonlymacaroonpath=/var/lib/lnd-pub/readonly.macaroon
+
+    [Bitcoin]
+    bitcoin.mainnet=true
+    bitcoin.node=bitcoind
+
+    [Bitcoind]
+    bitcoind.rpchost=127.0.0.1:8332
+    bitcoind.rpccookie=/var/lib/bitcoind-main/.cookie
+    bitcoind.zmqpubrawblock=tcp://127.0.0.1:28332
+    bitcoind.zmqpubrawtx=tcp://127.0.0.1:28333
+  '';
+
+  environment.systemPackages = [ lnd pkgs.lndconnect ];
+
+  users.users.lnd = { isSystemUser = true; group = "lnd"; };
+  users.groups.lnd = { };
+  # lnd's own data (admin macaroon, wallet, TLS key) stays private to lnd: /var/lib/lnd is 0711 (enter only, no
+  # listing) and its data/, logs/ and tls.key are lnd-only. The read-only macaroon goes to lnd-pub, which hermes
+  # can read.
+  systemd.tmpfiles.rules = [ "d /var/lib/lnd-pub 0750 lnd hermes - -" ];
+
+  systemd.services.lnd = {
+    description = "Lightning Network Daemon (demo node: never fund it)";
+    wantedBy = [ "multi-user.target" ];
+    wants = [ "bitcoind-main.service" ];
+    after = [ "bitcoind-main.service" ];
+    restartTriggers = [ config.environment.etc."lnd/lnd.conf".source ];
+    serviceConfig = {
+      User = "lnd";
+      Group = "lnd";
+      # Core's RPC cookie is readable by the hermes group.
+      SupplementaryGroups = [ "hermes" ];
+      StateDirectory = "lnd";
+      StateDirectoryMode = "0711";
+      # Make lnd-pub before every start (as root, "+"): on a live apply, tmpfiles and lnd start unordered.
+      ExecStartPre = "+${pkgs.coreutils}/bin/install -d -m 0750 -o lnd -g hermes /var/lib/lnd-pub";
+      ExecStart = "${lnd}/bin/lnd --lnddir=/var/lib/lnd --configfile=/etc/lnd/lnd.conf";
+      Restart = "on-failure";
+      RestartSec = 10;
+    };
+  };
+
+  networking.firewall.interfaces.tailscale0.allowedTCPPorts = [ 8080 ];
+}
+RECIPE
+chmod 0644 /etc/nixos/recipes/bitcoin-node.md /etc/nixos/recipes/bitcoin-wallet.md /etc/nixos/recipes/lightning-node.md /etc/nixos/recipes/bitcoin-node.nix /etc/nixos/recipes/tailscale.nix /etc/nixos/recipes/lightning-node.nix
 cat > /etc/nixos/cc-agent.nix <<'FILE'
 { ... }:
 {
@@ -584,7 +811,17 @@ cat > /etc/nixos/cc-agent.nix <<'FILE'
     then read the result: tail -n 5 /var/log/cc-rebuild.log  (it ends with "RESULT 0" on success).
     Never put a password, key or token in a .nix file: the Nix store is readable by everyone.
     To undo: delete your file and start control-center-apply again.
+    Write files under /etc/nixos with the shell (cp, cat >): the file tool refuses paths under /etc.
+    Give the user links and results as plain text in your reply, not through a message tool.
+    Recipes for common requests are in recipes/ next to this file: bitcoin-node.md (a pruned Bitcoin node and
+    Tailscale), bitcoin-wallet.md (a watch-only wallet's balance) and lightning-node.md (lnd and a read-only
+    Zeus link). Read the matching recipe first and follow it. The Lightning node is a demo with no seed backup:
+    never fund it, and tell the user it must not receive funds.
   '';
+  # The recipes the lines above point to. The module files they copy are in /etc/nixos/recipes.
+  services.hermes-agent.documents."recipes/bitcoin-node.md" = ./recipes/bitcoin-node.md;
+  services.hermes-agent.documents."recipes/bitcoin-wallet.md" = ./recipes/bitcoin-wallet.md;
+  services.hermes-agent.documents."recipes/lightning-node.md" = ./recipes/lightning-node.md;
 
   systemd.tmpfiles.rules = [ "d /etc/nixos/extra 2775 root hermes - -" ];
   systemd.services.hermes-agent.serviceConfig.ReadWritePaths = [ "/etc/nixos/extra" ];
