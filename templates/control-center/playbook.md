@@ -593,8 +593,8 @@ Use it when the user asks for a Bitcoin node (this disk only fits a pruned one) 
    card. Then carry on in the same turn. Don't wait for them to sign in; `tailscale status` shows the link again.
 3. Wait for the rebuild: `tail -n 5 /var/log/cc-rebuild.log` about once a minute, until it ends with RESULT. If it
    failed, read `journalctl -u bitcoind-main-snapshot -n 20 --no-pager`.
-4. Use the node from your own shell: `bitcoin-cli -datadir=/var/lib/bitcoind-main getblockchaininfo`. Core runs in
-   your group, so you can read its cookie already: no new groups, ACLs, systemd-run or second rebuild. It catches
+4. Use the node from your own shell: `bitcoin-cli -datadir=/var/lib/bitcoind-main getblockchaininfo`. The module
+   already lets you read its cookie: add no groups or ACLs yourself, and no systemd-run or second rebuild. It catches
    up from the copy in a few minutes. Check about once a minute until blocks equals headers, then tell the user the
    latest block (height and time) and that the node is pruned and synced.
 RECIPE
@@ -647,8 +647,9 @@ RECIPE
 cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
 { pkgs, ... }:
 {
-  # Bitcoin Core 32.1, pruned. Its group is hermes, so the agent's own shell can read the RPC cookie at once
-  # (rpccookieperms=group makes the cookie 0640; the data directory is 0770 bitcoind-main:hermes).
+  # Bitcoin Core 32.1, pruned. It runs as bitcoind-main in its own group, never the hermes group: Hermes refuses
+  # every new chat when another account shares its group. The agent (hermes) reads the RPC cookie through an ACL
+  # (below), so its running shell can use bitcoin-cli at once, with no new group and no restart.
   services.bitcoind.main = {
     enable = true;
     # The Core version: this system's nixpkgs (32.1, the latest release on 2026-11-20). To bump, point this one line
@@ -657,7 +658,6 @@ cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
     # Keep about a week of blocks (2000 MiB): lnd's new wallet rescans from 48 hours before its creation, and a
     # 550 MiB window (about 295 blocks) is just short of that, so lnd would need blocks Core has already pruned.
     prune = 2000;
-    group = "hermes";
     # Small machines (4 GiB): a smaller UTXO cache and mempool leave memory for the page cache, the agent and T3.
     dbCache = 300;
     # ZMQ is on from the start, so adding Lightning later never changes Core's config (no restart, no re-check).
@@ -682,6 +682,13 @@ cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
   systemd.services.bitcoind-main.serviceConfig = {
     MemoryHigh = "60%";
     IOWeight = 50;
+    # Before every start, as root ("+"): hermes may enter the data directory, and what Core creates there from now
+    # on, the RPC cookie included, is readable (never writable) by hermes and by Core's group (lnd). The cookie
+    # stays 0640 (rpccookieperms=group), so no other user can read it.
+    ExecStartPre = [
+      "+${pkgs.coreutils}/bin/chown bitcoind-main:bitcoind-main /var/lib/bitcoind-main"
+      "+${pkgs.acl}/bin/setfacl -m u:hermes:r-x,d:u:hermes:r-x,d:m::r-x /var/lib/bitcoind-main"
+    ];
   };
 
   # Compressed swap in RAM: idle memory can move there, so the kernel stops evicting program code and file pages.
@@ -703,7 +710,6 @@ cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
     serviceConfig = {
       Type = "oneshot";
       User = "bitcoind-main";
-      Group = "hermes";
       StateDirectory = "bitcoind-main";
       StateDirectoryMode = "0770";
       PrivateTmp = true;
@@ -821,8 +827,9 @@ in
     serviceConfig = {
       User = "lnd";
       Group = "lnd";
-      # Core's RPC cookie is readable by the hermes group.
-      SupplementaryGroups = [ "hermes" ];
+      # Core's RPC cookie is readable by Core's own group. Never the hermes group: it would let lnd write into the
+      # agent's home.
+      SupplementaryGroups = [ "bitcoind-main" ];
       StateDirectory = "lnd";
       StateDirectoryMode = "0711";
       ExecStartPre = [
@@ -855,7 +862,7 @@ in
 RECIPE
 chmod 0644 /etc/nixos/recipes/bitcoin-node.md /etc/nixos/recipes/bitcoin-wallet.md /etc/nixos/recipes/lightning-node.md /etc/nixos/recipes/bitcoin-node.nix /etc/nixos/recipes/tailscale.nix /etc/nixos/recipes/lightning-node.nix
 cat > /etc/nixos/cc-agent.nix <<'FILE'
-{ ... }:
+{ config, lib, ... }:
 {
   # Lets the machine's own agent install more, the same declarative way: it writes one module
   # into /etc/nixos/extra and starts control-center-apply.service, which runs the rebuild as root.
@@ -885,6 +892,24 @@ cat > /etc/nixos/cc-agent.nix <<'FILE'
   systemd.tmpfiles.rules = [ "d /etc/nixos/extra 2775 root hermes - -" ];
   systemd.services.hermes-agent.serviceConfig.ReadWritePaths = [ "/etc/nixos/extra" ];
   systemd.services.hermes-backend.serviceConfig.ReadWritePaths = [ "/etc/nixos/extra" ];
+
+  # Hermes refuses every new chat when another account shares its group (its home is group-writable). So no other
+  # account may have the hermes group, as its own group or as a member, and no service running as another user may
+  # get it (Group= or SupplementaryGroups=). A module that breaks this fails the rebuild before anything changes.
+  assertions =
+    let
+      h = config.services.hermes-agent.group;
+      me = config.services.hermes-agent.user;
+      extra = c: lib.concatMap (g: lib.splitString " " (toString g)) (lib.toList (c.SupplementaryGroups or [ ]));
+      accounts = lib.unique (lib.remove me config.users.groups.${h}.members ++ lib.attrNames
+        (lib.filterAttrs (_: u: u.name != me && (u.group == h || lib.elem h u.extraGroups)) config.users.users));
+      services = lib.attrNames (lib.filterAttrs (_: s: toString (s.serviceConfig.User or me) != me
+        && (toString (s.serviceConfig.Group or "") == h || lib.elem h (extra s.serviceConfig))) config.systemd.services);
+    in
+    [ {
+      assertion = accounts == [ ] && services == [ ];
+      message = "The ${h} group must stay the agent's own (Hermes refuses new chats otherwise). Shared by accounts: ${toString accounts}; services: ${toString services}.";
+    } ];
 
   systemd.services.control-center-apply = {
     description = "Apply /etc/nixos for the agent";
