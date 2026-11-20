@@ -667,11 +667,9 @@ cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
     '';
   };
 
-  # Core throttles itself (memory and disk share) before it can starve sshd, the agent or T3.
-  systemd.services.bitcoind-main.serviceConfig = {
-    MemoryHigh = "1500M";
-    IOWeight = 50;
-  };
+  # Core gives way on the disk to sshd, the agent and T3 when they need it. No memory cap: a cgroup memory limit
+  # also counts Core's page cache, and capping it makes Core re-read its chainstate from disk all the time.
+  systemd.services.bitcoind-main.serviceConfig.IOWeight = 50;
 
   # Compressed swap in RAM: idle memory can move there, so the kernel stops evicting program code and file pages.
   zramSwap.enable = true;
