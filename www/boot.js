@@ -393,11 +393,9 @@ const render = (store, forceRender = false) => {
   renderProgress(store);
 };
 
+const progressView = {result: null, rows: new Map(), more: null};
 const renderProgress = (store) => {
-  const list = $('progress');
-  list.replaceChildren();
-  list.hidden = store.state === undefined || ['starting', 'working', 'locking'].includes(store.state);
-  if (list.hidden) return;
+  const hidden = store.state === undefined || ['starting', 'working', 'locking'].includes(store.state);
   const rows = [
     ['store', 'Make your store'],
     ['credit', 'Buy AI credit'],
@@ -424,21 +422,35 @@ const renderProgress = (store) => {
     const targets = store.poc_targets ?? [];
     const target = machine => targets.some(t => t.machine === machine);
     const liveSessions = (store.sessions ?? []).filter(session => session.session_state !== 'ended');
-    // The list follows one machine: the current purchase's, else a live session's, else the only saved machine.
-    const machine = purchase.machine ?? liveSessions.find(session => session.bound_set?.length === 1)?.bound_set[0]
-      ?? (targets.length === 1 ? targets[0].machine : undefined);
-    const tasks = (store.tasks ?? []).filter(task => machine !== undefined && task.machine === machine)
-      .sort((a, b) => (b.creation_rank ?? -1) - (a.creation_rank ?? -1));
-    const session = liveSessions.find(session => session.bound_set?.length === 1 && session.bound_set[0] === machine);
     const inLiveSession = task => liveSessions.some(session => session.identity === task.start_session);
-    // The live task, else the machine's newest task: an older success never stands in for newer unfinished work.
-    // A live session on this machine with no task yet is where the user is: an older session's task never stands in.
-    const task = tasks.find(task => !task.summary && inLiveSession(task)) ?? tasks.find(inLiveSession)
-      ?? (session ? undefined : tasks[0]);
+    const setupFor = machine => {
+      const tasks = (store.tasks ?? []).filter(task => machine !== undefined && task.machine === machine)
+        .sort((a, b) => (b.creation_rank ?? -1) - (a.creation_rank ?? -1));
+      const session = liveSessions.find(session => session.bound_set?.length === 1 && session.bound_set[0] === machine);
+      // The live task, else the machine's newest task: an older success never stands in for newer unfinished work.
+      // A live session on this machine with no task yet is where the user is: an older session's task never stands in.
+      const task = tasks.find(task => !task.summary && inLiveSession(task)) ?? tasks.find(inLiveSession)
+        ?? (session ? undefined : tasks[0]);
+      return {session, task};
+    };
+    const draft = Boolean(purchase.selection) && (!purchase.phase || purchase.phase === 'handed_off');
+    const setupSession = draft ? liveSessions.find(session => {
+      if (session.bound_set?.length !== 1) return false;
+      const {task} = setupFor(session.bound_set[0]);
+      return task && !task.verdict && task.status !== 'abandoned';
+    }) : undefined;
+    const followDraft = draft && !setupSession;
+    // A new draft takes over unless a live session still has a setup in progress.
+    const machine = followDraft ? undefined : setupSession?.bound_set[0] ?? purchase.machine
+      ?? liveSessions.find(session => session.bound_set?.length === 1)?.bound_set[0]
+      ?? (targets.length === 1 ? targets[0].machine : undefined);
+    const {session, task} = followDraft ? {} : setupFor(machine);
     const live = Boolean(task) && inLiveSession(task);
-    // A machine enrolled here without a purchase was never bought here: approving and paying don't apply to it.
-    const bought = Boolean(purchase.machine);
-    const saved = machine !== undefined ? target(machine) : targets.length > 0;
+    const completed = (purchase.completed ?? []).find(entry => machine !== undefined && entry.machine === machine);
+    const currentPurchase = machine !== undefined && machine === purchase.machine;
+    const bought = !followDraft && (machine !== undefined ? currentPurchase || Boolean(completed)
+      : targets.some(t => t.machine === purchase.machine || (purchase.completed ?? []).some(entry => entry.machine === t.machine)));
+    const saved = !followDraft && (machine !== undefined ? target(machine) : targets.length > 0);
     skipped = [false, false, !bought && saved, !bought && saved, false, false, false];
     const checksPassed = [
       'Delivered (service and TCP checks only)',
@@ -448,10 +460,11 @@ const renderProgress = (store) => {
     done = [
       !ceremony && store.seed_backup_stage === 'inactive',
       store.credit?.can_start === true || store.poc_configuration?.key_set === true,
-      bought && (['approved', 'registration_uncertain', 'registered', 'create_uncertain', 'email_verification',
-        'initial_invoice', 'invoice_uncertain', 'payment_readiness', 'handed_off'].includes(purchase.phase) || target(purchase.machine)),
-      bought && (purchase.payment?.is_paid === true || purchase.phase === 'handed_off' || target(purchase.machine)),
-      bought ? purchase.phase === 'handed_off' || target(purchase.machine) : saved,
+      bought && (!currentPurchase || ['approved', 'registration_uncertain', 'registered', 'create_uncertain', 'email_verification',
+        'initial_invoice', 'invoice_uncertain', 'payment_readiness', 'handed_off'].includes(purchase.phase) || saved),
+      bought && (currentPurchase ? purchase.payment?.is_paid === true || purchase.phase === 'handed_off' || saved
+        : completed?.is_paid === true || completed?.target_saved === true || saved),
+      currentPurchase ? purchase.phase === 'handed_off' || saved : saved,
       task?.status === 'verifying' || Boolean(task?.verdict),
       checksPassed,
     ];
@@ -527,44 +540,93 @@ const renderProgress = (store) => {
   // While the store step itself needs the user (create, unlock, the seed words), show only that step, so its controls
   // stay on a phone's first screen.
   const compact = current === 0;
-  for (const [index, [key, text]] of rows.entries()) {
-    if (compact && index > 0) continue;
-    const row = document.createElement('li');
-    row.dataset.progressStep = key;
-    row.dataset.progressState = done[index] ? 'done' : skipped[index] ? 'skip' : current === index ? 'current' : 'todo';
-    const mark = document.createElement('span');
-    mark.setAttribute('aria-hidden', 'true');
-    mark.textContent = done[index] ? '✓ ' : skipped[index] ? '– ' : current === index ? '▸ ' : '○ ';
-    const label = document.createElement('span');
-    label.textContent = skipped[index] ? `${text} — not needed for a machine you added yourself` : text;
-    row.append(mark, label);
-    if (current === index || index === 6 && done.every((value, row) => value || skipped[row])) {
-      if (current === index) row.setAttribute('aria-current', 'step');
-      const detail = document.createElement('div');
-      detail.dataset.progressLine = '';
-      detail.textContent = current === index ? line : 'Setup finished and its own checks passed. Its task card has the result.';
-      row.append(detail);
-    }
-    if (index === 5 && current === index && step !== undefined) {
-      const strip = document.createElement('div');
-      strip.dataset.progressStrip = '';
-      strip.setAttribute('role', 'img');
-      strip.setAttribute('aria-label', `Step ${step} of 12`);
-      for (let segment = 1; segment <= 12; segment++) {
-        const box = document.createElement('span');
-        if (segment <= step) box.dataset.filled = '';
-        strip.append(box);
+  const result = {
+    hidden,
+    rows: hidden ? [] : rows.slice(0, compact ? 1 : rows.length).map(([key, text], index) => ({
+      key,
+      state: done[index] ? 'done' : skipped[index] ? 'skip' : current === index ? 'current' : 'todo',
+      mark: done[index] ? '✓ ' : skipped[index] ? '– ' : current === index ? '▸ ' : '○ ',
+      label: skipped[index] ? `${text} — not needed for a machine you added yourself` : text,
+      current: current === index ? 'step' : null,
+      line: current === index ? line : index === 6 && done.every((value, row) => value || skipped[row])
+        ? 'Setup finished and its own checks passed. Its task card has the result.' : null,
+      step: index === 5 && current === index && step !== undefined ? step : null,
+    })),
+    more: !hidden && compact,
+  };
+  const signature = JSON.stringify(result);
+  if (progressView.result === signature) return;
+
+  const list = $('progress');
+  if (list.hidden !== hidden) list.hidden = hidden;
+  if (!hidden) {
+    const shown = [];
+    for (const data of result.rows) {
+      let cached = progressView.rows.get(data.key);
+      if (!cached) {
+        const row = document.createElement('li');
+        row.dataset.progressStep = data.key;
+        const mark = document.createElement('span');
+        mark.setAttribute('aria-hidden', 'true');
+        const label = document.createElement('span');
+        row.append(mark, label);
+        cached = {row, mark, label, detail: null, strip: null, boxes: []};
+        progressView.rows.set(data.key, cached);
       }
-      row.append(strip);
+      const {row, mark, label} = cached;
+      if (row.dataset.progressState !== data.state) row.dataset.progressState = data.state;
+      if (mark.textContent !== data.mark) mark.textContent = data.mark;
+      if (label.textContent !== data.label) label.textContent = data.label;
+      if (row.getAttribute('aria-current') !== data.current) {
+        if (data.current === null) row.removeAttribute('aria-current');
+        else row.setAttribute('aria-current', data.current);
+      }
+      if (data.line !== null) {
+        if (!cached.detail) {
+          cached.detail = document.createElement('div');
+          cached.detail.dataset.progressLine = '';
+        }
+        if (cached.detail.textContent !== data.line) cached.detail.textContent = data.line;
+        if (![...row.children].includes(cached.detail)) {
+          row.insertBefore(cached.detail, [...row.children].includes(cached.strip) ? cached.strip : null);
+        }
+      } else if ([...row.children].includes(cached.detail)) cached.detail.remove();
+      if (data.step !== null) {
+        if (!cached.strip) {
+          cached.strip = document.createElement('div');
+          cached.strip.dataset.progressStrip = '';
+          cached.strip.setAttribute('role', 'img');
+          for (let segment = 0; segment < 12; segment++) {
+            const box = document.createElement('span');
+            cached.boxes.push(box);
+            cached.strip.append(box);
+          }
+        }
+        const label = `Step ${data.step} of 12`;
+        if (cached.strip.getAttribute('aria-label') !== label) cached.strip.setAttribute('aria-label', label);
+        for (const [index, box] of cached.boxes.entries()) {
+          if (index < data.step) {
+            if (box.dataset.filled !== '') box.dataset.filled = '';
+          } else if (box.dataset.filled !== undefined) delete box.dataset.filled;
+        }
+        if (![...row.children].includes(cached.strip)) row.append(cached.strip);
+      } else if ([...row.children].includes(cached.strip)) cached.strip.remove();
+      shown.push(row);
     }
-    list.append(row);
+    if (result.more) {
+      if (!progressView.more) {
+        progressView.more = document.createElement('li');
+        progressView.more.dataset.progressMore = '';
+        progressView.more.textContent = 'Six more steps after this.';
+      }
+      shown.push(progressView.more);
+    }
+    for (const child of [...list.children]) if (!shown.includes(child)) child.remove();
+    for (const [index, row] of shown.entries()) {
+      if (list.children[index] !== row) list.insertBefore(row, list.children[index] ?? null);
+    }
   }
-  if (compact) {
-    const more = document.createElement('li');
-    more.dataset.progressMore = '';
-    more.textContent = 'Six more steps after this.';
-    list.append(more);
-  }
+  progressView.result = signature;
 };
 
 // Fixture wording until the signed bundle supplies it. No message supplies question text.
