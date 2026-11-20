@@ -816,6 +816,25 @@ fn vpsbg_image_relisted_before_create() {
 }
 
 #[test]
+fn vpsbg_terminated_foreign_server_allows_pre_create_gate() {
+    let (mut s, id, mut api) = fresh(true);
+    api.servers(vec![
+        json!({"id":1,"hostname":"tau-web-fake-terminated-foreign","status":"terminated"}),
+    ]);
+    create(&mut s, &mut api, &id).unwrap();
+    assert_eq!(api.creates, 1);
+    assert_eq!(api.pays, 0);
+    assert_eq!(s.vpsbg_purchases[&id].creates.len(), 1);
+    assert!(s.vpsbg_purchases[&id].associated.is_some());
+    assert!(s.vpsbg_reads.pause.is_none());
+    assert_eq!(s.vpsbg_reads.servers.len(), 1);
+    assert!(matches!(
+        &s.vpsbg_reads.servers[0],
+        wire::ServerFact::Terminated(row) if row.hostname == "tau-web-fake-terminated-foreign"
+    ));
+}
+
+#[test]
 fn vpsbg_create_echo_keeps_unknown() {
     for kind in 0..=5 {
         let (mut s, id, mut api) = fresh(true);

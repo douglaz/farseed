@@ -171,20 +171,14 @@ fn vpsbg_images_and_second_writer_gate_money() {
         "short_retention",
         "downloading_after_stale",
         "another_writer",
-        "unknown_age",
     ] {
         let mut s = money_store();
         let id = money_save(&mut s, "fake-image-gate", 'a');
         let mut api = MoneyApi::new(&s);
-        if case == "another_writer" || case == "unknown_age" {
-            let row = if case == "another_writer" {
-                let mut row = server_row();
-                row["hostname"] = json!("tau-web-unowned");
-                row["created_at"] = json!("2026-01-01T00:00:00Z");
-                row
-            } else {
-                json!({"id":1,"hostname":"tau-web-unowned","status":"terminated"})
-            };
+        if case == "another_writer" {
+            let mut row = server_row();
+            row["hostname"] = json!("tau-web-unowned");
+            row["created_at"] = json!("2026-01-01T00:00:00Z");
             api.responses
                 .insert("GET /v1/servers?page=1".into(), server_page(vec![row]));
         } else {
@@ -216,7 +210,7 @@ fn vpsbg_images_and_second_writer_gate_money() {
         let _ = block_on(s.vpsbg_progress(
             api.action(),
             &id,
-            case == "full" || case == "another_writer" || case == "unknown_age",
+            case == "full" || case == "another_writer",
         ));
         assert_eq!(api.posts("/v1/balance"), 0, "money sent for {case}");
         assert!(s.vpsbg_purchases[&id].deposits.is_empty());
@@ -230,11 +224,103 @@ fn vpsbg_images_and_second_writer_gate_money() {
                 "image_list_full"
             );
         }
-        if case == "another_writer" || case == "unknown_age" {
+        if case == "another_writer" {
             assert_eq!(
                 s.vpsbg_reads.pause.as_ref().unwrap()["kind"],
                 "another_writer"
             );
+        }
+    }
+}
+
+#[test]
+fn vpsbg_two_terminated_foreign_servers_allow_approval_and_deposit() {
+    // Terminated rows lack created_at, but cannot be written to by another active writer.
+    for fresh_approval in [true, false] {
+        let mut s = money_store();
+        let mut api = MoneyApi::new(&s);
+        api.responses.insert(
+            "GET /v1/servers?page=1".into(),
+            server_page(vec![
+                json!({"id":1,"hostname":"tau-web-fake-terminated-one","status":"terminated"}),
+                json!({"id":2,"hostname":"tau-web-fake-terminated-two","status":"terminated"}),
+            ]),
+        );
+        if fresh_approval {
+            let review = s
+                .vpsbg_review(&selected(), &money_balance(1998), api.time)
+                .unwrap();
+            block_on(s.vpsbg_approve(
+                api.action(),
+                money_approval("fake-terminated-account"),
+                review,
+            ))
+            .unwrap();
+        } else {
+            let id = money_save(&mut s, "fake-terminated-progress", 'a');
+            block_on(s.vpsbg_progress(api.action(), &id, true)).unwrap();
+        }
+        let id = &s
+            .procurement
+            .as_ref()
+            .unwrap()
+            .vpsbg
+            .as_ref()
+            .unwrap()
+            .purchase;
+        let state = &s.vpsbg_purchases[id];
+        assert_eq!(state.approvals.len(), 1);
+        assert_eq!(state.deposits.len(), 1);
+        assert!(state.deposits[0].invoice.is_some());
+        assert_eq!(api.posts("/v1/balance"), 1);
+        assert!(s.vpsbg_reads.pause.is_none());
+        assert_eq!(s.vpsbg_reads.servers.len(), 2);
+        assert!(
+            s.vpsbg_reads
+                .servers
+                .iter()
+                .all(|row| matches!(row, wire::ServerFact::Terminated(_)))
+        );
+    }
+}
+
+#[test]
+fn vpsbg_live_foreign_server_refuses_approval_without_record_or_money() {
+    for status in ["active", "processing"] {
+        for created_at in [
+            "2025-12-31T23:00:00Z",
+            "2025-12-31T00:00:00Z",
+            "2026-01-01T00:00:01Z",
+        ] {
+            let mut s = money_store();
+            let mut api = MoneyApi::new(&s);
+            let mut row = server_row();
+            row["hostname"] = json!("tau-web-fake-foreign-live");
+            row["status"] = json!(status);
+            row["created_at"] = json!(created_at);
+            api.responses
+                .insert("GET /v1/servers?page=1".into(), server_page(vec![row]));
+            let review = s
+                .vpsbg_review(&selected(), &money_balance(1998), api.time)
+                .unwrap();
+            let before = s.storage.files();
+            assert!(
+                block_on(s.vpsbg_approve(
+                    api.action(),
+                    money_approval("fake-live-foreign"),
+                    review,
+                ))
+                .is_err()
+            );
+            assert_eq!(
+                s.vpsbg_reads.pause.as_ref().unwrap()["kind"],
+                "another_writer"
+            );
+            assert_eq!(s.storage.files(), before);
+            assert!(s.procurement.is_none());
+            assert!(s.vpsbg_purchases.is_empty());
+            assert!(api.calls.iter().all(|(method, _, _)| method == "GET"));
+            assert_eq!(api.posts("/v1/balance"), 0);
         }
     }
 }

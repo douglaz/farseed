@@ -793,7 +793,8 @@ impl<S: Storage> Store<S> {
         for row in &servers {
             let (name, created) = match row {
                 wire::ServerFact::Live(d) => (&d.server.hostname, Some(d.server.created_at)),
-                wire::ServerFact::Terminated(d) => (&d.hostname, None),
+                // A terminated server cannot be written to, so it is no evidence of another writer.
+                wire::ServerFact::Terminated(_) => continue,
             };
             let owned = self.vpsbg_history().any(|p| {
                 p.vendor == Vendor::Vpsbg
