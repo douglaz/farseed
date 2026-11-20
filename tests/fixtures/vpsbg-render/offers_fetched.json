@@ -107,6 +107,7 @@
       "images": [
         {
           "default_username": "nixos",
+          "distribution": "nixos",
           "id": 1,
           "name": "Deployment image",
           "source": "deployment"
