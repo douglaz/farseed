@@ -1000,8 +1000,10 @@ pub(crate) fn vpsbg_timestamp(s: &str) -> Result<u64, String> {
     .map_err(|_| REFUSED.into())
 }
 
+/// The deployment image is our own NixOS 26.05 build, pinned by URL and size, so it is NixOS by construction. The
+/// distribution is what the Control center template checks before it admits a machine.
 pub(crate) fn image() -> Value {
-    json!({"id":1,"name":"Deployment image","default_username":"nixos","source":"deployment"})
+    json!({"id":1,"name":"Deployment image","default_username":"nixos","distribution":"nixos","source":"deployment"})
 }
 pub(super) fn offer_charge(offer: &Value) -> Result<Charge, String> {
     let p: Plan = serde_json::from_value(offer.clone()).map_err(|_| REFUSED)?;
