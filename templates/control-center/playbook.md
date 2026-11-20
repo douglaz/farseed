@@ -622,6 +622,8 @@ This is a demo node that must never hold funds: it has no seed backup, so anythi
 the user that in the chat, plainly. You only get its read-only macaroon, so you can't make an address, an invoice
 or a channel, and you must not try.
 
+Install nothing else: no QR tools or other extras. The plain-text link is the result.
+
 1. One rebuild. Fill in this machine's Tailscale address in the module template with the shell, changing nothing
    else, and apply:
    `sed "s/@tailscale_ip@/$(tailscale ip -4)/" /etc/nixos/recipes/lightning-node.nix > /etc/nixos/extra/lightning-node.nix && systemctl start control-center-apply`
@@ -722,10 +724,21 @@ RECIPE
 cat > /etc/nixos/recipes/lightning-node.nix <<'RECIPE'
 { pkgs, config, ... }:
 let
-  # The lnd version: one pinned nixpkgs (lnd 0.21.8-beta, the latest release on 2026-11-20). This system's own
-  # nixpkgs has 0.20.8, which refuses Bitcoin Core 32 ("node backend does not support taproot"). To bump, change
-  # this one line to a newer pinned nixpkgs revision and its narHash.
-  lnd = (builtins.getFlake "github:NixOS/nixpkgs/e21fec321d73511849707a7585e4ea155ee4bf40?narHash=sha256-ySrWnmZB5UsZTYGHHnBjllT05O5iFjElCRS%2BmabtfP0%3D").legacyPackages.x86_64-linux.lnd;
+  # The lnd version: lnd's own static release binary (0.21.8-beta, the latest release on 2026-11-20), pinned by the
+  # sha256 in its signed release manifest. One small download, no second nixpkgs to fetch or evaluate. This
+  # system's nixpkgs has lnd 0.20.8, which refuses Bitcoin Core 32 ("node backend does not support taproot").
+  # To bump: change the version and the sha256 (from manifest-v<version>.txt) together.
+  lndVersion = "0.21.8-beta";
+  lndSha256 = "4910a14801e10164ca2ea67f5935e2486874331d56bbd0638a68c6158a8e82c9";
+  lnd = pkgs.runCommandLocal "lnd-${lndVersion}" {
+    src = pkgs.fetchurl {
+      url = "https://github.com/lightningnetwork/lnd/releases/download/v${lndVersion}/lnd-linux-amd64-v${lndVersion}.tar.gz";
+      sha256 = lndSha256;
+    };
+  } ''
+    mkdir -p $out/bin
+    tar -xzf $src --strip-components=1 -C $out/bin
+  '';
   # This machine's Tailscale address, from `tailscale ip -4` (the recipe fills it in).
   tailscaleIp = "@tailscale_ip@";
 in
