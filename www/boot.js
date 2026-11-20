@@ -104,7 +104,7 @@ const defaultsReady = loadDefaults();
 const texts = {
   starting: 'Opening the local store…',
   working: 'Working…',
-  'in-use': 'tau-web may be open in another tab or window of this browser. If it is, use that one or close it. Otherwise wait a moment: this page carries on by itself.',
+  'in-use': 'Farseed may be open in another tab or window of this browser. If it is, use that one or close it. Otherwise wait a moment: this page carries on by itself.',
   none: 'There is no local store yet.',
   locked: 'The local store is locked.',
   locking: 'Locking: waiting for the worker to finish any begun write and clear working secrets…',
@@ -273,7 +273,7 @@ const updateCreatePassphrase = (state, error) => {
   warning.hidden = state !== 'none' || [...value].length >= 16 ||
     (value === '' && error === 'The two passphrases differ.');
   warning.textContent = value === ''
-    ? "With no passphrase, anyone who can open this browser on this phone, or who has a copy of its data, can open tau-web: your machines' keys, your provider account (which can buy machines with your money) and your AI credit."
+    ? "With no passphrase, anyone who can open this browser on this phone, or who has a copy of its data, can open Farseed: your machines' keys, your provider account (which can buy machines with your money) and your AI credit."
     : "A passphrase shorter than 16 characters can be guessed by anyone who has a copy of this browser's data.";
 };
 const render = (store, forceRender = false) => {
@@ -523,7 +523,7 @@ const renderProgress = (store) => {
       line = task?.verdict ? (!checksPassed ? 'The setup was handed over with findings. Its task card says what.' : '')
         : task && !live ? "The setup's session ended before it finished. See its task card below."
         : session?.inference_limits?.state === 'clock-withheld' && !session.credit_backed ? 'Waiting for you: verify the issuer clock below.'
-        : task?.status === 'verifying' ? 'tau-web is running its own final checks; nothing to press.' : '';
+        : task?.status === 'verifying' ? 'Farseed is running its own final checks; nothing to press.' : '';
     }
     if (current === 5 && task && live && !task.summary && task.status !== 'abandoned') {
       const latestCommand = (task.completed ?? []).filter(([, tool]) => tool?.name === 'exec').at(-1);
@@ -967,7 +967,7 @@ const renderSetup = (store) => {
     paragraph(facts, `Setup total: ${monthly} sat per month; ${monthly * 12n} sat per year.`);
   }
   paragraph(facts, 'Each machine will be bound alone in its own session.');
-  paragraph(facts, purchase ? 'The purchase card records the approved billing interval and currency. App Lock and Stop task do not cancel the VM or its billing. Payment remains external, and this page does not change automatic renewal.' : "Recurring means each machine is billed by its vendor every month from the moment it is created until it is destroyed or abandoned, whether or not setup finishes. tau-web never pays for a machine and cannot stop a vendor's billing; only you can.");
+  paragraph(facts, purchase ? 'The purchase card records the approved billing interval and currency. App Lock and Stop task do not cancel the VM or its billing. Payment remains external, and this page does not change automatic renewal.' : "Recurring means each machine is billed by its vendor every month from the moment it is created until it is destroyed or abandoned, whether or not setup finishes. Farseed never pays for a machine and cannot stop a vendor's billing; only you can.");
   if (!approved.length) {
     if (store.lifecycle_state === 'ended') return;
     const button = document.createElement('button');
@@ -1702,7 +1702,7 @@ const renderTasks = (store) => {
       }
     }
     if (task.status === 'complete' && task.verdict && session && store.lifecycle_state !== 'ended') {
-      paragraph(card, "Finished? End session stops tau-web's AI and cancels its session key. Your machine keeps running, and billing, until you delete it.");
+      paragraph(card, "Finished? End session stops Farseed's AI and cancels its session key. Your machine keeps running, and billing, until you delete it.");
       for (const [, tool, outcome] of task.completed) {
         if (tool.name === 'request_ai_key' && outcome?.content?.status === 'created') paragraph(card, `The AI key made for ${shortLine(tool.arguments.application, 64)} keeps working, up to its limit, until it expires or is revoked.`);
       }
@@ -1753,7 +1753,7 @@ const renderTasks = (store) => {
         if (task.rerun_refusal) paragraph(decision, task.rerun_refusal);
         else {
           paragraph(decision, 'Running it again is the usual choice. If it did arrive, running it again repeats its changes. This is your decision.');
-          paragraph(decision, 'Run it again: tau-web will send this command to the machine once more.');
+          paragraph(decision, 'Run it again: Farseed will send this command to the machine once more.');
         }
         paragraph(decision, 'It already ran: nothing is sent, and the AI carries on.');
         paragraph(decision, 'The earlier result stays unknown. The earlier command may arrive or run late, overlap later commands, and its late result will not appear here.');
@@ -1778,10 +1778,10 @@ const renderTasks = (store) => {
         const reissued = task.proposal?.call_id.startsWith('$rerun:');
         const unsent = reissued && task.rerun_unsent === true;
         if (unsent) {
-          paragraph(card, 'tau-web has not sent this command yet. Resume sends it to the machine once.');
-          paragraph(card, "If tau-web can't send it, choose Let the AI decide: this command still needs to run, and the AI will be told so.");
+          paragraph(card, 'Farseed has not sent this command yet. Resume sends it to the machine once.');
+          paragraph(card, "If Farseed can't send it, choose Let the AI decide: this command still needs to run, and the AI will be told so.");
         } else if (reissued) {
-          paragraph(card, 'tau-web sent this command once more and the machine has no record of it either. tau-web will not send it again by itself.');
+          paragraph(card, 'Farseed sent this command once more and the machine has no record of it either. Farseed will not send it again by itself.');
           paragraph(card, 'It already ran clears the obligation and sends nothing. Let the AI decide keeps the obligation: this command still needs to run.');
         }
         const labels = unsent
@@ -1802,7 +1802,7 @@ const renderTasks = (store) => {
           paragraph(confirmation, reissued
             ? draft.continuation === 'as_if_done'
               ? 'The AI will be told you recorded this command as already run and must not run it again to meet this obligation.'
-              : 'This command still needs to run. The AI will be told that; tau-web will not send it again by itself.'
+              : 'This command still needs to run. The AI will be told that; Farseed will not send it again by itself.'
             : 'The AI may then run the same command again.');
           paragraph(confirmation, 'If the earlier command arrives or runs late, it can overlap later commands and the page will never show it.');
           if (snapshot.read === 'incomplete') paragraph(confirmation, 'The incomplete command may still be running.');
@@ -1902,7 +1902,7 @@ const renderDelivery = (section, machine, store) => {
   if (plain) {
     const verdict = document.createElement('p');
     verdict.dataset.deliveryVerdict = machine;
-    verdict.textContent = "This card lists what tau-web checked on this machine itself, and what it didn't. The fuller check against tau-web's lockdown checklist isn't in this version. Each setup task's own result is on its task card.";
+    verdict.textContent = "This card lists what Farseed checked on this machine itself, and what it didn't. The fuller check against Farseed's lockdown checklist isn't in this version. Each setup task's own result is on its task card.";
     card.append(verdict);
     if (entry.summary) deliveryDetailsButton(card, machine, 'entry', 'delivery details', store);
     const verdictTasks = (store.tasks ?? []).filter(task => task.machine === machine && task.verdict);
@@ -1915,8 +1915,8 @@ const renderDelivery = (section, machine, store) => {
     if (deliveryTaskChecksPassed(task)) {
       const count = task.read_plan.length;
       paragraph(checked, count === 1
-        ? 'When the AI handed the setup over, tau-web ran 1 check on this machine itself. It passed:'
-        : `When the AI handed the setup over, tau-web ran ${count} checks on this machine itself. All ${count} passed:`);
+        ? 'When the AI handed the setup over, Farseed ran 1 check on this machine itself. It passed:'
+        : `When the AI handed the setup over, Farseed ran ${count} checks on this machine itself. All ${count} passed:`);
       const list = document.createElement('ul');
       for (const [index, read] of task.read_plan.entries()) {
         const item = document.createElement('li');
@@ -1947,24 +1947,24 @@ const renderDelivery = (section, machine, store) => {
       const count = task.read_plan.length;
       const results = Array.isArray(task.verification) ? task.verification.filter(entry => entry?.observation != null).length : 0;
       paragraph(checked, results === 0
-        ? `tau-web's own final checks on this machine have no result yet: 0 of ${count}. The task card shows what happens next.`
-        : `tau-web's own final checks on this machine haven't all passed: ${results} of ${count} have a result so far. The task card shows which, and what to do next.`);
+        ? `Farseed's own final checks on this machine have no result yet: 0 of ${count}. The task card shows what happens next.`
+        : `Farseed's own final checks on this machine haven't all passed: ${results} of ${count} have a result so far. The task card shows which, and what to do next.`);
     } else if (recordTasks.length > 1) {
-      paragraph(checked, `tau-web has final-check records from ${recordTasks.length} setup tasks on this machine. Each task card shows its own results.`);
+      paragraph(checked, `Farseed has final-check records from ${recordTasks.length} setup tasks on this machine. Each task card shows its own results.`);
     } else if (summaryTasks.length > 0) {
       paragraph(checked, "This page shows this machine's earlier tasks in short form, so their final checks aren't listed here. Each task card shows its result.");
-    } else paragraph(checked, "tau-web has no record of its own final checks on this machine yet.");
+    } else paragraph(checked, "Farseed has no record of its own final checks on this machine yet.");
     card.append(checked);
     const unchecked = document.createElement('section');
     unchecked.dataset.deliveryUnchecked = machine;
-    paragraph(unchecked, "What tau-web didn't check:");
+    paragraph(unchecked, "What Farseed didn't check:");
     const list = document.createElement('ul');
     const addUnchecked = text => {
       const item = document.createElement('li');
       item.textContent = text;
       list.append(item);
     };
-    addUnchecked("The whole machine against tau-web's lockdown checklist: this version can't run that check yet");
+    addUnchecked("The whole machine against Farseed's lockdown checklist: this version can't run that check yet");
     addUnchecked('Where the machine connects out to');
     if (task) {
       if (task.read_plan.some(read => read?.kind === 'enabled')) addUnchecked('That the services come back after a restart: no reboot was tried');
@@ -1974,7 +1974,7 @@ const renderDelivery = (section, machine, store) => {
         addUnchecked("Your T3 Code link: you chose Later, so it isn't linked yet");
       }
     }
-    addUnchecked("Anything that changes later: tau-web doesn't keep watching the machine, so these results are from when the checks ran");
+    addUnchecked("Anything that changes later: Farseed doesn't keep watching the machine, so these results are from when the checks ran");
     unchecked.append(list);
     card.append(unchecked);
     if (verdictTasks.length === 1) renderDeliveredUrls(card, taskDeliveredUrls(verdictTasks[0]));
@@ -1994,7 +1994,7 @@ const renderDelivery = (section, machine, store) => {
       delivery.verdict === 'delivery evidence not yet supplied' && delivery.findings_count === 0) {
     const verdict = document.createElement('p');
     verdict.dataset.deliveryVerdict = machine;
-    verdict.textContent = "Open delivery details for what tau-web checked on this machine and what it didn't. Each setup task's own result is on its task card.";
+    verdict.textContent = "Open delivery details for what Farseed checked on this machine and what it didn't. Each setup task's own result is on its task card.";
     card.append(verdict);
     if (entry.summary) deliveryDetailsButton(card, machine, 'entry', 'delivery details', store);
     section.append(card);
@@ -2046,7 +2046,7 @@ const renderDelivery = (section, machine, store) => {
   for (const name of delivery.applications ?? []) {
     const application = document.createElement('section');
     application.dataset.deliveryApplication = '';
-    paragraph(application, `${name} is an AI that acts on this server by itself. tau-web's promises cover what tau-web's AI does, not what ${name} does.`);
+    paragraph(application, `${name} is an AI that acts on this server by itself. Farseed's promises cover what Farseed's AI does, not what ${name} does.`);
     paragraph(application, `It does not mean ${name} works`);
     card.append(application);
   }
@@ -2970,8 +2970,8 @@ const renderPersistence = (generation, granted) => {
   if (generation !== persistGeneration) return;
   persist.dataset.state = granted ? 'granted' : 'refused';
   persist.textContent = granted
-    ? "Chrome has agreed to keep tau-web's data on this phone. It can still be lost if the phone is lost or reset, or its browser data is cleared."
-    : "Chrome hasn't promised to keep tau-web's data on this phone. If the phone runs short of space, Chrome may delete it, and with it your AI credit and your provider account. Your machines would keep running, but this page could no longer reach them. Bookmark this page in Chrome, then press Check again: when we tested Chrome on Android, a bookmark was enough for it to agree to keep the data. ";
+    ? "Chrome has agreed to keep Farseed's data on this phone. It can still be lost if the phone is lost or reset, or its browser data is cleared."
+    : "Chrome hasn't promised to keep Farseed's data on this phone. If the phone runs short of space, Chrome may delete it, and with it your AI credit and your provider account. Your machines would keep running, but this page could no longer reach them. Bookmark this page in Chrome, then press Check again: when we tested Chrome on Android, a bookmark was enough for it to agree to keep the data. ";
   if (!granted) persist.append(persistCheck);
   // A refusal stays visible in the store step (STA-23: visibly report a refusal); the granted line sits in Store options.
   const fold = $('step-store-fold');
