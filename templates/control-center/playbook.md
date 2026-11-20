@@ -624,12 +624,12 @@ or a channel, and you must not try.
 
 Install nothing else: no QR tools or other extras. The plain-text link is the result.
 
-1. One rebuild. Fill in this machine's Tailscale address in the module template with the shell, changing nothing
-   else, and apply:
-   `sed "s/@tailscale_ip@/$(tailscale ip -4)/" /etc/nixos/recipes/lightning-node.nix > /etc/nixos/extra/lightning-node.nix && systemctl start control-center-apply`
+1. One rebuild. Copy the module template unchanged with the shell and apply:
+   `cp /etc/nixos/recipes/lightning-node.nix /etc/nixos/extra/ && systemctl start control-center-apply`
    The module runs lnd as its own user (lnd) with no seed, peers or channels, starts it once Core's RPC answers,
    and opens lnd's REST port 8080 only on tailscale0. Do not change Bitcoin Core's configuration; ZMQ is already
-   on. Then `tail -n 5 /var/log/cc-rebuild.log` about once a minute, until it ends with RESULT.
+   on. Then `tail -n 5 /var/log/cc-rebuild.log` about once a minute, until it ends with RESULT. If you ever need to
+   restart lnd, you may: `systemctl restart lnd` (no edit or rebuild needed).
 2. lnd's state, read-only:
    `lncli --tlscertpath=/var/lib/lnd/tls.cert --macaroonpath=/var/lib/lnd-pub/readonly.macaroon getinfo`
    Repeat until synced_to_chain is true (usually under a minute once Core is at the tip). Tell the user the
@@ -650,7 +650,9 @@ cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
     # The Core version: this system's nixpkgs (32.1, the latest release on 2026-11-20). To bump, point this one line
     # at a newer pinned nixpkgs: (builtins.getFlake "github:NixOS/nixpkgs/<rev>?narHash=<hash>").legacyPackages.x86_64-linux.bitcoind
     package = pkgs.bitcoind;
-    prune = 550;
+    # Keep about a week of blocks (2000 MiB): lnd's new wallet rescans from 48 hours before its creation, and a
+    # 550 MiB window (about 295 blocks) is just short of that, so lnd would need blocks Core has already pruned.
+    prune = 2000;
     group = "hermes";
     # Small machines (4 GiB): a smaller UTXO cache and mempool leave memory for the page cache, the agent and T3.
     dbCache = 300;
@@ -762,8 +764,6 @@ let
     mkdir -p $out/bin
     tar -xzf $src --strip-components=1 -C $out/bin
   '';
-  # This machine's Tailscale address, from `tailscale ip -4` (the recipe fills it in).
-  tailscaleIp = "@tailscale_ip@";
 in
 {
   # Core already publishes ZMQ (the Bitcoin node module), so this module never restarts Core.
@@ -771,7 +771,9 @@ in
   # A demo node that must never hold funds: no seed backup (noseedbackup), no peers, no channels. It runs as its
   # own user, lnd. The agent (hermes) gets only the read-only macaroon (in /var/lib/lnd-pub) and the TLS certificate
   # (/var/lib/lnd/tls.cert, public), so neither the agent nor Zeus can make an address or an invoice, or open a channel.
-  # REST on 8080, reachable only over Tailscale.
+  # REST on 8080, reachable only over Tailscale. lnd puts every interface address it sees at its first start into
+  # its TLS certificate, Tailscale's 100.x included (Tailscale is up before this module), and Zeus uses the
+  # certificate carried in the link, so nothing machine-specific is written here.
   environment.etc."lnd/lnd.conf".text = ''
     [Application Options]
     noseedbackup=true
@@ -779,7 +781,6 @@ in
     nobootstrap=true
     rpclisten=127.0.0.1:10009
     restlisten=0.0.0.0:8080
-    tlsextraip=${tailscaleIp}
     readonlymacaroonpath=/var/lib/lnd-pub/readonly.macaroon
 
     [Bitcoin]
@@ -831,6 +832,18 @@ in
   };
 
   networking.firewall.interfaces.tailscale0.allowedTCPPorts = [ 8080 ];
+
+  # The agent may start, stop and restart lnd (and nothing else through this rule), e.g. after a fix.
+  security.polkit.extraConfig = ''
+    polkit.addRule(function(action, subject) {
+      if (action.id == "org.freedesktop.systemd1.manage-units" &&
+          action.lookup("unit") == "lnd.service" &&
+          ["start", "stop", "restart"].indexOf(action.lookup("verb")) >= 0 &&
+          subject.user == "hermes") {
+        return polkit.Result.YES;
+      }
+    });
+  '';
 }
 RECIPE
 chmod 0644 /etc/nixos/recipes/bitcoin-node.md /etc/nixos/recipes/bitcoin-wallet.md /etc/nixos/recipes/lightning-node.md /etc/nixos/recipes/bitcoin-node.nix /etc/nixos/recipes/tailscale.nix /etc/nixos/recipes/lightning-node.nix
@@ -886,6 +899,7 @@ cat > /etc/nixos/cc-agent.nix <<'FILE'
   '';
 }
 FILE
+touch /var/log/cc-rebuild.log && chown root:hermes /var/log/cc-rebuild.log && chmod 0640 /var/log/cc-rebuild.log
 sh /etc/nixos/cc-rebuild.sh
 STEP
 ```
