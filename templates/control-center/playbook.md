@@ -585,9 +585,10 @@ Use it when the user asks for a Bitcoin node (this disk only fits a pruned one) 
    - tailscale.nix: Tailscale, with you (hermes) as its operator.
 2. The Tailscale sign-in link comes first. Don't wait for the rebuild: every 15 seconds, for up to 3 minutes, run
    `timeout 20 tailscale up --operator=hermes` (keep the flag: a bare `tailscale up` drops you as operator). As
-   soon as it prints a https://login.tailscale.com/... link, write that link as plain text in your reply to the
-   user (not through a message tool, which hides it in a collapsed card), then carry on. Don't wait for them to
-   sign in; `tailscale status` shows the link again.
+   soon as it prints a https://login.tailscale.com/... link, your next message, before any other command, must
+   contain the full link as plain text (for example "Sign in to Tailscale: https://login.tailscale.com/a/..."): do
+   not save it for your final reply, and do not send it through a message tool, which hides it in a collapsed
+   card. Then carry on in the same turn. Don't wait for them to sign in; `tailscale status` shows the link again.
 3. Wait for the rebuild: `tail -n 5 /var/log/cc-rebuild.log` about once a minute, until it ends with RESULT. If it
    failed, read `journalctl -u bitcoind-main-snapshot -n 20 --no-pager`.
 4. Use the node from your own shell: `bitcoin-cli -datadir=/var/lib/bitcoind-main getblockchaininfo`. Core runs in
@@ -636,8 +637,9 @@ Install nothing else: no QR tools or other extras. The plain-text link is the re
    version, the block height and synced_to_chain. synced_to_graph stays false, because the node has no peers.
 3. The Zeus link, with the read-only macaroon (it can show the node but never spend or receive):
    `lndconnect --lnddir=/var/lib/lnd --configfile=/etc/lnd/lnd.conf --tlscertpath=/var/lib/lnd/tls.cert --readonlymacaroonpath=/var/lib/lnd-pub/readonly.macaroon --readonly --host=$(tailscale ip -4) --port=8080 -j`
-   Write it in a code block in your reply as plain text (not through a message tool, which hides it in a collapsed
-   card). In Zeus, the user copies it, accepts IMPORT, then SAVE; certificate verification is off
+   Your next message, before any other command, must contain the full link as plain text in a code block: do not
+   save it for a later reply, and do not send it through a message tool, which hides it in a collapsed card. In
+   Zeus, the user copies it, accepts IMPORT, then SAVE; certificate verification is off
    by default. The phone needs the Tailscale app on, in the same tailnet.
 RECIPE
 cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
