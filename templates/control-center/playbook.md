@@ -652,11 +652,23 @@ cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
     package = pkgs.bitcoind;
     prune = 550;
     group = "hermes";
+    # Small machines (4 GiB): a smaller UTXO cache and mempool leave memory for the page cache, the agent and T3.
+    dbCache = 300;
     extraConfig = ''
       rpccookieperms=group
       listenonion=0
+      maxmempool=50
     '';
   };
+
+  # Core throttles itself (memory and disk share) before it can starve sshd, the agent or T3.
+  systemd.services.bitcoind-main.serviceConfig = {
+    MemoryHigh = "1500M";
+    IOWeight = 50;
+  };
+
+  # Compressed swap in RAM: idle memory can move there, so the kernel stops evicting program code and file pages.
+  zramSwap.enable = true;
 
   # Before Core's first start: stream the published pruned copy into a staging folder, check its sha256, and only
   # then move blocks/ and chainstate/ into place and write the completion marker (last). The address and the sha256
@@ -679,6 +691,9 @@ cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
       StateDirectoryMode = "0770";
       PrivateTmp = true;
       TimeoutStartSec = "infinity";
+      # The 12.5 GB stream must not fill memory with dirty pages or take the whole disk.
+      MemoryHigh = "1G";
+      IOWeight = 50;
     };
     script = ''
       set -euo pipefail
