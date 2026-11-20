@@ -97,6 +97,7 @@ const publishDefaults = (material, accepted) => {
     if ($(id) && !defaultsEdited.has(id) && !providerReviewToken) $(id).value = material.fields[field];
   }
   updateInferenceFacts();
+  updateCreditAmount(renderedReport?.credit);
   $('defaults-status').textContent = 'Deployment defaults loaded. Public fields remain editable; review and approval use the displayed values.';
 };
 const defaultsReady = loadDefaults();
@@ -137,7 +138,7 @@ const snapshotWorker = () => {
   const generation = current?.generation;
   return { postMessage: (data, transfer) => current?.sendAt ? current.sendAt(data, transfer, generation) : current?.postMessage(data, transfer) };
 };
-const readinessWait = store => ({starting:'The provider is starting the machine.',published_key:'The machine’s published host key has not appeared yet.',address:'Waiting for one allocated IPv4 address.',refused:'The machine check could not finish. Open Details to review what happened.',ready:'Saving the machine for setup.',checking:'Checking whether the machine is ready.'}[store.readiness?.kind ?? 'checking'] ?? 'The machine’s status is unavailable.');
+const readinessWait = store => ({starting:'The provider is starting the machine.',published_key:'The machine’s published host key has not appeared yet.',address:'Waiting for one allocated IPv4 address.',refused:`The machine check could not finish. ${store.page_error_step === 'machine' && store.error ? `Reason: ${shortLine(store.error, 160)}` : 'No reason is available. Refresh to check again.'}`,ready:'Saving the machine for setup.',checking:'Checking whether the machine is ready.'}[store.readiness?.kind ?? 'checking'] ?? 'The machine’s status is unavailable.');
 const localTime = value => {
   const date = new Date(value);
   return date.toDateString() === new Date().toDateString()
@@ -185,7 +186,7 @@ const renderSteps = store => {
   }
   const messages = {
     store: texts[store.state] ?? store.state,
-    credit: store.credit_error || store.credit?.balance_text || (!store.credit?.account ? 'No inference credit yet.' : 'Inference credit balance not read yet.'),
+    credit: store.credit_error || creditBalanceText(store.credit) || (!store.credit?.account ? 'No inference credit yet.' : 'Inference credit balance not read yet.'),
     machine: store.readiness?.expired ? 'Published host-key wait expired after three hours. First contact is stopped.'
       : store.readiness?.inactive ? 'Machine checks are paused. Open the machine step for details.'
       : payReadiness(store.procurement ?? {}) ? `${readinessWait(store)} ${store.readiness?.checked_at ? `Last check: ${localTime(store.readiness.checked_at)}.` : 'The machine has not been checked yet.'}`
@@ -641,6 +642,7 @@ const paragraph = (parent, text) => {
 };
 const rawDetails = (parent, value, identity) => {
   const details = document.createElement('details');
+  details.hidden = true;
   const record = parent.closest('[data-machine], [data-task], [data-delivery-card], [id]');
   details.dataset.foldKey = JSON.stringify([identity ?? (record ? [...record.attributes]
     .filter(attribute => ['id', 'data-machine', 'data-task', 'data-delivery-card'].includes(attribute.name))
@@ -714,16 +716,16 @@ const purchaseStatus = purchase => ({
 })[purchase.phase] ?? 'Purchase status is unavailable. Open Details for the saved information.';
 const pauseMessages = new Map();
 const pauseGroup = (reasons, message) => reasons.forEach(reason => pauseMessages.set(reason, message));
-pauseGroup(['unknown task', 'stale or ended task', 'task ended'], 'This task is no longer available to continue. Review its saved details.');
+pauseGroup(['unknown task', 'stale or ended task', 'task ended'], reason => `This task is no longer available to continue. Review this saved reason: ${shortLine(reason, 160)}`);
 pauseGroup(['task encoding', 'task credential boundary', 'task result encoding', 'task result publication'], 'The page could not safely read or show this task. Unlock again; if it stays paused, keep the saved details for help.');
 pauseGroup(['protected output unavailable', 'job output hex', 'output key collision after protection', 'redaction marker cannot exclude held credentials'], 'The page could not safely check the result for secrets, so it was withheld. Unlock again; if it stays paused, keep the saved details for help.');
 pauseGroup(['session credential has no response scan representation', 'held credential derivation refused'], 'The page could not check results against its held credentials. Unlock again before Resume.');
 pauseGroup(['locked', 'response requires an unlocked seed'], 'The page is locked. Unlock it to continue.');
-pauseGroup(['missing pending job', 'missing pending identity', 'task has no pending job', 'no committed job evidence', 'job outcome is not trustworthy', 'pending task has no proposal', 'missing job exit', 'missing verification record', 'verification job mismatch'], 'The page cannot establish what happened to the earlier command. Review the saved details before deciding how to continue.');
+pauseGroup(['missing pending job', 'missing pending identity', 'task has no pending job', 'no committed job evidence', 'job outcome is not trustworthy', 'pending task has no proposal', 'missing job exit', 'missing verification record', 'verification job mismatch'], reason => `The page cannot establish what happened to the earlier command. Review this saved reason before deciding how to continue: ${shortLine(reason, 160)}`);
 pauseGroup(['resolved target differs from task machine', 'fresh authority must bind only the task machine'], 'The connection points to a different machine. Restore the original machine connection before Resume.');
 pauseGroup(['resolved relay, host and user are required before Resume'], 'The machine connection is incomplete. Supply its relay, address and login name before Resume.');
 pauseGroup(['trusted host pin missing; configure it before Resume'], 'The machine’s trusted host key is missing. Configure it before Resume.');
-pauseGroup(['committed job record differs from its intent and cannot checkpoint; pending identity retained for inspection; to configure, Stop task; remote effects and command holds remain'], 'The saved result does not match the command that was sent. Review Details and use Stop task before changing the setup. Earlier commands may still run.');
+pauseGroup(['committed job record differs from its intent and cannot checkpoint; pending identity retained for inspection; to configure, Stop task; remote effects and command holds remain'], reason => `The saved result does not match the command that was sent. Saved reason: ${shortLine(reason, 160)}. Review this reason and use Stop task before changing the setup. Earlier commands may still run.`);
 pauseGroup(['session authority belongs to another task; use the task’s original session'], 'This connection belongs to a different task. Restore this task’s original session before Resume.');
 pauseGroup(['proposal approval pending; review the open requirements card and approve explicitly or reject before Resume'], 'The proposed requirements need your decision. Review the requirements card and approve or reject it before Resume.');
 pauseGroup(['original session requires acceptance of Acting on a goal with no brief'], 'This session still needs your approval to act on a goal without a brief. Review and accept that choice before Resume.');
@@ -733,7 +735,7 @@ pauseGroup(['session cap exhausted'], 'The session’s spending limit has been r
 pauseGroup(['session expired'], 'The session has expired. Review the session controls before continuing.');
 pauseGroup(['incompatible issuer usage', 'incompatible or missing issuer acceptance'], 'The saved spending approval cannot be used. Review the session’s spending approval before continuing.');
 pauseGroup(['clock uncertain; verification required', 'clock evidence out of range'], 'The page cannot rely on its clock. Use the clock check before Resume.');
-pauseGroup(['invalid spend', 'invalid spend exponent', 'invalid nonnegative spend', 'spend scale', 'unsupported spend precision'], 'The page could not read the spending amount safely. Review the saved details before continuing.');
+pauseGroup(['invalid spend', 'invalid spend exponent', 'invalid nonnegative spend', 'spend scale', 'unsupported spend precision'], reason => `The page could not read the spending amount safely. Review this saved reason before continuing: ${shortLine(reason, 160)}`);
 pauseGroup(['recorded job is running; Resume inspects it again'], 'The earlier command is still running. Resume checks it again without running it twice.');
 pauseGroup(['task paused: diagnostic protection failed; inspect authority and configuration before Resume'], 'The page could not safely show why it stopped. Check the session and connection settings before Resume.');
 pauseGroup(['recorded job output requires protection before checkpoint', 'verification excerpt requires protection before checkpoint'], 'The page could not safely save the command result. Unlock again before Resume; the earlier command will be checked without running it twice.');
@@ -746,22 +748,25 @@ const plainPause = reason => {
   const checkpoint = 'recorded result could not be checkpointed: ';
   if (reason.startsWith(checkpoint)) {
     const cause = reason.slice(checkpoint.length);
-    return pauseMessages.get(cause) ?? 'The browser could not safely save the result. Reopen and unlock this page before Resume; the earlier command will be checked without running it twice.';
+    return pauseMessages.has(cause) ? plainPause(cause) : 'The browser could not safely save the result. Reopen and unlock this page before Resume; the earlier command will be checked without running it twice.';
   }
-  if (pauseMessages.has(reason)) return pauseMessages.get(reason);
+  if (pauseMessages.has(reason)) {
+    const message = pauseMessages.get(reason);
+    return typeof message === 'function' ? message(reason) : message;
+  }
   const machineCheck = reason.match(/^Checked the machine at (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z): it has no record of this command\. /);
   if (machineCheck) return `Checked the machine at ${new Date(machineCheck[1]).toLocaleString()}: it has no record of this command.`;
   if (/^collection returned no outcome for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return 'The earlier command’s result is not available yet. Resume checks it again without running it twice.';
-  if (/^collection record identity mismatch for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return 'The returned result does not match the earlier command. Review Details before Resume; the command will not be run twice.';
+  if (/^collection record identity mismatch for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return `The returned result does not match the earlier command. Saved reason: ${shortLine(reason, 160)}. Review this reason before Resume; the command will not be run twice.`;
   if (/^collection (?:recorded no record found|could not confirm whether the command reached the machine; Resume will check again without running it twice) for pending call \d+ job [0-9a-f]+; pending identity retained$/.test(reason)) return 'The page could not confirm whether the command reached the machine. Resume will check again without running it twice.';
-  if (/^collection (?:failed for pending call|failed for pending call \d+ job|.* for pending call) /.test(reason)) return 'The page could not establish the earlier command’s result. Review Details and check the connection before Resume; the command will not be run twice.';
+  if (/^collection (?:failed for pending call|failed for pending call \d+ job|.* for pending call) /.test(reason)) return `The page could not establish the earlier command’s result. Saved reason: ${shortLine(reason, 160)}. Review this reason and check the connection before Resume; the command will not be run twice.`;
   return reason;
 };
 const sessionWait = reason => {
   if (reason === 'Inference key required for another request; existing job collection remains available.') return 'Resupply the AI connection key to continue. The page can still collect the earlier command’s result.';
   if (reason === 'Automatic inference waits for the admitted endpoint and model. Restore them, or explicitly Resume with the displayed configuration. Existing job collection remains available.') return 'Restore the earlier AI connection settings, or use Resume to approve the settings shown here. The page can still collect the earlier command’s result.';
   const plain = plainPause(reason);
-  return plain !== reason ? plain : 'This session needs a check before more work can run. Review Details and unlock again.';
+  return plain !== reason ? plain : `This session needs a check before more work can run. Saved reason: ${shortLine(reason, 160)}. Review this reason and unlock again.`;
 };
 const commandResultWord = result => {
   const content = result?.content ?? result;
@@ -803,6 +808,22 @@ const showCheckReport = (parent, report) => {
     : report.exit_status === 0 ? 'ran without an error (exit 0)' : `failed (exit ${report.exit_status})`;
   paragraph(parent, `${commandSummary(report.command)} — ${result}`);
   rawDetails(parent, report);
+};
+// Delivery reports carry the command as its exact bytes in lowercase hex; show it as text, or as unreadable.
+const hexCommandText = hex => {
+  if (typeof hex !== 'string' || !/^(?:[0-9a-f]{2})*$/.test(hex)) return '';
+  try { return new TextDecoder('utf-8', {fatal: true}).decode(Uint8Array.from(hex.match(/../g) ?? [], byte => parseInt(byte, 16))); }
+  catch { return ''; }
+};
+const showDeliveryReport = (parent, report) => {
+  paragraph(parent, `Command: ${commandSummary(hexCommandText(report.command))}`);
+  paragraph(parent, `Exit status: ${report.terminal?.exit_status ?? report.evidence?.at(-1)?.exit_status ?? 'not recorded'}.`);
+  for (const evidence of report.evidence ?? []) {
+    paragraph(parent, `Result: ${shortLine(evidence.state?.replaceAll('_', ' ') ?? 'unknown')}; exit status: ${evidence.exit_status ?? 'not recorded'}.`);
+    paragraph(parent, `Command match: ${{advisory_match: 'matches the saved command', finding: 'differs from the saved command', no_record: 'no command record'}[evidence.agreement] ?? 'unknown'}.`);
+    if (evidence.stdout) paragraph(parent, `Output: ${shortLine(evidence.stdout, 320)}`);
+    if (evidence.stderr) paragraph(parent, `Error output: ${shortLine(evidence.stderr, 320)}`);
+  }
 };
 const readableFacts = (parent, value) => {
   const list = document.createElement('dl');
@@ -1188,6 +1209,7 @@ const renderCommandResult = (result) => {
   if (result.optional_report) paragraph(card, 'Checks the AI wrote — not part of Delivered');
   paragraph(card, `Command ${commandResultWord(result)}.${result.historical ? ' This is a saved result; it does not allow any new action.' : ''}`);
   const details = rawDetails(card, {call: result.call, job: result.job, exit_status: result.exit_status}, ['command-result', result.call]);
+  details.hidden = false;
   for (const field of ['stdout', 'stderr']) {
     paragraph(details, field === 'stdout' ? 'Output' : 'Error output');
     const output = document.createElement('pre'); output.dataset.commandOutput = ''; output.textContent = result[field] ?? ''; details.append(output);
@@ -1674,7 +1696,7 @@ const renderTasks = (store) => {
     }
     for (const finding of task.findings ?? []) {
       const service = finding.service?.name;
-      paragraph(card, ['sign_in', 'control_center', 'control_center_files', 'unmet_command'].includes(finding.field) ? finding.detail : service ? `${service} does not match the approved setup.` : finding.field === 'inbound' ? 'The listening ports do not match the approved setup.' : 'A setup check found a difference or could not finish. Open Details to review it.');
+      paragraph(card, ['sign_in', 'control_center', 'control_center_files', 'unmet_command'].includes(finding.field) ? finding.detail : service ? `${service} does not match the approved setup.` : finding.field === 'inbound' ? 'The listening ports do not match the approved setup.' : `A setup check found a difference or could not finish. ${shortLine(finding.detail, 160) || 'No further reason is available.'}`);
       rawDetails(card, finding);
     }
     for (const note of task.notes ?? []) paragraph(card, note.text === 'enabled, restart not demonstrated'
@@ -1832,7 +1854,8 @@ const renderTasks = (store) => {
         card.append(confirmation); showConfirmation();
       }
     } else if (task.disposition_refusal) {
-      paragraph(card, 'The page cannot accept a choice about the unknown result yet. Review Details before continuing.');
+      paragraph(card, `Saved reason: ${shortLine(task.disposition_refusal, 160)}`);
+      paragraph(card, 'The page cannot accept a choice about the unknown result yet. Review the saved reason above before continuing.');
       rawDetails(card, {reason: task.disposition_refusal}, ['task', task.id, 'choice-refused']);
     }
     paragraph(card, 'Stop task ends this task here. What was already done on the machine stays, and the machine keeps running and billing until you delete it.');
@@ -1984,7 +2007,10 @@ const renderDelivery = (section, machine, store) => {
       if (delivery.report_note) paragraph(reports, delivery.report_note);
       const count = deliveryDetails.commands.get(machine)?.value?.length ?? delivery.reports_count;
       const records = deliveryDetailsButton(reports, machine, 'commands', `commands (${count})`, store);
-      for (const [index, report] of (records ?? []).entries()) rawDetails(reports, report, ['delivery', machine, 'report', index]);
+      for (const [index, report] of (records ?? []).entries()) {
+        showDeliveryReport(reports, report);
+        rawDetails(reports, report, ['delivery', machine, 'report', index]);
+      }
       card.append(reports);
     }
     section.append(card);
@@ -2057,7 +2083,10 @@ const renderDelivery = (section, machine, store) => {
     if (delivery.report_note) paragraph(reports, delivery.report_note);
     const count = deliveryDetails.commands.get(machine)?.value?.length ?? delivery.reports_count;
     const records = deliveryDetailsButton(reports, machine, 'commands', `commands (${count})`, store);
-    for (const [index, report] of (records ?? []).entries()) rawDetails(reports, report, ['delivery', machine, 'report', index]);
+    for (const [index, report] of (records ?? []).entries()) {
+      showDeliveryReport(reports, report);
+      rawDetails(reports, report, ['delivery', machine, 'report', index]);
+    }
     card.append(reports);
   }
   const session = (store.sessions ?? []).find(s => s.session_state !== 'ended' && s.bound_set.includes(machine));
@@ -2147,9 +2176,33 @@ setInterval(() => {
 // Measured by the test side on 2026-11-18 with the default model: 0.14-0.17 USD per setup
 // on older builds, 0.07 USD on the build that runs every block by name. Update when that changes.
 const setupCreditUsd = {low: '0.10', high: '0.20', suggested: '0.50'};
+const creditUsdPerSat = credit => {
+  const topup = credit?.last_topup;
+  const rate = topup?.usd / topup?.sat;
+  return Number.isFinite(rate) && rate > 0 ? rate : null;
+};
+const wholeSats = amount => Math.round(amount).toLocaleString('en-US');
+const creditBalanceText = credit => {
+  const rate = creditUsdPerSat(credit);
+  return credit?.balance_text && rate !== null && Number.isFinite(credit.balance)
+    ? `${credit.balance_text} (≈ ${wholeSats(credit.balance / rate)} sat)` : credit?.balance_text;
+};
+const updateCreditAmount = credit => {
+  const input = $('credit-amount');
+  const output = $('credit-amount-value');
+  const rate = creditUsdPerSat(credit);
+  const sat = input.valueAsNumber;
+  output.hidden = rate === null || !input.validity.valid || !Number.isFinite(sat);
+  output.textContent = output.hidden ? '' : `${wholeSats(sat)} sat ≈ ${(sat * rate).toFixed(2)} USD`;
+};
 const renderCredit = (store, enabled) => {
-  $('credit-guidance').textContent = `Setting up one machine usually uses about ${setupCreditUsd.low}-${setupCreditUsd.high} USD of AI credit. Buying ${setupCreditUsd.suggested} USD leaves room to spare; unused credit stays in your account.`;
   const credit = store.credit;
+  const rate = creditUsdPerSat(credit);
+  const setupSats = rate === null ? '' : ` (≈ ${wholeSats(Number(setupCreditUsd.low) / rate)}-${wholeSats(Number(setupCreditUsd.high) / rate)} sat)`;
+  const suggestedSats = rate === null ? '' : ` (≈ ${wholeSats(Number(setupCreditUsd.suggested) / rate)} sat)`;
+  $('credit-guidance').textContent = `Setting up one machine usually uses about ${setupCreditUsd.low}-${setupCreditUsd.high} USD${setupSats} of AI credit. Buying ${setupCreditUsd.suggested} USD${suggestedSats} leaves room to spare; unused credit stays in your account.`;
+  $('credit-rate').textContent = rate === null ? 'The sat equivalent shows here after your first top-up.' : 'Estimates use the rate from your last top-up.';
+  updateCreditAmount(credit);
   const invoices = credit?.invoices ?? [];
   const latest = invoices.at(-1);
   const unresolved = latest && !['paid', 'expired_unpaid', 'abandoned'].includes(latest.outcome);
@@ -2167,6 +2220,7 @@ const renderCredit = (store, enabled) => {
     slot.append(row);
   }
 };
+$('credit-amount').addEventListener('input', () => updateCreditAmount(renderedReport?.credit));
 $('credit-invoice').addEventListener('click', () => {
   $('credit-invoice').disabled = true;
   worker.postMessage({credit_request:{action:'invoice',amount:Number($('credit-amount').value)}});
@@ -2620,7 +2674,7 @@ const renderPoc = (store) => {
       paragraph(row, store.credit.disclosure);
       if (readingCredit) paragraph(row, 'Reading AI credit balance…');
       else if (store.credit_error) paragraph(row, store.credit_error);
-      else if (!store.credit.can_start) paragraph(row, store.credit.balance_text);
+      else if (!store.credit.can_start) paragraph(row, creditBalanceText(store.credit));
     }
     for (const [kind, label] of [['poc_bind', 'Start session'], ['poc_public_keys', 'Show public keys']]) {
       if (liveSession && kind === 'poc_bind') continue;

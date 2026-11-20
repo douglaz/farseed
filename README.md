@@ -1583,7 +1583,7 @@ the host tests run.
   BYO retirement invokes no global End or paid-key revocation cleanup.
 - **The single writer.** `worker.js` takes an exclusive Web Lock, `tau-web-store`, before the
   module reads the store, and holds it for the worker's whole life (`STA-1`, `STA-7`).
-  - A worker that cannot get the lock queues for it, and the page says "tau-web may be open in
+  - A worker that cannot get the lock queues for it, and the page says "Farseed may be open in
     another tab or window of this browser. If it is, use that one or close it. Otherwise wait a
     moment: this page carries on by itself." When the holder ends, the queued worker takes the
     lock and opens the store; the holder may be this page's own previous worker (below).
@@ -1600,12 +1600,12 @@ the host tests run.
 any await, inside the refused note's "Check again" press, and (as on load) when the page becomes
 visible again after a refusal. The API exists in the page and not in the worker. The answer shows only on an open store,
 after the seed words, never on the create or locked screens. A refusal, including API absence or an
-exception, stays visible in the store step: "Chrome hasn't promised to keep tau-web's data on this
+exception, stays visible in the store step: "Chrome hasn't promised to keep Farseed's data on this
 phone. If the phone runs short of space, Chrome may delete it, and with it your AI credit and your
 provider account. Your machines would keep running, but this page could no longer reach them.
 Bookmark this page in Chrome, then press Check again: when we tested Chrome on Android, a bookmark
 was enough for it to agree to keep the data." followed by the Check again button. A grant, requested in that load or not, reads
-"Chrome has agreed to keep tau-web's data on this phone. It can still be lost if the phone is lost or reset, or its browser data is cleared." inside Store options. Nothing on
+"Chrome has agreed to keep Farseed's data on this phone. It can still be lost if the phone is lost or reset, or its browser data is cleared." inside Store options. Nothing on
 the page promises the store cannot be lost.
 
 **Limits.**

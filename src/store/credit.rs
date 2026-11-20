@@ -15,6 +15,8 @@ pub(crate) struct State {
     pub sessions: std::collections::BTreeSet<String>,
     /// Rebuilt only by a successful current read, never by replay.
     pub balance: Option<f64>,
+    /// Latest positive credit increase from a settling invoice status, rebuilt on replay.
+    pub last_topup: Option<(u64, f64)>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
@@ -121,6 +123,7 @@ impl<S: Storage> Store<S> {
         let selected = false;
         json!({"selected":selected,"account":self.credit.account.is_some(), "balance":self.credit.balance,
             "balance_text":self.credit.balance.map(crate::poc::credit::display_balance),
+            "last_topup":self.credit.last_topup.map(|(sat, usd)| json!({"sat":sat,"usd":usd})),
             "can_start":self.credit_can_start(), "invoices":self.credit.invoices,
             "disclosure":crate::poc::credit::DISCLOSURE})
     }
@@ -262,10 +265,19 @@ impl<S: Storage> Store<S> {
         match record {
             Record::Invoice(invoice) => self.credit.invoices.push(invoice.clone()),
             Record::Status {
-                status, outcome, ..
+                status,
+                outcome,
+                balance,
+                ..
             } => {
                 let invoice = self.credit.invoices.last_mut().expect("validated invoice");
                 if !invoice.resolved() {
+                    if *outcome == Payment::Paid
+                        && let Some(balance) = balance.filter(|n| *n > invoice.baseline)
+                    {
+                        self.credit.last_topup =
+                            Some((invoice.amount_sat, balance - invoice.baseline));
+                    }
                     invoice.last_status = status.clone();
                     invoice.outcome = *outcome;
                 }
