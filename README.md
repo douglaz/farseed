@@ -1,10 +1,13 @@
-# tau-web-rust
+# Farseed
 
-The implementation of the tau-web harness: a client-side AI harness that runs in a phone
+The implementation of the Farseed harness: a client-side AI harness that runs in a phone
 browser and provisions real infrastructure on its operator's behalf. Rust, compiled to
 WebAssembly, following the configuration the specification records.
 
-**The specification lives in [`douglaz/tau-web-spec`](https://github.com/douglaz/tau-web-spec)
+Farseed was called tau-web until November 2026. The crate, the store, the on-disk paths and
+most of this document still use the old name.
+
+**The specification lives in [`douglaz/farseed-spec`](https://github.com/douglaz/farseed-spec)
 and is vendored here at `spec/`, pinned to an exact commit, today `9086166`** (spec ADR-0031).
 The build refuses to run if the checked-out tree does not match the pin, and every release
 records the spec commit it was built from. What the build compiles in from the pin:
@@ -6491,3 +6494,16 @@ operator commands. Host binding cases reject a separate object with identical se
 binding values, including an ended session without inference limits; lifecycle cases retain
 expiry and cap-exhaustion checks. These supplement the existing CNF-102/40 lifecycle fixtures
 and supply no live issuer, production admission or physical-device evidence.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
+this work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without
+any additional terms or conditions.

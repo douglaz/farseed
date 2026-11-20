@@ -1,4 +1,4 @@
 [submodule "spec"]
 	path = spec
-	url = git@github.com:douglaz/tau-web-spec.git
+	url = git@github.com:douglaz/farseed-spec.git
 	branch = main
