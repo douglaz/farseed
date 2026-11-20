@@ -667,9 +667,13 @@ cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
     '';
   };
 
-  # Core gives way on the disk to sshd, the agent and T3 when they need it. No memory cap: a cgroup memory limit
-  # also counts Core's page cache, and capping it makes Core re-read its chainstate from disk all the time.
-  systemd.services.bitcoind-main.serviceConfig.IOWeight = 50;
+  # Core gives way on the disk to sshd, the agent and T3 when they need it, and its memory (page cache included) stays
+  # at 60% of the machine's RAM, so its chainstate cache can grow without pushing the agent and T3 out of memory.
+  # A fixed cap starves Core's cache on big machines; no cap starves everything else on small ones.
+  systemd.services.bitcoind-main.serviceConfig = {
+    MemoryHigh = "60%";
+    IOWeight = 50;
+  };
 
   # Compressed swap in RAM: idle memory can move there, so the kernel stops evicting program code and file pages.
   zramSwap.enable = true;
