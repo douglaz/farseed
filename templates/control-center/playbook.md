@@ -556,7 +556,9 @@ sh /etc/nixos/cc-check.sh hermes
 Expect `CHECKS hermes PASS`. The check itself waits up to 90 seconds for the dashboard to start answering.
 
 **If it fails:** on `REBUILD FAILED`, see **Recovery R1**. If `hermes_backend_up` fails, look at
-`journalctl -u hermes-backend -n 20 --no-pager | cut -c1-200` and report those lines.
+`journalctl -u hermes-backend -n 20 --no-pager | cut -c1-200` and report those lines. If the only FAIL line is
+`gateway_on_loopback_9120`, Hermes is still starting (on a busy machine this can take about 2 minutes): wait 1
+minute (`sleep 60`) and run the Check again, once.
 
 ---
 
@@ -661,6 +663,8 @@ cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
     # ZMQ is on from the start, so adding Lightning later never changes Core's config (no restart, no re-check).
     # checklevel=1: the startup check still reads the last 6 blocks and checks their validity, but skips the undo
     # and chainstate-disconnect levels, which on a small machine's disk take many minutes.
+    # addnode: one reliable peer that serves blocks at once (tau-web's own node), so a silent peer can't hold the next
+    # block while the node catches up after the copy.
     extraConfig = ''
       rpccookieperms=group
       listenonion=0
@@ -668,6 +672,7 @@ cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
       checklevel=1
       zmqpubrawblock=tcp://127.0.0.1:28332
       zmqpubrawtx=tcp://127.0.0.1:28333
+      addnode=65.109.125.160:8333
     '';
   };
 
@@ -1274,6 +1279,9 @@ printf '%s  /etc/nixos/cc-rebuild.sh\n%s  /etc/nixos/cc-check.sh\n' 369725dca22a
 ```
 Expect `CHECKS done PASS`. If only a `visit_` check fails for an onion address, wait 2 minutes and run it again: a
 new onion service can take a few minutes to become reachable.
+If the only FAIL line is `t3_sees_hermes_ready`: T3 Code checks Hermes only when it starts, so waiting doesn't
+help. Run `systemctl restart t3code`, wait 1 minute (`sleep 60`) and run the Check again, once. If it still fails,
+stop and report the FAIL lines; don't investigate further.
 
 **Then report to the user:** "Your control center is ready. Open https://app.t3.codes, sign in to your T3
 account, choose this machine and talk to Hermes Agent. You can also reach Hermes' own dashboard over WireGuard:
