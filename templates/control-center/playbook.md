@@ -627,9 +627,9 @@ Install nothing else: no QR tools or other extras. The plain-text link is the re
 1. One rebuild. Fill in this machine's Tailscale address in the module template with the shell, changing nothing
    else, and apply:
    `sed "s/@tailscale_ip@/$(tailscale ip -4)/" /etc/nixos/recipes/lightning-node.nix > /etc/nixos/extra/lightning-node.nix && systemctl start control-center-apply`
-   The module runs lnd as its own user (lnd) with no seed, peers or channels, adds ZMQ to Core (Core restarts once),
-   and opens lnd's REST port 8080 only on tailscale0. Then `tail -n 5 /var/log/cc-rebuild.log` about once a minute,
-   until it ends with RESULT.
+   The module runs lnd as its own user (lnd) with no seed, peers or channels, starts it once Core's RPC answers,
+   and opens lnd's REST port 8080 only on tailscale0. Do not change Bitcoin Core's configuration; ZMQ is already
+   on. Then `tail -n 5 /var/log/cc-rebuild.log` about once a minute, until it ends with RESULT.
 2. lnd's state, read-only:
    `lncli --tlscertpath=/var/lib/lnd/tls.cert --macaroonpath=/var/lib/lnd-pub/readonly.macaroon getinfo`
    Repeat until synced_to_chain is true (usually under a minute once Core is at the tip). Tell the user the
@@ -654,10 +654,16 @@ cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
     group = "hermes";
     # Small machines (4 GiB): a smaller UTXO cache and mempool leave memory for the page cache, the agent and T3.
     dbCache = 300;
+    # ZMQ is on from the start, so adding Lightning later never changes Core's config (no restart, no re-check).
+    # checklevel=1: the startup check still reads the last 6 blocks and checks their validity, but skips the undo
+    # and chainstate-disconnect levels, which on a small machine's disk take many minutes.
     extraConfig = ''
       rpccookieperms=group
       listenonion=0
       maxmempool=50
+      checklevel=1
+      zmqpubrawblock=tcp://127.0.0.1:28332
+      zmqpubrawtx=tcp://127.0.0.1:28333
     '';
   };
 
@@ -758,11 +764,7 @@ let
   tailscaleIp = "@tailscale_ip@";
 in
 {
-  # Block and transaction notifications for lnd.
-  services.bitcoind.main.extraConfig = ''
-    zmqpubrawblock=tcp://127.0.0.1:28332
-    zmqpubrawtx=tcp://127.0.0.1:28333
-  '';
+  # Core already publishes ZMQ (the Bitcoin node module), so this module never restarts Core.
 
   # A demo node that must never hold funds: no seed backup (noseedbackup), no peers, no channels. It runs as its
   # own user, lnd. The agent (hermes) gets only the read-only macaroon (in /var/lib/lnd-pub) and the TLS certificate
@@ -803,6 +805,8 @@ in
     wantedBy = [ "multi-user.target" ];
     wants = [ "bitcoind-main.service" ];
     after = [ "bitcoind-main.service" ];
+    # lnd stops and restarts with Core.
+    partOf = [ "bitcoind-main.service" ];
     restartTriggers = [ config.environment.etc."lnd/lnd.conf".source ];
     serviceConfig = {
       User = "lnd";
@@ -811,11 +815,16 @@ in
       SupplementaryGroups = [ "hermes" ];
       StateDirectory = "lnd";
       StateDirectoryMode = "0711";
-      # Make lnd-pub before every start (as root, "+"): on a live apply, tmpfiles and lnd start unordered.
-      ExecStartPre = "+${pkgs.coreutils}/bin/install -d -m 0750 -o lnd -g hermes /var/lib/lnd-pub";
+      ExecStartPre = [
+        # Make lnd-pub before every start (as root, "+"): on a live apply, tmpfiles and lnd start unordered.
+        "+${pkgs.coreutils}/bin/install -d -m 0750 -o lnd -g hermes /var/lib/lnd-pub"
+        # Start lnd only once Core's RPC answers (Core's startup check can take minutes), not in a retry loop.
+        "${config.services.bitcoind.main.package}/bin/bitcoin-cli -datadir=/var/lib/bitcoind-main -rpcwait -rpcwaittimeout=3600 getblockcount"
+      ];
       ExecStart = "${lnd}/bin/lnd --lnddir=/var/lib/lnd --configfile=/etc/lnd/lnd.conf";
+      TimeoutStartSec = "infinity";
       Restart = "on-failure";
-      RestartSec = 10;
+      RestartSec = 30;
     };
   };
 
