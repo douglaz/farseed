@@ -627,7 +627,8 @@ The node's wallet was made at set-up from a seed that the page handed to the use
 Never open, print, copy or look for that file. Before anyone puts money on the node, ask the
 user whether they saved that file in their password manager. When they answer "saved", delete the machine's copy:
 `systemctl start lnd-seed-delete`, and tell them it is gone. Until then, tell them plainly not to fund the node.
-You only get its read-only macaroon, so you can't make an address, an invoice or a channel, and you must not try.
+You only get its read-only macaroon, so you can't make an address, an invoice or a channel, and you must not try,
+unless the user asks for payment access ("Payment access" below).
 
 Install nothing else: no QR tools or other extras. The plain-text link is the result.
 
@@ -649,6 +650,36 @@ Install nothing else: no QR tools or other extras. The plain-text link is the re
    save it for a later reply, and do not send it through a message tool, which hides it in a collapsed card. In
    Zeus, the user copies it, accepts IMPORT, then SAVE; certificate verification is off
    by default. The phone needs the Tailscale app on, in the same tailnet.
+
+**Payment access** (only when the user asks the node to pay or be paid)
+Only after the seed file is deleted (the user said "saved"); the module refuses before that.
+1. One rebuild. Copy the module template unchanged and apply:
+   `cp /etc/nixos/recipes/lightning-pay.nix /etc/nixos/extra/ && systemctl start control-center-apply`
+   As root it bakes /var/lib/lnd-pub/pay.macaroon, valid 2 days and allowed only the lnd calls that step 2's
+   commands make. It works on this machine and through lnd's REST port from any device on the user's tailnet:
+   anyone there who holds a copy can spend with it. Never print, copy or send it, and never read admin.macaroon.
+   Renew it with `systemctl restart lnd-pay-macaroon`, which also revokes the old one. Keep nolisten, open no port, and change no
+   other module.
+2. Use it only as
+   `lncli --tlscertpath=/var/lib/lnd/tls.cert --macaroonpath=/var/lib/lnd-pub/pay.macaroon <command>`, with these
+   commands: getinfo, newaddress, connect, listpeers, openchannel, closechannel, pendingchannels, listchannels,
+   decodepayreq, payinvoice, trackpayment, addinvoice, lookupinvoice, listpayments, listinvoices, walletbalance,
+   listchaintxns, sendcoins and estimatefee. Use no other command. lnd checks calls, not commands: it refuses
+   calls outside that set, but another command made of the same calls still works. Never use closeallchannels,
+   which closes every channel at once.
+   To reach a peer: `lncli ... connect <pubkey>@<host>:<port>` (outbound only).
+3. Before every spend (opening or closing a channel, paying an invoice, sending on-chain), tell the user the exact
+   command, the amount in sat and the fee (rate or limit), and wait for their yes. One yes is for one command.
+   Channels are private (`--private`). If an open is refused, tell the user why and wait.
+4. If a payment's result is unclear, never pay again: check it with
+   `lncli ... listpayments --include_incomplete` and tell the user. After an unclear sendcoins, openchannel or
+   closechannel, first check `lncli ... listchaintxns` and `lncli ... pendingchannels`, and never send again until
+   that result is known.
+5. After a channel opens or closes, copy the channel backup for the user: `systemctl start lnd-backup-copy`.
+   It lands in /var/lib/farseed-files; tell the user its name and size, never its contents.
+6. To end payment access: delete /etc/nixos/extra/lightning-pay.nix and apply. That removes the macaroon and, while
+   lnd answers, revokes every copy of it. If lnd isn't answering at that moment, copies stay valid until they
+   expire (at most 2 days), unless payment access is turned on again, which revokes them first.
 RECIPE
 cat > /etc/nixos/recipes/bitcoin-node.nix <<'RECIPE'
 { pkgs, ... }:
@@ -890,7 +921,120 @@ in
   '';
 }
 RECIPE
-chmod 0644 /etc/nixos/recipes/bitcoin-node.md /etc/nixos/recipes/bitcoin-wallet.md /etc/nixos/recipes/lightning-node.md /etc/nixos/recipes/bitcoin-node.nix /etc/nixos/recipes/tailscale.nix /etc/nixos/recipes/lightning-node.nix
+cat > /etc/nixos/recipes/lightning-pay.nix <<'RECIPE'
+{ pkgs, lib, ... }:
+# Payment access for the agent (only when the user asks the node to pay and be paid). Copy unchanged.
+# - A root one-shot bakes /var/lib/lnd-pub/pay.macaroon (root:hermes 0440), valid 2 days and allowed exactly the lnd
+#   calls the recipe uses (the list below): no macaroon, signing, backup, abandon or delete rights.
+#   It works on this machine and through lnd's REST port 8080 from any device on the user's tailnet: anyone there who
+#   holds a copy of the file can spend with it.
+#   lnd enforces that list of calls, not lncli commands: an lncli command made only of those calls works too (for
+#   example closeallchannels), so the recipe tells the agent which commands to use.
+# - It is baked under its own root key. Every bake first deletes that key. Whenever the unit stops (removing this
+#   module, a restart, or a start that failed or was killed after the file was written), ExecStopPost removes the
+#   file and deletes the key: that revokes every copy, wherever it is. That deletion needs lnd to answer; if it
+#   doesn't, copies stay valid until they expire (at most 2 days), unless a new bake revokes them first.
+# - It refuses while the set-up seed file is still on the machine (the user hasn't said "saved").
+# - lnd-backup-copy.service copies lnd's channel backup into /var/lib/farseed-files for the user (root-only there).
+# - The agent may start (or restart, to renew) the bake and start the copy; nothing else through this rule.
+# The agent never reads admin.macaroon. nolisten stays; no port is opened.
+let
+  lncli = "/run/current-system/sw/bin/lncli --rpcserver=127.0.0.1:10009 --tlscertpath=/var/lib/lnd/tls.cert";
+  admin = "/var/lib/lnd/data/chain/bitcoin/mainnet/admin.macaroon";
+  out = "/var/lib/lnd-pub/pay.macaroon";
+  # This macaroon's own root key (0 is lnd's default key, which the other macaroons use): deleting it revokes this
+  # macaroon and nothing else.
+  keyId = "7301";
+  # Exactly the calls the recipe uses.
+  calls = [
+    "/lnrpc.Lightning/GetInfo"
+    "/lnrpc.Lightning/NewAddress"
+    "/lnrpc.Lightning/ConnectPeer"
+    "/lnrpc.Lightning/ListPeers"
+    "/lnrpc.Lightning/OpenChannel"
+    "/lnrpc.Lightning/CloseChannel"
+    "/lnrpc.Lightning/PendingChannels"
+    "/lnrpc.Lightning/ListChannels"
+    "/lnrpc.Lightning/DecodePayReq"
+    "/routerrpc.Router/SendPaymentV2"
+    "/routerrpc.Router/TrackPaymentV2"
+    "/lnrpc.Lightning/AddInvoice"
+    "/lnrpc.Lightning/LookupInvoice"
+    "/lnrpc.Lightning/ListPayments"
+    "/lnrpc.Lightning/ListInvoices"
+    "/lnrpc.Lightning/WalletBalance"
+    "/lnrpc.Lightning/GetTransactions"
+    "/lnrpc.Lightning/SendCoins"
+    "/lnrpc.Lightning/EstimateFee"
+  ];
+  revoke = "${lncli} --macaroonpath=${admin} deletemacaroonid ${keyId}";
+  stop = pkgs.writeShellScript "lnd-pay-macaroon-stop" ''
+    ${pkgs.coreutils}/bin/rm -f ${out} ${out}.tmp
+    if ${revoke} > /dev/null; then
+      echo "payment macaroon revoked (root key ${keyId} deleted)"
+    else
+      echo "could not revoke now (is lnd running?): copies stay valid until they expire (at most 2 days), unless a new bake revokes them first"
+    fi
+  '';
+in
+{
+  systemd.services.lnd-pay-macaroon = {
+    description = "Bake the agent's limited lnd payment macaroon";
+    wantedBy = [ "multi-user.target" ];
+    after = [ "lnd.service" ];
+    wants = [ "lnd.service" ];
+    path = [ pkgs.coreutils pkgs.findutils ];
+    serviceConfig = {
+      Type = "oneshot";
+      RemainAfterExit = true;
+      UMask = "0077";
+      TimeoutStartSec = "infinity";
+      # ExecStopPost, not ExecStop: it also runs after a failed or killed start.
+      ExecStopPost = "${stop}";
+    };
+    script = ''
+      set -eu
+      n=$(find /var/lib/control-center -maxdepth 1 -name 'lnd-seed-*.txt' -type f | wc -l)
+      [ "$n" -eq 0 ] || { echo "the seed file is still on the machine: the user must save it first"; exit 1; }
+      until ${lncli} --macaroonpath=${admin} getinfo > /dev/null 2>&1; do sleep 10; done
+      rm -f ${out}.tmp
+      # Revoke every earlier copy before making a new one.
+      ${revoke} > /dev/null
+      ${lncli} --macaroonpath=${admin} bakemacaroon --root_key_id ${keyId} --timeout 172800 --save_to ${out}.tmp \
+        ${lib.concatMapStringsSep " " (c: "uri:${c}") calls} > /dev/null
+      chown root:hermes ${out}.tmp
+      chmod 0440 ${out}.tmp
+      mv ${out}.tmp ${out}
+      echo "payment macaroon baked: ${out} (own root key ${keyId}, 2 days)"
+    '';
+  };
+
+  systemd.services.lnd-backup-copy = {
+    description = "Copy lnd's channel backup into /var/lib/farseed-files";
+    path = [ pkgs.coreutils ];
+    serviceConfig = { Type = "oneshot"; UMask = "0077"; };
+    script = ''
+      set -eu
+      install -d -m 0700 /var/lib/farseed-files
+      name="channel-backup-$(date -u +%Y%m%dT%H%M%SZ).backup"
+      install -m 0600 /var/lib/lnd/data/chain/bitcoin/mainnet/channel.backup "/var/lib/farseed-files/$name"
+      echo "copied: /var/lib/farseed-files/$name ($(stat -c %s "/var/lib/farseed-files/$name") bytes)"
+    '';
+  };
+
+  security.polkit.extraConfig = ''
+    polkit.addRule(function(action, subject) {
+      if (action.id == "org.freedesktop.systemd1.manage-units" && subject.user == "hermes" &&
+          ((action.lookup("unit") == "lnd-pay-macaroon.service" &&
+            ["start", "restart"].indexOf(action.lookup("verb")) >= 0) ||
+           (action.lookup("unit") == "lnd-backup-copy.service" && action.lookup("verb") == "start"))) {
+        return polkit.Result.YES;
+      }
+    });
+  '';
+}
+RECIPE
+chmod 0644 /etc/nixos/recipes/bitcoin-node.md /etc/nixos/recipes/bitcoin-wallet.md /etc/nixos/recipes/lightning-node.md /etc/nixos/recipes/bitcoin-node.nix /etc/nixos/recipes/tailscale.nix /etc/nixos/recipes/lightning-node.nix /etc/nixos/recipes/lightning-pay.nix
 cat > /etc/nixos/cc-agent.nix <<'FILE'
 { config, lib, ... }:
 {
@@ -910,8 +1054,9 @@ cat > /etc/nixos/cc-agent.nix <<'FILE'
     Write files under /etc/nixos with the shell (cp, cat >): the file tool refuses paths under /etc.
     Give the user links and results as plain text in your reply, not through a message tool.
     Recipes for common requests are in recipes/ next to this file: bitcoin-node.md (a pruned Bitcoin node and
-    Tailscale), bitcoin-wallet.md (a watch-only wallet's balance) and lightning-node.md (lnd and a read-only
-    Zeus link). Read the matching recipe first and follow it. The Lightning node's seed was handed to the user
+    Tailscale), bitcoin-wallet.md (a watch-only wallet's balance) and lightning-node.md (lnd, a read-only
+    Zeus link, and payment access when the user wants the node to pay or be paid). Read the matching recipe
+    first and follow it. The Lightning node's seed was handed to the user
     at set-up: before anyone funds the node, make sure they saved it (lightning-node.md).
   '';
   # The recipes the lines above point to. The module files they copy are in /etc/nixos/recipes.
