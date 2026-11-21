@@ -17,7 +17,7 @@ You are building the user's control center on this NixOS machine. Follow the ste
    fills in the words in CAPITALS itself. Only if `run_step_block` isn't offered, copy the block out and replace
    only the CAPITALS words the step names, with their values.
 2. Never print a secret. Don't cat, echo or grep the files in /var/lib/control-center, except files ending in
-   `.pub`. Don't print the user's wireguard.conf or login file.
+   `.pub`. Don't print the user's wireguard.conf, login file or Lightning seed file.
 3. Never put a secret in /etc/nixos or in any `.nix` file.
 4. Make every lasting change through /etc/nixos and `sh /etc/nixos/cc-rebuild.sh`. Never use nix-env,
    nix profile, pip, npm -g or curl|sh, and never edit /etc outside /etc/nixos.
@@ -90,7 +90,7 @@ Propose exactly this declaration. It lists every listener and service the finish
     { "name": "tor", "scope": { "kind": "system" }, "lifecycle": "enabled-survives-reboot" }
   ],
   "key_material": {
-    "spendable": false,
+    "spendable": true,
     "permitted": [
       { "kind": "private-non-spendable", "where": "/var/lib/control-center/wg-server.key" },
       { "kind": "private-non-spendable", "where": "/var/lib/control-center/wg-user.key" },
@@ -118,6 +118,8 @@ What each entry is:
 
 Every entry with `none` is loopback-only. If the login user isn't `nixos`, change `/home/nixos` to the user's
 home.
+`spendable: true` covers the Lightning seed file, the wallet password and lnd's wallet; the schema has no
+spendable kind, so their paths are not listed.
 
 ---
 
@@ -621,17 +623,21 @@ Use it when the user asks for a Lightning node, lnd or a Zeus connection. It nee
 Tailscale signed in: if `tailscale ip -4` prints no 100.x address, show the user the link from `tailscale status`
 and wait for them to sign in.
 
-This is a demo node that must never hold funds: it has no seed backup, so anything sent to it could be lost. Tell
-the user that in the chat, plainly. You only get its read-only macaroon, so you can't make an address, an invoice
-or a channel, and you must not try.
+The node's wallet was made at set-up from a seed that the page handed to the user as a file (lnd-seed-....txt).
+Never open, print, copy or look for that file. Before anyone puts money on the node, ask the
+user whether they saved that file in their password manager. When they answer "saved", delete the machine's copy:
+`systemctl start lnd-seed-delete`, and tell them it is gone. Until then, tell them plainly not to fund the node.
+You only get its read-only macaroon, so you can't make an address, an invoice or a channel, and you must not try.
 
 Install nothing else: no QR tools or other extras. The plain-text link is the result.
 
 1. One rebuild. Copy the module template unchanged with the shell and apply:
    `cp /etc/nixos/recipes/lightning-node.nix /etc/nixos/extra/ && systemctl start control-center-apply`
-   The module runs lnd as its own user (lnd) with no seed, peers or channels, starts it once Core's RPC answers,
-   and opens lnd's REST port 8080 only on tailscale0. Do not change Bitcoin Core's configuration; ZMQ is already
-   on. Then `tail -n 5 /var/log/cc-rebuild.log` about once a minute, until it ends with RESULT. If you ever need to
+   The module runs lnd as its own user (lnd) on the set-up's wallet (it unlocks itself), with no peers or
+   channels, starts it once Core's RPC answers, and opens lnd's REST port 8080 only on tailscale0. Do not change
+   Bitcoin Core's configuration; ZMQ is already on. Then `tail -n 5 /var/log/cc-rebuild.log` about once a minute,
+   until it ends with RESULT. If lnd does not start because the wallet is missing (a machine set up before
+   wallets were made at set-up), stop and tell the user: don't create a wallet yourself. If you ever need to
    restart lnd, you may: `systemctl restart lnd` (no edit or rebuild needed).
 2. lnd's state, read-only:
    `lncli --tlscertpath=/var/lib/lnd/tls.cert --macaroonpath=/var/lib/lnd-pub/readonly.macaroon getinfo`
@@ -781,15 +787,16 @@ in
 {
   # Core already publishes ZMQ (the Bitcoin node module), so this module never restarts Core.
 
-  # A demo node that must never hold funds: no seed backup (noseedbackup), no peers, no channels. It runs as its
-  # own user, lnd. The agent (hermes) gets only the read-only macaroon (in /var/lib/lnd-pub) and the TLS certificate
+  # lnd with the wallet made at set-up (Step 11) from the seed the user got through the page; lnd unlocks it itself
+  # with the set-up's password file, also after a reboot. No peers, no channels. It runs as its own user, lnd. The
+  # agent (hermes) gets only the read-only macaroon (in /var/lib/lnd-pub) and the TLS certificate
   # (/var/lib/lnd/tls.cert, public), so neither the agent nor Zeus can make an address or an invoice, or open a channel.
   # REST on 8080, reachable only over Tailscale. lnd puts every interface address it sees at its first start into
   # its TLS certificate, Tailscale's 100.x included (Tailscale is up before this module), and Zeus uses the
   # certificate carried in the link, so nothing machine-specific is written here.
   environment.etc."lnd/lnd.conf".text = ''
     [Application Options]
-    noseedbackup=true
+    wallet-unlock-password-file=/var/lib/lnd/wallet-password
     nolisten=true
     nobootstrap=true
     rpclisten=127.0.0.1:10009
@@ -817,7 +824,7 @@ in
   systemd.tmpfiles.rules = [ "d /var/lib/lnd-pub 0750 lnd hermes - -" ];
 
   systemd.services.lnd = {
-    description = "Lightning Network Daemon (demo node: never fund it)";
+    description = "Lightning Network Daemon";
     wantedBy = [ "multi-user.target" ];
     wants = [ "bitcoind-main.service" ];
     after = [ "bitcoind-main.service" ];
@@ -835,6 +842,12 @@ in
       ExecStartPre = [
         # Make lnd-pub before every start (as root, "+"): on a live apply, tmpfiles and lnd start unordered.
         "+${pkgs.coreutils}/bin/install -d -m 0750 -o lnd -g hermes /var/lib/lnd-pub"
+        # Only the wallet made at set-up (from the seed the user has): with none, lnd does not start at all.
+        "+${pkgs.coreutils}/bin/test -s /var/lib/lnd/data/chain/bitcoin/mainnet/wallet.db"
+        # Set-up made the wallet as root; lnd owns its data whatever order things ran in.
+        "+${pkgs.coreutils}/bin/chown -R lnd:lnd /var/lib/lnd/data"
+        # lnd's own copy of the wallet password (root-only original from set-up), so it unlocks without anyone.
+        "+${pkgs.coreutils}/bin/install -m 0400 -o lnd -g lnd /var/lib/control-center/lnd-wallet-password /var/lib/lnd/wallet-password"
         # Start lnd only once Core's RPC answers (Core's startup check can take minutes), not in a retry loop.
         "${config.services.bitcoind.main.package}/bin/bitcoin-cli -datadir=/var/lib/bitcoind-main -rpcwait -rpcwaittimeout=3600 getblockcount"
       ];
@@ -847,12 +860,29 @@ in
 
   networking.firewall.interfaces.tailscale0.allowedTCPPorts = [ 8080 ];
 
-  # The agent may start, stop and restart lnd (and nothing else through this rule), e.g. after a fix.
+  # Once the user says they saved the seed file (handed over at set-up, root-only in /var/lib/control-center), the
+  # agent deletes the machine's copy. It must find exactly one file; the agent never opens it.
+  systemd.services.lnd-seed-delete = {
+    description = "Delete the Lightning seed file the page handed to the user";
+    path = [ pkgs.coreutils pkgs.findutils ];
+    serviceConfig.Type = "oneshot";
+    script = ''
+      set -eu
+      n=$(find /var/lib/control-center -maxdepth 1 -name 'lnd-seed-*.txt' -type f | wc -l)
+      [ "$n" -eq 1 ] || { echo "expected exactly one seed file, found $n"; exit 1; }
+      find /var/lib/control-center -maxdepth 1 -name 'lnd-seed-*.txt' -type f -exec shred -u {} +
+      [ "$(find /var/lib/control-center -maxdepth 1 -name 'lnd-seed-*.txt' | wc -l)" -eq 0 ]
+      echo "seed file deleted"
+    '';
+  };
+
+  # The agent may start, stop and restart lnd, and start the seed deletion (nothing else through this rule).
   security.polkit.extraConfig = ''
     polkit.addRule(function(action, subject) {
       if (action.id == "org.freedesktop.systemd1.manage-units" &&
-          action.lookup("unit") == "lnd.service" &&
-          ["start", "stop", "restart"].indexOf(action.lookup("verb")) >= 0 &&
+          ((action.lookup("unit") == "lnd.service" &&
+            ["start", "stop", "restart"].indexOf(action.lookup("verb")) >= 0) ||
+           (action.lookup("unit") == "lnd-seed-delete.service" && action.lookup("verb") == "start")) &&
           subject.user == "hermes") {
         return polkit.Result.YES;
       }
@@ -881,8 +911,8 @@ cat > /etc/nixos/cc-agent.nix <<'FILE'
     Give the user links and results as plain text in your reply, not through a message tool.
     Recipes for common requests are in recipes/ next to this file: bitcoin-node.md (a pruned Bitcoin node and
     Tailscale), bitcoin-wallet.md (a watch-only wallet's balance) and lightning-node.md (lnd and a read-only
-    Zeus link). Read the matching recipe first and follow it. The Lightning node is a demo with no seed backup:
-    never fund it, and tell the user it must not receive funds.
+    Zeus link). Read the matching recipe first and follow it. The Lightning node's seed was handed to the user
+    at set-up: before anyone funds the node, make sure they saved it (lightning-node.md).
   '';
   # The recipes the lines above point to. The module files they copy are in /etc/nixos/recipes.
   services.hermes-agent.documents."recipes/bitcoin-node.md" = ./recipes/bitcoin-node.md;
@@ -1260,18 +1290,45 @@ umask 077
 { echo "http://10.88.0.1:9119/"; [ -n "$ONION" ] && echo "http://$ONION/"; } > "$H/app-url.txt"
 chmod 600 "$H/wireguard.conf" "$H/control-center-login.txt"; chmod 644 "$H/app-url.txt"
 chown "$U": "$H/wireguard.conf" "$H/control-center-login.txt" "$H/app-url.txt"
+# The Lightning wallet (used only if the user later asks for a Lightning node). Its seed goes to the user now,
+# through the page like the files above, as a root-only file; never printed. A rerun never makes a second seed: with
+# a complete wallet it offers the one seed file again (until the user has it deleted); anything half made stops here.
+W=/var/lib/lnd/data/chain/bitcoin/mainnet
+SEEDS=$(find $S -maxdepth 1 -name 'lnd-seed-*.txt' -type f | wc -l)
+if [ -e $W/wallet.db ] || [ -e $S/lnd-wallet-password ] || [ -e $S/lnd-new ] || [ "$SEEDS" -gt 0 ]; then
+  if [ ! -e $W/wallet.db ] || [ ! -e $S/lnd-wallet-password ] || [ -e $S/lnd-new ] || [ "$SEEDS" -gt 1 ]; then
+    echo "STOP: a half-made Lightning wallet is on this machine; don't make another seed. Report this."; exit 1
+  fi
+else
+  L=$(nix build --no-link --print-out-paths --inputs-from /etc/nixos nixpkgs#lndinit)/bin/lndinit
+  install -d -m 0700 $S/lnd-new
+  $L gen-seed > $S/lnd-new/seed
+  $L gen-password > $S/lnd-new/password
+  install -d -m 0700 $W
+  $L init-wallet --network=mainnet --secret-source=file --file.seed=$S/lnd-new/seed \
+    --file.wallet-password=$S/lnd-new/password --init-type=file --init-file.output-wallet-dir=$W > /dev/null 2>&1
+  test -s $W/wallet.db
+  install -m 0600 $S/lnd-new/seed "$S/lnd-seed-$(date -u +%Y%m%dT%H%MZ)-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n').txt"
+  mv $S/lnd-new/password $S/lnd-wallet-password
+  shred -u $S/lnd-new/seed
+  rmdir $S/lnd-new
+fi
+SEED=$(find $S -maxdepth 1 -name 'lnd-seed-*.txt' -type f)
 echo FILES_WRITTEN; echo "OFFER $H/wireguard.conf"; echo "OFFER $H/control-center-login.txt"
+if [ -n "$SEED" ]; then echo "OFFER $SEED"; fi
 STEP
 ```
 Then call `offer_file` for each `OFFER` path the block printed, so the user can download them from the page:
 - the `wireguard.conf` path: label `WireGuard connection file`, why `Import it in your WireGuard app to reach
   the dashboard privately`;
 - the `control-center-login.txt` path: label `Control center sign-in`, why `Your dashboard password and how to
-  open T3 Code`.
+  open T3 Code`;
+- the `lnd-seed-....txt` path: label `Lightning wallet seed`, why `Controls your node's money: anyone with this
+  file can take it. Save it in your password manager, then delete it from Downloads.`
 
-Never print these two files: their contents only reach the user through `offer_file`.
+Never print these files: their contents only reach the user through `offer_file`.
 
-After the two `offer_file` calls, run the Check below. This step isn't done until it prints
+After the `offer_file` calls, run the Check below. This step isn't done until it prints
 `CHECKS handover PASS`; don't go on to the final check or commit before that.
 
 **Check** (run it alone, exactly as written)
@@ -1288,7 +1345,9 @@ name or with the fact in its place.
 ## Step 12: Commit, final check, report
 
 If you didn't call `offer_file` for `wireguard.conf` and `control-center-login.txt` in Step 11, do it first (the
-paths are in the user's home folder, which Step 1 printed).
+paths are in the user's home folder, which Step 1 printed). If you didn't offer the Lightning seed file either,
+offer it right after this step's Do block: its path is the `OFFER` line that block prints. If it prints a `STOP`
+line instead, offer no seed file and report that line.
 
 **Do**
 ```sh
@@ -1296,6 +1355,10 @@ sh -eu <<'STEP'
 git -C /etc/nixos add -A
 git -C /etc/nixos -c user.name=control-center -c user.email=root@localhost commit -q -m "Control center" || true
 git -C /etc/nixos log --oneline | head -n 3
+n=$(find /var/lib/control-center -maxdepth 1 -name 'lnd-seed-*.txt' -type f | wc -l)
+if [ "$n" -eq 1 ]; then echo "OFFER $(find /var/lib/control-center -maxdepth 1 -name 'lnd-seed-*.txt' -type f)"
+elif [ "$n" -eq 0 ]; then echo "No Lightning seed file to offer (deleted after the user saved it, or none made)."
+else echo "STOP: $n Lightning seed files; offer none and report this."; fi
 STEP
 ```
 **Check** (run it alone, exactly as written; it takes up to 5 minutes: it also checks T3 Connect and visits every address in app-url.txt):
