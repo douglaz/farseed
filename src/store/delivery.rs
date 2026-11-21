@@ -317,9 +317,19 @@ impl<S: Storage> Store<S> {
     pub(crate) fn delivery_command_records(&self, machine: &str) -> Option<Value> {
         self.dispatch.approved_entries.contains_key(machine).then(|| {
             self.dispatch.calls.values().filter(|c| c.intent.machine == machine)
-                .map(|c| json!({"command":c.intent.command,
-                    "terminal":self.dispatch.terminals.iter().find(|t| t.terminal.call == c.intent.call),
-                    "evidence":self.dispatch.jobs.iter().filter(|e| e.evidence.call == c.intent.call).collect::<Vec<_>>()}))
+                .map(|c| {
+                    if self.renewal_step_for_call(c.intent.call).is_some() {
+                        // Even explicit command-history details must not publish renewal output.
+                        json!({"command":c.intent.command,
+                            "terminal":{"exit_status":self.dispatch.jobs.iter().rev()
+                                .find(|report| report.evidence.call == c.intent.call)
+                                .and_then(|report| report.exit_status)},"evidence":[]})
+                    } else {
+                        json!({"command":c.intent.command,
+                            "terminal":self.dispatch.terminals.iter().find(|t| t.terminal.call == c.intent.call),
+                            "evidence":self.dispatch.jobs.iter().filter(|e| e.evidence.call == c.intent.call).collect::<Vec<_>>()})
+                    }
+                })
                 .collect::<Vec<_>>().into()
         })
     }

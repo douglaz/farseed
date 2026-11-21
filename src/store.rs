@@ -3145,6 +3145,9 @@ impl<S: Storage + Clone, K: Kdf> Local<S, K> {
                 .collect::<Vec<_>>()
                 .into();
         }
+        if let State::Unlocked(store) = &self.state {
+            store.withhold_renewal_output(&mut report);
+        }
         self.protect_report(report)
     }
 }

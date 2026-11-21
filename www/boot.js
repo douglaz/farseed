@@ -430,7 +430,7 @@ const renderProgress = (store) => {
     const liveSessions = (store.sessions ?? []).filter(session => session.session_state !== 'ended');
     const inLiveSession = task => liveSessions.some(session => session.identity === task.start_session);
     const setupFor = machine => {
-      const tasks = (store.tasks ?? []).filter(task => machine !== undefined && task.machine === machine)
+      const tasks = (store.tasks ?? []).filter(task => !task.ai_key_renewal && machine !== undefined && task.machine === machine)
         .sort((a, b) => (b.creation_rank ?? -1) - (a.creation_rank ?? -1));
       const session = liveSessions.find(session => session.bound_set?.length === 1 && session.bound_set[0] === machine);
       // The live task, else the machine's newest task: an older success never stands in for newer unfinished work.
@@ -1211,6 +1211,12 @@ const renderCommandResult = (result) => {
   }
   const card = document.createElement('section');
   card.dataset.commandResult = String(result.call);
+  if (result.ai_key_renewal) {
+    paragraph(card, `${result.step}: ${result.status}.`);
+    const previous = slot.querySelector(`[data-command-result="${Number(result.call)}"]`);
+    if (previous) previous.replaceWith(card); else slot.append(card);
+    return;
+  }
   if (result.optional_report) paragraph(card, 'Checks the AI wrote — not part of Delivered');
   paragraph(card, `Command ${commandResultWord(result)}.${result.historical ? ' This is a saved result; it does not allow any new action.' : ''}`);
   const details = rawDetails(card, {call: result.call, job: result.job, exit_status: result.exit_status}, ['command-result', result.call]);
@@ -1535,11 +1541,53 @@ const playbookCommand = origin => {
   const suffix = controlCenterLabels.blocks[origin.block];
   if (name && suffix !== undefined) return `step ${origin.step}, ${suffix || name}`;
 };
+const renewalDrafts = new Map();
+const renderAiKeyApproval = (card, task, session, store, worker, draftDecision) => {
+  const requestCard = document.createElement('section');
+  requestCard.dataset.aiKeyRequest = '';
+  paragraph(requestCard, `Create an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} on this machine (limit ${task.ai_key_limit_usd} USD, expires in 30 days)?`);
+  paragraph(requestCard, "Paid from your inference balance. It can read the account's usage history. It ends when the machine is destroyed, it expires, or it is revoked.");
+  paragraph(requestCard, "This key is for the operator's application and outlives this session. Lock, Stop task and End session do not revoke it.");
+  const needsClass = (store.poc_targets ?? []).find(target => target.machine === task.machine)?.ai_key_needs_class_answer !== false;
+  const unavailable = !session || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
+  let classAnswer;
+  const sendDecision = (decision, answer) => {
+    for (const control of requestCard.querySelectorAll('button')) control.disabled = true;
+    if (draftDecision) { draftDecision(decision, answer); return; }
+    worker.postMessage({task: {action: `ai-key-${decision}`, id: task.id, session: session.identity, call_id: task.proposal.call_id, revision: task.revision, ...(answer ? {machine_class_answer: answer} : {})}});
+  };
+  if (needsClass) {
+    const question = paragraph(requestCard, 'Does this machine serve only you?');
+    question.dataset.machineClass = '';
+    for (const [answer, text] of [['only-me', 'Only me'], ['others-too', 'Others too'], ['not-sure', 'Not sure']]) {
+      const button = document.createElement('button');
+      button.type = 'button'; button.textContent = text; button.dataset.machineClassAnswer = answer;
+      button.setAttribute('aria-pressed', 'false');
+      button.disabled = unavailable;
+      button.addEventListener('click', () => {
+        if (answer !== 'only-me') { sendDecision('class', answer); return; }
+        classAnswer = answer;
+        button.setAttribute('aria-pressed', 'true');
+        requestCard.querySelector('[data-ai-key-decision="create"]').disabled = unavailable;
+      });
+      requestCard.append(button);
+    }
+  }
+  for (const [decision, text] of [['create', 'Create key'], ['decline', "Don't"]]) {
+    const button = document.createElement('button');
+    button.type = 'button'; button.textContent = text; button.dataset.aiKeyDecision = decision;
+    button.disabled = unavailable || (decision === 'create' && needsClass);
+    button.addEventListener('click', () => sendDecision(decision, decision === 'create' ? classAnswer : undefined));
+    requestCard.append(button);
+  }
+  card.append(requestCard);
+};
 const renderTasks = (store) => {
   if (store.state !== 'unlocked' || store.lifecycle_generation !== taskHistoryGeneration) {
     taskHistoryPage = null;
     taskHistoryGeneration = store.lifecycle_generation;
   }
+  if (store.state !== 'unlocked' || store.lifecycle_state === 'ended') renewalDrafts.clear();
   if (store.state !== 'unlocked' || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state)) fileDownloads.clear();
   const worker = snapshotWorker();
   let slot = $('tasks');
@@ -1562,6 +1610,20 @@ const renderTasks = (store) => {
   slot.replaceChildren();
   slot.hidden = store.state !== 'unlocked' || store.seed_backup_stage !== 'inactive';
   if (slot.hidden) return;
+  for (const [machine, {identity, id}] of renewalDrafts) {
+    const session = (store.sessions ?? []).find(session => session.identity === identity && session.session_state !== 'ended' && session.bound_set.length === 1 && session.bound_set[0] === machine);
+    const existing = (store.tasks ?? []).some(task => task.ai_key_renewal && task.start_session === identity && task.machine === machine && !['complete', 'abandoned'].includes(task.status));
+    if (!session || existing) { renewalDrafts.delete(machine); continue; }
+    const card = document.createElement('section');
+    paragraph(card, `Renewing Hermes's AI key on ${machine}: waiting for you.`);
+    const draft = {machine, ai_key_limit_usd: (store.poc_targets ?? []).find(target => target.machine === machine)?.ai_key_limit_usd, proposal: {tool: {arguments: {application: 'Hermes Agent'}}}};
+    renderAiKeyApproval(card, draft, session, store, worker, (decision, answer) => {
+      renewalDrafts.delete(machine);
+      if (decision === 'create') worker.postMessage({task: {action: 'renew-ai-key', id, machine, session: identity, ...(answer ? {machine_class_answer: answer} : {})}});
+      renderTasks(store);
+    });
+    slot.append(card);
+  }
   for (const entry of visibleTasks(store, slot)) {
     const opened = entry.summary ? taskDetails.get(entry.id) : undefined;
     const task = opened?.task ?? entry;
@@ -1573,6 +1635,28 @@ const renderTasks = (store) => {
     card.dataset.cycleTimings = JSON.stringify(task.cycle_timings ?? []);
     card.dataset.replyTools = JSON.stringify(task.reply_tools ?? []);
     const session = (store.sessions ?? []).find(s => s.identity === task.start_session && s.session_state !== 'ended' && s.bound_set.length === 1 && s.bound_set[0] === task.machine);
+    if (task.ai_key_renewal) {
+      paragraph(card, `Renewing Hermes's AI key on ${task.machine}: ${taskStatus(task.status, task)}.`);
+      if (awaitingAiKey(task)) renderAiKeyApproval(card, task, session, store, worker);
+      else if (task.verdict) paragraph(card, task.verdict);
+      else if (task.pause_reason) paragraph(card, task.pause_reason);
+      else if (task.pending) paragraph(card, 'Waiting for the recorded renewal step. Resume collects its result without running it twice.');
+      else if (task.status !== 'abandoned') paragraph(card, 'Continuing the AI key renewal.');
+      if (!['complete', 'abandoned'].includes(task.status) && !awaitingAiKey(task)) {
+        for (const [action, label] of [['resume', 'Resume'], ['abandon', 'Stop task']]) {
+          const button = document.createElement('button');
+          button.type = 'button'; button.textContent = label;
+          button.disabled = !session || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
+          button.addEventListener('click', () => {
+            button.disabled = true;
+            worker.postMessage({task: {action, id: task.id, session: task.start_session}});
+          });
+          card.append(button);
+        }
+      }
+      slot.append(card);
+      continue;
+    }
     paragraph(card, `Setting up ${task.machine}: ${taskStatus(task.status, task)}.`);
     if (entry.summary) {
       const open = document.createElement('button');
@@ -1705,43 +1789,7 @@ const renderTasks = (store) => {
           card.append(row);
         }
       } else if (awaitingAiKey(task)) {
-        const requestCard = document.createElement('section');
-        requestCard.dataset.aiKeyRequest = '';
-        paragraph(requestCard, `Create an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} on this machine (limit ${task.ai_key_limit_usd} USD, expires in 30 days)?`);
-        paragraph(requestCard, "Paid from your inference balance. It can read the account's usage history. It ends when the machine is destroyed, it expires, or it is revoked.");
-        paragraph(requestCard, "This key is for the operator's application and outlives this session. Lock, Stop task and End session do not revoke it.");
-        const needsClass = (store.poc_targets ?? []).find(target => target.machine === task.machine)?.ai_key_needs_class_answer !== false;
-        const unavailable = !session || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
-        let classAnswer;
-        const sendDecision = (decision, answer) => {
-          for (const control of requestCard.querySelectorAll('button')) control.disabled = true;
-          worker.postMessage({task: {action: `ai-key-${decision}`, id: task.id, session: session.identity, call_id: task.proposal.call_id, revision: task.revision, ...(answer ? {machine_class_answer: answer} : {})}});
-        };
-        if (needsClass) {
-          const question = paragraph(requestCard, 'Does this machine serve only you?');
-          question.dataset.machineClass = '';
-          for (const [answer, text] of [['only-me', 'Only me'], ['others-too', 'Others too'], ['not-sure', 'Not sure']]) {
-            const button = document.createElement('button');
-            button.type = 'button'; button.textContent = text; button.dataset.machineClassAnswer = answer;
-            button.setAttribute('aria-pressed', 'false');
-            button.disabled = unavailable;
-            button.addEventListener('click', () => {
-              if (answer !== 'only-me') { sendDecision('class', answer); return; }
-              classAnswer = answer;
-              button.setAttribute('aria-pressed', 'true');
-              requestCard.querySelector('[data-ai-key-decision="create"]').disabled = unavailable;
-            });
-            requestCard.append(button);
-          }
-        }
-        for (const [decision, text] of [['create', 'Create key'], ['decline', "Don't"]]) {
-          const button = document.createElement('button');
-          button.type = 'button'; button.textContent = text; button.dataset.aiKeyDecision = decision;
-          button.disabled = unavailable || (decision === 'create' && needsClass);
-          button.addEventListener('click', () => sendDecision(decision, decision === 'create' ? classAnswer : undefined));
-          requestCard.append(button);
-        }
-        card.append(requestCard);
+        renderAiKeyApproval(card, task, session, store, worker);
       } else if (task.proposal.call_id.startsWith('$rerun:')) {
         const label = task.pending ? task.status === 'paused' ? 'Re-issued command' : 'Running again' : 'Ready to send once more';
         paragraph(card, `${label}: ${commandSummary(task.proposal.tool.arguments.command)}`);
@@ -1999,10 +2047,10 @@ const renderDelivery = (section, machine, store) => {
     verdict.textContent = "This card lists what Farseed checked on this machine itself, and what it didn't. The fuller check against Farseed's lockdown checklist isn't in this version. Each setup task's own result is on its task card.";
     card.append(verdict);
     if (entry.summary) deliveryDetailsButton(card, machine, 'entry', 'delivery details', store);
-    const verdictTasks = (store.tasks ?? []).filter(task => task.machine === machine && task.verdict);
+    const verdictTasks = (store.tasks ?? []).filter(task => !task.ai_key_renewal && task.machine === machine && task.verdict);
     const recordTasks = (store.tasks ?? []).filter(task => task.machine === machine && task.summary !== true &&
       Array.isArray(task.read_plan) && task.read_plan.length > 0);
-    const summaryTasks = (store.tasks ?? []).filter(task => task.machine === machine && task.summary === true);
+    const summaryTasks = (store.tasks ?? []).filter(task => !task.ai_key_renewal && task.machine === machine && task.summary === true);
     const task = recordTasks.length === 1 ? recordTasks[0] : null;
     const checked = document.createElement('section');
     checked.dataset.deliveryChecked = machine;
@@ -2112,7 +2160,7 @@ const renderDelivery = (section, machine, store) => {
   }
   // Tasks arrive keyed by random id, not in time order: show addresses here only when exactly one task on this machine
   // has a verdict; otherwise each task's own card shows its addresses.
-  const verdictTasks = (store.tasks ?? []).filter(task => task.machine === machine && task.verdict);
+  const verdictTasks = (store.tasks ?? []).filter(task => !task.ai_key_renewal && task.machine === machine && task.verdict);
   if (verdictTasks.length === 1) renderDeliveredUrls(card, taskDeliveredUrls(verdictTasks[0]));
   if (isLive) {
     const about = document.createElement('details');
@@ -2726,6 +2774,25 @@ const renderPoc = (store) => {
     if (target.file_access_available) renderMachineFiles(row, target.machine, enabled, worker);
     else if (target.file_access_unavailable_message) paragraph(row, target.file_access_unavailable_message);
     const liveSession = (store.sessions ?? []).find(session => session.session_state !== 'ended' && (session.bound_set ?? []).includes(target.machine));
+    if (target.hermes_ai_key) paragraph(row, `Hermes's AI key: cap ${target.hermes_ai_key.cap} USD, expires ${target.hermes_ai_key.expires}. When Hermes answers 'HTTP 402 … usage limit exceeded', the key is used up: press Renew AI key.`);
+    if (target.hermes_ai_key_not_installed) paragraph(row, 'A newer key was created but not installed; press Renew AI key to try again.');
+    if (target.ai_key_renewal_available) {
+      const button = document.createElement('button');
+      button.type = 'button'; button.textContent = 'Renew AI key';
+      button.disabled = !enabled;
+      button.addEventListener('click', () => {
+        button.disabled = true;
+        if (liveSession) {
+          if (!renewalDrafts.has(target.machine)) {
+            const id = Array.from(crypto.getRandomValues(new Uint8Array(24)), byte => byte.toString(16).padStart(2, '0')).join('');
+            renewalDrafts.set(target.machine, {identity: liveSession.identity, id});
+          }
+          renderTasks(store);
+        }
+        button.disabled = !enabled;
+      });
+      row.append(button);
+    } else if (target.ai_key_renewal_unavailable_message) paragraph(row, target.ai_key_renewal_unavailable_message);
     const creditSession = (store.sessions ?? []).some(session => session.credit_backed && session.session_state !== 'ended' && (session.bound_set ?? []).includes(target.machine));
     const creditChoice = store.credit?.selected || !store.poc_configuration?.key_set;
     const readingCredit = store.credit?.account && store.credit.balance === null && !store.credit_error;

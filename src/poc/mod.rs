@@ -9,6 +9,8 @@ pub mod files;
     )
 )]
 pub mod inference;
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) mod key_renewal;
 pub(crate) mod proposal;
 #[cfg_attr(
     not(target_arch = "wasm32"),

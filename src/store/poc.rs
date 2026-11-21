@@ -199,8 +199,16 @@ impl Task {
     /// Keep complete text until the publication boundary protects it and bounds the card.
     pub(super) fn view(&self) -> Value {
         let mut value = serde_json::to_value(self).expect("task serializes");
+        value["ai_key_renewal"] = json!(crate::poc::key_renewal::is_renewal(self));
         value["file_offers"] = serde_json::to_value(self.file_offers()).expect("offers serialize");
         value["pause_reason"] = self.publication_pause_reason();
+        if crate::poc::key_renewal::is_renewal(self) {
+            for step in value["completed"].as_array_mut().expect("completed steps") {
+                if step[1]["name"] == "exec" {
+                    step[2]["content"] = json!({"step":crate::poc::key_renewal::step_name(step[0].as_str().unwrap_or_default())});
+                }
+            }
+        }
         if self.awaiting_ai_key() {
             value["ai_key_limit_usd"] = json!(crate::poc::credit::AI_KEY_CAP);
         }
@@ -259,7 +267,7 @@ impl Task {
                 )
             })
             .unwrap_or_default();
-        json!({"summary":true,"id":self.id,"revision":self.revision,"start_session":self.start_session,
+        json!({"summary":true,"ai_key_renewal":crate::poc::key_renewal::is_renewal(self),"id":self.id,"revision":self.revision,"start_session":self.start_session,
             "machine":self.machine,"status":self.status,
             "goal":self.goal,
             "pause_reason":self.publication_pause_reason(),"verdict":self.verdict,
@@ -420,6 +428,12 @@ pub(crate) enum Record {
         limits: Limits,
     },
     Start {
+        id: String,
+        session: String,
+        limits: Limits,
+    },
+    // A separate maintenance task retains the setup task and all old key custody.
+    RenewAiKey {
         id: String,
         session: String,
         limits: Limits,
@@ -720,9 +734,10 @@ impl<S: Storage> Store<S> {
             return Err("task requires its original session".into());
         }
         let live = self.live_goal_session(session)?;
-        if self
-            .poc_session_task(session)
-            .is_some_and(|owner| owner.id != id)
+        if !crate::poc::key_renewal::is_renewal(task)
+            && self
+                .poc_session_task(session)
+                .is_some_and(|owner| owner.id != id)
         {
             return Err(crate::poc::wait::SESSION_OWNER.into());
         }
@@ -888,6 +903,9 @@ impl<S: Storage> Store<S> {
 
     pub async fn poc_prepare_next(&mut self, task: &Task, session: &str) -> Result<Task, String> {
         self.poc_authority(&task.id, session)?;
+        if crate::poc::key_renewal::is_renewal(task) && self.poc_needs_declaration(&task.machine) {
+            return Err("AI key renewal is unavailable for this machine.".into());
+        }
         if self.poc_needs_declaration(&task.machine) && task.before_setup.is_none() {
             self.poc_change(&task.id, task.revision, Change::PrepareRead)
                 .await
@@ -974,6 +992,111 @@ impl<S: Storage> Store<S> {
     /// Acceptance and task inputs share one durable boundary, including a lost append reply.
     pub async fn poc_accept_start(&mut self, session: &str) -> Result<(), String> {
         self.poc_start(session).await.map(|_| ())
+    }
+    pub(crate) fn renewal_step_for_call(&self, call: u64) -> Option<&'static str> {
+        self.poc
+            .values()
+            .filter(|task| crate::poc::key_renewal::is_renewal(task))
+            .find_map(|task| {
+                if task
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.call == call)
+                {
+                    return task
+                        .proposal
+                        .as_ref()
+                        .map(|proposal| crate::poc::key_renewal::step_name(&proposal.call_id));
+                }
+                task.completed
+                    .iter()
+                    .find(|(_, _, output)| output["content"]["call"] == call)
+                    .map(|(id, _, _)| crate::poc::key_renewal::step_name(id))
+            })
+    }
+    /// Remove renewal output, including encoded job-record streams, at inspection publication.
+    pub(crate) fn withhold_renewal_output(&self, value: &mut Value) {
+        fn strip(value: &mut Value) {
+            match value {
+                Value::Object(fields) => {
+                    fields.remove("stdout");
+                    fields.remove("stderr");
+                    for child in fields.values_mut() {
+                        strip(child);
+                    }
+                }
+                Value::Array(values) => {
+                    for child in values {
+                        strip(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if value
+            .get("call")
+            .and_then(Value::as_u64)
+            .is_some_and(|call| self.renewal_step_for_call(call).is_some())
+        {
+            strip(value);
+        } else {
+            match value {
+                Value::Object(fields) => {
+                    for child in fields.values_mut() {
+                        self.withhold_renewal_output(child);
+                    }
+                }
+                Value::Array(values) => {
+                    for child in values {
+                        self.withhold_renewal_output(child);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) async fn poc_renew_ai_key(
+        &mut self,
+        machine: &str,
+        session: &str,
+        id: &str,
+    ) -> Result<Task, String> {
+        let live = self
+            .check_connection_session_for(machine, None)
+            .map_err(|_| crate::poc::key_renewal::LIVE_REQUIRED)?;
+        if live.identity != session {
+            return Err(crate::poc::key_renewal::LIVE_REQUIRED.into());
+        }
+        let session = live.identity.clone();
+        self.live_goal_session(&session)?;
+        if let Some(task) = self.poc.get(id) {
+            if task.machine == machine
+                && task.start_session == session
+                && crate::poc::key_renewal::is_renewal(task)
+            {
+                return Ok(task.clone());
+            }
+            return Err("AI key decision is no longer available".into());
+        }
+        if let Some(task) = self.poc.values().find(|task| {
+            task.machine == machine
+                && task.start_session == session
+                && crate::poc::key_renewal::is_renewal(task)
+                && !task.ended()
+        }) {
+            return Ok(task.clone());
+        }
+        let record = Record::RenewAiKey {
+            id: id.into(),
+            session,
+            limits: Limits::default(),
+        };
+        let task = self.project_poc(self.next, &record)?;
+        self.poc_record_safe(&record)?;
+        let number = self.commit(&Event::Poc(record.clone())).await?;
+        self.apply_poc(number, &record)?;
+        Ok(task)
     }
     pub async fn poc_start(&mut self, session: &str) -> Result<Task, String> {
         self.poc_create_inner(session, true).await
@@ -1359,9 +1482,10 @@ impl<S: Storage> Store<S> {
         // protects its derived outcome separately before checkpointing it.
         self.poc_record_safe(record)?;
         let task = match record {
-            Record::Create { .. } | Record::Start { .. } | Record::Rerun { .. } => {
-                self.project_poc(number, record)?
-            }
+            Record::Create { .. }
+            | Record::Start { .. }
+            | Record::RenewAiKey { .. }
+            | Record::Rerun { .. } => self.project_poc(number, record)?,
             Record::Change { id, .. }
             | Record::Command {
                 binding: Binding { task: id, .. },
@@ -1391,6 +1515,9 @@ impl<S: Storage> Store<S> {
             && let Some(acceptance) = self.poc_new_acceptance(session)?
         {
             self.push_acceptance(acceptance);
+        }
+        if matches!(record, Record::RenewAiKey { .. }) {
+            self.poc_creation_order.push(task.id.clone());
         }
         if matches!(record, Record::Create { .. } | Record::Start { .. }) {
             self.poc_creation_order.push(task.id.clone());
@@ -1431,8 +1558,14 @@ impl<S: Storage> Store<S> {
             id,
             session,
             limits,
+        }
+        | Record::RenewAiKey {
+            id,
+            session,
+            limits,
         } = record
         {
+            let renewal = matches!(record, Record::RenewAiKey { .. });
             if matches!(record, Record::Start { .. }) {
                 self.poc_new_acceptance(session)?;
             }
@@ -1444,28 +1577,70 @@ impl<S: Storage> Store<S> {
                 || id.len() != 48
                 || hex::decode(id).is_err()
                 || self.poc.contains_key(id)
-                || self.poc_session_task(session).is_some()
+                || (!renewal && self.poc_session_task(session).is_some())
                 || exposure.bound_set.len() != 1
                 || limits.requests == 0
                 || limits.steps == 0
-                || (matches!(record, Record::Create { .. }) && !self.accepted_no_brief(session))
+                || ((matches!(record, Record::Create { .. }) || renewal)
+                    && !self.accepted_no_brief(session))
             {
                 return Err("invalid task creation".into());
+            }
+            if renewal
+                && (self.poc_needs_declaration(&exposure.bound_set[0].machine)
+                    || !self
+                        .poc_targets
+                        .get(&exposure.bound_set[0].machine)
+                        .is_some_and(|target| {
+                            target
+                                .application_inference_keys
+                                .iter()
+                                .any(|key| key.application == "Hermes Agent")
+                        })
+                    || self.poc.values().any(|task| {
+                        task.machine == exposure.bound_set[0].machine
+                            && task.start_session == *session
+                            && crate::poc::key_renewal::is_renewal(task)
+                            && !task.ended()
+                    }))
+            {
+                return Err("AI key renewal is unavailable for this machine.".into());
             }
             return Ok(Task {
                 id: id.clone(),
                 start_session: session.clone(),
-                goal: goal.text.clone(),
-                template: goal.template.clone(),
-                options: goal.options.clone(),
-                inputs: goal.inputs.clone(),
+                goal: if renewal {
+                    crate::poc::key_renewal::GOAL.into()
+                } else {
+                    goal.text.clone()
+                },
+                template: if renewal {
+                    Some(crate::poc::key_renewal::ID.into())
+                } else {
+                    goal.template.clone()
+                },
+                options: if renewal { None } else { goal.options.clone() },
+                inputs: if renewal { None } else { goal.inputs.clone() },
                 machine: exposure.bound_set[0].machine.clone(),
                 approved_plan: None,
                 completed: vec![],
-                proposal: None,
+                proposal: renewal.then(|| Proposal {
+                    call_id: crate::poc::key_renewal::KEY.into(),
+                    tool: Tool::RequestAiKey {
+                        machine: exposure.bound_set[0].machine.clone(),
+                        application: "Hermes Agent".into(),
+                        purpose: "The control center's own AI agent".into(),
+                    },
+                    check: None,
+                    report: None,
+                }),
                 ai_key_approved: false,
                 pending: None,
-                status: Status::Running,
+                status: if renewal {
+                    Status::Waiting
+                } else {
+                    Status::Running
+                },
                 pause_reason: None,
                 requests: 0,
                 steps: 0,
@@ -2094,6 +2269,9 @@ impl<S: Storage> Store<S> {
                             ));
                         }
                         task.active();
+                        if !create && crate::poc::key_renewal::is_renewal(&task) {
+                            task.status = Status::Abandoned;
+                        }
                     }
                     Change::AiKeyClassDecision { answer, at } => {
                         if !task.awaiting_ai_key()
@@ -2423,7 +2601,7 @@ impl<S: Storage> Store<S> {
                         if !background && exit.is_none() && !proposal.check_batch() {
                             return Err(crate::poc::wait::NO_EXIT.into());
                         }
-                        let outcome = if matches!(proposal.tool, Tool::RequestAiKey { .. }) {
+                        let mut outcome = if matches!(proposal.tool, Tool::RequestAiKey { .. }) {
                             if background {
                                 return Err("AI key write is still running; inspect the recorded job before Resume".into());
                             }
@@ -2433,6 +2611,9 @@ impl<S: Storage> Store<S> {
                         } else {
                             json!({"call":pending.call,"job":pending.job,"exit_status":exit,"stdout":report.stdout,"stderr":report.stderr})
                         };
+                        if crate::poc::key_renewal::is_renewal(&task) {
+                            outcome["call"] = json!(pending.call);
+                        }
                         let proposal = task.proposal.take().expect("checked proposal");
                         // The checkpoint derives from already committed, protected evidence. Do not
                         // make its bytes depend on credentials that disappear at worker restart.
@@ -2529,6 +2710,22 @@ impl<S: Storage> Store<S> {
                         ));
                         task.pending = None;
                         task.active();
+                        if crate::poc::key_renewal::is_renewal(&task) {
+                            let call = &task.completed.last().expect("settled command").0;
+                            if call == crate::poc::key_renewal::CHECK {
+                                if crate::poc::key_renewal::check_passed(exit, &report.stdout) {
+                                    task.status = Status::Complete;
+                                    task.verdict = Some(
+                                        "Hermes's AI key was renewed. The Hermes check passed."
+                                            .into(),
+                                    );
+                                } else {
+                                    task.pause(crate::poc::key_renewal::failed(call));
+                                }
+                            } else if crate::poc::key_renewal::next(self, &task).is_err() {
+                                task.pause(crate::poc::key_renewal::failed(call));
+                            }
+                        }
                     }
                     Change::Wait { why, running } => {
                         if task.pending.is_none() || why.trim().is_empty() {

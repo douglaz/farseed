@@ -280,6 +280,34 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             .map(|_| ())
     }
     async fn change(&mut self, task: &Task, change: Change) -> Result<Task, String> {
+        // Renewal errors name the step, never any remote diagnostic bytes.
+        let change = if super::key_renewal::is_renewal(task) {
+            let call = task
+                .proposal
+                .as_ref()
+                .map(|p| p.call_id.as_str())
+                .unwrap_or(super::key_renewal::KEY);
+            match change {
+                Change::Pause(_) if task.proposal.is_some() && task.pending.is_none() => {
+                    Change::Pause(super::key_renewal::failed(call))
+                }
+                Change::Wait { running, .. } => Change::Wait {
+                    why: format!(
+                        "AI key renewal: {} {}. Resume collects the recorded job without running it twice.",
+                        super::key_renewal::step_name(call),
+                        if running {
+                            "is still running"
+                        } else {
+                            "has an unknown outcome"
+                        }
+                    ),
+                    running,
+                },
+                other => other,
+            }
+        } else {
+            change
+        };
         if task.pending.is_some() {
             super::timings::resume(task);
         }
@@ -602,7 +630,29 @@ async fn committed(
         return Ok(None);
     };
 
-    let mut value = serde_json::json!({"command_result":report});
+    let mut value = if super::key_renewal::is_renewal(task) {
+        let call = task
+            .proposal
+            .as_ref()
+            .ok_or(crate::poc::wait::NO_PROPOSAL)?;
+        let status = match &observation {
+            Observation::Committed => {
+                if report.exit_status == Some(0) {
+                    "finished"
+                } else {
+                    "failed"
+                }
+            }
+            Observation::Running => "still running",
+            _ => "result unknown",
+        };
+        serde_json::json!({"command_result":{
+            "call":pending.call,"ai_key_renewal":true,
+            "step":super::key_renewal::step_name(&call.call_id),"status":status
+        }})
+    } else {
+        serde_json::json!({"command_result":report})
+    };
     if task
         .proposal
         .as_ref()
@@ -854,6 +904,7 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
     #[serde(deny_unknown_fields)]
     struct Request {
         action: String,
+        machine: Option<String>,
         id: Option<String>,
         session: Option<String>,
         limits: Option<crate::store::poc::Limits>,
@@ -881,6 +932,7 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
             "resume"
                 | "dispose-pending"
                 | "ai-key-create"
+                | "renew-ai-key"
                 | "ai-key-decline"
                 | "ai-key-class"
                 | "operator-answer"
@@ -909,8 +961,29 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                     return Err(why.into());
                 }
                 let store = writer.store().ok_or(crate::poc::wait::LOCKED)?;
-                let task = store.poc_task(id)?;
+                let task = if request.action == "renew-ai-key" {
+                    let machine = request.machine.as_deref().ok_or("machine required")?;
+                    if automatic
+                        || match request.machine_class_answer {
+                            Some(crate::store::poc_targets::KeyCardAnswer::OnlyMe) => false,
+                            None => store.ai_key_needs_class_answer(machine),
+                            _ => true,
+                        }
+                    {
+                        return Err("AI key decision is no longer available".into());
+                    }
+                    store.poc_renew_ai_key(machine, session, id).await?
+                } else {
+                    store.poc_task(id)?
+                };
+                let id = task.id.as_str();
                 store.check_task_session(&task, session)?;
+                if request.action == "dispose-pending" && super::key_renewal::is_renewal(&task) {
+                    return Err(
+                        "AI key renewal only collects the recorded job; it cannot run it twice."
+                            .into(),
+                    );
+                }
                 // A queued wake may have selected this task before recovery paused it.
                 if automatic && !store.eligible_tasks().iter().any(|task| task.id == id) {
                     return Ok(());
@@ -958,23 +1031,24 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                         .await?
                 } else if matches!(
                     request.action.as_str(),
-                    "ai-key-create" | "ai-key-decline" | "ai-key-class"
+                    "ai-key-create" | "ai-key-decline" | "ai-key-class" | "renew-ai-key"
                 ) {
                     crate::poc::run::check_raise(id)?;
                     store.poc_authority(id, session)?;
                     if automatic
-                        || request.revision != Some(task.revision)
-                        || request.call_id.as_deref()
-                            != task
-                                .proposal
-                                .as_ref()
-                                .map(|proposal| proposal.call_id.as_str())
+                        || (request.action != "renew-ai-key"
+                            && (request.revision != Some(task.revision)
+                                || request.call_id.as_deref()
+                                    != task
+                                        .proposal
+                                        .as_ref()
+                                        .map(|proposal| proposal.call_id.as_str())))
                     {
                         return Err("AI key decision is no longer available".into());
                     }
                     let decision = match (request.action.as_str(), request.machine_class_answer) {
                         (
-                            "ai-key-create",
+                            "ai-key-create" | "renew-ai-key",
                             Some(crate::store::poc_targets::KeyCardAnswer::OnlyMe),
                         )
                         | (
@@ -987,9 +1061,11 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                             answer: request.machine_class_answer.expect("matched answer"),
                             at: (js_sys::Date::now() / 1000.0) as u64,
                         },
-                        ("ai-key-create" | "ai-key-decline", None) => Change::AiKeyDecision {
-                            create: request.action == "ai-key-create",
-                        },
+                        ("ai-key-create" | "ai-key-decline" | "renew-ai-key", None) => {
+                            Change::AiKeyDecision {
+                                create: request.action != "ai-key-decline",
+                            }
+                        }
                         _ => return Err("AI key decision is no longer available".into()),
                     };
                     store.poc_change(id, task.revision, decision).await?
@@ -997,7 +1073,7 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                     task
                 }
             };
-            if !automatic {
+            if !automatic && !super::key_renewal::is_renewal(&task) {
                 crate::poc::credit::browser::retry_mint(session);
             }
             let resolved = {
@@ -1136,6 +1212,10 @@ struct Configured {
 }
 impl run::Model for Configured {
     async fn ready(&mut self, task: &Task, session: &str) -> Result<(), String> {
+        self.continuation.check()?;
+        if super::key_renewal::is_renewal(task) {
+            return Ok(());
+        }
         #[cfg(feature = "tracer")]
         if crate::testonly::poc_model_configured() {
             return Ok(());
@@ -1205,6 +1285,14 @@ impl run::Model for Configured {
         // Progress has released the preceding result. Configuration may change during
         // the next request, whose adapter detects changes and aborts honestly.
         self.response.borrow_mut().take();
+        if super::key_renewal::is_renewal(task) {
+            let local = local();
+            let mut writer = local.lock().await;
+            self.continuation.check()?;
+            let store = writer.store().ok_or("locked")?;
+            store.check_task_session(task, session)?;
+            return super::key_renewal::next(store, task).map_err(Into::into);
+        }
         #[cfg(feature = "tracer")]
         if let Some(next) = crate::testonly::poc_model_next(
             &task.machine,

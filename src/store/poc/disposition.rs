@@ -412,6 +412,9 @@ impl<S: Storage> Store<S> {
 
     pub(crate) fn poc_task_view(&self, task: &Task) -> Value {
         let mut value = task.view();
+        if crate::poc::key_renewal::is_renewal(task) {
+            return value;
+        }
         #[cfg(target_arch = "wasm32")]
         if task.awaiting_operator() {
             let display = task

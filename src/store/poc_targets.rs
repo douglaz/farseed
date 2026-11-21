@@ -123,6 +123,50 @@ impl<S: Storage> Store<S> {
                 value["file_access_unavailable_message"] = json!(
                     (resolves && !live_session).then_some(crate::poc::files::LIVE_SESSION_REQUIRED)
                 );
+                let hermes_keys = record
+                    .application_inference_keys
+                    .iter()
+                    .filter(|key| key.application == "Hermes Agent")
+                    .collect::<Vec<_>>();
+                let installed = hermes_keys.iter().rposition(|key| {
+                    let task = self
+                        .ai_keys
+                        .iter()
+                        .find(|entry| entry.mint.name == key.name)
+                        .and_then(|entry| self.poc.get(&entry.task));
+                    task.is_none_or(|task| {
+                        !crate::poc::key_renewal::is_renewal(task)
+                            || (task.status == super::poc::Status::Complete
+                                && task.completed.last().is_some_and(|(call, _, output)| {
+                                    call == crate::poc::key_renewal::CHECK
+                                        && crate::poc::key_renewal::check_passed(
+                                            output["content"]["exit_status"]
+                                                .as_u64()
+                                                .and_then(|exit| u32::try_from(exit).ok()),
+                                            output["content"]["stdout"]
+                                                .as_str()
+                                                .unwrap_or_default(),
+                                        )
+                                }))
+                    })
+                });
+                let hermes_key = installed.map(|index| hermes_keys[index]);
+                value["hermes_ai_key_not_installed"] =
+                    json!(!hermes_keys.is_empty() && installed != Some(hermes_keys.len() - 1));
+                value["ai_key_limit_usd"] = json!(crate::poc::credit::AI_KEY_CAP);
+                value["ai_key_renewal_available"] = json!(!hermes_keys.is_empty() && live_session);
+                value["ai_key_renewal_unavailable_message"] = json!(
+                    (!hermes_keys.is_empty() && !live_session)
+                        .then_some(crate::poc::key_renewal::LIVE_REQUIRED)
+                );
+                if let Some(key) = hermes_key {
+                    let cap = self
+                        .ai_keys
+                        .iter()
+                        .find(|entry| entry.mint.name == key.name)
+                        .map(|entry| entry.mint.requested_cap);
+                    value["hermes_ai_key"] = json!({"cap":cap,"expires":key.expires});
+                }
                 value["application_inference_keys"] = json!(record.application_inference_keys);
                 value["ai_key_needs_class_answer"] =
                     json!(self.ai_key_needs_class_answer(&record.target.machine));
