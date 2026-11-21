@@ -2711,7 +2711,7 @@ const templateControls = (parent, template, draft) => {
   });
 };
 
-const startInputs = (row, machine, initialGoal = '', documentSource = true, creditMode = false, templates = [], defaultTemplateSelected = false) => {
+const startInputs = (row, machine, initialGoal = '', documentSource = true, creditMode = false, templates = [], defaultTemplateSelected = false, controlCenterStarted = false) => {
   const goal = document.createElement('textarea'); if (creditMode) goal.dataset.creditGoal = machine; goal.dataset.startGoal = machine;
   goal.setAttribute('aria-label', 'Goal before Start session'); goal.value = creditGoalDrafts.get(machine) ?? initialGoal;
   goal.addEventListener('input', () => creditGoalDrafts.set(machine, goal.value));
@@ -2724,12 +2724,16 @@ const startInputs = (row, machine, initialGoal = '', documentSource = true, cred
   let selected;
   let values;
   if (template) {
-    const draft = creditTemplateDrafts.get(machine) ?? {selected: defaultTemplateSelected, options: {}, inputs: {}};
+    const draft = creditTemplateDrafts.get(machine) ?? {selected: defaultTemplateSelected, startedSeen: controlCenterStarted, options: {}, inputs: {}};
+    if (controlCenterStarted && !draft.startedSeen) {
+      draft.selected = false;
+      draft.startedSeen = true;
+    }
     creditTemplateDrafts.set(machine, draft);
     const label = document.createElement('label');
     selected = document.createElement('input');
     selected.type = 'checkbox'; selected.dataset.creditTemplate = template.id; selected.checked = draft.selected;
-    selected.addEventListener('change', () => { draft.selected = selected.checked; });
+    selected.addEventListener('change', () => { draft.selected = selected.checked; draft.startedSeen = controlCenterStarted; });
     goal.addEventListener('input', () => {
       if (goal.value.length && selected.checked) selected.checked = draft.selected = false;
     });
@@ -2774,6 +2778,7 @@ const renderPoc = (store) => {
     if (target.file_access_available) renderMachineFiles(row, target.machine, enabled, worker);
     else if (target.file_access_unavailable_message) paragraph(row, target.file_access_unavailable_message);
     const liveSession = (store.sessions ?? []).find(session => session.session_state !== 'ended' && (session.bound_set ?? []).includes(target.machine));
+    if (liveSession) creditTemplateDrafts.delete(target.machine);
     if (target.hermes_ai_key) paragraph(row, `Hermes's AI key: cap ${target.hermes_ai_key.cap} USD, expires ${target.hermes_ai_key.expires}. When Hermes answers 'HTTP 402 … usage limit exceeded', the key is used up: press Renew AI key.`);
     if (target.hermes_ai_key_not_installed) paragraph(row, 'A newer key was created but not installed; press Renew AI key to try again.');
     if (target.ai_key_renewal_available) {
@@ -2804,8 +2809,8 @@ const renderPoc = (store) => {
     if (liveSession) paragraph(row, `A session is running for ${target.machine}. Its progress is on the task card above.`);
     else paragraph(row, `Start session approves the selected AI connection for ${target.machine}.`);
     const defaultTemplateSelected = store.procurement?.machine === target.machine &&
-      store.procurement?.approved_selection?.image?.distribution === 'nixos';
-    const inputs = liveSession ? null : startInputs(row, target.machine, '', !useCredit, useCredit, store.goal_templates, defaultTemplateSelected);
+      store.procurement?.approved_selection?.image?.distribution === 'nixos' && !target.control_center_started;
+    const inputs = liveSession ? null : startInputs(row, target.machine, '', !useCredit, useCredit, store.goal_templates, defaultTemplateSelected, target.control_center_started);
     if (liveSession && creditSession) {
       paragraph(row, store.credit.disclosure);
       if (store.credit_error) paragraph(row, store.credit_error);

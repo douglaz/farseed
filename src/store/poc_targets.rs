@@ -115,6 +115,10 @@ impl<S: Storage> Store<S> {
             .values()
             .map(|record| {
                 let mut value = serde_json::to_value(&record.target).expect("target serializes");
+                value["control_center_started"] = json!(self.poc.values().any(|task| {
+                    task.machine == record.target.machine
+                        && task.template.as_deref() == Some(crate::poc::template::ID)
+                }));
                 let resolves = crate::poc::targets::resolve(self, &record.target.machine).is_ok();
                 let live_session = self
                     .check_connection_session_for(&record.target.machine, None)
