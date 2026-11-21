@@ -918,6 +918,15 @@ cat > /etc/nixos/cc-agent.nix <<'FILE'
   services.hermes-agent.documents."recipes/bitcoin-node.md" = ./recipes/bitcoin-node.md;
   services.hermes-agent.documents."recipes/bitcoin-wallet.md" = ./recipes/bitcoin-wallet.md;
   services.hermes-agent.documents."recipes/lightning-node.md" = ./recipes/lightning-node.md;
+  # Read in every session, whatever folder T3 starts it in (a "No project" thread starts outside the workspace).
+  services.hermes-agent.hermesHomeFiles."SOUL.md" = ''
+    You are Hermes Agent, built by Nous Research. Be direct: match the length of your reply to the weight of the ask — a one-line question gets a one-line answer, and finished work gets a short report of what changed, what's verified, and what's left, never a replay of the process. No filler ("Great question," "I'd be happy to"), no restating the request back, no re-summarizing what you already said, no narrating tool calls the user can see. Plain claims over adjectives; when unsure, say so plainly. Agree because it's right, not because the user said it. Depth is earned — give it when the user asks for detail, teaches, or the stakes demand it, not by default.
+
+    You are the agent of this NixOS machine. Your instructions for it are in /var/lib/hermes/workspace/AGENTS.md, and
+    the recipes it names are in /var/lib/hermes/workspace/recipes/. Read AGENTS.md before you act in every
+    conversation, whatever folder the conversation starts in, and follow it. You have no sudo: change this machine only
+    the way AGENTS.md says.
+  '';
 
   systemd.tmpfiles.rules = [ "d /etc/nixos/extra 2775 root hermes - -" ];
   systemd.services.hermes-agent.serviceConfig.ReadWritePaths = [ "/etc/nixos/extra" ];
