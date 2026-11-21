@@ -123,8 +123,41 @@ pub fn launch_with_input(
 /// A private, synchronous harness read job. Only path bytes are inserted as octal data.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn file_read(path: &str, elevation: Elevation) -> String {
+    file_read_with_confinement(path, elevation, false)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn file_read_with_confinement(
+    path: &str,
+    elevation: Elevation,
+    confined: bool,
+) -> String {
+    let confinement = if confined {
+        // Assert the generated path too, before it can be sent to the machine.
+        let name = path
+            .strip_prefix(crate::poc::files::DIRECTORY)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .expect("confined file path");
+        assert!(crate::poc::files::valid_name(name));
+        "confined=true"
+    } else {
+        "confined=false"
+    };
     elevated(
-        include_str!("jobs/file-read.sh").replace("@PATH@", &octal(path.as_bytes())),
+        include_str!("jobs/file-read.sh")
+            .replace("@CONFINEMENT@", confinement)
+            .replace("@PATH@", &octal(path.as_bytes())),
+        elevation,
+    )
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn file_list(elevation: Elevation) -> String {
+    elevated(
+        include_str!("jobs/file-list.sh").replace(
+            "@DIRECTORY@",
+            &octal(crate::poc::files::DIRECTORY.as_bytes()),
+        ),
         elevation,
     )
 }

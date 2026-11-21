@@ -5,6 +5,81 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 pub const LIMIT: usize = 1024 * 1024;
+pub const DIRECTORY: &str = "/var/lib/farseed-files";
+pub const LIVE_SESSION_REQUIRED: &str =
+    "Files can be fetched from this machine while its session is live.";
+
+pub fn valid_name(name: &str) -> bool {
+    (1..=100).contains(&name.len())
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+#[derive(Serialize)]
+pub struct ListedFile {
+    pub name: String,
+    pub size: u64,
+}
+
+#[derive(Serialize)]
+pub struct Listing {
+    pub files: Vec<ListedFile>,
+    pub truncated: bool,
+    pub empty_message: String,
+}
+
+impl Listing {
+    /// Private response framing: names and sizes never pass through a task or report.
+    pub fn parse(bytes: &[u8]) -> Result<Self, String> {
+        let invalid = "The file list could not be verified. Try again.";
+        let text = std::str::from_utf8(bytes).map_err(|_| invalid)?;
+        let mut listing = Self {
+            files: Vec::new(),
+            truncated: false,
+            empty_message: format!(
+                "No files to get. Put a file in {DIRECTORY} on this machine first."
+            ),
+        };
+        if text == "TAUNONE\n" {
+            return Ok(listing);
+        }
+        let mut lines = text.strip_suffix('\n').ok_or(invalid)?.split('\n');
+        let last = lines.next_back().ok_or(invalid)?;
+        listing.truncated = match last {
+            "TAUEND" => false,
+            "TAUMORE" => true,
+            _ => return Err(invalid.into()),
+        };
+        for line in lines {
+            let (name, size) = line
+                .strip_prefix("TAUENTRY ")
+                .and_then(|line| line.split_once(' '))
+                .ok_or(invalid)?;
+            if !valid_name(name)
+                || size.is_empty()
+                || !size.bytes().all(|b| b.is_ascii_digit())
+                || (size.len() > 1 && size.starts_with('0'))
+                || listing.files.len() >= 32
+                || listing
+                    .files
+                    .last()
+                    .is_some_and(|file| file.name.as_str() >= name)
+            {
+                return Err(invalid.into());
+            }
+            listing.files.push(ListedFile {
+                name: name.into(),
+                size: size.parse().map_err(|_| invalid)?,
+            });
+        }
+        if listing.truncated && listing.files.len() != 32 {
+            return Err(invalid.into());
+        }
+        Ok(listing)
+    }
+}
 
 pub fn valid_path(path: &str) -> bool {
     (1..=4096).contains(&path.len()) && !path.bytes().any(|b| matches!(b, 0 | b'\n' | b'\r'))

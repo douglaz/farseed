@@ -1134,16 +1134,15 @@ async fn resend_missing(
     }
 }
 
-/// Click-only synchronous harness job. This deliberately bypasses command evidence:
-/// no intent, terminal, stdout file, report, task mutation, or command retry is created.
-/// Connection admission, configuring account, elevation and pinned SSH are shared.
-pub(crate) async fn download_file(
+/// Click-only synchronous harness reads share connection admission, elevation, pinned SSH,
+/// deadline and private buffers. No intent, command evidence, task or report is created.
+async fn private_file_read(
     pins: &impl PinSource,
     journal: &mut impl BoundJournal,
     target: &Target,
-    path: &str,
-) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
-    use base64::Engine;
+    script: impl FnOnce(jobs::Elevation) -> String,
+    output_limit: usize,
+) -> Result<(zeroize::Zeroizing<Vec<u8>>, Option<u32>), String> {
     use zeroize::Zeroizing;
     const UNAVAILABLE: &str =
         "The file could not be downloaded. Check the machine connection and try again.";
@@ -1198,7 +1197,7 @@ pub(crate) async fn download_file(
         let mut channel = ssh.channel_open_session().await.map_err(|_| UNAVAILABLE)?;
         journal.current(&session).await.map_err(|_| UNAVAILABLE)?;
         channel
-            .exec(true, jobs::file_read(path, elevation).as_bytes())
+            .exec(true, script(elevation).as_bytes())
             .await
             .map_err(|_| UNAVAILABLE)?;
         let mut output = Zeroizing::new(Vec::new());
@@ -1207,7 +1206,7 @@ pub(crate) async fn download_file(
         while let Some(message) = channel.wait().await {
             match message {
                 ChannelMsg::Data { data } => {
-                    if output.len().saturating_add(data.len()) > 1_420_000 {
+                    if output.len().saturating_add(data.len()) > output_limit {
                         return Err(
                             "The file changed or its transfer could not be verified. Try again.",
                         );
@@ -1231,6 +1230,48 @@ pub(crate) async fn download_file(
         if !closed {
             return Err("The download outcome is unknown. Try again.");
         }
+        Ok((output, status))
+    };
+    stop.until(work)
+        .await
+        .ok_or("The download was interrupted. Try again.")?
+        .map_err(str::to_owned)
+}
+
+/// Offers retain their existing unrestricted (except internal state) file-read behavior.
+pub(crate) async fn download_file(
+    pins: &impl PinSource,
+    journal: &mut impl BoundJournal,
+    target: &Target,
+    path: &str,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    download_file_with_confinement(pins, journal, target, path, false).await
+}
+
+pub(crate) async fn download_file_with_confinement(
+    pins: &impl PinSource,
+    journal: &mut impl BoundJournal,
+    target: &Target,
+    path: &str,
+    confined: bool,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, String> {
+    use base64::Engine;
+    use zeroize::Zeroizing;
+    let (output, status) = private_file_read(
+        pins,
+        journal,
+        target,
+        |elevation| {
+            if confined {
+                jobs::file_read_with_confinement(path, elevation, true)
+            } else {
+                jobs::file_read(path, elevation)
+            }
+        },
+        1_420_000,
+    )
+    .await?;
+    let decode = || -> Result<Zeroizing<Vec<u8>>, &str> {
         match status {
             Some(44) => return Err("too-large"),
             Some(45) => {
@@ -1240,7 +1281,11 @@ pub(crate) async fn download_file(
             }
             Some(46) => return Err("Files under /var/lib/tau-web/ cannot be downloaded."),
             Some(0) => {}
-            _ => return Err(UNAVAILABLE),
+            _ => {
+                return Err(
+                    "The file could not be downloaded. Check the machine connection and try again.",
+                );
+            }
         }
         let invalid = "The file changed or its transfer could not be verified. Try again.";
         let split = output.iter().position(|b| *b == b'\n').ok_or(invalid)?;
@@ -1267,10 +1312,21 @@ pub(crate) async fn download_file(
         }
         Ok(bytes)
     };
-    stop.until(work)
-        .await
-        .ok_or("The download was interrupted. Try again.")?
-        .map_err(str::to_owned)
+    decode().map_err(str::to_owned)
+}
+
+pub(crate) async fn list_files(
+    pins: &impl PinSource,
+    journal: &mut impl BoundJournal,
+    target: &Target,
+) -> Result<crate::poc::files::Listing, String> {
+    let (output, status) = private_file_read(pins, journal, target, jobs::file_list, 8192).await?;
+    if status != Some(0) {
+        return Err(
+            "The files could not be listed. Check the machine connection and try again.".into(),
+        );
+    }
+    crate::poc::files::Listing::parse(&output)
 }
 
 async fn evidence_result(

@@ -286,6 +286,11 @@ const render = (store, forceRender = false) => {
   }
   renderedReport = store;
   renderedReportJson = report;
+  if (store.state !== 'unlocked' || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state) ||
+      store.lifecycle_generation !== taskDetailsStore?.lifecycle_generation) {
+    machineFileLists.clear();
+    for (const key of fileDownloads.keys()) if (JSON.parse(key)[0].startsWith('machine:')) fileDownloads.delete(key);
+  }
   if (store.state !== 'unlocked' || ['suspended', 'reconciling'].includes(store.lifecycle_state) ||
       store.lifecycle_generation !== taskDetailsStore?.lifecycle_generation) clearDetails();
   else {
@@ -1221,12 +1226,19 @@ const renderCommandResult = (result) => {
 const taskDispositionDrafts = new Map();
 // Download state contains status only, never bytes, paths entered by the operator, or URLs.
 const fileDownloads = new Map();
+const machineFileLists = new Map();
 const fileKey = (task, offer) => JSON.stringify([task, offer]);
+const fileActionsEnabled = () => taskDetailsStore?.state === 'unlocked' && !ceremony &&
+  !['suspended', 'reconciling', 'ended'].includes(taskDetailsStore.lifecycle_state);
+const fileRow = (id, offer) => id.startsWith('machine:')
+  ? document.querySelector(`[data-machine-files="${CSS.escape(id.slice(8))}"] [data-file-offer="${CSS.escape(offer)}"]`)
+  : document.querySelector(`[data-task="${CSS.escape(id)}"] [data-file-offer="${CSS.escape(offer)}"]`);
 const updateFileRow = (row, task, file) => {
   const state = fileDownloads.get(fileKey(task, file.id));
   const button = row.querySelector('[data-file-download]');
-  button.disabled = !!state?.pending;
-  button.textContent = state?.pending ? `Downloading ${file.label}…` : state?.error ? `Retry download ${file.label}` : `Download ${file.label}`;
+  button.disabled = !!state?.pending || !fileActionsEnabled();
+  button.textContent = task.startsWith('machine:') ? (state?.pending ? 'Downloading…' : 'Download')
+    : state?.pending ? `Downloading ${file.label}…` : state?.error ? `Retry download ${file.label}` : `Download ${file.label}`;
   row.querySelector('[data-file-error]')?.remove();
   if (state?.error) {
     const error = paragraph(row, state.error === 'too-large' ? `${file.label} is larger than 1 MiB; it wasn't downloaded.` : state.error);
@@ -1234,11 +1246,14 @@ const updateFileRow = (row, task, file) => {
   }
 };
 const interruptFileDownloads = () => {
+  for (const state of machineFileLists.values()) {
+    if (state.pending) { state.pending = false; state.error = 'The file list was interrupted. Try again.'; }
+  }
   for (const [key, state] of fileDownloads) {
     if (!state.pending) continue;
     state.pending = false; state.error = 'The download was interrupted. Try again.';
     const [task, offer] = JSON.parse(key);
-    const row = document.querySelector(`[data-task="${CSS.escape(task)}"] [data-file-offer="${CSS.escape(offer)}"]`);
+    const row = fileRow(task, offer);
     if (row) updateFileRow(row, task, state.file);
   }
 };
@@ -1247,7 +1262,7 @@ const receiveFileDownload = (data, current) => {
   const state = fileDownloads.get(key);
   try {
     if (worker !== current || data.generation !== current.generation || document.visibilityState === 'hidden' ||
-        !state?.pending || state.request !== data.request) return;
+        !fileActionsEnabled() || !state?.pending || state.request !== data.request) return;
     if (data.error) state.error = data.error;
     else if (data.bytes instanceof Uint8Array && typeof data.filename === 'string') {
       const blob = new Blob([data.bytes], {type: 'application/octet-stream'});
@@ -1259,17 +1274,73 @@ const receiveFileDownload = (data, current) => {
       } finally { setTimeout(() => URL.revokeObjectURL(url), 0); }
     } else state.error = 'The download outcome is unknown. Try again.';
     state.pending = false;
-    const row = document.querySelector(`[data-task="${CSS.escape(data.id)}"] [data-file-offer="${CSS.escape(data.offer)}"]`);
+    const row = fileRow(data.id, data.offer);
     if (row) updateFileRow(row, data.id, state.file);
   } catch {
     state.error = 'The download could not be saved. Try again.';
     state.pending = false;
-    const row = document.querySelector(`[data-task="${CSS.escape(data.id)}"] [data-file-offer="${CSS.escape(data.offer)}"]`);
+    const row = fileRow(data.id, data.offer);
     if (row) updateFileRow(row, data.id, state.file);
   } finally {
     if (data.bytes instanceof Uint8Array) data.bytes.fill(0);
     delete data.bytes;
   }
+};
+
+const receiveMachineFileList = (data, current) => {
+  const state = machineFileLists.get(data.machine);
+  if (worker !== current || data.generation !== current.generation || document.visibilityState === 'hidden' ||
+      !fileActionsEnabled() || !state?.pending || state.request !== data.request) return;
+  state.pending = false;
+  if (data.error) state.error = data.error;
+  else state.listing = data.listing;
+  render(taskDetailsStore, true);
+};
+
+const renderMachineFiles = (row, machine, enabled, worker) => {
+  const section = document.createElement('section'); section.dataset.machineFiles = machine;
+  const state = machineFileLists.get(machine);
+  const list = document.createElement('button'); list.type = 'button';
+  list.textContent = 'Get a file from this machine'; list.disabled = !enabled || !!state?.pending;
+  list.addEventListener('click', () => {
+    if (!fileActionsEnabled() || machineFileLists.get(machine)?.pending) return;
+    const request = crypto.randomUUID();
+    machineFileLists.set(machine, {pending: true, request});
+    render(taskDetailsStore, true);
+    worker.postMessage({machine_file_list: {machine, request}});
+  });
+  section.append(list);
+  if (state) {
+    paragraph(section, 'Files from your machine can be secret. Keep them in a password manager and delete the downloaded copy.');
+    if (state.pending) paragraph(section, 'Listing files…');
+    if (state.error) paragraph(section, state.error);
+    if (state.listing) {
+      if (!state.listing.files.length) paragraph(section, state.listing.empty_message);
+      for (const entry of state.listing.files) {
+        const file = {id: entry.name, label: entry.name};
+        const item = document.createElement('div'); item.dataset.fileOffer = entry.name;
+        paragraph(item, `${entry.name} (${entry.size} bytes)`);
+        if (entry.size > 1048576) paragraph(item, 'too large to download');
+        else {
+          const id = `machine:${machine}`;
+          const button = document.createElement('button'); button.type = 'button'; button.dataset.fileDownload = entry.name;
+          button.addEventListener('click', () => {
+            const key = fileKey(id, entry.name);
+            if (!fileActionsEnabled() || fileDownloads.get(key)?.pending) return;
+            const request = crypto.randomUUID();
+            fileDownloads.set(key, {pending: true, request, file});
+            updateFileRow(item, id, file);
+            worker.postMessage({machine_file_download: {machine, name: entry.name, request}});
+          });
+          item.append(button); updateFileRow(item, id, file);
+          if (!enabled) button.disabled = true;
+        }
+        section.append(item);
+      }
+      if (state.listing.truncated) paragraph(section, 'Only the first 32 files are shown.');
+    }
+  }
+  row.append(section);
 };
 
 const deliveredHostKind = (hostname) => {
@@ -1576,7 +1647,7 @@ const renderTasks = (store) => {
       const button = document.createElement('button'); button.type = 'button'; button.dataset.fileDownload = file.id;
       button.addEventListener('click', () => {
         const key = fileKey(task.id, file.id);
-        if (fileDownloads.get(key)?.pending) return;
+        if (!fileActionsEnabled() || fileDownloads.get(key)?.pending) return;
         const request = crypto.randomUUID();
         fileDownloads.set(key, {pending: true, request, file});
         updateFileRow(row, task.id, file);
@@ -2652,6 +2723,8 @@ const renderPoc = (store) => {
     paragraph(row, `Connect to ${target.host} on port ${target.port} as ${target.user}. ${target.elevation === 'sudo -n' ? 'Commands can use administrator access without a password.' : target.elevation === 'none' ? 'Commands use this login’s normal access.' : 'Open Details for command access settings.'}`);
     paragraph(row, `Trusted machine host key: ${target.pin}`);
     rawDetails(row, target, ['target', target.machine]);
+    if (target.file_access_available) renderMachineFiles(row, target.machine, enabled, worker);
+    else if (target.file_access_unavailable_message) paragraph(row, target.file_access_unavailable_message);
     const liveSession = (store.sessions ?? []).find(session => session.session_state !== 'ended' && (session.bound_set ?? []).includes(target.machine));
     const creditSession = (store.sessions ?? []).some(session => session.credit_backed && session.session_state !== 'ended' && (session.bound_set ?? []).includes(target.machine));
     const creditChoice = store.credit?.selected || !store.poc_configuration?.key_set;
@@ -2799,6 +2872,11 @@ const start = () => {
     finally { if (key.byteLength) key.fill(0); }
   });
   worker.onmessage = ({ data }) => {
+    if (data.machine_file_list) { receiveMachineFileList(data.machine_file_list, current); return; }
+    if (data.machine_file_download) {
+      receiveFileDownload({...data.machine_file_download, id: `machine:${data.machine_file_download.machine}`, offer: data.machine_file_download.name}, current);
+      return;
+    }
     if (data.file_download) { receiveFileDownload(data.file_download, current); return; }
     if (data.task_details) { receiveTaskDetails(data.task_details, current); return; }
     if (typeof data.task_details_unavailable === 'string') { receiveTaskDetails({request: data.task_details_unavailable, error: true}, current); return; }

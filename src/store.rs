@@ -1172,8 +1172,9 @@ impl<S: Storage> Store<S> {
         self.connection_session_for(machine, None).await
     }
 
-    pub async fn connection_session_for(
-        &mut self,
+    /// Read-only connection admission, without recording an unbound refusal.
+    pub(crate) fn check_connection_session_for(
+        &self,
         machine: &str,
         origin: Option<&Rc<Session>>,
     ) -> Result<Rc<Session>, AdmissionRefusal> {
@@ -1204,6 +1205,18 @@ impl<S: Storage> Store<S> {
             self.check_current_session(session)
                 .map_err(AdmissionRefusal::Journal)?;
             return Ok(Rc::clone(session));
+        }
+        Err(AdmissionRefusal::Unbound)
+    }
+
+    pub async fn connection_session_for(
+        &mut self,
+        machine: &str,
+        origin: Option<&Rc<Session>>,
+    ) -> Result<Rc<Session>, AdmissionRefusal> {
+        match self.check_connection_session_for(machine, origin) {
+            Err(AdmissionRefusal::Unbound) => {}
+            result => return result,
         }
         let refusal = ConnectionRefusal {
             machine: machine.into(),

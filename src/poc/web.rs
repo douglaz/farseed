@@ -1519,3 +1519,125 @@ pub async fn poc_download(
     .await;
     result.map_err(Into::into)
 }
+
+/// Machine file metadata is a private page response, never a task or report publication.
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub async fn poc_machine_files(machine: String) -> Result<String, wasm_bindgen::JsValue> {
+    let result = async {
+        let continuation = crate::lifecycle::owner().continuation()?;
+        let (target, pins) = {
+            let local = local();
+            let mut writer = local.lock().await;
+            continuation.check()?;
+            let store = writer
+                .store()
+                .ok_or("Unlock before downloading the file.")?;
+            store
+                .check_connection_session_for(&machine, None)
+                .map_err(|_| crate::poc::files::LIVE_SESSION_REQUIRED)?;
+            crate::poc::targets::resolve(store, &machine)
+                .map_err(|_| "The machine connection is unavailable. Try again.")?
+        };
+        let mut journal = StoreJournal {
+            local: local(),
+            unavailable: false,
+        };
+        let listing = crate::harness::list_files(&pins, &mut journal, &target).await?;
+        let local = local();
+        let mut writer = local.lock().await;
+        continuation.check()?;
+        let store = writer
+            .store()
+            .ok_or("Unlock before downloading the file.")?;
+        store
+            .check_connection_session_for(&machine, None)
+            .map_err(|_| crate::poc::files::LIVE_SESSION_REQUIRED)?;
+        crate::poc::targets::resolve(store, &machine)
+            .map_err(|_| "The machine connection is unavailable. Try again.")?;
+        let value =
+            serde_json::to_value(listing).map_err(|_| "The file list could not be prepared.")?;
+        if store
+            .protect_publication(&value, &[])
+            .map_err(|_| "The file list could not be shown safely.")?
+            != value
+        {
+            return Err("The file list could not be shown safely.".into());
+        }
+        Ok::<_, String>(value.to_string())
+    }
+    .await;
+    result.map_err(Into::into)
+}
+
+/// A validated name selects one confined file; bytes use the same private offer save path.
+#[wasm_bindgen::prelude::wasm_bindgen]
+pub async fn poc_machine_download(
+    machine: String,
+    name: String,
+) -> Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue> {
+    let result = async {
+        if !crate::poc::files::valid_name(&name) {
+            return Err("This file name cannot be downloaded.".into());
+        }
+        let continuation = crate::lifecycle::owner().continuation()?;
+        let path = format!("{}/{name}", crate::poc::files::DIRECTORY);
+        let (target, pins) = {
+            let local = local();
+            let mut writer = local.lock().await;
+            continuation.check()?;
+            let store = writer
+                .store()
+                .ok_or("Unlock before downloading the file.")?;
+            store
+                .check_connection_session_for(&machine, None)
+                .map_err(|_| crate::poc::files::LIVE_SESSION_REQUIRED)?;
+            crate::poc::targets::resolve(store, &machine)
+                .map_err(|_| "The machine connection is unavailable. Try again.")?
+        };
+        let mut journal = StoreJournal {
+            local: local(),
+            unavailable: false,
+        };
+        let bytes = crate::harness::download_file_with_confinement(
+            &pins,
+            &mut journal,
+            &target,
+            &path,
+            true,
+        )
+        .await?;
+        let filename = {
+            let local = local();
+            let mut writer = local.lock().await;
+            continuation.check()?;
+            let store = writer
+                .store()
+                .ok_or("Unlock before downloading the file.")?;
+            store
+                .check_connection_session_for(&machine, None)
+                .map_err(|_| crate::poc::files::LIVE_SESSION_REQUIRED)?;
+            crate::poc::targets::resolve(store, &machine)
+                .map_err(|_| "The machine connection is unavailable. Try again.")?;
+            let unchanged = |text: &str| {
+                matches!(
+                    store.protect_publication(&serde_json::Value::String(text.into()), &[]),
+                    Ok(serde_json::Value::String(protected)) if protected == text
+                )
+            };
+            if unchanged(&path) && unchanged(&name) {
+                name
+            } else {
+                "download".into()
+            }
+        };
+        let result = js_sys::Object::new();
+        js_sys::Reflect::set(&result, &"filename".into(), &filename.into())
+            .map_err(|_| "The download could not be prepared. Try again.")?;
+        let data = js_sys::Uint8Array::from(bytes.as_slice());
+        js_sys::Reflect::set(&result, &"bytes".into(), &data)
+            .map_err(|_| "The download could not be prepared. Try again.")?;
+        Ok::<_, String>(result.into())
+    }
+    .await;
+    result.map_err(Into::into)
+}

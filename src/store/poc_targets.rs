@@ -115,6 +115,14 @@ impl<S: Storage> Store<S> {
             .values()
             .map(|record| {
                 let mut value = serde_json::to_value(&record.target).expect("target serializes");
+                let resolves = crate::poc::targets::resolve(self, &record.target.machine).is_ok();
+                let live_session = self
+                    .check_connection_session_for(&record.target.machine, None)
+                    .is_ok();
+                value["file_access_available"] = json!(resolves && live_session);
+                value["file_access_unavailable_message"] = json!(
+                    (resolves && !live_session).then_some(crate::poc::files::LIVE_SESSION_REQUIRED)
+                );
                 value["application_inference_keys"] = json!(record.application_inference_keys);
                 value["ai_key_needs_class_answer"] =
                     json!(self.ai_key_needs_class_answer(&record.target.machine));
