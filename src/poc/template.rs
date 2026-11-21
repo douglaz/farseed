@@ -290,3 +290,76 @@ impl Template {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::{self, Elevation};
+
+    #[test]
+    fn vendored_template_blocks_have_launch_headroom() {
+        // TargetRecord::validate accepts at most 64 machine-name bytes. Test both
+        // supported target privilege routes, including the larger sudo wrapper.
+        let machine = "m".repeat(64);
+        // Bounds from valid_ssh_key, Configuration::new and targets::host.
+        // ai_keys::path uses a 48-byte task ID and a u64 step counter; 128
+        // bytes safely bounds its fixed prefix plus both components.
+        let substitutions = [
+            (3, "USER_SSH_KEY", "x".repeat(8192)),
+            (4, "AI_KEY_PATH", "x".repeat(128)),
+            (5, "AI_BASE_URL", "x".repeat(2048)),
+            (5, "AI_MODEL", "x".repeat(128)),
+            (11, "MACHINE_ADDRESS", "x".repeat(253)),
+        ];
+        let headroom_limit = jobs::MAX_LAUNCH_BYTES * 90 / 100;
+        let mut failures = Vec::new();
+        // CONTROL_CENTER is currently the only vendored goal template. Include
+        // Recovery (step 0), even though it is admitted only after a failure.
+        for (id, template) in [(ID, &*CONTROL_CENTER)] {
+            for (number, blocks) in std::iter::once((0, &template.recovery_blocks)).chain(
+                template
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .map(|(index, step)| (index + 1, &step.blocks)),
+            ) {
+                for (label, source) in blocks {
+                    let mut command = (*source).to_owned();
+                    // Match resolve_task_block's step-specific substitutions.
+                    // Values contain no placeholder names, so replacement here
+                    // has the same result as its immutable-source span filling.
+                    for (step, name, value) in &substitutions {
+                        if number == *step {
+                            command = command.replace(name, value);
+                        }
+                    }
+                    for elevation in [Elevation::None, Elevation::SudoNoninteractive] {
+                        let raw = jobs::launch_size_with_elevation(
+                            &machine,
+                            source.as_bytes(),
+                            elevation,
+                        );
+                        let size = jobs::launch_size_with_elevation(
+                            &machine,
+                            command.as_bytes(),
+                            elevation,
+                        );
+                        println!(
+                            "{id} step {number} {label} {elevation:?}: source={} raw_launch={raw} filled={} launch={size} limit={} headroom_limit={headroom_limit}",
+                            source.len(),
+                            command.len(),
+                            jobs::MAX_LAUNCH_BYTES,
+                        );
+                        if !jobs::launch_fits(size) || size > headroom_limit {
+                            failures.push(format!(
+                                "{id} step {number} {label} {elevation:?}: {size} bytes exceeds {headroom_limit} (90% of {})",
+                                jobs::MAX_LAUNCH_BYTES,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+}

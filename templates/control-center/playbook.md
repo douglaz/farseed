@@ -570,7 +570,10 @@ After this step, Hermes can add a module to /etc/nixos/extra and apply it. Every
 for the user's approval in the chat. The step also puts the recipes Hermes follows for a Bitcoin node,
 Tailscale, a wallet balance and Lightning in /etc/nixos/recipes (public text: no secret is in them).
 
-**Do**
+Run **Recipes** first with `run_step_block` (step 6, block `Recipes`), then **Do** with
+`run_step_block` (step 6, block `Do`), then Wait and Check by name.
+
+**Recipes**
 ```sh
 sh -eu <<'STEP'
 install -d -m 0755 /etc/nixos/recipes
@@ -796,6 +799,11 @@ cat > /etc/nixos/recipes/tailscale.nix <<'RECIPE'
   };
 }
 RECIPE
+STEP
+```
+**Do**
+```sh
+sh -eu <<'STEP'
 cat > /etc/nixos/recipes/lightning-node.nix <<'RECIPE'
 { pkgs, config, ... }:
 let
