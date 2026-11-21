@@ -316,9 +316,10 @@ impl<S: Storage> Store<S> {
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn delivery_command_records(&self, machine: &str) -> Option<Value> {
         self.dispatch.approved_entries.contains_key(machine).then(|| {
+            let renewal_calls = self.renewal_calls();
             self.dispatch.calls.values().filter(|c| c.intent.machine == machine)
                 .map(|c| {
-                    if self.renewal_step_for_call(c.intent.call).is_some() {
+                    if renewal_calls.contains(&c.intent.call) {
                         // Even explicit command-history details must not publish renewal output.
                         json!({"command":c.intent.command,
                             "terminal":{"exit_status":self.dispatch.jobs.iter().rev()

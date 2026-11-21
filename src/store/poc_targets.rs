@@ -111,14 +111,23 @@ impl<S: Storage> Store<S> {
     }
 
     pub fn poc_targets_view(&self) -> Value {
+        let control_center_started = self
+            .poc
+            .values()
+            .filter(|task| task.template.as_deref() == Some(crate::poc::template::ID))
+            .map(|task| task.machine.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let keys_by_name = self
+            .ai_keys
+            .iter()
+            .map(|entry| (entry.mint.name.as_str(), entry))
+            .collect::<std::collections::HashMap<_, _>>();
         self.poc_targets
             .values()
             .map(|record| {
                 let mut value = serde_json::to_value(&record.target).expect("target serializes");
-                value["control_center_started"] = json!(self.poc.values().any(|task| {
-                    task.machine == record.target.machine
-                        && task.template.as_deref() == Some(crate::poc::template::ID)
-                }));
+                value["control_center_started"] =
+                    json!(control_center_started.contains(record.target.machine.as_str()));
                 let resolves = crate::poc::targets::resolve(self, &record.target.machine).is_ok();
                 let live_session = self
                     .check_connection_session_for(&record.target.machine, None)
@@ -133,10 +142,8 @@ impl<S: Storage> Store<S> {
                     .filter(|key| key.application == "Hermes Agent")
                     .collect::<Vec<_>>();
                 let installed = hermes_keys.iter().rposition(|key| {
-                    let task = self
-                        .ai_keys
-                        .iter()
-                        .find(|entry| entry.mint.name == key.name)
+                    let task = keys_by_name
+                        .get(key.name.as_str())
                         .and_then(|entry| self.poc.get(&entry.task));
                     task.is_none_or(|task| {
                         !crate::poc::key_renewal::is_renewal(task)
@@ -164,10 +171,8 @@ impl<S: Storage> Store<S> {
                         .then_some(crate::poc::key_renewal::LIVE_REQUIRED)
                 );
                 if let Some(key) = hermes_key {
-                    let cap = self
-                        .ai_keys
-                        .iter()
-                        .find(|entry| entry.mint.name == key.name)
+                    let cap = keys_by_name
+                        .get(key.name.as_str())
                         .map(|entry| entry.mint.requested_cap);
                     value["hermes_ai_key"] = json!({"cap":cap,"expires":key.expires});
                 }

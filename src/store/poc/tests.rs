@@ -18,6 +18,9 @@ fn ready_without_requirements() -> Store<MemoryStorage> {
     goal_ready(enrolled())
 }
 fn enrolled() -> Store<MemoryStorage> {
+    enrolled_with_class_answer(crate::dispatch::ClassAnswer::No)
+}
+fn enrolled_with_class_answer(class_answer: crate::dispatch::ClassAnswer) -> Store<MemoryStorage> {
     use base64::Engine;
     let mut s = block_on(create(MemoryStorage::default(), &Fixed, pass())).unwrap();
     block_on(s.seed_backup(allocation::Completion::Skipped)).unwrap();
@@ -36,7 +39,7 @@ fn enrolled() -> Store<MemoryStorage> {
             ),
         },
         approve_existing: true,
-        class_answer: crate::dispatch::ClassAnswer::No,
+        class_answer,
         approve_maintained_access: true,
     }))
     .unwrap();
@@ -3151,7 +3154,7 @@ fn poc_ai_key_replay_preserves_legacy_and_new_outcome_caps_and_refuses_other_cap
     use crate::poc::credit::{Mint, SecretText};
     use crate::store::ai_keys::Record;
 
-    for cap in [0.25, 1.0, 0.5] {
+    for cap in [0.25, 1.0, 5.0, 2.0] {
         let mut s = ready();
         let task = create_task(&mut s);
         let task = change(&mut s, &task, Change::Request);
@@ -3167,8 +3170,15 @@ fn poc_ai_key_replay_preserves_legacy_and_new_outcome_caps_and_refuses_other_cap
                 },
             },
         );
-        assert_eq!(s.poc_task_view(&task)["ai_key_limit_usd"], 1.0);
-        let task = change(&mut s, &task, Change::AiKeyDecision { create: true });
+        assert_eq!(s.poc_task_view(&task)["ai_key_limit_usd"], 5.0);
+        let task = change(
+            &mut s,
+            &task,
+            Change::AiKeyDecision {
+                create: true,
+                approved_cap: None,
+            },
+        );
         let expiry = "2026-11-11T00:00:00Z";
         let name = "k0123456789abcdef01234567";
         let record = Record::Request {
@@ -3192,7 +3202,7 @@ fn poc_ai_key_replay_preserves_legacy_and_new_outcome_caps_and_refuses_other_cap
                 .unwrap(),
             ),
         };
-        if cap == 0.5 {
+        if cap == 2.0 {
             block_on(s.commit(&Event::PocAiKey(record))).unwrap();
             let error = block_on(unlock(
                 MemoryStorage::with_files(s.storage.files()),
@@ -3229,6 +3239,208 @@ fn poc_ai_key_replay_preserves_legacy_and_new_outcome_caps_and_refuses_other_cap
         assert_eq!(
             replayed.ai_key_outcome(&task, Some(1)).unwrap()["limit_usd"],
             cap
+        );
+    }
+}
+
+#[test]
+fn poc_ai_key_non_renewal_summary_omits_renewal_flag() {
+    let mut store = ready();
+    let task = create_task(&mut store);
+    assert!(
+        !task
+            .summary_view()
+            .as_object()
+            .unwrap()
+            .contains_key("ai_key_renewal")
+    );
+    assert!(
+        !task
+            .view()
+            .as_object()
+            .unwrap()
+            .contains_key("ai_key_renewal")
+    );
+}
+
+fn ai_key_proposal(store: &mut Store<MemoryStorage>) -> Task {
+    let task = create_task(store);
+    let task = change(store, &task, Change::Request);
+    change(
+        store,
+        &task,
+        Change::Propose {
+            call_id: "application-key".into(),
+            tool: Tool::RequestAiKey {
+                machine: task.machine.clone(),
+                application: "Hermes Agent".into(),
+                purpose: "run the requested service".into(),
+            },
+        },
+    )
+}
+
+#[test]
+fn poc_ai_key_resumed_approval_mints_its_cap_including_class_answer_and_renewal() {
+    use crate::poc::credit::{Mint, SecretText, ai_key_request};
+    use crate::store::ai_keys::Record as KeyRecord;
+
+    for legacy in [true, false] {
+        for class_answer in [false, true] {
+            let mut store = if class_answer {
+                let mut store = goal_ready(enrolled_with_class_answer(
+                    crate::dispatch::ClassAnswer::Yes,
+                ));
+                store.fixture_requirements("fixture");
+                store
+            } else {
+                ready()
+            };
+            let mut task = ai_key_proposal(&mut store);
+            for renewal in [false, true] {
+                if renewal {
+                    let record = Record::RenewAiKey {
+                        id: "a".repeat(48),
+                        session: task.start_session.clone(),
+                        limits: Limits::default(),
+                    };
+                    let number = block_on(store.commit(&Event::Poc(record.clone()))).unwrap();
+                    store.apply_poc(number, &record).unwrap();
+                    task = store.poc_task(&"a".repeat(48)).unwrap();
+                }
+                assert_eq!(task.view()["ai_key_limit_usd"], 5.0);
+                // These are the exact old wire shapes, with no approved_cap field.
+                let decision: Change = serde_json::from_value(if class_answer && !renewal {
+                    json!({"ai_key_class_decision":{"answer":"only-me","at":1}})
+                } else {
+                    json!({"ai_key_decision":{"create":true}})
+                })
+                .unwrap();
+                if legacy {
+                    let record = Record::Change {
+                        id: task.id.clone(),
+                        expected: task.revision,
+                        change: decision,
+                    };
+                    let number = block_on(store.commit(&Event::Poc(record.clone()))).unwrap();
+                    store.apply_poc(number, &record).unwrap();
+                } else {
+                    // Live admission fills the cap before committing either approval path.
+                    change(&mut store, &task, decision);
+                }
+                // Simulate losing the browser after approval, before recording a mint.
+                store = reopen(&store);
+                task = store.poc_task(&task.id).unwrap();
+                let cap = if legacy { 1.0 } else { 5.0 };
+                assert!(task.ai_key_approved);
+                assert_eq!(task.ai_key_approved_cap, (!legacy).then_some(5.0));
+                let expiry = "2026-11-11T00:00:00Z";
+                let name = if renewal {
+                    "k1123456789abcdef01234567"
+                } else {
+                    "k0123456789abcdef01234567"
+                };
+                // The browser uses these same mint and HTTP-body constructors on Resume.
+                let mint = Mint::ai_key(
+                    &task,
+                    name.into(),
+                    crate::poc::provisioning::timestamp(expiry).unwrap(),
+                );
+                assert_eq!(mint.requested_cap, cap);
+                assert_eq!(ai_key_request(&mint, expiry)["usage_limit_usd"], cap);
+                let call = task.proposal.as_ref().unwrap().call_id.clone();
+                block_on(store.ai_key_commit(KeyRecord::Request {
+                    task: task.id.clone(),
+                    call: call.clone(),
+                    path: crate::store::ai_keys::path(&task),
+                    mint,
+                    configuration: None,
+                }))
+                .unwrap();
+                assert_eq!(
+                    reopen(&store)
+                        .ai_key(&task.id, &call)
+                        .unwrap()
+                        .mint
+                        .requested_cap,
+                    cap
+                );
+                if !renewal {
+                    // A held Hermes key makes the real renewal record eligible.
+                    block_on(store.ai_key_commit(KeyRecord::Held {
+                        machine: task.machine.clone(),
+                        name: name.into(),
+                        issuer_id: "application-key-id".into(),
+                        expires: expiry.into(),
+                        key: SecretText(Zeroizing::new("synthetic-application-key-value".into())),
+                    }))
+                    .unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn poc_ai_key_failed_uses_requested_then_approved_then_current_cap() {
+    use crate::poc::credit::Mint;
+    use crate::store::ai_keys::Record as KeyRecord;
+
+    for (approved_cap, request_cap, expected) in [
+        (Some(5.0), Some(1.0), 1.0),
+        (Some(1.0), None, 1.0),
+        (Some(5.0), None, 5.0),
+        (None, None, 5.0),
+    ] {
+        let mut store = ready();
+        let mut task = ai_key_proposal(&mut store);
+        if let Some(cap) = approved_cap {
+            if cap == 1.0 {
+                let record = Record::Change {
+                    id: task.id.clone(),
+                    expected: task.revision,
+                    change: serde_json::from_value(json!({"ai_key_decision":{"create":true}}))
+                        .unwrap(),
+                };
+                let number = block_on(store.commit(&Event::Poc(record.clone()))).unwrap();
+                store.apply_poc(number, &record).unwrap();
+                task = store.poc_task(&task.id).unwrap();
+            } else {
+                task = change(
+                    &mut store,
+                    &task,
+                    Change::AiKeyDecision {
+                        create: true,
+                        approved_cap: None,
+                    },
+                );
+            }
+        }
+        if let Some(cap) = request_cap {
+            let mut mint = Mint::ai_key(&task, "k0123456789abcdef01234567".into(), 1_794_355_200);
+            mint.requested_cap = cap;
+            block_on(store.ai_key_commit(KeyRecord::Request {
+                task: task.id.clone(),
+                call: task.proposal.as_ref().unwrap().call_id.clone(),
+                path: crate::store::ai_keys::path(&task),
+                mint,
+                configuration: None,
+            }))
+            .unwrap();
+        }
+        let task = change(
+            &mut store,
+            &task,
+            Change::AiKeyFailed("outcome unknown".into()),
+        );
+        assert_eq!(
+            task.completed.last().unwrap().2["content"]["limit_usd"],
+            expected
+        );
+        let replayed = reopen(&store).poc_task(&task.id).unwrap();
+        assert_eq!(
+            replayed.completed.last().unwrap().2["content"]["limit_usd"],
+            expected
         );
     }
 }

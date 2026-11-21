@@ -1014,15 +1014,11 @@ pub(crate) async fn prepare_ai_key(task: &crate::store::poc::Task) -> Result<boo
                 .await?;
             return Ok(false);
         }
-        let mint = Mint {
-            session: task.start_session.clone(),
-            name: mint_name()?,
-            requested_cap: AI_KEY_CAP,
-            requested_expiry: now().checked_add(AI_KEY_LIFETIME).ok_or(MINT_FAILED)?,
-            issuer_id: None,
-            returned_cap: None,
-            returned_expiry: None,
-        };
+        let mint = Mint::ai_key(
+            task,
+            mint_name()?,
+            now().checked_add(AI_KEY_LIFETIME).ok_or(MINT_FAILED)?,
+        );
         store
             .ai_key_commit(KeyRecord::Request {
                 task: task.id.clone(),
@@ -1045,7 +1041,7 @@ pub(crate) async fn prepare_ai_key(task: &crate::store::poc::Task) -> Result<boo
         "POST",
         "/keys",
         Auth::Account,
-        Some(ai_key_request(&mint.name, &expiry)),
+        Some(ai_key_request(&mint, &expiry)),
     )
     .await
     .map_err(|_| UNKNOWN)?;

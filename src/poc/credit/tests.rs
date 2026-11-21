@@ -311,14 +311,9 @@ fn poc_credit_account_response_is_validated_as_one_pair() {
 }
 
 #[test]
-fn poc_credit_ai_key_request_and_returned_cap_are_exactly_one_dollar() {
+fn poc_credit_ai_key_request_and_returned_cap_are_exactly_five_dollars() {
     let name = "k0123456789abcdef01234567";
     let expiry = "2026-11-11T00:00:00Z";
-    let request = ai_key_request(name, expiry);
-    assert_eq!(
-        request,
-        json!({"name":name,"usage_limit_usd":1.0,"expire_at":expiry})
-    );
     let mint = Mint {
         session: "session-1".into(),
         name: name.into(),
@@ -328,7 +323,12 @@ fn poc_credit_ai_key_request_and_returned_cap_are_exactly_one_dollar() {
         returned_cap: None,
         returned_expiry: None,
     };
-    assert_eq!(mint.requested_cap, 1.0);
+    let request = ai_key_request(&mint, expiry);
+    assert_eq!(
+        request,
+        json!({"name":name,"usage_limit_usd":5.0,"expire_at":expiry})
+    );
+    assert_eq!(mint.requested_cap, 5.0);
     let mut response = json!({"status":"success","data":request});
     response["data"]["_id"] = json!("key-1");
     response["data"]["reset_period"] = Value::Null;
@@ -336,11 +336,12 @@ fn poc_credit_ai_key_request_and_returned_cap_are_exactly_one_dollar() {
     for cap in [
         json!(0.25),
         json!(0.5),
-        json!(0.99),
-        json!(1.01),
+        json!(1.0),
+        json!(4.99),
+        json!(5.01),
         json!(2.0),
         Value::Null,
-        json!("1"),
+        json!("5"),
     ] {
         response["data"]["usage_limit_usd"] = cap;
         assert!(returned_mint(&response, &mint).is_err());

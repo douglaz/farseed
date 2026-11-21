@@ -4,9 +4,9 @@ use serde_json::Value;
 use zeroize::{Zeroize, Zeroizing};
 
 pub const CAP: f64 = 1.0;
-pub const AI_KEY_CAP: f64 = 1.0;
+pub const AI_KEY_CAP: f64 = 5.0;
 // Records minted before the raise keep their recorded cap and still replay.
-pub const LEGACY_AI_KEY_CAP: f64 = 0.25;
+pub const LEGACY_AI_KEY_CAPS: &[f64] = &[0.25, 1.0];
 pub const AI_KEY_LIFETIME: u64 = 30 * 86_400;
 pub const LIFETIME: u64 = 86_400;
 pub const POLL_SECONDS: u64 = 5;
@@ -332,6 +332,18 @@ fn expiry_nanos(text: &str) -> Option<u128> {
 }
 impl Mint {
     #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) fn ai_key(task: &crate::store::poc::Task, name: String, expiry: u64) -> Self {
+        Self {
+            session: task.start_session.clone(),
+            name,
+            requested_cap: task.ai_key_cap(),
+            requested_expiry: expiry,
+            issuer_id: None,
+            returned_cap: None,
+            returned_expiry: None,
+        }
+    }
+    #[cfg(any(target_arch = "wasm32", test))]
     pub(crate) fn retry_eligible(&self, now_nanos: u128) -> bool {
         let cutoff = match &self.returned_expiry {
             Some(expiry) => expiry_nanos(expiry),
@@ -341,8 +353,8 @@ impl Mint {
     }
 }
 #[cfg(any(target_arch = "wasm32", test))]
-pub(crate) fn ai_key_request(name: &str, expiry: &str) -> Value {
-    serde_json::json!({"name":name,"usage_limit_usd":AI_KEY_CAP,"expire_at":expiry})
+pub(crate) fn ai_key_request(mint: &Mint, expiry: &str) -> Value {
+    serde_json::json!({"name":mint.name,"usage_limit_usd":mint.requested_cap,"expire_at":expiry})
 }
 
 pub fn returned_mint(value: &Value, mint: &Mint) -> Result<(String, String), String> {

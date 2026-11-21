@@ -117,7 +117,7 @@ pub struct UnmetCommand {
     /// Exact UTF-8 command bytes, without normalization.
     pub command: String,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Task {
     pub id: String,
@@ -134,6 +134,8 @@ pub struct Task {
     pub completed: Vec<Step>,
     pub proposal: Option<Proposal>,
     pub ai_key_approved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_key_approved_cap: Option<f64>,
     pub pending: Option<Pending>,
     pub status: Status,
     pub pause_reason: Option<String>,
@@ -168,6 +170,14 @@ pub struct Task {
     pub commands_recorded_as_run: Vec<UnmetCommand>,
 }
 impl Task {
+    pub(crate) fn ai_key_cap(&self) -> f64 {
+        self.ai_key_approved_cap.unwrap_or(if self.ai_key_approved {
+            // Approvals recorded before the cap was persisted authorized 1 USD.
+            1.0
+        } else {
+            crate::poc::credit::AI_KEY_CAP
+        })
+    }
     pub fn awaiting_operator(&self) -> bool {
         self.pending.is_none()
             && self
@@ -199,10 +209,10 @@ impl Task {
     /// Keep complete text until the publication boundary protects it and bounds the card.
     pub(super) fn view(&self) -> Value {
         let mut value = serde_json::to_value(self).expect("task serializes");
-        value["ai_key_renewal"] = json!(crate::poc::key_renewal::is_renewal(self));
         value["file_offers"] = serde_json::to_value(self.file_offers()).expect("offers serialize");
         value["pause_reason"] = self.publication_pause_reason();
         if crate::poc::key_renewal::is_renewal(self) {
+            value["ai_key_renewal"] = json!(true);
             for step in value["completed"].as_array_mut().expect("completed steps") {
                 if step[1]["name"] == "exec" {
                     step[2]["content"] = json!({"step":crate::poc::key_renewal::step_name(step[0].as_str().unwrap_or_default())});
@@ -210,7 +220,7 @@ impl Task {
             }
         }
         if self.awaiting_ai_key() {
-            value["ai_key_limit_usd"] = json!(crate::poc::credit::AI_KEY_CAP);
+            value["ai_key_limit_usd"] = json!(self.ai_key_cap());
         }
         value
     }
@@ -267,11 +277,15 @@ impl Task {
                 )
             })
             .unwrap_or_default();
-        json!({"summary":true,"ai_key_renewal":crate::poc::key_renewal::is_renewal(self),"id":self.id,"revision":self.revision,"start_session":self.start_session,
+        let mut value = json!({"summary":true,"id":self.id,"revision":self.revision,"start_session":self.start_session,
             "machine":self.machine,"status":self.status,
             "goal":self.goal,
             "pause_reason":self.publication_pause_reason(),"verdict":self.verdict,
-            "delivered_urls":delivered_urls})
+            "delivered_urls":delivered_urls});
+        if crate::poc::key_renewal::is_renewal(self) {
+            value["ai_key_renewal"] = json!(true);
+        }
+        value
     }
     pub(super) fn truncate_view(
         value: &mut Value,
@@ -400,6 +414,8 @@ pub enum Change {
     AiKeyFailed(String),
     AiKeyDecision {
         create: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approved_cap: Option<f64>,
     },
     OperatorAnswer {
         call_id: String,
@@ -408,6 +424,8 @@ pub enum Change {
     AiKeyClassDecision {
         answer: super::poc_targets::KeyCardAnswer,
         at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approved_cap: Option<f64>,
     },
     Settle,
     Inspect,
@@ -993,26 +1011,31 @@ impl<S: Storage> Store<S> {
     pub async fn poc_accept_start(&mut self, session: &str) -> Result<(), String> {
         self.poc_start(session).await.map(|_| ())
     }
-    pub(crate) fn renewal_step_for_call(&self, call: u64) -> Option<&'static str> {
-        self.poc
+    /// Build once per publication, rather than searching task history for each call.
+    pub(crate) fn renewal_calls(&self) -> std::collections::HashSet<u64> {
+        let mut calls = std::collections::HashSet::new();
+        for task in self
+            .poc
             .values()
             .filter(|task| crate::poc::key_renewal::is_renewal(task))
-            .find_map(|task| {
-                if task
-                    .pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.call == call)
-                {
-                    return task
-                        .proposal
+        {
+            if let Some(pending) = &task.pending
+                && task.proposal.is_some()
+            {
+                calls.insert(pending.call);
+            }
+            for (_, _, output) in &task.completed {
+                if let Some(call) = output["content"]["call"].as_u64()
+                    && !task
+                        .pending
                         .as_ref()
-                        .map(|proposal| crate::poc::key_renewal::step_name(&proposal.call_id));
+                        .is_some_and(|pending| pending.call == call)
+                {
+                    calls.insert(call);
                 }
-                task.completed
-                    .iter()
-                    .find(|(_, _, output)| output["content"]["call"] == call)
-                    .map(|(id, _, _)| crate::poc::key_renewal::step_name(id))
-            })
+            }
+        }
+        calls
     }
     /// Remove renewal output, including encoded job-record streams, at inspection publication.
     pub(crate) fn withhold_renewal_output(&self, value: &mut Value) {
@@ -1033,27 +1056,30 @@ impl<S: Storage> Store<S> {
                 _ => {}
             }
         }
-        if value
-            .get("call")
-            .and_then(Value::as_u64)
-            .is_some_and(|call| self.renewal_step_for_call(call).is_some())
-        {
-            strip(value);
-        } else {
-            match value {
-                Value::Object(fields) => {
-                    for child in fields.values_mut() {
-                        self.withhold_renewal_output(child);
+        fn withhold(value: &mut Value, calls: &std::collections::HashSet<u64>) {
+            if value
+                .get("call")
+                .and_then(Value::as_u64)
+                .is_some_and(|call| calls.contains(&call))
+            {
+                strip(value);
+            } else {
+                match value {
+                    Value::Object(fields) => {
+                        for child in fields.values_mut() {
+                            withhold(child, calls);
+                        }
                     }
-                }
-                Value::Array(values) => {
-                    for child in values {
-                        self.withhold_renewal_output(child);
+                    Value::Array(values) => {
+                        for child in values {
+                            withhold(child, calls);
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
+        withhold(value, &self.renewal_calls());
     }
     #[cfg(target_arch = "wasm32")]
     pub(crate) async fn poc_renew_ai_key(
@@ -1162,11 +1188,22 @@ impl<S: Storage> Store<S> {
                     return Err("malformed-reply reason contains protected material".into());
                 }
             }
-            Change::AiKeyDecision { create: true } => {
+            Change::AiKeyDecision {
+                create: true,
+                approved_cap,
+            } => {
                 // New approvals require the class answer; recorded approvals retain their meaning.
                 if self.ai_key_needs_class_answer(&self.poc_task(id)?.machine) {
                     return Err("answer the machine question on the key card first".into());
                 }
+                *approved_cap = Some(crate::poc::credit::AI_KEY_CAP);
+            }
+            Change::AiKeyClassDecision {
+                answer: super::poc_targets::KeyCardAnswer::OnlyMe,
+                approved_cap,
+                ..
+            } => {
+                *approved_cap = Some(crate::poc::credit::AI_KEY_CAP);
             }
             Change::Pause(why) | Change::Wait { why, .. } | Change::SkipRead(why) => {
                 *why = self
@@ -1533,6 +1570,7 @@ impl<S: Storage> Store<S> {
                 Change::AiKeyClassDecision {
                     answer: super::poc_targets::KeyCardAnswer::OnlyMe,
                     at,
+                    ..
                 },
             ..
         } = record
@@ -1635,6 +1673,7 @@ impl<S: Storage> Store<S> {
                     report: None,
                 }),
                 ai_key_approved: false,
+                ai_key_approved_cap: None,
                 pending: None,
                 status: if renewal {
                     Status::Waiting
@@ -2032,6 +2071,7 @@ impl<S: Storage> Store<S> {
                         task.malformed = None;
                         task.completion_tokens = initial_completion_tokens();
                         task.ai_key_approved = false;
+                        task.ai_key_approved_cap = None;
                         let wire = serde_json::to_value(tool).map_err(|_| "tool encoding")?;
                         Tool::parse(&wire)?;
                         if call_id.is_empty()
@@ -2247,7 +2287,10 @@ impl<S: Storage> Store<S> {
                         ));
                         task.active();
                     }
-                    Change::AiKeyDecision { create } => {
+                    Change::AiKeyDecision {
+                        create,
+                        approved_cap,
+                    } => {
                         if !task.awaiting_ai_key()
                             || self
                                 .ai_key(&task.id, &task.proposal.as_ref().expect("request").call_id)
@@ -2257,6 +2300,7 @@ impl<S: Storage> Store<S> {
                         }
                         if *create {
                             task.ai_key_approved = true;
+                            task.ai_key_approved_cap = *approved_cap;
                         } else {
                             let proposal = task.proposal.take().expect("request");
                             task.completed.push((
@@ -2273,7 +2317,11 @@ impl<S: Storage> Store<S> {
                             task.status = Status::Abandoned;
                         }
                     }
-                    Change::AiKeyClassDecision { answer, at } => {
+                    Change::AiKeyClassDecision {
+                        answer,
+                        at,
+                        approved_cap,
+                    } => {
                         if !task.awaiting_ai_key()
                             || !self.ai_key_needs_class_answer(&task.machine)
                             || !self.poc_targets.contains_key(&task.machine)
@@ -2287,6 +2335,7 @@ impl<S: Storage> Store<S> {
                         }
                         if *answer == super::poc_targets::KeyCardAnswer::OnlyMe {
                             task.ai_key_approved = true;
+                            task.ai_key_approved_cap = *approved_cap;
                         } else {
                             let proposal = task.proposal.take().expect("request");
                             let reason = if *answer == super::poc_targets::KeyCardAnswer::OthersToo
@@ -2315,7 +2364,8 @@ impl<S: Storage> Store<S> {
                             return Err("AI key failure record refused".into());
                         }
                         let entry = self.ai_key(&task.id, &proposal.call_id);
-                        task.completed.push((proposal.call_id, proposal.tool, crate::goals::untrusted("tool_output", json!({"status":"failed","reason":reason,"path":entry.map(|e| &e.path),"limit_usd":crate::poc::credit::AI_KEY_CAP}))));
+                        let cap = entry.map_or_else(|| task.ai_key_cap(), |e| e.mint.requested_cap);
+                        task.completed.push((proposal.call_id, proposal.tool, crate::goals::untrusted("tool_output", json!({"status":"failed","reason":reason,"path":entry.map(|e| &e.path),"limit_usd":cap}))));
                         task.active();
                     }
                     Change::RejectDeclaration => {

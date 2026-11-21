@@ -1060,10 +1060,12 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                         ) => Change::AiKeyClassDecision {
                             answer: request.machine_class_answer.expect("matched answer"),
                             at: (js_sys::Date::now() / 1000.0) as u64,
+                            approved_cap: None,
                         },
                         ("ai-key-create" | "ai-key-decline" | "renew-ai-key", None) => {
                             Change::AiKeyDecision {
                                 create: request.action != "ai-key-decline",
+                                approved_cap: None,
                             }
                         }
                         _ => return Err("AI key decision is no longer available".into()),

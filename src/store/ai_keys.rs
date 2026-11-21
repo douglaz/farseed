@@ -1,6 +1,6 @@
 //! Application inference key custody is encrypted; the machine owns its revocation metadata.
 use super::*;
-use crate::poc::credit::{AI_KEY_CAP, LEGACY_AI_KEY_CAP, Mint, SecretText};
+use crate::poc::credit::{AI_KEY_CAP, LEGACY_AI_KEY_CAPS, Mint, SecretText};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -118,7 +118,8 @@ impl<S: Storage> Store<S> {
                     || self.ai_key(&task.id, call).is_some()
                     || *saved_path != path(&task)
                     || mint.session != task.start_session
-                    || (mint.requested_cap != AI_KEY_CAP && mint.requested_cap != LEGACY_AI_KEY_CAP)
+                    || (mint.requested_cap != AI_KEY_CAP
+                        && !LEGACY_AI_KEY_CAPS.contains(&mint.requested_cap))
                     || mint.requested_expiry == 0
                     || mint.name.len() != 25
                     || !crate::poc::credit::identifier(&mint.name)
