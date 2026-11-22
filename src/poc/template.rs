@@ -360,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn template_requests_zero_retention_for_the_configured_endpoint() {
+    fn template_configured_endpoint_preserves_identity_catalog_and_zero_retention() {
         let step = &CONTROL_CENTER.steps[4];
         let source = step.blocks.get("Do").unwrap();
         let module = source
@@ -370,14 +370,18 @@ mod tests {
             .split("\nFILE\n")
             .next()
             .unwrap();
-        let model = module.split("settings.model = {").nth(1).unwrap();
-        assert!(
-            model
-                .split("};")
-                .next()
-                .unwrap()
-                .contains("base_url = \"@ai_base_url@\";")
-        );
+        let model = module
+            .split("settings.model = {")
+            .nth(1)
+            .unwrap()
+            .split("};")
+            .next()
+            .unwrap();
+        // Start with the same named identity that a completed turn publishes.
+        assert!(model.contains("provider = \"custom:farseed-credit\";"));
+        assert!(model.contains("base_url = \"@ai_base_url@\";"));
+        assert!(model.contains("default = \"@ai_model@\";"));
+        assert!(model.contains("key_env = \"CONTROL_CENTER_AI_KEY\";"));
         let custom = module
             .split("settings.custom_providers = [ {")
             .nth(1)
@@ -387,6 +391,13 @@ mod tests {
         assert!(entry.contains("base_url = \"@ai_base_url@\";"));
         // Sessions saved or resumed under the named entry take their key from it.
         assert!(entry.contains("key_env = \"CONTROL_CENTER_AI_KEY\";"));
+        assert!(entry.contains("discover_models = false;"));
+        // The setup default and both recipe choices remain selectable without discovery.
+        let models = entry.split("models = [\n").nth(1).unwrap();
+        assert_eq!(
+            models.split("      ];").next().unwrap(),
+            "        \"@ai_model@\"\n        \"anthropic/claude-opus-5.5\"\n        \"anthropic/claude-sonnet-5.5\"\n"
+        );
         assert!(entry.contains("extra_body = { provider = { zdr = true; }; };"));
     }
 

@@ -525,7 +525,7 @@ cat > /etc/nixos/cc-hermes.nix <<'FILE'
     # Secrets (AI key, dashboard sign-in) live in this root-only file, never in /etc/nixos.
     environmentFiles = [ "/var/lib/control-center/hermes.env" ];
     settings.model = {
-      provider = "custom";
+      provider = "custom:farseed-credit";
       base_url = "@ai_base_url@";
       default = "@ai_model@";
       key_env = "CONTROL_CENTER_AI_KEY";
@@ -534,6 +534,12 @@ cat > /etc/nixos/cc-hermes.nix <<'FILE'
       name = "farseed-credit";
       base_url = "@ai_base_url@";
       key_env = "CONTROL_CENTER_AI_KEY";
+      discover_models = false;
+      models = [
+        "@ai_model@"
+        "anthropic/claude-opus-5.5"
+        "anthropic/claude-sonnet-5.5"
+      ];
       extra_body = { provider = { zdr = true; }; };
     } ];
     # Hermes' internal listener gets a fixed loopback port (otherwise a random one at every start).
