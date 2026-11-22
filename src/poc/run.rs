@@ -48,6 +48,24 @@ pub async fn commit_command(
     Ok(call)
 }
 
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn reserve_execution_response(
+    task: &Task,
+    response: &mut Option<super::inference::CommandResponse>,
+) {
+    // A renewal can queue behind Start's session-key mint. Reserving a machine response
+    // before key custody exists makes that mint refuse response_pending(). Web reserves
+    // after preparation, before the machine write, so protection still covers its result.
+    if !super::key_renewal::is_renewal(task)
+        || !task
+            .proposal
+            .as_ref()
+            .is_some_and(|proposal| matches!(proposal.tool, Tool::RequestAiKey { .. }))
+    {
+        response.get_or_insert_with(super::inference::CommandResponse::reserve);
+    }
+}
+
 /// Retain an early refusal from the protected store report alongside the durable identity.
 pub fn page_outcome(id: &str, report: &Value) -> Value {
     let mut outcome = serde_json::json!({"task":id});

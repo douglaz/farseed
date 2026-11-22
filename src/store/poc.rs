@@ -613,7 +613,7 @@ impl<S: Storage> Store<S> {
             }
         }
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", test))]
     pub(crate) fn eligible_tasks(&self) -> Vec<Task> {
         self.poc
             .values()
@@ -769,6 +769,24 @@ impl<S: Storage> Store<S> {
             return Err(crate::poc::wait::ACCEPTANCE.into());
         }
         Ok(live)
+    }
+    /// Recording an operator's renewal approval has no external effect. Execution still
+    /// requires full authority, including resolution of an open requirements card.
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) fn poc_key_decision_authority(
+        &self,
+        task: &Task,
+        session: &str,
+    ) -> Result<(), String> {
+        if crate::poc::key_renewal::is_renewal(task) {
+            self.check_task_session(task, session)?;
+            if !self.accepted_no_brief(session) {
+                return Err(crate::poc::wait::ACCEPTANCE.into());
+            }
+            Ok(())
+        } else {
+            self.poc_authority(&task.id, session).map(|_| ())
+        }
     }
     fn poc_session_task(&self, session: &str) -> Option<&Task> {
         self.poc_by_session
@@ -1081,7 +1099,7 @@ impl<S: Storage> Store<S> {
         }
         withhold(value, &self.renewal_calls());
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(any(target_arch = "wasm32", test))]
     pub(crate) async fn poc_renew_ai_key(
         &mut self,
         machine: &str,
@@ -1173,6 +1191,16 @@ impl<S: Storage> Store<S> {
         expected: u64,
         mut change: Change,
     ) -> Result<Task, String> {
+        let task = self.poc.get(id).ok_or(crate::poc::wait::UNKNOWN_TASK)?;
+        if crate::poc::key_renewal::is_renewal(task) {
+            let unknown_key = task.proposal.as_ref().is_some_and(|proposal| {
+                matches!(proposal.tool, Tool::RequestAiKey { .. })
+                    && self
+                        .ai_key(id, &proposal.call_id)
+                        .is_some_and(|entry| entry.key.is_none())
+            });
+            change = crate::poc::key_renewal::local_change(task, change, unknown_key);
+        }
         #[cfg(target_arch = "wasm32")]
         let timing_started = crate::poc::timings::now();
         #[cfg(target_arch = "wasm32")]

@@ -13,30 +13,7 @@ thread_local! {
     static CONFIG: RefCell<Option<Configuration>> = const { RefCell::new(None) };
     static KEY: RefCell<Option<InferenceAccountCredential>> = const { RefCell::new(None) };
     static REQUESTS: RefCell<Vec<std::rc::Weak<Pending>>> = const { RefCell::new(Vec::new()) };
-    static COMMAND_RESPONSES: Cell<usize> = const { Cell::new(0) };
     static REVISION: Cell<u64> = const { Cell::new(0) };
-}
-
-/// Reserve the current protection inventory until a command response leaves the worker.
-/// This holds no writer across transport waits. Configuration refuses promptly while any
-/// response is pending, so a terminal's capacity preflight remains valid through release.
-/// Each caller (including a held request) owns its own reservation; drop covers all exits.
-pub(crate) struct CommandResponse;
-impl CommandResponse {
-    pub(crate) fn reserve() -> Self {
-        COMMAND_RESPONSES.set(
-            COMMAND_RESPONSES
-                .get()
-                .checked_add(1)
-                .expect("command response count"),
-        );
-        Self
-    }
-}
-impl Drop for CommandResponse {
-    fn drop(&mut self) {
-        COMMAND_RESPONSES.set(COMMAND_RESPONSES.get() - 1);
-    }
 }
 
 struct Pending {
@@ -158,10 +135,6 @@ pub(crate) fn restore(configuration: Configuration) {
 pub(crate) fn key_is_set() -> bool {
     KEY.with_borrow(Option::is_some) || crate::poc::credit::browser::key_present()
 }
-pub(crate) fn response_pending() -> bool {
-    COMMAND_RESPONSES.get() != 0
-}
-
 pub(crate) async fn configure(
     endpoint: String,
     model: String,

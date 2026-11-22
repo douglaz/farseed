@@ -2,6 +2,48 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn poc_credit_queued_key_fence_captures_readiness_but_never_revives_lifecycle_authority() {
+    use std::cell::Cell;
+    use std::future::Future;
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+    for suspend in [false, true] {
+        let owner = Rc::new(crate::lifecycle::Authority::default());
+        let continuation = owner.continuation().unwrap();
+        let revision = Cell::new(0);
+        let release = Cell::new(false);
+        let old = OperationFence::new(continuation.clone(), revision.get());
+        let wait = std::future::poll_fn(|_| {
+            if release.get() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        });
+        let mut waiting =
+            std::pin::pin!(OperationFence::after_wait(&continuation, wait, || revision.get()));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        revision.set(1);
+        if suspend {
+            owner.suspend();
+            owner.revalidated().unwrap();
+        }
+        release.set(true);
+        assert!(old.check(revision.get()).is_err());
+        match waiting.as_mut().poll(&mut cx) {
+            Poll::Ready(Ok((fence, ()))) if !suspend => {
+                fence.check(revision.get()).unwrap();
+                revision.set(2);
+                assert!(fence.check(revision.get()).is_err());
+            }
+            Poll::Ready(Err(why)) if suspend => assert!(why.contains("stale continuation")),
+            _ => panic!("queued fence did not preserve lifecycle authority"),
+        }
+    }
+}
+
+#[test]
 fn poc_credit_cleanup_cutoffs_use_returned_precision_or_requested_tolerance() {
     let requested = super::super::provisioning::timestamp("2026-11-11T00:00:00Z").unwrap();
     let mut mint = Mint {

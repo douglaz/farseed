@@ -1,6 +1,6 @@
 //! Deterministic application-key maintenance, using the ordinary durable task runner.
 use crate::goals::Tool;
-use crate::store::poc::Task;
+use crate::store::poc::{Change, Task};
 use crate::store::{Storage, Store};
 
 pub(crate) const ID: &str = "renew-hermes-ai-key@1";
@@ -28,6 +28,115 @@ pub(crate) fn step_name(call: &str) -> &'static str {
 }
 pub(crate) fn failed(call: &str) -> String {
     format!("AI key renewal stopped: {} failed.", step_name(call))
+}
+
+pub(crate) const APPROVAL: &str = "AI key renewal is waiting for requirements approval. Approve or reject the open requirements card, then Resume.";
+pub(crate) const UNKNOWN_KEY: &str = "AI key creation has an unknown outcome. The recorded request will not be sent again. Check the credit account and Stop task before starting another renewal.";
+pub(crate) const CREDIT: &str = "AI key renewal is waiting for inference credit. Fund or restore the credit account, then Resume.";
+pub(crate) const INTERRUPTED: &str = "AI key renewal was interrupted. Restore the live session, then Resume; a recorded key request will not be sent again.";
+pub(crate) const PREREQUISITES: &str = "AI key renewal is waiting for execution prerequisites. Check session, connection and credit settings, then Resume.";
+
+/// A completed result, rather than a refusal before execution, establishes step failure.
+fn execution_failed(task: &Task) -> bool {
+    let Some((call, _, output)) = task.completed.last() else {
+        return false;
+    };
+    let outcome = &output["content"];
+    let exit = outcome["exit_status"]
+        .as_u64()
+        .and_then(|exit| u32::try_from(exit).ok());
+    match call.as_str() {
+        KEY => outcome["status"] == "failed",
+        WRITE | REBUILD | RESTART => exit.is_some_and(|exit| exit != 0),
+        CHECK => {
+            exit.is_some() && !check_passed(exit, outcome["stdout"].as_str().unwrap_or_default())
+        }
+        call if call.starts_with(WAIT) => exit.is_some() && next_result_failed_wait(outcome),
+        _ => false,
+    }
+}
+fn next_result_failed_wait(outcome: &serde_json::Value) -> bool {
+    let stdout = outcome["stdout"].as_str().unwrap_or_default();
+    !((outcome["exit_status"] == 3
+        && stdout
+            .lines()
+            .any(|line| line == "STILL RUNNING. Run the same wait command again."))
+        || (outcome["exit_status"] == 0
+            && stdout.lines().any(|line| line.starts_with("REBUILD OK "))))
+}
+
+/// Only local sentences reach a renewal card. A refusal is not a failed execution.
+pub(crate) fn local_change(task: &Task, change: Change, unknown_key: bool) -> Change {
+    let call = task.proposal.as_ref().map_or(KEY, |p| p.call_id.as_str());
+    match change {
+        Change::Pause(why) => {
+            let cause = why
+                .strip_prefix(
+                    "original accepted session authority for the task machine is required: ",
+                )
+                .unwrap_or(&why);
+            let sentence = if unknown_key || cause == UNKNOWN_KEY {
+                UNKNOWN_KEY.into()
+            } else if cause == super::wait::APPROVAL_PENDING || cause == APPROVAL {
+                APPROVAL.into()
+            } else if cause == CREDIT || cause == "no inference credit account is available" {
+                CREDIT.into()
+            } else if cause == "Credit store write hold; unlock again before continuing."
+                || cause == "Unlock before using inference credit."
+                || cause == "locked"
+                || cause.starts_with("journal append outcome uncertain")
+            {
+                "AI key renewal is waiting for the local credit store. Unlock again, then Resume."
+                    .into()
+            } else if cause == "AI key request needs the operator's decision" {
+                "AI key renewal is waiting for your approval. Choose Create key or Don't on the key card.".into()
+            } else if cause == "inference endpoint missing" {
+                "AI key renewal is waiting for inference configuration. Restore the endpoint and model, then Resume.".into()
+            } else if cause.starts_with("installation facts:") {
+                "AI key renewal is waiting for approved installation facts. Review the machine's declaration, then Resume.".into()
+            } else if cause == super::wait::TARGET_REQUIRED || cause == super::wait::TARGET_DIFFERS
+            {
+                "AI key renewal is waiting for its machine connection. Restore the saved target, then Resume.".into()
+            } else if cause == INTERRUPTED
+                || cause == "Credit operation interrupted."
+                || cause == super::wait::SUSPENSION
+                || cause == "stale continuation; reconciliation required"
+            {
+                INTERRUPTED.into()
+            } else if task.proposal.is_none()
+                && execution_failed(task)
+                && task
+                    .completed
+                    .last()
+                    .is_some_and(|(last, _, _)| why == failed(last))
+            {
+                why
+            } else if cause == super::wait::PIN_REQUIRED {
+                "AI key renewal is waiting for a trusted host pin. Restore the pin, then Resume."
+                    .into()
+            } else if cause == super::wait::ACCEPTANCE
+                || why.starts_with("original accepted session authority")
+            {
+                "AI key renewal is waiting for its original live session. Restore session authority, then Resume.".into()
+            } else {
+                PREREQUISITES.into()
+            };
+            Change::Pause(sentence)
+        }
+        Change::Wait { running, .. } => Change::Wait {
+            why: format!(
+                "AI key renewal: {} {}. Resume collects the recorded job without running it twice.",
+                step_name(call),
+                if running {
+                    "is still running"
+                } else {
+                    "has an unknown outcome"
+                }
+            ),
+            running,
+        },
+        other => other,
+    }
 }
 
 /// The same parsed, vendored shell blocks that run_step_block uses. No model supplies bytes.

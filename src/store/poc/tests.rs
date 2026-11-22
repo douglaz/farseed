@@ -3149,6 +3149,8 @@ mod correction_tests;
 
 mod interruption_tests;
 
+mod renewal_tests;
+
 #[test]
 fn poc_ai_key_replay_preserves_legacy_and_new_outcome_caps_and_refuses_other_caps() {
     use crate::poc::credit::{Mint, SecretText};

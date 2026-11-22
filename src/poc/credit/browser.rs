@@ -128,31 +128,24 @@ fn origin() -> Result<String, String> {
 
 #[derive(Clone)]
 struct Fence {
-    continuation: crate::lifecycle::Continuation,
-    revision: u64,
+    guard: OperationFence,
     session: Option<String>,
 }
 impl Fence {
     fn new(session: Option<&str>) -> Result<Self, String> {
         Ok(Self {
-            continuation: crate::lifecycle::owner().continuation()?,
-            revision: REVISION.get(),
+            guard: OperationFence::new(crate::lifecycle::owner().continuation()?, REVISION.get()),
             session: session.map(str::to_owned),
         })
     }
     fn scoped(&self, session: &str) -> Self {
         Self {
-            continuation: self.continuation.clone(),
-            revision: self.revision,
+            guard: self.guard.clone(),
             session: Some(session.into()),
         }
     }
     fn check(&self) -> Result<(), String> {
-        self.continuation.check()?;
-        if self.revision != REVISION.get() {
-            return Err("Credit operation interrupted.".into());
-        }
-        Ok(())
+        self.guard.check(REVISION.get())
     }
     fn store<'a>(
         &self,
@@ -782,8 +775,7 @@ pub(crate) async fn ensure(
     allow_mint: bool,
 ) -> Result<(), String> {
     let fence = Fence {
-        continuation: continuation.clone(),
-        revision: REVISION.get(),
+        guard: OperationFence::new(continuation.clone(), REVISION.get()),
         session: Some(session.into()),
     };
     let local = crate::worker::local();
@@ -846,12 +838,7 @@ async fn mint_inner(session: &str, replace: bool, parent: &Fence) -> Result<(), 
     }
     let fence = parent.scoped(session);
     fence.check()?;
-    if crate::poc::inference::response_pending() {
-        return Err(
-            "Credit configuration refused: command response pending; retry after it completes."
-                .into(),
-        );
-    }
+    session_mint_ready()?;
     #[cfg(feature = "tracer")]
     crate::testonly::session_point("credit_mint_writer").await;
     {
@@ -972,7 +959,11 @@ pub(crate) async fn refusal(status: u16, bytes: &[u8], session: &str) -> String 
 }
 
 /// A recorded request is never minted twice. Missing custody after it means unknown outcome.
-pub(crate) async fn prepare_ai_key(task: &crate::store::poc::Task) -> Result<bool, String> {
+pub(crate) async fn prepare_ai_key(
+    task: &crate::store::poc::Task,
+    continuation: &crate::lifecycle::Continuation,
+) -> Result<bool, String> {
+    use crate::store::ai_keys::Preparation;
     use crate::store::ai_keys::Record as KeyRecord;
     const UNKNOWN: &str =
         "AI key creation outcome is unknown; the recorded request will not be sent again";
@@ -980,16 +971,23 @@ pub(crate) async fn prepare_ai_key(task: &crate::store::poc::Task) -> Result<boo
     if !task.ai_key_approved {
         return Err("AI key request needs the operator's decision".into());
     }
-    let fence = Fence::new(Some(&task.start_session))?;
-    let _active = Active::wait().await;
+    let (guard, _active) =
+        OperationFence::after_wait(continuation, Active::wait(), || REVISION.get()).await?;
+    let fence = Fence {
+        guard,
+        session: Some(task.start_session.clone()),
+    };
     let local = crate::worker::local();
     let mint = {
         let mut local = local.lock().await;
         let store = fence.store(&mut local)?;
-        store.check_task_session(task, &task.start_session)?;
-        if let Some(entry) = store.ai_key(&task.id, &proposal.call_id) {
-            if entry.key.is_some() {
-                return Ok(true);
+        let preparation = store.ai_key_preparation(task)?;
+        if preparation == Preparation::Held {
+            return Ok(true);
+        }
+        if preparation == Preparation::Unknown {
+            if crate::poc::key_renewal::is_renewal(task) {
+                return Err(crate::poc::key_renewal::UNKNOWN_KEY.into());
             }
             store
                 .poc_change(
@@ -1002,7 +1000,10 @@ pub(crate) async fn prepare_ai_key(task: &crate::store::poc::Task) -> Result<boo
                 .await?;
             return Ok(false);
         }
-        if store.credit_account().is_none() {
+        if preparation == Preparation::AccountRequired {
+            if crate::poc::key_renewal::is_renewal(task) {
+                return Err(crate::poc::key_renewal::CREDIT.into());
+            }
             store
                 .poc_change(
                     &task.id,

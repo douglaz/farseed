@@ -280,34 +280,6 @@ impl<P: PinSource> Runtime for Web<'_, P> {
             .map(|_| ())
     }
     async fn change(&mut self, task: &Task, change: Change) -> Result<Task, String> {
-        // Renewal errors name the step, never any remote diagnostic bytes.
-        let change = if super::key_renewal::is_renewal(task) {
-            let call = task
-                .proposal
-                .as_ref()
-                .map(|p| p.call_id.as_str())
-                .unwrap_or(super::key_renewal::KEY);
-            match change {
-                Change::Pause(_) if task.proposal.is_some() && task.pending.is_none() => {
-                    Change::Pause(super::key_renewal::failed(call))
-                }
-                Change::Wait { running, .. } => Change::Wait {
-                    why: format!(
-                        "AI key renewal: {} {}. Resume collects the recorded job without running it twice.",
-                        super::key_renewal::step_name(call),
-                        if running {
-                            "is still running"
-                        } else {
-                            "has an unknown outcome"
-                        }
-                    ),
-                    running,
-                },
-                other => other,
-            }
-        } else {
-            change
-        };
         if task.pending.is_some() {
             super::timings::resume(task);
         }
@@ -359,9 +331,7 @@ impl<P: PinSource> Runtime for Web<'_, P> {
 
     async fn execute(&mut self, binding: Binding, task: &Task) -> Result<(), String> {
         super::timings::resume(task);
-        self.response
-            .borrow_mut()
-            .get_or_insert_with(crate::poc::inference::CommandResponse::reserve);
+        run::reserve_execution_response(task, &mut self.response.borrow_mut());
         {
             let local = local();
             let mut writer = local.lock().await;
@@ -393,9 +363,12 @@ impl<P: PinSource> Runtime for Web<'_, P> {
         let (command, input) = match &proposal.tool {
             crate::goals::Tool::Exec { command, .. } => (command.clone(), None),
             crate::goals::Tool::RequestAiKey { .. } => {
-                if !crate::poc::credit::browser::prepare_ai_key(task).await? {
+                if !crate::poc::credit::browser::prepare_ai_key(task, &self.continuation).await? {
                     return Ok(());
                 }
+                self.response
+                    .borrow_mut()
+                    .get_or_insert_with(crate::poc::inference::CommandResponse::reserve);
                 let local = local();
                 let mut writer = local.lock().await;
                 self.continuation.check()?;
@@ -1034,7 +1007,7 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                     "ai-key-create" | "ai-key-decline" | "ai-key-class" | "renew-ai-key"
                 ) {
                     crate::poc::run::check_raise(id)?;
-                    store.poc_authority(id, session)?;
+                    store.poc_key_decision_authority(&task, session)?;
                     if automatic
                         || (request.action != "renew-ai-key"
                             && (request.revision != Some(task.revision)

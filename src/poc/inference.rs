@@ -1343,9 +1343,14 @@ mod browser;
 pub(crate) use browser::next;
 #[cfg(target_arch = "wasm32")]
 pub(crate) use browser::{
-    CommandResponse, approval, configuration, configure, end, freeze, held_key, key_is_set,
-    response_pending, restore, restore_credit, retry_progress, stop_session, stop_task,
+    approval, configuration, configure, end, freeze, held_key, key_is_set, restore, restore_credit,
+    retry_progress, stop_session, stop_task,
 };
+
+#[cfg(any(target_arch = "wasm32", test))]
+mod response;
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) use response::{CommandResponse, response_pending};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) mod tests;

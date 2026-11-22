@@ -20,6 +20,52 @@ pub(crate) const RECOVERY_KEY_PRESS: &str = "This session needs a new AI key bef
 pub const REFUSED: &str = "The credit service refused this request.";
 pub const DISCLOSURE: &str = "Inference uses a key capped at 1 USD of your credit and valid 24 hours (requested limits, per key). A new key with the same limits is made after each Unlock or New key press, so a session can use more than 1 USD in total; your credit balance is the overall limit.";
 
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn session_mint_ready() -> Result<(), String> {
+    if super::inference::response_pending() {
+        return Err(
+            "Credit configuration refused: command response pending; retry after it completes."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// A queued mint keeps the caller's lifecycle authority, but captures credit configuration
+/// only after the preceding credit operation has released its lock.
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Clone)]
+pub(crate) struct OperationFence {
+    continuation: crate::lifecycle::Continuation,
+    revision: u64,
+}
+#[cfg(any(target_arch = "wasm32", test))]
+impl OperationFence {
+    pub(crate) fn new(continuation: crate::lifecycle::Continuation, revision: u64) -> Self {
+        Self {
+            continuation,
+            revision,
+        }
+    }
+    pub(crate) async fn after_wait<T>(
+        continuation: &crate::lifecycle::Continuation,
+        wait: impl std::future::Future<Output = T>,
+        revision: impl FnOnce() -> u64,
+    ) -> Result<(Self, T), String> {
+        continuation.check()?;
+        let active = wait.await;
+        continuation.check()?;
+        Ok((Self::new(continuation.clone(), revision()), active))
+    }
+    pub(crate) fn check(&self, revision: u64) -> Result<(), String> {
+        self.continuation.check()?;
+        if self.revision != revision {
+            return Err("Credit operation interrupted.".into());
+        }
+        Ok(())
+    }
+}
+
 /// A decoded secret clears even when a later field fails to decode.
 pub(crate) struct SecretText(pub Zeroizing<String>);
 impl Serialize for SecretText {

@@ -20,6 +20,15 @@ pub(crate) struct Entry {
     pub key: Option<SecretText>,
     pub configuration: Option<crate::poc::inference::Configuration>,
 }
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Preparation {
+    Mint,
+    Held,
+    Unknown,
+    AccountRequired,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub(crate) enum Record {
@@ -51,6 +60,25 @@ pub(crate) fn command(path: &str, bytes: usize) -> String {
     )
 }
 impl<S: Storage> Store<S> {
+    /// Re-evaluate durable custody on every Resume, before considering another mint.
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) fn ai_key_preparation(&self, task: &poc::Task) -> Result<Preparation, String> {
+        self.check_task_session(task, &task.start_session)?;
+        self.poc_authority(&task.id, &task.start_session)?;
+        self.credit_ready()?;
+        let proposal = task.proposal.as_ref().ok_or("AI key request missing")?;
+        if !matches!(proposal.tool, crate::goals::Tool::RequestAiKey { .. })
+            || !task.ai_key_approved
+        {
+            return Err("AI key request needs the operator's decision".into());
+        }
+        Ok(match self.ai_key(&task.id, &proposal.call_id) {
+            Some(entry) if entry.key.is_some() => Preparation::Held,
+            Some(_) => Preparation::Unknown,
+            None if self.credit_account().is_none() => Preparation::AccountRequired,
+            None => Preparation::Mint,
+        })
+    }
     pub(crate) fn ai_key(&self, task: &str, call: &str) -> Option<&Entry> {
         self.ai_keys
             .iter()
