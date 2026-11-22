@@ -1074,7 +1074,43 @@ in
   '';
 }
 RECIPE
+cat > /etc/nixos/recipes/stronger-agent-model.md <<'RECIPE'
+# Recipe: a stronger model for this agent
+
+To use a stronger model for this agent, follow these steps only when the user asks.
+
+1. Before applying, tell the user plainly:
+   - The agent's AI key has a 5 USD cap, roughly a dozen turns of the stronger model. When it runs out, the
+     agent stops answering until the key is renewed from the page.
+   - The credit service lists this model on its weaker 'anon' tier. This agent still asks for zero retention on
+     every request, and the service accepted that for this model in a test on 2026-11-22. Whether the upstream
+     provider keeps nothing is the service's promise; Farseed can't check it.
+   Ask the user whether to apply this change, including undo if the read-back fails, and wait for their approval.
+2. Write /etc/nixos/extra/agent-model.nix with the shell (`cat >`), using this module. The model id is on its
+   own line so it is easy to change:
+
+       { lib, ... }:
+       {
+         services.hermes-agent.settings = lib.mkAfter { model.default =
+           "anthropic/claude-sonnet-5.5";
+         };
+       }
+
+   Change only the model default. Leave the connection settings and AI key alone; keep zero retention on every
+   request.
+3. Run `systemctl start control-center-apply`. Read `tail -n 5 /var/log/cc-rebuild.log` about once a minute until
+   it ends with RESULT. Continue only on `RESULT 0`. If it fails or the result is unclear, stop and tell the user.
+4. Run the read-only command `HERMES_HOME=/var/lib/hermes/.hermes hermes config get model.default`. It
+   reads `model.default` from /var/lib/hermes/.hermes/config.yaml. Confirm the printed value equals the model id in step 2.
+   If the command fails or the value differs, tell the user and undo the change they approved:
+   delete /etc/nixos/extra/agent-model.nix, then apply again and wait for `RESULT 0` as in step 3. Do not report success.
+5. The new model applies to conversations started after the change: start a new T3 thread.
+
+To undo: ask the user and wait before applying, delete /etc/nixos/extra/agent-model.nix, then apply and wait for
+`RESULT 0` as in step 3. In a new T3 thread, the agent returns to the set-up model.
+RECIPE
 chmod 0644 /etc/nixos/recipes/bitcoin-node.md /etc/nixos/recipes/bitcoin-wallet.md /etc/nixos/recipes/lightning-node.md /etc/nixos/recipes/bitcoin-node.nix /etc/nixos/recipes/tailscale.nix /etc/nixos/recipes/lightning-node.nix /etc/nixos/recipes/lightning-pay.nix
+chmod 0644 /etc/nixos/recipes/stronger-agent-model.md
 cat > /etc/nixos/cc-agent.nix <<'FILE'
 { config, lib, ... }:
 {
@@ -1097,8 +1133,9 @@ cat > /etc/nixos/cc-agent.nix <<'FILE'
     Before stopping or restarting a service, applying a rebuild, a large download, a new recurring automation or
     any spend, ask the user and wait, in every access mode.
     Recipes for common requests are in recipes/ next to this file: bitcoin-node.md (a pruned Bitcoin node and
-    Tailscale), bitcoin-wallet.md (a watch-only wallet's balance) and lightning-node.md (lnd, a read-only
-    Zeus link, and payment access when the user wants the node to pay or be paid). Read the matching recipe
+    Tailscale), bitcoin-wallet.md (a watch-only wallet's balance), lightning-node.md (lnd, a read-only
+    Zeus link, and payment access when the user wants the node to pay or be paid), and stronger-agent-model.md
+    (a stronger model for this agent, only when asked). Read the matching recipe
     first and follow it. The Lightning node's seed was handed to the user
     at set-up: before anyone funds the node, make sure they saved it (lightning-node.md).
   '';
@@ -1106,6 +1143,7 @@ cat > /etc/nixos/cc-agent.nix <<'FILE'
   services.hermes-agent.documents."recipes/bitcoin-node.md" = ./recipes/bitcoin-node.md;
   services.hermes-agent.documents."recipes/bitcoin-wallet.md" = ./recipes/bitcoin-wallet.md;
   services.hermes-agent.documents."recipes/lightning-node.md" = ./recipes/lightning-node.md;
+  services.hermes-agent.documents."recipes/stronger-agent-model.md" = ./recipes/stronger-agent-model.md;
   # Read in every session, whatever folder T3 starts it in (a "No project" thread starts outside the workspace).
   services.hermes-agent.hermesHomeFiles."SOUL.md" = ''
     Before stopping or restarting a service, applying a rebuild, a large download, a new recurring automation or

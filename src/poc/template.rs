@@ -391,6 +391,84 @@ mod tests {
     }
 
     #[test]
+    fn template_stronger_agent_model_is_opt_in_and_changes_only_the_model() {
+        let source = CONTROL_CENTER.steps[5].blocks.get("Do").unwrap();
+        let recipe = source
+            .split("cat > /etc/nixos/recipes/stronger-agent-model.md <<'RECIPE'\n")
+            .nth(1)
+            .unwrap()
+            .split("\nRECIPE\n")
+            .next()
+            .unwrap();
+        assert!(source.contains("chmod 0644 /etc/nixos/recipes/stronger-agent-model.md"));
+        assert!(source.contains("services.hermes-agent.documents.\"recipes/stronger-agent-model.md\" = ./recipes/stronger-agent-model.md;"));
+        let agents = source
+            .split("documents.\"AGENTS.md\" = ''\n")
+            .nth(1)
+            .unwrap()
+            .split("\n  '';")
+            .next()
+            .unwrap();
+        assert!(agents.contains(
+            "stronger-agent-model.md\n    (a stronger model for this agent, only when asked)"
+        ));
+        let module = recipe
+            .split("own line so it is easy to change:\n\n")
+            .nth(1)
+            .unwrap()
+            .split("\n\n")
+            .next()
+            .unwrap();
+        assert_eq!(
+            module,
+            // mkAfter on the whole settings definition orders it after Step 5's, so the deep merge's last
+            // definition (this one) wins; a plain assignment loses (Nix merges imported modules in reverse).
+            "       { lib, ... }:\n       {\n         services.hermes-agent.settings = lib.mkAfter { model.default =\n           \"anthropic/claude-sonnet-5.5\";\n         };\n       }"
+        );
+        for forbidden in [
+            "custom_providers",
+            "extra_body",
+            "key_env",
+            "mkForce",
+            "mkOverride",
+            "mkDefault",
+            "systemctl restart",
+        ] {
+            assert!(!recipe.contains(forbidden), "recipe contains {forbidden}");
+        }
+        for required in [
+            "only when the user asks",
+            "Before applying, tell the user plainly",
+            "5 USD cap, roughly a dozen turns",
+            "agent stops answering until the key is renewed from the page",
+            "weaker 'anon' tier",
+            "still asks for zero retention on\n     every request",
+            "accepted that for this model in a test on 2026-11-22",
+            "Whether the upstream\n     provider keeps nothing is the service's promise; Farseed can't check it",
+            "Ask the user whether to apply this change, including undo if the read-back fails, and wait for their approval",
+            "Write /etc/nixos/extra/agent-model.nix with the shell",
+            "Leave the connection settings and AI key alone",
+            "systemctl start control-center-apply",
+            "tail -n 5 /var/log/cc-rebuild.log",
+            "Continue only on `RESULT 0`",
+            "If it fails or the result is unclear, stop and tell the user",
+            "HERMES_HOME=/var/lib/hermes/.hermes hermes config get model.default",
+            "reads `model.default` from /var/lib/hermes/.hermes/config.yaml",
+            "Confirm the printed value equals the model id in step 2",
+            "If the command fails or the value differs, tell the user",
+            "delete /etc/nixos/extra/agent-model.nix, then apply again and wait for `RESULT 0` as in step 3",
+            "The new model applies to conversations started after the change: start a new T3 thread",
+            "To undo: ask the user and wait before applying, delete /etc/nixos/extra/agent-model.nix",
+            "the agent returns to the set-up model",
+        ] {
+            assert!(
+                recipe.contains(required),
+                "missing model switch rule: {required}"
+            );
+        }
+    }
+
+    #[test]
     fn template_recipes_preserve_payment_and_copy_rules() {
         let step = &CONTROL_CENTER.steps[5];
         let recipes = step.blocks.get("Recipes").unwrap();
