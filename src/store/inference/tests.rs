@@ -37,6 +37,122 @@ pub(crate) fn ready() -> Store<MemoryStorage> {
     s.synthetic_confirm_limits(100).unwrap();
     s
 }
+// Use the same public-fact bounds as vendored_template_blocks_have_launch_headroom.
+// AI_KEY_PATH (128 bytes there) is filled only on the machine, never a prompt fact.
+pub(crate) fn template_request_fixture() -> (
+    Store<MemoryStorage>,
+    crate::poc::inference::Configuration,
+    crate::store::poc::Task,
+) {
+    let mut store = block_on(create(MemoryStorage::default(), &Fixed, pass())).unwrap();
+    block_on(store.seed_backup(crate::allocation::Completion::Skipped)).unwrap();
+    let machine = "m".repeat(64);
+    block_on(
+        store.poc_enroll(crate::store::poc_targets::Enrollment {
+            target: crate::poc::targets::TargetRecord {
+                machine: machine.clone(),
+                relay: "wss://relay.invalid/".into(),
+                profile: "v1".into(),
+                host: [
+                    "h".repeat(63),
+                    "h".repeat(63),
+                    "h".repeat(63),
+                    "h".repeat(61),
+                ]
+                .join("."),
+                port: 22,
+                user: "root".into(),
+                elevation: crate::jobs::Elevation::None,
+                pin: format!(
+                    "SHA256:{}",
+                    base64::engine::general_purpose::STANDARD_NO_PAD.encode([3; 32])
+                ),
+            },
+            approve_existing: true,
+            class_answer: crate::dispatch::ClassAnswer::No,
+            approve_maintained_access: true,
+        }),
+    )
+    .unwrap();
+    let endpoint = format!(
+        "https://inference.invalid/{}",
+        "e".repeat(2048 - "https://inference.invalid/".len())
+    );
+    let config = crate::poc::inference::Configuration::new(endpoint, "m".repeat(128)).unwrap();
+    let session = block_on(store.admit(
+        &machine,
+        &[],
+        crate::binding::InferenceApproval {
+            approved: true,
+            configuration: config.clone(),
+        },
+    ))
+    .unwrap();
+    block_on(
+        store.set_inference_account(crate::credential::InferenceAccountCredential::new(
+            b"fixture-account-private-value".to_vec(),
+        )),
+    )
+    .unwrap();
+    store.synthetic_confirm_limits(100).unwrap();
+    block_on(store.enter_goal(&session, "template request sizing".into(), None)).unwrap();
+    let mut task = block_on(store.poc_start(&session)).unwrap();
+    let declaration_text = crate::poc::template::CONTROL_CENTER.declaration.unwrap();
+    let declaration = serde_json::from_str(
+        declaration_text
+            .split_once("```json\n")
+            .unwrap()
+            .1
+            .split_once("```")
+            .unwrap()
+            .0,
+    )
+    .unwrap();
+    store
+        .propose_requirements(
+            &session,
+            42,
+            crate::declaration::Proposal::Declaration {
+                machine: machine.clone(),
+                declaration,
+            },
+            &crate::goals::Tool::Done {
+                machine: machine.clone(),
+                urls: vec![],
+                checks: vec![],
+            },
+        )
+        .unwrap();
+    block_on(store.approve_requirements(&session, &machine, 42)).unwrap();
+    task.template = Some(crate::poc::template::ID.into());
+    task.options = Some(std::collections::BTreeMap::from([("TOR".into(), true)]));
+    task.goal = crate::poc::template::goal(task.options.as_ref());
+    // A valid SSH key line at the 8192-byte input limit.
+    let encoded = base64::engine::general_purpose::STANDARD
+        .encode([b"\0\0\0\x0bssh-ed25519".as_slice(), &[1; 6045]].concat());
+    let mut key = format!("ssh-ed25519 {encoded}");
+    key.push(' ');
+    key.push_str(&"k".repeat(8192 - key.len()));
+    task.inputs = Some(std::collections::BTreeMap::from([(
+        "USER_SSH_KEY".into(),
+        key,
+    )]));
+    assert!(crate::poc::template::valid_inputs(task.inputs.as_ref()));
+    // Request construction is read-only. Populate the goal projection too, so
+    // the request includes the same duplicated input metadata as a template goal.
+    // Enrolled targets have no distribution metadata for template admission.
+    let goal = store
+        .goals
+        .iter_mut()
+        .find(|goal| goal.session == session)
+        .unwrap();
+    goal.text = task.goal.clone();
+    goal.template = task.template.clone();
+    goal.options = task.options.clone();
+    goal.inputs = task.inputs.clone();
+    (store, config, task)
+}
+
 fn reopen(s: &Store<MemoryStorage>) -> Store<MemoryStorage> {
     block_on(unlock(
         MemoryStorage::with_files(s.storage.files()),

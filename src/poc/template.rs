@@ -191,6 +191,42 @@ fn latest_exec(task: &Task) -> Option<(&str, &str)> {
 }
 
 impl Template {
+    /// Only the model's view is shortened. Admission and progress still compare
+    /// the original publisher text, and the catalogue keeps the executable bytes.
+    pub fn prompt_text(&self, text: &'static str, by_name: bool) -> std::borrow::Cow<'static, str> {
+        let recovery = text == self.recovery;
+        if !by_name || (!recovery && !self.steps.iter().any(|step| step.text == text)) {
+            return text.into();
+        }
+        let mut prompt = String::new();
+        let mut label = None;
+        let mut in_block = false;
+        for line in text.split_inclusive('\n') {
+            let trimmed = line.trim_end_matches('\n');
+            if in_block {
+                if trimmed == "```" {
+                    in_block = false;
+                    prompt.push_str(line);
+                }
+                continue;
+            }
+            prompt.push_str(line);
+            if let Some(rest) = trimmed.strip_prefix("**") {
+                let (name, _) = rest.split_once("**").expect("parsed template label");
+                label = Some(if recovery {
+                    name.split_once(':').expect("parsed Recovery label").0
+                } else {
+                    name
+                });
+            } else if trimmed == "```sh" {
+                let label = label.take().expect("parsed template block label");
+                prompt.push_str(&format!("[block {label}: use run_step_block]\n"));
+                in_block = true;
+            }
+        }
+        prompt.into()
+    }
+
     pub fn recovery_needed(&self, task: &Task) -> bool {
         (!task.verifying && !task.findings.is_empty()) || self.failed(task)
     }
@@ -295,6 +331,33 @@ impl Template {
 mod tests {
     use super::*;
     use crate::jobs::{self, Elevation};
+
+    #[test]
+    fn model_steps_keep_prose_and_labels_but_not_shell_bodies() {
+        let template = &CONTROL_CENTER;
+        for (text, blocks) in std::iter::once((template.recovery, &template.recovery_blocks))
+            .chain(template.steps.iter().map(|step| (step.text, &step.blocks)))
+        {
+            let mut expected = text.to_owned();
+            for (label, body) in blocks {
+                // Check also occurs inside Later. Match the complete fence so
+                // shared command bytes cannot alter another catalogue entry.
+                expected = expected.replace(
+                    &format!("```sh\n{body}```"),
+                    &format!("```sh\n[block {label}: use run_step_block]\n```"),
+                );
+            }
+            assert_eq!(template.prompt_text(text, true), expected);
+            assert_eq!(template.prompt_text(text, false), text);
+        }
+        // The declaration is JSON the model must propose, not executable blocks.
+        let declaration = template.declaration.unwrap();
+        assert_eq!(template.prompt_text(declaration, true), declaration);
+        assert_eq!(template.prompt_text(FINISHED, true), FINISHED);
+        // Header examples and fact descriptions are prose, with no shell fences.
+        assert!(!template.header.contains("```"));
+        assert!(!template.facts.contains("```"));
+    }
 
     #[test]
     fn vendored_template_blocks_have_launch_headroom() {
