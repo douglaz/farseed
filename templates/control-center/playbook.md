@@ -530,6 +530,12 @@ cat > /etc/nixos/cc-hermes.nix <<'FILE'
       default = "@ai_model@";
       key_env = "CONTROL_CENTER_AI_KEY";
     };
+    settings.custom_providers = [ {
+      name = "farseed-credit";
+      base_url = "@ai_base_url@";
+      key_env = "CONTROL_CENTER_AI_KEY";
+      extra_body = { provider = { zdr = true; }; };
+    } ];
     # Hermes' internal listener gets a fixed loopback port (otherwise a random one at every start).
     settings.webapp = { enabled = true; host = "127.0.0.1"; port = 9120; };
     # The web dashboard. A non-loopback bind turns on its sign-in gate; the firewall keeps the port
@@ -593,7 +599,7 @@ Use it when the user asks for a Bitcoin node (this disk only fits a pruned one) 
 2. The Tailscale sign-in link comes first. Don't wait for the rebuild: every 15 seconds, for up to 3 minutes, run
    `timeout 20 tailscale up --operator=hermes` (keep the flag: a bare `tailscale up` drops you as operator). As
    soon as it prints a https://login.tailscale.com/... link, your next message, before any other command, must
-   contain the full link as plain text (for example "Sign in to Tailscale: https://login.tailscale.com/a/..."): do
+   contain the full link alone in a code block: do
    not save it for your final reply, and do not send it through a message tool, which hides it in a collapsed
    card. Then carry on in the same turn. Don't wait for them to sign in; `tailscale status` shows the link again.
 3. Wait for the rebuild: `tail -n 5 /var/log/cc-rebuild.log` about once a minute, until it ends with RESULT. If it
@@ -642,7 +648,7 @@ Install nothing else: no QR tools or other extras. The plain-text link is the re
    Bitcoin Core's configuration; ZMQ is already on. Then `tail -n 5 /var/log/cc-rebuild.log` about once a minute,
    until it ends with RESULT. If lnd does not start because the wallet is missing (a machine set up before
    wallets were made at set-up), stop and tell the user: don't create a wallet yourself. If you ever need to
-   restart lnd, you may: `systemctl restart lnd` (no edit or rebuild needed).
+   restart lnd, ask the user and wait first, then run `systemctl restart lnd` (no rebuild needed).
 2. lnd's state, read-only:
    `lncli --tlscertpath=/var/lib/lnd/tls.cert --macaroonpath=/var/lib/lnd-pub/readonly.macaroon getinfo`
    Repeat until synced_to_chain is true (usually under a minute once Core is at the tip). Tell the user the
@@ -670,16 +676,28 @@ Only after the seed file is deleted (the user said "saved"); the module refuses 
    listchaintxns, sendcoins and estimatefee. Use no other command. lnd checks calls, not commands: it refuses
    calls outside that set, but another command made of the same calls still works. Never use closeallchannels,
    which closes every channel at once.
+   To receive, always use `lncli ... addinvoice --private`, even for "give me an invoice": private channels need
+   route hints. Put the invoice alone in a code block.
    To reach a peer: `lncli ... connect <pubkey>@<host>:<port>` (outbound only).
+   Before proposing a channel, show the peer's alias and public key. It must be able to route to the user's phone
+   wallet. Say why in one sentence, including what you checked and what you couldn't check. If you can't establish
+   that it can route there, pause and ask the user. For a user-supplied peer, show its alias and ask for confirmation.
 3. Before every spend (opening or closing a channel, paying an invoice, sending on-chain), tell the user the exact
    command, the amount in sat and the fee (rate or limit), and wait for their yes. One yes is for one command.
    Channels are private (`--private`). If an open is refused, tell the user why and wait.
+   Default payment fee limit: 1% of the amount, rounded up to whole sat, at least 10 sat and at most 50 sat.
+   For a channel open, use the node's fee estimate, never above 10 sat/vB or 2,000 sat total fee. If the total
+   fee can't be bounded, stop and ask. Anything outside these defaults needs the user to state the number;
+   a general yes isn't enough. Still ask before every spend, showing the exact amount and fee rate or limit.
 4. If a payment's result is unclear, never pay again: check it with
    `lncli ... listpayments --include_incomplete` and tell the user. After an unclear sendcoins, openchannel or
    closechannel, first check `lncli ... listchaintxns` and `lncli ... pendingchannels`, and never send again until
    that result is known.
 5. After a channel opens or closes, copy the channel backup for the user: `systemctl start lnd-backup-copy`.
-   It lands in /var/lib/farseed-files; tell the user its name and size, never its contents.
+   Read the actual name from `journalctl -u lnd-backup-copy -n 5 --no-pager` (the `copied: <path>` line), or
+   `ls -t /var/lib/farseed-files`; never compose a name. Tell the user, without waiting to be asked, that the
+   backup is ready under "Get a file from this machine". Give its real name alone in a code block and its size,
+   never its contents.
 6. To end payment access: delete /etc/nixos/extra/lightning-pay.nix and apply. That removes the macaroon and, while
    lnd answers, revokes every copy of it. If lnd isn't answering at that moment, copies stay valid until they
    expire (at most 2 days), unless payment access is turned on again, which revokes them first.
@@ -1061,6 +1079,9 @@ cat > /etc/nixos/cc-agent.nix <<'FILE'
     To undo: delete your file and start control-center-apply again.
     Write files under /etc/nixos with the shell (cp, cat >): the file tool refuses paths under /etc.
     Give the user links and results as plain text in your reply, not through a message tool.
+    Put anything the user must copy (an address, an invoice, a file name, a link) alone in a code block.
+    Before stopping or restarting a service, applying a rebuild, a large download, a new recurring automation or
+    any spend, ask the user and wait, in every access mode.
     Recipes for common requests are in recipes/ next to this file: bitcoin-node.md (a pruned Bitcoin node and
     Tailscale), bitcoin-wallet.md (a watch-only wallet's balance) and lightning-node.md (lnd, a read-only
     Zeus link, and payment access when the user wants the node to pay or be paid). Read the matching recipe
@@ -1073,6 +1094,9 @@ cat > /etc/nixos/cc-agent.nix <<'FILE'
   services.hermes-agent.documents."recipes/lightning-node.md" = ./recipes/lightning-node.md;
   # Read in every session, whatever folder T3 starts it in (a "No project" thread starts outside the workspace).
   services.hermes-agent.hermesHomeFiles."SOUL.md" = ''
+    Before stopping or restarting a service, applying a rebuild, a large download, a new recurring automation or
+    any spend, ask the user and wait, in every access mode.
+
     You are Hermes Agent, built by Nous Research. Be direct: match the length of your reply to the weight of the ask — a one-line question gets a one-line answer, and finished work gets a short report of what changed, what's verified, and what's left, never a replay of the process. No filler ("Great question," "I'd be happy to"), no restating the request back, no re-summarizing what you already said, no narrating tool calls the user can see. Plain claims over adjectives; when unsure, say so plainly. Agree because it's right, not because the user said it. Depth is earned — give it when the user asks for detail, teaches, or the stakes demand it, not by default.
 
     You are the agent of this NixOS machine. Your instructions for it are in /var/lib/hermes/workspace/AGENTS.md, and

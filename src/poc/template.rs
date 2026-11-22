@@ -360,6 +360,91 @@ mod tests {
     }
 
     #[test]
+    fn template_requests_zero_retention_for_the_configured_endpoint() {
+        let step = &CONTROL_CENTER.steps[4];
+        let source = step.blocks.get("Do").unwrap();
+        let module = source
+            .split("cat > /etc/nixos/cc-hermes.nix <<'FILE'\n")
+            .nth(1)
+            .unwrap()
+            .split("\nFILE\n")
+            .next()
+            .unwrap();
+        let model = module.split("settings.model = {").nth(1).unwrap();
+        assert!(
+            model
+                .split("};")
+                .next()
+                .unwrap()
+                .contains("base_url = \"@ai_base_url@\";")
+        );
+        let custom = module
+            .split("settings.custom_providers = [ {")
+            .nth(1)
+            .unwrap();
+        let entry = custom.split("} ];").next().unwrap();
+        assert!(entry.contains("name = \"farseed-credit\";"));
+        assert!(entry.contains("base_url = \"@ai_base_url@\";"));
+        // Sessions saved or resumed under the named entry take their key from it.
+        assert!(entry.contains("key_env = \"CONTROL_CENTER_AI_KEY\";"));
+        assert!(entry.contains("extra_body = { provider = { zdr = true; }; };"));
+    }
+
+    #[test]
+    fn template_recipes_preserve_payment_and_copy_rules() {
+        let step = &CONTROL_CENTER.steps[5];
+        let recipes = step.blocks.get("Recipes").unwrap();
+        let payment = recipes
+            .split("**Payment access**")
+            .nth(1)
+            .unwrap()
+            .split("\nRECIPE\n")
+            .next()
+            .unwrap();
+        for required in [
+            "addinvoice --private",
+            "even for \"give me an invoice\"",
+            "peer's alias and public key",
+            "what you checked and what you couldn't check",
+            "For a user-supplied peer, show its alias and ask for confirmation",
+            "1% of the amount, rounded up to whole sat, at least 10 sat and at most 50 sat",
+            "node's fee estimate, never above 10 sat/vB or 2,000 sat total fee",
+            "Anything outside these defaults needs the user to state the number",
+            "One yes is for one command",
+            "journalctl -u lnd-backup-copy -n 5 --no-pager",
+            "`copied: <path>`",
+            "`ls -t /var/lib/farseed-files`; never compose a name",
+            "without waiting to be asked",
+            "Get a file from this machine",
+        ] {
+            assert!(
+                payment.contains(required),
+                "missing payment rule: {required}"
+            );
+        }
+        let source = step.blocks.get("Do").unwrap();
+        let approval = "Before stopping or restarting a service, applying a rebuild, a large download, a new recurring automation or\n    any spend, ask the user and wait, in every access mode.";
+        for document in ["documents.\"AGENTS.md\"", "hermesHomeFiles.\"SOUL.md\""] {
+            let body = source
+                .split(&format!("{document} = ''\n"))
+                .nth(1)
+                .unwrap()
+                .split("\n  '';")
+                .next()
+                .unwrap();
+            assert!(
+                body.contains(approval),
+                "missing approval rule in {document}"
+            );
+            if document.starts_with("documents.") {
+                assert!(body.contains("Put anything the user must copy (an address, an invoice, a file name, a link) alone in a code block."));
+            }
+        }
+        assert!(recipes.contains("contain the full link alone in a code block"));
+        assert!(recipes.contains("restart lnd, ask the user and wait first"));
+    }
+
+    #[test]
     fn vendored_template_blocks_have_launch_headroom() {
         // TargetRecord::validate accepts at most 64 machine-name bytes. Test both
         // supported target privilege routes, including the larger sudo wrapper.
