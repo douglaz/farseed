@@ -191,6 +191,11 @@ pub fn resolve<S: crate::store::Storage>(
     let record = store
         .poc_target(machine)
         .ok_or("machine has no stored target or pin")?;
+    let unavailable = "The machine connection is unavailable. Try again.";
+    let value = serde_json::to_value(record).map_err(|_| unavailable)?;
+    if !crate::poc::inference::safe(store, &value, &[]) {
+        return Err(unavailable.into());
+    }
     let pins = StoredPins::from_record(record)?;
     let target = Target {
         machine: record.machine.clone(),

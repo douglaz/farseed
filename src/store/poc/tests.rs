@@ -183,6 +183,101 @@ fn evidence(s: &mut Store<MemoryStorage>, task: &Task, record: crate::jobs::Reco
 }
 
 #[test]
+fn download_path_refuses_current_credentials_without_transmission_or_echo() {
+    let mut store = ready();
+    let email = "private-file-owner@example.invalid";
+    store.hold_test_credential(email.as_bytes());
+    for credential in ["fixture-account-private-value", email] {
+        for directory in ["/tmp", crate::poc::files::DIRECTORY] {
+            let path = format!("{directory}/{credential}.txt");
+            assert!(crate::poc::files::allowed_path(&path));
+            let mut sent = Vec::new();
+            let result = store
+                .check_transmitted_path(&path)
+                .map(|()| sent.push(path.clone()));
+            assert_eq!(result.unwrap_err(), "This file path cannot be downloaded.");
+            assert!(sent.is_empty());
+        }
+    }
+}
+
+#[test]
+fn download_path_rechecks_an_offer_admitted_before_credential_custody() {
+    let mut store = ready();
+    let task = create_task(&mut store);
+    let task = change(&mut store, &task, Change::Request);
+    let credential = "later-held-owner@example.invalid";
+    let path = format!("/tmp/{credential}.txt");
+    let task = change(
+        &mut store,
+        &task,
+        Change::Propose {
+            call_id: "file".into(),
+            tool: Tool::OfferFile {
+                machine: task.machine.clone(),
+                path: path.clone(),
+                label: "Requested file".into(),
+                why: "Save the requested file".into(),
+            },
+        },
+    );
+    let mut store = reopen(&store);
+    let offer = store.poc_task(&task.id).unwrap().file_offers().remove(0);
+    assert_eq!(offer.path, path);
+    assert!(store.check_transmitted_path(&offer.path).is_ok());
+
+    store.hold_test_credential(credential.as_bytes());
+    let mut sent = Vec::new();
+    let result = store
+        .check_transmitted_path(&offer.path)
+        .map(|()| sent.push(offer.path.clone()));
+    assert_eq!(result.unwrap_err(), "This file path cannot be downloaded.");
+    assert!(sent.is_empty());
+    assert_eq!(
+        store.poc_task(&task.id).unwrap().file_offers()[0].path,
+        path
+    );
+}
+
+#[test]
+fn download_path_rechecks_credentials_admitted_during_connection_setup() {
+    for path in [
+        "/tmp/later-download-key.txt",
+        "/var/lib/farseed-files/later-download-key.txt",
+    ] {
+        let mut store = ready();
+        store.check_transmitted_path(path).unwrap();
+
+        // Connection setup can yield after the entry-point check. New credential
+        // custody need not end the session (as with browser inference configuration).
+        let session = store.sessions[0].identity.clone();
+        store.hold_test_credential(b"later-download-key");
+        assert!(store.check_connection_session_for("fixture", None).is_ok());
+        assert_eq!(store.sessions[0].identity, session);
+        assert_eq!(
+            store.check_transmitted_path(path).unwrap_err(),
+            "This file path cannot be downloaded."
+        );
+    }
+}
+
+#[test]
+fn download_path_passes_clean_bytes_unchanged() {
+    let store = ready();
+    for path in [
+        "/tmp/requested file.txt",
+        "/var/lib/farseed-files/archive.tar",
+    ] {
+        let mut sent = Vec::new();
+        store
+            .check_transmitted_path(path)
+            .map(|()| sent.push(path.to_owned()))
+            .unwrap();
+        assert_eq!(sent, [path]);
+    }
+}
+
+#[test]
 fn poc_request_restores_useful_facts_without_seed_allocation_associations() {
     use base64::Engine;
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};

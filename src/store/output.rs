@@ -2,6 +2,19 @@
 use super::*;
 
 impl<S: Storage> Store<S> {
+    /// Refuse paths changed by the current held-credential publication boundary.
+    pub fn check_transmitted_path(&self, path: &str) -> Result<(), String> {
+        let value = Value::String(path.into());
+        if self
+            .protect_publication(&value, &[])
+            .is_ok_and(|safe| safe == value)
+        {
+            Ok(())
+        } else {
+            Err("This file path cannot be downloaded.".into())
+        }
+    }
+
     /// Check original string bytes and field names before serializing an output value.
     pub fn protect_output(&self, value: &Value) -> Result<Value, String> {
         self.protect_output_with(value, &[])

@@ -1141,6 +1141,7 @@ async fn private_file_read(
     journal: &mut impl BoundJournal,
     target: &Target,
     script: impl FnOnce(jobs::Elevation) -> String,
+    path: Option<&str>,
     output_limit: usize,
 ) -> Result<(zeroize::Zeroizing<Vec<u8>>, Option<u32>), String> {
     use zeroize::Zeroizing;
@@ -1196,10 +1197,24 @@ async fn private_file_read(
         journal.current(&session).await.map_err(|_| UNAVAILABLE)?;
         let mut channel = ssh.channel_open_session().await.map_err(|_| UNAVAILABLE)?;
         journal.current(&session).await.map_err(|_| UNAVAILABLE)?;
-        channel
-            .exec(true, script(elevation).as_bytes())
-            .await
-            .map_err(|_| UNAVAILABLE)?;
+        {
+            let local = crate::worker::local();
+            let mut local = local.lock().await;
+            if let Some(path) = path {
+                local
+                    .store()
+                    .ok_or(UNAVAILABLE)?
+                    .check_transmitted_path(path)
+                    .map_err(|_| "This file path cannot be downloaded.")?;
+            }
+            // Recheck the original bytes after connection waits. Keep the writer
+            // through enqueue, so configuring inference cannot change custody even
+            // if the channel's send queue yields. No wait separates check and exec.
+            channel
+                .exec(true, script(elevation).as_bytes())
+                .await
+                .map_err(|_| UNAVAILABLE)?;
+        }
         let mut output = Zeroizing::new(Vec::new());
         let mut status = None;
         let mut closed = false;
@@ -1268,6 +1283,7 @@ pub(crate) async fn download_file_with_confinement(
                 jobs::file_read(path, elevation)
             }
         },
+        Some(path),
         1_420_000,
     )
     .await?;
@@ -1320,7 +1336,8 @@ pub(crate) async fn list_files(
     journal: &mut impl BoundJournal,
     target: &Target,
 ) -> Result<crate::poc::files::Listing, String> {
-    let (output, status) = private_file_read(pins, journal, target, jobs::file_list, 8192).await?;
+    let (output, status) =
+        private_file_read(pins, journal, target, jobs::file_list, None, 8192).await?;
     if status != Some(0) {
         return Err(
             "The files could not be listed. Check the machine connection and try again.".into(),

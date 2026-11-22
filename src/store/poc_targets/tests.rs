@@ -52,6 +52,34 @@ fn enroll(store: &mut Store<MemoryStorage>) {
 }
 
 #[test]
+fn poc_targets_resolution_refuses_later_held_connection_fields() {
+    let target = enrollment().target;
+    for (field, credential) in [
+        ("username", target.user.as_str()),
+        ("host", target.host.as_str()),
+        ("relay", target.relay.as_str()),
+        ("machine", target.machine.as_str()),
+        ("profile", target.profile.as_str()),
+        ("pin", target.pin.as_str()),
+        ("port", "22"),
+        ("elevation", "none"),
+    ] {
+        let mut store = ready();
+        enroll(&mut store);
+        let mut store = reopen(&store).unwrap();
+        assert!(crate::poc::targets::resolve(&store, &target.machine).is_ok());
+
+        store.hold_test_credential(credential.as_bytes());
+        let refusal = match crate::poc::targets::resolve(&store, &target.machine) {
+            Err(why) => why,
+            Ok(_) => panic!("later-held {field} was accepted for connection"),
+        };
+        assert_eq!(refusal, "The machine connection is unavailable. Try again.");
+        assert_eq!(store.poc_target(&target.machine), Some(&target));
+    }
+}
+
+#[test]
 fn poc_targets_atomic_encrypted_enrollment_replay_and_public_identity() {
     let mut store = ready();
     enroll(&mut store);

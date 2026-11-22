@@ -1557,6 +1557,7 @@ pub async fn poc_download(
             if !crate::poc::files::allowed_path(&file.path) {
                 return Err("This file path cannot be downloaded.".into());
             }
+            store.check_transmitted_path(&file.path)?;
             let (target, pins) = crate::poc::targets::resolve(store, &file.machine)
                 .map_err(|_| "The machine connection is unavailable. Try again.")?;
             (file, target, pins)
@@ -1675,6 +1676,7 @@ pub async fn poc_machine_download(
             let store = writer
                 .store()
                 .ok_or("Unlock before downloading the file.")?;
+            store.check_transmitted_path(&path)?;
             store
                 .check_connection_session_for(&machine, None)
                 .map_err(|_| crate::poc::files::LIVE_SESSION_REQUIRED)?;
