@@ -12,6 +12,21 @@ pub(crate) struct MachineKey {
     pub expires: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetirementState {
+    Needed,
+    Pending,
+    Failed,
+    Revoked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Retirement {
+    pub key: MachineKey,
+    pub state: RetirementState,
+}
+
 pub(crate) struct Entry {
     pub task: String,
     pub call: String,
@@ -32,6 +47,16 @@ pub(crate) enum Preparation {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub(crate) enum Record {
+    PlanRetirement {
+        task: String,
+        expected: u64,
+        key: MachineKey,
+    },
+    Retirement {
+        task: String,
+        issuer_id: String,
+        state: RetirementState,
+    },
     Request {
         task: String,
         call: String,
@@ -60,6 +85,68 @@ pub(crate) fn command(path: &str, bytes: usize) -> String {
     )
 }
 impl<S: Storage> Store<S> {
+    pub(crate) fn ai_key_retirements_for(&self, task: &poc::Task) -> Option<&Retirement> {
+        self.ai_key_retirements.get(&task.id)
+    }
+
+    /// Opening old stores is read-only. Resuming an unfinished v1 renewal explicitly
+    /// records its replacement and upgrades that task before any further machine work.
+    #[cfg(any(target_arch = "wasm32", test))]
+    pub(crate) async fn prepare_key_retirement(
+        &mut self,
+        task: &poc::Task,
+    ) -> Result<poc::Task, String> {
+        if task.template.as_deref() != Some(crate::poc::key_renewal::LEGACY_ID) || task.ended() {
+            return Ok(task.clone());
+        }
+        let key = self
+            .installed_hermes_key(&task.machine)
+            .cloned()
+            .ok_or("installed Hermes key missing")?;
+        self.ai_key_commit(Record::PlanRetirement {
+            task: task.id.clone(),
+            expected: task.revision,
+            key,
+        })
+        .await?;
+        self.poc_task(&task.id)
+    }
+
+    /// Live ownership guard; replay checks durable transition shape without live authority.
+    pub(crate) fn check_key_retirement(&self, task: &poc::Task) -> Result<(), String> {
+        if self.poc_task(&task.id)? != *task {
+            return Err("key retirement task changed".into());
+        }
+        let old = &self
+            .ai_key_retirements_for(task)
+            .ok_or("key retirement missing")?
+            .key;
+        let current = self
+            .installed_hermes_key(&task.machine)
+            .ok_or("installed key missing")?;
+        let own = self
+            .ai_key(&task.id, crate::poc::key_renewal::KEY)
+            .ok_or("new key missing")?;
+        if !crate::poc::key_renewal::checked(task)
+            || task.ended()
+            || current.name != own.mint.name
+            || old.record_id == current.record_id
+            || old.path == current.path
+            || !self.poc_targets.get(&task.machine).is_some_and(|record| record.application_inference_keys.contains(old))
+            || self.ai_keys.iter().any(|entry| entry.mint.name == old.name && self.poc.get(&entry.task).is_some_and(|user| {
+                !user.ended() && !self.ended_sessions.contains(&user.start_session)
+            }))
+            || self.poc.values().any(|user| user.id != task.id && user.machine == task.machine
+                && !user.ended() && !self.ended_sessions.contains(&user.start_session)
+                && user.proposal.iter().map(|proposal| &proposal.tool)
+                    .chain(user.completed.iter().map(|(_, tool, _)| tool))
+                    .any(|tool| matches!(tool, crate::goals::Tool::Exec { command, .. } if command.contains(&old.path))))
+        {
+            return Err("replaced key is still in use or belongs to another task".into());
+        }
+        Ok(())
+    }
+
     /// Re-evaluate durable custody on every Resume, before considering another mint.
     #[cfg(any(target_arch = "wasm32", test))]
     pub(crate) fn ai_key_preparation(&self, task: &poc::Task) -> Result<Preparation, String> {
@@ -123,6 +210,44 @@ impl<S: Storage> Store<S> {
     }
     fn validate_ai_key(&self, record: &Record) -> Result<(), String> {
         match record {
+            Record::PlanRetirement {
+                task,
+                expected,
+                key,
+            } => {
+                let task = self.poc_task(task)?;
+                if task.template.as_deref() != Some(crate::poc::key_renewal::LEGACY_ID)
+                    || task.ended()
+                    || task.revision != *expected
+                    || self.ai_key_retirements.contains_key(&task.id)
+                    || self.installed_hermes_key(&task.machine) != Some(key)
+                    || task.revision == u64::MAX
+                {
+                    return Err("legacy key retirement plan refused".into());
+                }
+            }
+            Record::Retirement {
+                task,
+                issuer_id,
+                state,
+            } => {
+                let task = self.poc_task(task)?;
+                let retirement = self
+                    .ai_key_retirements_for(&task)
+                    .ok_or("key retirement missing")?;
+                if issuer_id != &retirement.key.record_id
+                    || !crate::poc::key_renewal::checked(&task)
+                    || task.ended()
+                    || task.pending.is_some()
+                    || (retirement.state == RetirementState::Revoked
+                        && *state != RetirementState::Revoked)
+                    || *state == RetirementState::Needed
+                    || (*state != RetirementState::Pending
+                        && retirement.state != RetirementState::Pending)
+                {
+                    return Err("key retirement transition refused".into());
+                }
+            }
             Record::Request {
                 task,
                 call,
@@ -198,6 +323,24 @@ impl<S: Storage> Store<S> {
     pub(super) fn replay_ai_key(&mut self, record: &Record) -> Result<(), String> {
         self.validate_ai_key(record)?;
         match record {
+            Record::PlanRetirement { task, key, .. } => {
+                let current = self.poc.get_mut(task).expect("validated legacy renewal");
+                current.template = Some(crate::poc::key_renewal::ID.into());
+                current.revision += 1;
+                self.ai_key_retirements.insert(
+                    task.clone(),
+                    Retirement {
+                        key: key.clone(),
+                        state: RetirementState::Needed,
+                    },
+                );
+            }
+            Record::Retirement { task, state, .. } => {
+                self.ai_key_retirements
+                    .get_mut(task)
+                    .expect("validated retirement")
+                    .state = *state;
+            }
             Record::Request {
                 task,
                 call,
@@ -252,6 +395,15 @@ impl<S: Storage> Store<S> {
         self.credit_ready()?;
         self.validate_ai_key(&record)?;
         match &record {
+            Record::PlanRetirement { task, .. } => {
+                let task = self.poc_task(task)?;
+                self.poc_authority(&task.id, &task.start_session)?;
+            }
+            Record::Retirement { task, .. } => {
+                let task = self.poc_task(task)?;
+                self.poc_authority(&task.id, &task.start_session)?;
+                self.check_key_retirement(&task)?;
+            }
             Record::Request { task, .. } => {
                 self.poc_authority(task, &self.poc_task(task)?.start_session)?;
             }

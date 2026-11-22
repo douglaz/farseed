@@ -65,6 +65,19 @@ const page = new vm.SourceTextModule(`${prefix}\nconst worker = firstWorker; ren
 });
 await page.link(() => { throw new Error('Unexpected page import'); });
 await page.evaluate();
+if (payload.renewalProbe) {
+  const tasks = all(elements.get('tau-tasks'));
+  assert(tasks.some(element => element.textContent === payload.expectedSentence));
+  const resume = tasks.filter(element => element.tag === 'button' && element.textContent === 'Resume');
+  assert.equal(resume.length, payload.tasks[0].status === 'complete' ? 0 : 1);
+  if (resume.length) {
+    assert.equal(resume[0].disabled, false);
+    resume[0].listeners.click();
+    assert.equal(messages[0].task.id, payload.tasks[0].id);
+    assert.equal(messages[0].task.action, 'resume');
+  }
+  return;
+}
 const setup = all(elements.get('tau-setup'));
 const taskSetup = all(elements.get('tau-task-setup'));
 const tasks = all(elements.get('tau-tasks'));

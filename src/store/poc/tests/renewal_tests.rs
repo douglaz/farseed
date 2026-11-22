@@ -6,6 +6,9 @@ fn starting_session() -> (Store<MemoryStorage>, Task, Task) {
     renewal_session(true)
 }
 fn renewal_session(approve: bool) -> (Store<MemoryStorage>, Task, Task) {
+    renewal_session_mode(approve, false)
+}
+fn renewal_session_mode(approve: bool, legacy: bool) -> (Store<MemoryStorage>, Task, Task) {
     let mut store = ready();
     block_on(store.credit_install(&crate::poc::credit::AccountRecord::from_response(
         201, &json!({"success":true,"credit_id":"synthetic-credit-account","api_key":"synthetic-default-key"}),
@@ -46,7 +49,19 @@ fn renewal_session(approve: bool) -> (Store<MemoryStorage>, Task, Task) {
     .unwrap();
     let goal = block_on(store.poc_start(&session)).unwrap();
     assert!(goal.proposal.is_none());
-    let renewal = block_on(store.poc_renew_ai_key("fixture", &session, &"a".repeat(48))).unwrap();
+    let renewal = if legacy {
+        let record = Record::RenewAiKey {
+            id: "a".repeat(48),
+            session: session.clone(),
+            limits: Limits::default(),
+            replacement: None,
+        };
+        let number = block_on(store.commit(&Event::Poc(record.clone()))).unwrap();
+        store.apply_poc(number, &record).unwrap();
+        store.poc_task(&"a".repeat(48)).unwrap()
+    } else {
+        block_on(store.poc_renew_ai_key("fixture", &session, &"a".repeat(48))).unwrap()
+    };
     let renewal = if approve {
         change(
             &mut store,
@@ -201,6 +216,16 @@ fn poc_ai_key_renewal_starting_goal_requirements_approval_then_resume_creates() 
 struct CreditService {
     names: BTreeMap<String, std::collections::BTreeSet<String>>,
     requests: usize,
+    keys: BTreeMap<String, (String, String, bool)>,
+    deletes: Vec<String>,
+    events: Vec<String>,
+    delete_failure: bool,
+    delete_lost: bool,
+    list_failure: bool,
+    omit_deleted_at: bool,
+    hide_old_from_list: bool,
+    unrelated_delete_404: Option<&'static [u8]>,
+    list_responses: std::collections::VecDeque<Value>,
 }
 
 #[test]
@@ -272,6 +297,10 @@ impl CreditService {
         {
             return (409, json!({"status":"error","error":"duplicate name"}));
         }
+        self.keys.insert(
+            format!("key-{}", self.requests),
+            (account.into(), name.into(), false),
+        );
         (
             201,
             json!({"status":"success","data":{
@@ -303,9 +332,20 @@ struct MintRuntime {
 }
 impl MintRuntime {
     fn new(store: Store<MemoryStorage>) -> Self {
+        let mut service = CreditService::default();
+        for key in store
+            .poc_targets
+            .values()
+            .flat_map(|target| &target.application_inference_keys)
+        {
+            service.keys.insert(
+                key.record_id.clone(),
+                ("operator".into(), key.name.clone(), false),
+            );
+        }
         Self {
             store,
-            service: CreditService::default(),
+            service,
             revision: Cell::new(0),
             continuation: Rc::new(crate::lifecycle::Authority::default())
                 .continuation()
@@ -678,9 +718,27 @@ fn poc_ai_key_renewal_whole_journal_replays_with_unchanged_projection() {
                 &task.start_session,
             ))
             .unwrap();
+            if completed
+                .completed
+                .last()
+                .is_some_and(|(call, _, _)| call == crate::poc::key_renewal::CHECK)
+            {
+                assert!(
+                    !completed.ended(),
+                    "Hermes passing must still retire the replaced key"
+                );
+                assert!(completed.verdict.is_none());
+                block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+                    runtime: &mut runtime,
+                    task: completed.clone(),
+                    account: "operator",
+                }))
+                .unwrap();
+                runtime.checkpoint("old key revoked");
+            }
         }
         assert_eq!(completed.status, Status::Complete);
-        assert_eq!(completed.completed.len(), 6);
+        assert_eq!(completed.completed.len(), 7);
         assert_eq!(runtime.service.requests, 1);
         assert_eq!(runtime.writes, 1);
         // Each prefix comes from the final encrypted journal; replay re-runs the
@@ -698,4 +756,1156 @@ fn poc_ai_key_renewal_whole_journal_replays_with_unchanged_projection() {
         }
         assert_eq!(reopen(&runtime.store).poc, runtime.store.poc);
     }
+}
+
+struct RetireRuntime<'a> {
+    runtime: &'a mut MintRuntime,
+    task: Task,
+    account: &'a str,
+}
+impl crate::poc::key_renewal::RetirementRuntime for RetireRuntime<'_> {
+    async fn retirement(&mut self) -> Result<crate::store::ai_keys::Retirement, String> {
+        self.runtime.store.check_key_retirement(&self.task)?;
+        self.runtime
+            .store
+            .ai_key_retirements_for(&self.task)
+            .cloned()
+            .ok_or("retirement missing".into())
+    }
+    async fn record(
+        &mut self,
+        state: crate::store::ai_keys::RetirementState,
+    ) -> Result<(), String> {
+        let issuer_id = self
+            .runtime
+            .store
+            .ai_key_retirements_for(&self.task)
+            .unwrap()
+            .key
+            .record_id
+            .clone();
+        self.runtime
+            .store
+            .ai_key_commit(KeyRecord::Retirement {
+                task: self.task.id.clone(),
+                issuer_id,
+                state,
+            })
+            .await
+    }
+    async fn list(&mut self) -> Result<(u16, Value), String> {
+        let service = &mut self.runtime.service;
+        service.events.push("GET".into());
+        if service.list_failure {
+            return Err("lost GET".into());
+        }
+        if let Some(value) = service.list_responses.pop_front() {
+            return Ok((200, value));
+        }
+        Ok((
+            200,
+            json!({"status":"success","data":service.keys.iter()
+            .filter(|(id, (account, _, _))| account == self.account && !(service.hide_old_from_list && *id == "setup-key"))
+            .map(|(id, (_, name, deleted))| {
+                let mut key = json!({"_id":id,"name":name});
+                if !service.omit_deleted_at {
+                    key["deleted_at"] = json!(deleted.then_some("2026-11-22T00:00:00Z"));
+                }
+                key
+            })
+            .collect::<Vec<_>>()}),
+        ))
+    }
+    async fn delete(&mut self, id: &str) -> Result<u16, String> {
+        self.runtime.store.check_key_retirement(&self.task)?;
+        let retirement = self
+            .runtime
+            .store
+            .ai_key_retirements_for(&self.task)
+            .unwrap();
+        if retirement.key.record_id != id
+            || retirement.state != crate::store::ai_keys::RetirementState::Pending
+        {
+            return Err("retirement identity or state changed".into());
+        }
+        let service = &mut self.runtime.service;
+        service.events.push(format!("DELETE {id}"));
+        service.deletes.push(id.into());
+        let Some((owner, _, deleted)) = service.keys.get_mut(id) else {
+            return Ok(404);
+        };
+        if owner != self.account {
+            return Ok(403);
+        }
+        if service.delete_failure {
+            return Ok(503);
+        }
+        if let Some(body) = service.unrelated_delete_404 {
+            // Match the browser transport: these statuses need no JSON body.
+            if crate::poc::key_renewal::delete_status_without_body(404) {
+                return Ok(404);
+            }
+            crate::poc::credit::decode(body)?;
+            return Ok(404);
+        }
+        *deleted = true;
+        if service.delete_lost {
+            return Err("lost DELETE response".into());
+        }
+        Ok(200)
+    }
+}
+
+/// Drive all real proposals/settlements through CHECK, with fake machine output only.
+fn checked_renewal(pass: bool) -> (MintRuntime, Task) {
+    checked_renewal_mode(pass, false)
+}
+fn checked_renewal_mode(pass: bool, legacy: bool) -> (MintRuntime, Task) {
+    let (store, _, task) = renewal_session_mode(true, legacy);
+    let mut runtime = MintRuntime::new(store);
+    let mut task = block_on(run::resume(
+        &mut runtime,
+        &mut run::Unconfigured,
+        &task.id,
+        &task.start_session,
+    ))
+    .unwrap();
+    loop {
+        let (call, tool, origin) = crate::poc::key_renewal::next(&runtime.store, &task).unwrap();
+        let checking = call == crate::poc::key_renewal::CHECK;
+        let stdout = if call.starts_with(crate::poc::key_renewal::WAIT) {
+            "REBUILD OK fixture"
+        } else if checking && pass {
+            "CHECKS hermes PASS"
+        } else {
+            ""
+        };
+        let requesting = block_on(runtime.change(&task, Change::Request)).unwrap();
+        let proposal =
+            block_on(runtime.propose(&requesting, &task.start_session, call, tool, origin))
+                .unwrap();
+        append(&mut runtime.store, &proposal, &task.start_session);
+        let pending = runtime.store.poc_task(&task.id).unwrap();
+        evidence(
+            &mut runtime.store,
+            &pending,
+            record(
+                &pending,
+                Some(if checking && !pass { 1 } else { 0 }),
+                stdout,
+            ),
+        );
+        task = block_on(run::resume(
+            &mut runtime,
+            &mut run::Unconfigured,
+            &task.id,
+            &task.start_session,
+        ))
+        .unwrap();
+        if checking {
+            return (runtime, task);
+        }
+    }
+}
+
+#[test]
+fn poc_ai_key_renewal_retirement_only_after_check_and_never_new_key() {
+    use crate::poc::key_renewal::retire;
+    let (store, _, task) = starting_session();
+    let mut runtime = MintRuntime::new(store);
+    let created = block_on(run::resume(
+        &mut runtime,
+        &mut run::Unconfigured,
+        &task.id,
+        &task.start_session,
+    ))
+    .unwrap();
+    assert!(
+        block_on(retire(&mut RetireRuntime {
+            runtime: &mut runtime,
+            task: created,
+            account: "operator"
+        }))
+        .is_err()
+    );
+    assert!(
+        runtime.service.events.is_empty(),
+        "no credit requests before the Hermes check"
+    );
+    let (mut runtime, task) = checked_renewal(false);
+    assert!(
+        block_on(retire(&mut RetireRuntime {
+            runtime: &mut runtime,
+            task,
+            account: "operator"
+        }))
+        .is_err()
+    );
+    assert!(runtime.service.deletes.is_empty());
+    let (mut runtime, task) = checked_renewal(true);
+    assert!(!task.ended());
+    let retirement = runtime.store.ai_key_retirements_for(&task).unwrap().clone();
+    assert_eq!(retirement.key.record_id, "setup-key");
+    let new = runtime.store.poc_targets[&task.machine]
+        .application_inference_keys
+        .last()
+        .unwrap()
+        .record_id
+        .clone();
+    block_on(retire(&mut RetireRuntime {
+        runtime: &mut runtime,
+        task: task.clone(),
+        account: "operator",
+    }))
+    .unwrap();
+    assert_eq!(runtime.service.deletes, ["setup-key"]);
+    assert!(!runtime.service.keys[&new].2);
+    let (call, tool, _) = crate::poc::key_renewal::next(&runtime.store, &task).unwrap();
+    assert!(call.starts_with(crate::poc::key_renewal::REMOVE));
+    assert!(
+        matches!(tool, Tool::Exec {command, ..} if command == crate::poc::key_renewal::remove_command(&retirement.key))
+    );
+}
+
+#[test]
+fn poc_ai_key_renewal_retirement_failure_and_lost_response_resume_without_blind_delete() {
+    use crate::poc::key_renewal::{RETIRE_FAILED, retire};
+    use crate::store::ai_keys::RetirementState;
+    for lost in [false, true] {
+        let (mut runtime, task) = checked_renewal(true);
+        runtime.service.delete_failure = !lost;
+        runtime.service.delete_lost = lost;
+        let error = block_on(retire(&mut RetireRuntime {
+            runtime: &mut runtime,
+            task: task.clone(),
+            account: "operator",
+        }))
+        .unwrap_err();
+        assert_eq!(error, RETIRE_FAILED);
+        assert_eq!(
+            runtime.store.ai_key_retirements_for(&task).unwrap().state,
+            RetirementState::Failed
+        );
+        let paused = change(&mut runtime.store, &task, Change::Pause(error));
+        assert_eq!(paused.view()["pause_reason"], RETIRE_FAILED);
+        assert!(paused.verdict.is_none());
+        runtime.store = reopen(&runtime.store);
+        fresh(&mut runtime.store);
+        runtime.service.list_failure = true;
+        assert!(
+            block_on(retire(&mut RetireRuntime {
+                runtime: &mut runtime,
+                task: paused.clone(),
+                account: "operator"
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            runtime.service.deletes.len(),
+            1,
+            "failed read never authorizes a retry"
+        );
+        runtime.service.list_failure = false;
+        runtime.service.delete_failure = false;
+        runtime.service.delete_lost = false;
+        block_on(retire(&mut RetireRuntime {
+            runtime: &mut runtime,
+            task: paused,
+            account: "operator",
+        }))
+        .unwrap();
+        assert_eq!(runtime.service.deletes.len(), if lost { 1 } else { 2 });
+        for (index, event) in runtime.service.events.iter().enumerate() {
+            if event.starts_with("DELETE") {
+                assert_eq!(runtime.service.events[index - 1], "GET");
+            }
+        }
+    }
+}
+
+#[test]
+fn poc_ai_key_renewal_reload_mid_revoke_reconciles_pending() {
+    use crate::poc::key_renewal::{RetirementRuntime, retire};
+    use crate::store::ai_keys::RetirementState;
+    for sent in [false, true] {
+        let (mut runtime, task) = checked_renewal(true);
+        let mut adapter = RetireRuntime {
+            runtime: &mut runtime,
+            task: task.clone(),
+            account: "operator",
+        };
+        block_on(adapter.record(RetirementState::Pending)).unwrap();
+        if sent {
+            block_on(adapter.list()).unwrap();
+            assert_eq!(block_on(adapter.delete("setup-key")).unwrap(), 200);
+        }
+        runtime.store = reopen(&runtime.store);
+        assert_eq!(
+            runtime.store.ai_key_retirements_for(&task).unwrap().state,
+            RetirementState::Pending
+        );
+        fresh(&mut runtime.store);
+        block_on(retire(&mut RetireRuntime {
+            runtime: &mut runtime,
+            task: task.clone(),
+            account: "operator",
+        }))
+        .unwrap();
+        assert_eq!(runtime.service.deletes, ["setup-key"]);
+        let calls = runtime.service.events.len();
+        block_on(retire(&mut RetireRuntime {
+            runtime: &mut runtime,
+            task,
+            account: "operator",
+        }))
+        .unwrap();
+        assert_eq!(
+            runtime.service.events.len(),
+            calls,
+            "revoked record avoids another request"
+        );
+    }
+}
+
+#[test]
+fn poc_ai_key_renewal_r3_unrelated_404_stays_failed_and_retries_fresh() {
+    use crate::poc::key_renewal::{RETIRE_FAILED, next, retire};
+    use crate::store::ai_keys::RetirementState;
+    for omit_deleted_at in [false, true] {
+        let (mut runtime, mut task) = checked_renewal(true);
+        runtime.service.omit_deleted_at = omit_deleted_at;
+        let completed = task.completed.clone();
+        let old = runtime
+            .store
+            .ai_key_retirements_for(&task)
+            .unwrap()
+            .key
+            .clone();
+        for body in [
+            b"".as_slice(),
+            b"<html>Cannot DELETE /keys/setup-key</html>".as_slice(),
+        ] {
+            runtime.service.unrelated_delete_404 = Some(body);
+            let error = block_on(retire(&mut RetireRuntime {
+                runtime: &mut runtime,
+                task: task.clone(),
+                account: "operator",
+            }))
+            .unwrap_err();
+            assert_eq!(error, RETIRE_FAILED);
+            assert!(error.contains("old key's revocation is not confirmed"));
+            assert_eq!(
+                runtime.store.ai_key_retirements_for(&task).unwrap().state,
+                RetirementState::Failed
+            );
+            assert!(
+                !runtime.service.keys["setup-key"].2,
+                "the issuer still holds the live key"
+            );
+            assert!(
+                next(&runtime.store, &task).is_err(),
+                "no old-file removal is dispatched"
+            );
+            task = change(&mut runtime.store, &task, Change::Pause(error));
+            assert_eq!(task.completed, completed, "no removal outcome is recorded");
+            assert!(task.pending.is_none());
+            assert!(task.verdict.is_none());
+            assert_eq!(
+                runtime.store.ai_key_retirements_for(&task).unwrap().key,
+                old
+            );
+            runtime.store = reopen(&runtime.store);
+            fresh(&mut runtime.store);
+        }
+        assert_eq!(
+            runtime.service.events,
+            [
+                "GET",
+                "DELETE setup-key",
+                "GET",
+                "GET",
+                "DELETE setup-key",
+                "GET"
+            ]
+        );
+        runtime.service.unrelated_delete_404 = None;
+        block_on(retire(&mut RetireRuntime {
+            runtime: &mut runtime,
+            task: task.clone(),
+            account: "operator",
+        }))
+        .unwrap();
+        assert_eq!(&runtime.service.events[6..], ["GET", "DELETE setup-key"]);
+        assert_eq!(
+            runtime.store.ai_key_retirements_for(&task).unwrap().state,
+            RetirementState::Revoked
+        );
+    }
+}
+
+#[test]
+fn poc_ai_key_renewal_r3_complete_absence_and_delete_404_is_revoked() {
+    let (mut runtime, task) = checked_renewal(true);
+    runtime.service.keys.remove("setup-key");
+    block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+        runtime: &mut runtime,
+        task: task.clone(),
+        account: "operator",
+    }))
+    .unwrap();
+    assert_eq!(runtime.service.events, ["GET", "DELETE setup-key"]);
+    assert_eq!(
+        runtime.store.ai_key_retirements_for(&task).unwrap().state,
+        crate::store::ai_keys::RetirementState::Revoked
+    );
+}
+
+#[test]
+fn poc_ai_key_renewal_r3_incomplete_absence_404_needs_confirmation() {
+    use crate::store::ai_keys::RetirementState;
+    for paginated in [false, true] {
+        for confirmation in ["revoked", "live", "absent", "incomplete", "malformed"] {
+            let (mut runtime, task) = checked_renewal(true);
+            runtime.service.unrelated_delete_404 = Some(b"");
+            let keys = (0..if paginated { 1 } else { 129 })
+                .map(|i| json!({"_id":format!("extra-{i}"), "name":format!("extra-name-{i}")}))
+                .collect::<Vec<_>>();
+            let mut listing = json!({"status":"success", "data": keys});
+            if paginated {
+                listing["has_more"] = json!(true);
+            }
+            runtime.service.list_responses.push_back(listing.clone());
+            let confirmed = match confirmation {
+                "revoked" | "live" => {
+                    listing["data"].as_array_mut().unwrap().push(json!({"_id":"setup-key", "name":runtime.service.keys["setup-key"].1, "deleted_at": if confirmation == "revoked" { json!("2026-11-22T00:00:00Z") } else { Value::Null }}));
+                    listing
+                }
+                "absent" => json!({"status":"success", "data":[]}),
+                "incomplete" => listing,
+                _ => json!({"status":"success", "data":null}),
+            };
+            runtime.service.list_responses.push_back(confirmed);
+            let result = block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+                runtime: &mut runtime,
+                task: task.clone(),
+                account: "operator",
+            }));
+            let revoked = matches!(confirmation, "revoked" | "absent");
+            assert_eq!(
+                result.is_ok(),
+                revoked,
+                "paginated={paginated}, confirmation={confirmation}"
+            );
+            assert_eq!(runtime.service.events, ["GET", "DELETE setup-key", "GET"]);
+            assert_eq!(
+                runtime.store.ai_key_retirements_for(&task).unwrap().state,
+                if revoked {
+                    RetirementState::Revoked
+                } else {
+                    RetirementState::Failed
+                }
+            );
+            assert!(task.verdict.is_none());
+        }
+    }
+}
+
+#[test]
+fn poc_ai_key_renewal_r3_delete_200_is_revoked() {
+    let (mut runtime, task) = checked_renewal(true);
+    block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+        runtime: &mut runtime,
+        task: task.clone(),
+        account: "operator",
+    }))
+    .unwrap();
+    assert_eq!(runtime.service.events, ["GET", "DELETE setup-key"]);
+    assert_eq!(
+        runtime.store.ai_key_retirements_for(&task).unwrap().state,
+        crate::store::ai_keys::RetirementState::Revoked
+    );
+}
+
+#[test]
+fn poc_ai_key_renewal_r2_missing_deleted_at_sends_delete() {
+    let (mut runtime, task) = checked_renewal(true);
+    runtime.service.omit_deleted_at = true;
+    block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+        runtime: &mut runtime,
+        task: task.clone(),
+        account: "operator",
+    }))
+    .unwrap();
+    assert_eq!(runtime.service.events, ["GET", "DELETE setup-key"]);
+    assert_eq!(
+        runtime.store.ai_key_retirements_for(&task).unwrap().state,
+        crate::store::ai_keys::RetirementState::Revoked
+    );
+}
+
+#[test]
+fn poc_ai_key_renewal_r2_absent_id_sends_delete_for_200_and_404() {
+    for absent_on_server in [false, true] {
+        let (mut runtime, task) = checked_renewal(true);
+        runtime.service.hide_old_from_list = true;
+        if absent_on_server {
+            runtime.service.keys.remove("setup-key");
+        }
+        block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+            runtime: &mut runtime,
+            task: task.clone(),
+            account: "operator",
+        }))
+        .unwrap();
+        assert_eq!(runtime.service.events, ["GET", "DELETE setup-key"]);
+        assert_eq!(
+            runtime.store.ai_key_retirements_for(&task).unwrap().state,
+            crate::store::ai_keys::RetirementState::Revoked
+        );
+    }
+}
+
+#[test]
+fn poc_ai_key_renewal_r2_absent_id_failed_delete_remains_retryable() {
+    let (mut runtime, task) = checked_renewal(true);
+    runtime.service.hide_old_from_list = true;
+    runtime.service.delete_failure = true;
+    assert!(
+        block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+            runtime: &mut runtime,
+            task: task.clone(),
+            account: "operator",
+        }))
+        .is_err()
+    );
+    assert_eq!(
+        runtime.store.ai_key_retirements_for(&task).unwrap().state,
+        crate::store::ai_keys::RetirementState::Failed
+    );
+    runtime.service.delete_failure = false;
+    block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+        runtime: &mut runtime,
+        task,
+        account: "operator",
+    }))
+    .unwrap();
+    assert_eq!(
+        runtime.service.events,
+        ["GET", "DELETE setup-key", "GET", "DELETE setup-key"]
+    );
+}
+
+#[test]
+fn poc_ai_key_renewal_r2_oversized_list_falls_back_to_delete() {
+    let (mut runtime, task) = checked_renewal(true);
+    for i in 0..129 {
+        runtime.service.keys.insert(
+            format!("extra-{i}"),
+            ("operator".into(), format!("extra-name-{i}"), false),
+        );
+    }
+    block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+        runtime: &mut runtime,
+        task: task.clone(),
+        account: "operator",
+    }))
+    .unwrap();
+    assert_eq!(runtime.service.events, ["GET", "DELETE setup-key"]);
+    assert_eq!(
+        runtime.store.ai_key_retirements_for(&task).unwrap().state,
+        crate::store::ai_keys::RetirementState::Revoked
+    );
+}
+
+#[test]
+fn poc_ai_key_renewal_r2_ended_session_recovers_same_task_and_retirement() {
+    for pending_removal in [false, true] {
+        let (mut runtime, mut task) = checked_renewal(true);
+        if pending_removal {
+            block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+                runtime: &mut runtime,
+                task: task.clone(),
+                account: "operator",
+            }))
+            .unwrap();
+            let (call, tool, origin) =
+                crate::poc::key_renewal::next(&runtime.store, &task).unwrap();
+            let requesting = block_on(runtime.change(&task, Change::Request)).unwrap();
+            let proposal =
+                block_on(runtime.propose(&requesting, &task.start_session, call, tool, origin))
+                    .unwrap();
+            append(&mut runtime.store, &proposal, &task.start_session);
+            task = runtime.store.poc_task(&task.id).unwrap();
+        } else {
+            runtime.service.delete_failure = true;
+            assert!(
+                block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+                    runtime: &mut runtime,
+                    task: task.clone(),
+                    account: "operator",
+                }))
+                .is_err()
+            );
+            runtime.service.delete_failure = false;
+        }
+        let retirement = runtime.store.ai_key_retirements_for(&task).unwrap().clone();
+        let key_requests = runtime.service.requests;
+        assert!(
+            runtime
+                .store
+                .project_poc(
+                    runtime.store.next,
+                    &Record::TakeOverRenewal {
+                        id: task.id.clone(),
+                        expected: task.revision,
+                        session: task.start_session.clone(),
+                    }
+                )
+                .is_err(),
+            "a live session's renewal cannot be taken over"
+        );
+        block_on(runtime.store.end_session(&task.start_session)).unwrap();
+        runtime.store = reopen(&runtime.store);
+        let session = fresh(&mut runtime.store);
+        // A normal new session has its own goal and acceptance before Renew AI key.
+        block_on(
+            runtime
+                .store
+                .enter_goal(&session, "Keep Hermes working".into(), None),
+        )
+        .unwrap();
+        assert!(
+            runtime
+                .store
+                .project_poc(
+                    runtime.store.next,
+                    &Record::TakeOverRenewal {
+                        id: task.id.clone(),
+                        expected: task.revision + 1,
+                        session: session.clone(),
+                    }
+                )
+                .is_err(),
+            "stale takeover must not change authority"
+        );
+        let recovered = block_on(runtime.store.poc_renew_ai_key(
+            &task.machine,
+            &session,
+            &"b".repeat(48),
+        ))
+        .unwrap();
+        assert_eq!(recovered.id, task.id);
+        assert_eq!(
+            recovered.start_session, session,
+            "Renew must take over the ended session's task"
+        );
+        assert_eq!(recovered.revision, task.revision + 1);
+        // The page's Renew handler continues the recovered task instead of
+        // rejecting a second key-creation decision after the key was installed.
+        assert_eq!(
+            block_on(runtime.store.poc_renew_ai_key_decision(
+                recovered.clone(),
+                Change::AiKeyDecision {
+                    create: true,
+                    approved_cap: None
+                }
+            ))
+            .unwrap(),
+            recovered
+        );
+        assert_eq!(recovered.pending, task.pending);
+        assert_eq!(recovered.proposal, task.proposal);
+        assert_eq!(recovered.completed, task.completed);
+        assert_eq!(
+            runtime.store.ai_key_retirements_for(&recovered),
+            Some(&retirement)
+        );
+        runtime
+            .store
+            .check_task_session(&recovered, &session)
+            .unwrap();
+        runtime
+            .store
+            .poc_authority(&recovered.id, &session)
+            .unwrap();
+        assert!(
+            runtime
+                .store
+                .check_task_session(&task, &task.start_session)
+                .is_err()
+        );
+        let duplicate = block_on(runtime.store.poc_renew_ai_key(
+            &task.machine,
+            &session,
+            &"c".repeat(48),
+        ))
+        .unwrap();
+        assert_eq!(duplicate, recovered, "never create a second live renewal");
+        runtime.store = reopen(&runtime.store);
+        fresh(&mut runtime.store);
+        assert_eq!(runtime.store.poc_task(&task.id).unwrap(), recovered);
+        let completed = if pending_removal {
+            evidence(
+                &mut runtime.store,
+                &recovered,
+                record(&recovered, Some(0), ""),
+            );
+            block_on(run::resume(
+                &mut runtime,
+                &mut run::Unconfigured,
+                &recovered.id,
+                &session,
+            ))
+            .unwrap()
+        } else {
+            finish_retirement(&mut runtime, &recovered)
+        };
+        assert_eq!(completed.status, Status::Complete);
+        assert_eq!(
+            runtime.service.requests, key_requests,
+            "takeover must not mint again"
+        );
+        assert_eq!(
+            runtime
+                .service
+                .deletes
+                .iter()
+                .filter(|id| *id == "setup-key")
+                .count(),
+            if pending_removal { 1 } else { 2 }
+        );
+        let next = block_on(runtime.store.poc_renew_ai_key(
+            &task.machine,
+            &session,
+            &"d".repeat(48),
+        ))
+        .unwrap();
+        assert_ne!(next.id, recovered.id, "future renewals are unblocked");
+        assert_ne!(
+            runtime
+                .store
+                .ai_key_retirements_for(&next)
+                .unwrap()
+                .key
+                .record_id,
+            retirement.key.record_id
+        );
+        assert_eq!(reopen(&runtime.store).poc, runtime.store.poc);
+    }
+}
+
+#[test]
+fn poc_ai_key_renewal_fixed_command_removes_only_old_file() {
+    let (runtime, task) = checked_renewal(true);
+    let mut key = runtime
+        .store
+        .ai_key_retirements_for(&task)
+        .unwrap()
+        .key
+        .clone();
+    let directory = std::env::current_dir()
+        .unwrap()
+        .join("target")
+        .join(format!(
+            "renewkey-files-{}",
+            hex::encode(random::<8>().unwrap())
+        ));
+    std::fs::create_dir_all(&directory).unwrap();
+    let old = directory.join("old-key");
+    let new = directory.join("new-key");
+    std::fs::write(&old, "synthetic old key").unwrap();
+    std::fs::write(&new, "synthetic new key").unwrap();
+    key.path = old.to_str().unwrap().into();
+    let command = crate::poc::key_renewal::remove_command(&key);
+    assert!(
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(!old.exists());
+    assert!(new.exists());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn poc_ai_key_renewal_legacy_journal_keeps_check_completion_unchanged() {
+    let (runtime, task) = checked_renewal_mode(true, true);
+    assert_eq!(
+        task.template.as_deref(),
+        Some(crate::poc::key_renewal::LEGACY_ID)
+    );
+    assert_eq!(task.status, Status::Complete);
+    assert_eq!(
+        task.verdict.as_deref(),
+        Some("Hermes's AI key was renewed. The Hermes check passed.")
+    );
+    assert_eq!(task.completed.len(), 6);
+    let replayed = reopen(&runtime.store);
+    assert_eq!(replayed.poc, runtime.store.poc);
+    assert!(replayed.ai_key_retirements.is_empty());
+    assert_eq!(
+        replayed.poc_targets_view(),
+        runtime.store.poc_targets_view()
+    );
+}
+
+#[test]
+fn poc_ai_key_renewal_retirement_rejects_new_or_other_issuer_and_active_users() {
+    use crate::store::ai_keys::RetirementState;
+    let (mut runtime, task) = checked_renewal(true);
+    let new = runtime.store.poc_targets[&task.machine]
+        .application_inference_keys
+        .last()
+        .unwrap()
+        .record_id
+        .clone();
+    for issuer_id in [new, "another-machines-key".into()] {
+        assert!(
+            block_on(runtime.store.ai_key_commit(KeyRecord::Retirement {
+                task: task.id.clone(),
+                issuer_id,
+                state: RetirementState::Pending,
+            }))
+            .is_err()
+        );
+    }
+    let old_path = runtime
+        .store
+        .ai_key_retirements_for(&task)
+        .unwrap()
+        .key
+        .path
+        .clone();
+    let mut goal = runtime
+        .store
+        .poc
+        .values()
+        .find(|other| other.id != task.id && other.start_session == task.start_session)
+        .unwrap()
+        .clone();
+    goal.proposal = Some(Proposal {
+        call_id: "other-user".into(),
+        tool: Tool::Exec {
+            machine: task.machine.clone(),
+            command: format!("cat '{old_path}'"),
+        },
+        check: None,
+        report: None,
+    });
+    runtime.store.poc.insert(goal.id.clone(), goal.clone());
+    assert!(
+        block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+            runtime: &mut runtime,
+            task: task.clone(),
+            account: "operator"
+        }))
+        .is_err()
+    );
+    assert!(runtime.service.deletes.is_empty());
+    runtime.store.poc.get_mut(&goal.id).unwrap().status = Status::Complete;
+    // Stale work cannot revoke after Stop task or another task change.
+    let _ = change(&mut runtime.store, &task, Change::Abandon);
+    assert!(
+        block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+            runtime: &mut runtime,
+            task,
+            account: "operator"
+        }))
+        .is_err()
+    );
+    assert!(runtime.service.deletes.is_empty());
+}
+
+#[test]
+fn poc_ai_key_renewal_fake_credit_delete_enforces_account_scope() {
+    use crate::poc::key_renewal::RetirementRuntime;
+    let (mut runtime, task) = checked_renewal(true);
+    let mut adapter = RetireRuntime {
+        runtime: &mut runtime,
+        task,
+        account: "another-account",
+    };
+    block_on(adapter.record(crate::store::ai_keys::RetirementState::Pending)).unwrap();
+    assert!(
+        block_on(adapter.delete("key-1")).is_err(),
+        "the adapter never accepts the new key's id"
+    );
+    assert_eq!(block_on(adapter.delete("setup-key")).unwrap(), 403);
+    assert_eq!(runtime.service.deletes, ["setup-key"]);
+    assert!(!runtime.service.keys["setup-key"].2);
+}
+
+#[test]
+fn poc_ai_key_renewal_remove_failure_pauses_and_resume_retries_with_new_job() {
+    use crate::poc::key_renewal::{REMOVE_FAILED, next, retire};
+    let (mut runtime, task) = checked_renewal(true);
+    block_on(retire(&mut RetireRuntime {
+        runtime: &mut runtime,
+        task: task.clone(),
+        account: "operator",
+    }))
+    .unwrap();
+    let (first, tool, origin) = next(&runtime.store, &task).unwrap();
+    let requesting = block_on(runtime.change(&task, Change::Request)).unwrap();
+    let proposal = block_on(runtime.propose(
+        &requesting,
+        &task.start_session,
+        first.clone(),
+        tool,
+        origin,
+    ))
+    .unwrap();
+    append(&mut runtime.store, &proposal, &task.start_session);
+    let pending = runtime.store.poc_task(&task.id).unwrap();
+    let identity = pending.pending.clone();
+    // Reload with the recorded removal outstanding: collect, never relaunch.
+    runtime.store = reopen(&runtime.store);
+    fresh(&mut runtime.store);
+    assert_eq!(runtime.store.poc_task(&task.id).unwrap().pending, identity);
+    evidence(&mut runtime.store, &pending, record(&pending, Some(1), ""));
+    let paused = block_on(run::resume(
+        &mut runtime,
+        &mut run::Unconfigured,
+        &task.id,
+        &task.start_session,
+    ))
+    .unwrap();
+    assert_eq!(paused.status, Status::Paused);
+    assert_eq!(paused.pause_reason.as_deref(), Some(REMOVE_FAILED));
+    assert!(paused.verdict.is_none());
+    let (retry, _, _) = next(&runtime.store, &paused).unwrap();
+    assert_ne!(
+        retry, first,
+        "only a known terminal failure permits another removal job"
+    );
+    assert_eq!(runtime.service.deletes, ["setup-key"]);
+}
+
+fn finish_retirement(runtime: &mut MintRuntime, task: &Task) -> Task {
+    block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+        runtime,
+        task: task.clone(),
+        account: "operator",
+    }))
+    .unwrap();
+    let (call, tool, origin) = crate::poc::key_renewal::next(&runtime.store, task).unwrap();
+    let requesting = block_on(runtime.change(task, Change::Request)).unwrap();
+    let proposal =
+        block_on(runtime.propose(&requesting, &task.start_session, call, tool, origin)).unwrap();
+    append(&mut runtime.store, &proposal, &task.start_session);
+    let pending = runtime.store.poc_task(&task.id).unwrap();
+    evidence(&mut runtime.store, &pending, record(&pending, Some(0), ""));
+    block_on(run::resume(
+        runtime,
+        &mut run::Unconfigured,
+        &task.id,
+        &task.start_session,
+    ))
+    .unwrap()
+}
+
+#[test]
+fn poc_ai_key_renewal_next_renewal_replaces_newest_installed_key() {
+    let (mut runtime, task) = checked_renewal(true);
+    let new = runtime
+        .store
+        .installed_hermes_key(&task.machine)
+        .unwrap()
+        .clone();
+    assert_ne!(new.record_id, "setup-key");
+    let completed = finish_retirement(&mut runtime, &task);
+    assert_eq!(completed.status, Status::Complete);
+    let next = block_on(runtime.store.poc_renew_ai_key(
+        &task.machine,
+        &task.start_session,
+        &"b".repeat(48),
+    ))
+    .unwrap();
+    assert_eq!(
+        runtime.store.ai_key_retirements_for(&next).unwrap().key,
+        new
+    );
+    let replayed = reopen(&runtime.store);
+    assert_eq!(
+        replayed.ai_key_retirements,
+        runtime.store.ai_key_retirements
+    );
+}
+
+#[test]
+fn poc_ai_key_renewal_card_shows_failure_retry_progress_and_success_offline() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let (mut runtime, task) = checked_renewal(true);
+    runtime.service.unrelated_delete_404 = Some(b"<html>Cannot DELETE</html>");
+    let error = block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+        runtime: &mut runtime,
+        task: task.clone(),
+        account: "operator",
+    }))
+    .unwrap_err();
+    let paused = change(&mut runtime.store, &task, Change::Pause(error));
+    let check_page = |store: &Store<MemoryStorage>, task: &Task, sentence: &str| {
+        let payload = json!({"state":"unlocked", "seed_backup_stage":"inactive", "renewalProbe":true,
+            "expectedSentence":sentence, "setup":store.dispatch.setup_view(), "sessions":store.sessions(),
+            "tasks":[store.poc_task_view(task)]});
+        let mut probe = Command::new("node")
+            .args([
+                "--experimental-vm-modules",
+                "-e",
+                include_str!("../page-probe.cjs"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        probe
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        let output = probe.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    check_page(
+        &runtime.store,
+        &paused,
+        crate::poc::key_renewal::RETIRE_FAILED,
+    );
+    runtime.service.unrelated_delete_404 = None;
+    block_on(crate::poc::key_renewal::retire(&mut RetireRuntime {
+        runtime: &mut runtime,
+        task: paused.clone(),
+        account: "operator",
+    }))
+    .unwrap();
+    check_page(
+        &runtime.store,
+        &paused,
+        "The old key was revoked. Its file still needs removal. Resume collects any recorded removal job before continuing.",
+    );
+    let complete = finish_retirement(&mut runtime, &paused);
+    assert_eq!(complete.status, Status::Complete);
+    check_page(&runtime.store, &complete, crate::poc::key_renewal::SUCCESS);
+}
+
+#[test]
+fn poc_ai_key_renewal_legacy_resume_records_upgrade_without_losing_pending_job() {
+    let (store, _, task) = renewal_session_mode(true, true);
+    let mut runtime = MintRuntime::new(store);
+    let created = block_on(run::resume(
+        &mut runtime,
+        &mut run::Unconfigured,
+        &task.id,
+        &task.start_session,
+    ))
+    .unwrap();
+    let (call, tool, origin) = crate::poc::key_renewal::next(&runtime.store, &created).unwrap();
+    let requesting = block_on(runtime.change(&created, Change::Request)).unwrap();
+    let proposed =
+        block_on(runtime.propose(&requesting, &task.start_session, call, tool, origin)).unwrap();
+    append(&mut runtime.store, &proposed, &task.start_session);
+    let before = runtime.store.poc_task(&task.id).unwrap();
+    runtime.store = reopen(&runtime.store);
+    assert_eq!(
+        runtime.store.poc_task(&task.id).unwrap(),
+        before,
+        "opening a historical journal never upgrades it"
+    );
+    fresh(&mut runtime.store);
+    let upgraded = block_on(runtime.store.prepare_key_retirement(&before)).unwrap();
+    assert_eq!(
+        upgraded.template.as_deref(),
+        Some(crate::poc::key_renewal::ID)
+    );
+    assert_eq!(upgraded.revision, before.revision + 1);
+    assert_eq!(upgraded.completed, before.completed);
+    assert_eq!(upgraded.pending, before.pending);
+    assert_eq!(upgraded.proposal, before.proposal);
+    assert_eq!(
+        runtime
+            .store
+            .ai_key_retirements_for(&upgraded)
+            .unwrap()
+            .key
+            .record_id,
+        "setup-key"
+    );
+    let replayed = reopen(&runtime.store);
+    assert_eq!(replayed.poc_task(&task.id).unwrap(), upgraded);
+    assert_eq!(
+        replayed.ai_key_retirements,
+        runtime.store.ai_key_retirements
+    );
+    evidence(
+        &mut runtime.store,
+        &upgraded,
+        record(&upgraded, Some(0), ""),
+    );
+    let collected = block_on(run::resume(
+        &mut runtime,
+        &mut run::Unconfigured,
+        &task.id,
+        &task.start_session,
+    ))
+    .unwrap();
+    assert!(collected.pending.is_none());
+    assert_eq!(collected.completed.len(), 2);
+    assert!(
+        runtime.service.deletes.is_empty(),
+        "upgrading does not revoke before CHECK"
+    );
+    let mut current = collected;
+    loop {
+        let (call, tool, origin) = crate::poc::key_renewal::next(&runtime.store, &current).unwrap();
+        let checking = call == crate::poc::key_renewal::CHECK;
+        let stdout = if checking {
+            "CHECKS hermes PASS"
+        } else if call.starts_with(crate::poc::key_renewal::WAIT) {
+            "REBUILD OK fixture"
+        } else {
+            ""
+        };
+        let requesting = block_on(runtime.change(&current, Change::Request)).unwrap();
+        let proposal =
+            block_on(runtime.propose(&requesting, &task.start_session, call, tool, origin))
+                .unwrap();
+        append(&mut runtime.store, &proposal, &task.start_session);
+        let pending = runtime.store.poc_task(&task.id).unwrap();
+        evidence(
+            &mut runtime.store,
+            &pending,
+            record(&pending, Some(0), stdout),
+        );
+        current = block_on(run::resume(
+            &mut runtime,
+            &mut run::Unconfigured,
+            &task.id,
+            &task.start_session,
+        ))
+        .unwrap();
+        if checking {
+            break;
+        }
+    }
+    assert!(
+        !current.ended(),
+        "an upgraded legacy task cannot finish at CHECK"
+    );
+    let complete = finish_retirement(&mut runtime, &current);
+    assert_eq!(
+        complete.verdict.as_deref(),
+        Some(crate::poc::key_renewal::SUCCESS)
+    );
+    assert_eq!(runtime.service.deletes, ["setup-key"]);
+    assert_eq!(runtime.service.requests, 1);
 }

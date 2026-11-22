@@ -1043,10 +1043,29 @@ async fn request_with_mode(request: String, response: Response, automatic: bool)
                         }
                         _ => return Err("AI key decision is no longer available".into()),
                     };
-                    store.poc_change(id, task.revision, decision).await?
+                    if request.action == "renew-ai-key" {
+                        store.poc_renew_ai_key_decision(task, decision).await?
+                    } else {
+                        store.poc_change(id, task.revision, decision).await?
+                    }
                 } else {
                     task
                 }
+            };
+            let task = if task.template.as_deref() == Some(super::key_renewal::LEGACY_ID)
+                && !task.ended()
+            {
+                crate::poc::run::check_raise(&task.id)?;
+                let local = local();
+                let mut writer = local.lock().await;
+                continuation.check()?;
+                writer
+                    .store()
+                    .ok_or(crate::poc::wait::LOCKED)?
+                    .prepare_key_retirement(&task)
+                    .await?
+            } else {
+                task
             };
             if !automatic && !super::key_renewal::is_renewal(&task) {
                 crate::poc::credit::browser::retry_mint(session);
@@ -1261,6 +1280,11 @@ impl run::Model for Configured {
         // the next request, whose adapter detects changes and aborts honestly.
         self.response.borrow_mut().take();
         if super::key_renewal::is_renewal(task) {
+            if task.template.as_deref() == Some(super::key_renewal::ID)
+                && super::key_renewal::checked(task)
+            {
+                crate::poc::credit::browser::retire_ai_key(task, &self.continuation).await?;
+            }
             let local = local();
             let mut writer = local.lock().await;
             self.continuation.check()?;

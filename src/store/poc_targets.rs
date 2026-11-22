@@ -110,6 +110,41 @@ impl<S: Storage> Store<S> {
         self.poc_targets.get(machine).map(|record| &record.target)
     }
 
+    pub(crate) fn hermes_key_installed(&self, key: &super::ai_keys::MachineKey) -> bool {
+        let task = self
+            .ai_keys
+            .iter()
+            .find(|entry| entry.mint.name == key.name)
+            .and_then(|entry| self.poc.get(&entry.task));
+        task.is_none_or(|task| {
+            !crate::poc::key_renewal::is_renewal(task)
+                || (task.template.as_deref() == Some(crate::poc::key_renewal::ID)
+                    && crate::poc::key_renewal::checked(task))
+                || (task.status == super::poc::Status::Complete
+                    && task.completed.last().is_some_and(|(call, _, output)| {
+                        call == crate::poc::key_renewal::CHECK
+                            && crate::poc::key_renewal::check_passed(
+                                output["content"]["exit_status"]
+                                    .as_u64()
+                                    .and_then(|exit| u32::try_from(exit).ok()),
+                                output["content"]["stdout"].as_str().unwrap_or_default(),
+                            )
+                    }))
+        })
+    }
+
+    pub(crate) fn installed_hermes_key(
+        &self,
+        machine: &str,
+    ) -> Option<&super::ai_keys::MachineKey> {
+        self.poc_targets
+            .get(machine)?
+            .application_inference_keys
+            .iter()
+            .rev()
+            .find(|key| key.application == "Hermes Agent" && self.hermes_key_installed(key))
+    }
+
     pub fn poc_targets_view(&self) -> Value {
         let control_center_started = self
             .poc
@@ -141,26 +176,9 @@ impl<S: Storage> Store<S> {
                     .iter()
                     .filter(|key| key.application == "Hermes Agent")
                     .collect::<Vec<_>>();
-                let installed = hermes_keys.iter().rposition(|key| {
-                    let task = keys_by_name
-                        .get(key.name.as_str())
-                        .and_then(|entry| self.poc.get(&entry.task));
-                    task.is_none_or(|task| {
-                        !crate::poc::key_renewal::is_renewal(task)
-                            || (task.status == super::poc::Status::Complete
-                                && task.completed.last().is_some_and(|(call, _, output)| {
-                                    call == crate::poc::key_renewal::CHECK
-                                        && crate::poc::key_renewal::check_passed(
-                                            output["content"]["exit_status"]
-                                                .as_u64()
-                                                .and_then(|exit| u32::try_from(exit).ok()),
-                                            output["content"]["stdout"]
-                                                .as_str()
-                                                .unwrap_or_default(),
-                                        )
-                                }))
-                    })
-                });
+                let installed = hermes_keys
+                    .iter()
+                    .rposition(|key| self.hermes_key_installed(key));
                 let hermes_key = installed.map(|index| hermes_keys[index]);
                 value["hermes_ai_key_not_installed"] =
                     json!(!hermes_keys.is_empty() && installed != Some(hermes_keys.len() - 1));

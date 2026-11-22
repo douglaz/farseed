@@ -3,7 +3,8 @@ use crate::goals::Tool;
 use crate::store::poc::{Change, Task};
 use crate::store::{Storage, Store};
 
-pub(crate) const ID: &str = "renew-hermes-ai-key@1";
+pub(crate) const LEGACY_ID: &str = "renew-hermes-ai-key@1";
+pub(crate) const ID: &str = "renew-hermes-ai-key@2";
 pub(crate) const GOAL: &str = "Renew Hermes's AI key";
 pub(crate) const LIVE_REQUIRED: &str = "Renew the AI key while this machine's session is live.";
 pub(crate) const KEY: &str = "renew-key";
@@ -11,10 +12,15 @@ pub(crate) const WRITE: &str = "renew-secrets";
 pub(crate) const REBUILD: &str = "renew-rebuild";
 pub(crate) const WAIT: &str = "renew-wait-";
 pub(crate) const RESTART: &str = "renew-restart";
+pub(crate) const REMOVE: &str = "renew-remove-old-key";
+pub(crate) const SUCCESS: &str = "Hermes's AI key was renewed. The Hermes check passed. The old key was revoked and its file removed.";
+pub(crate) const RETIRE_FAILED: &str = "Hermes passed its check, but the old key's revocation is not confirmed and its file has not been removed. Resume checks the credit account before retrying revocation.";
+pub(crate) const REMOVE_FAILED: &str = "The old key was revoked, but its file could not be removed. Resume retries file removal; it collects any running recorded job first.";
+pub(crate) const RETIRE_PENDING: &str = "Hermes passed its check. The old key still needs revocation and file removal. Resume checks the credit account before retrying revocation.";
 pub(crate) const CHECK: &str = "renew-check";
 
 pub(crate) fn is_renewal(task: &Task) -> bool {
-    task.template.as_deref() == Some(ID)
+    matches!(task.template.as_deref(), Some(ID | LEGACY_ID))
 }
 pub(crate) fn step_name(call: &str) -> &'static str {
     match call {
@@ -23,10 +29,14 @@ pub(crate) fn step_name(call: &str) -> &'static str {
         REBUILD => "Rebuild",
         RESTART => "Restart services",
         CHECK => "Check Hermes",
+        call if call.starts_with(REMOVE) => "Remove old key file",
         _ => "Wait for rebuild",
     }
 }
 pub(crate) fn failed(call: &str) -> String {
+    if call.starts_with(REMOVE) {
+        return REMOVE_FAILED.into();
+    }
     format!("AI key renewal stopped: {} failed.", step_name(call))
 }
 
@@ -48,6 +58,7 @@ fn execution_failed(task: &Task) -> bool {
     match call.as_str() {
         KEY => outcome["status"] == "failed",
         WRITE | REBUILD | RESTART => exit.is_some_and(|exit| exit != 0),
+        call if call.starts_with(REMOVE) => exit.is_some_and(|exit| exit != 0),
         CHECK => {
             exit.is_some() && !check_passed(exit, outcome["stdout"].as_str().unwrap_or_default())
         }
@@ -75,7 +86,9 @@ pub(crate) fn local_change(task: &Task, change: Change, unknown_key: bool) -> Ch
                     "original accepted session authority for the task machine is required: ",
                 )
                 .unwrap_or(&why);
-            let sentence = if unknown_key || cause == UNKNOWN_KEY {
+            let sentence = if [RETIRE_FAILED, RETIRE_PENDING, REMOVE_FAILED].contains(&cause) {
+                cause.into()
+            } else if unknown_key || cause == UNKNOWN_KEY {
                 UNKNOWN_KEY.into()
             } else if cause == super::wait::APPROVAL_PENDING || cause == APPROVAL {
                 APPROVAL.into()
@@ -191,6 +204,19 @@ pub(crate) fn next<S: Storage>(
             CHECK.into(),
             super::template::CONTROL_CENTER.steps[4].blocks["Check"].into(),
         ),
+        call if (call == CHECK || call.starts_with(REMOVE))
+            && checked(task)
+            && task.template.as_deref() == Some(ID) =>
+        {
+            let retirement = store.ai_key_retirements_for(task).ok_or(RETIRE_FAILED)?;
+            if retirement.state != crate::store::ai_keys::RetirementState::Revoked {
+                return Err(RETIRE_PENDING.into());
+            }
+            (
+                format!("{REMOVE}-{}", task.steps),
+                remove_command(&retirement.key),
+            )
+        }
         call => return Err(failed(call)),
     };
     Ok((
@@ -211,4 +237,143 @@ pub(crate) fn check_passed(exit: Option<u32>, stdout: &str) -> bool {
         && stdout
             .lines()
             .any(|line| line == "CHECKS hermes PASS" || line.starts_with("CHECKS hermes PASS "))
+}
+
+/// A successful recorded check, even while retirement is unfinished, installs the new key.
+pub(crate) fn checked(task: &Task) -> bool {
+    task.completed.iter().any(|(call, _, output)| {
+        call == CHECK
+            && check_passed(
+                output["content"]["exit_status"]
+                    .as_u64()
+                    .and_then(|exit| u32::try_from(exit).ok()),
+                output["content"]["stdout"].as_str().unwrap_or_default(),
+            )
+    })
+}
+
+pub(crate) fn remove_command(key: &crate::store::ai_keys::MachineKey) -> String {
+    format!(
+        "rm -f -- '{}' && [ ! -e '{}' ] && [ ! -L '{}' ]",
+        key.path, key.path, key.path
+    )
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[allow(async_fn_in_trait)]
+pub(crate) trait RetirementRuntime {
+    async fn retirement(&mut self) -> Result<crate::store::ai_keys::Retirement, String>;
+    async fn record(&mut self, state: crate::store::ai_keys::RetirementState)
+    -> Result<(), String>;
+    async fn list(&mut self) -> Result<(u16, serde_json::Value), String>;
+    async fn delete(&mut self, id: &str) -> Result<u16, String>;
+}
+
+/// These DELETE statuses need no response body; a 404 still needs key-specific evidence.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn delete_status_without_body(status: u16) -> bool {
+    matches!(status, 200 | 404)
+}
+
+/// Shared by the worker and native fake service. Every DELETE requires a fresh account read.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) async fn retire(runtime: &mut impl RetirementRuntime) -> Result<(), String> {
+    use crate::store::ai_keys::RetirementState;
+    let retirement = runtime.retirement().await.map_err(|_| RETIRE_FAILED)?;
+    if retirement.state == RetirementState::Revoked {
+        return Ok(());
+    }
+    // Persist uncertainty before awaiting any external effect, including on the first try.
+    runtime
+        .record(RetirementState::Pending)
+        .await
+        .map_err(|_| RETIRE_FAILED)?;
+    let result: Result<(), String> = async {
+        let (status, value) = runtime.list().await?;
+        let evidence = retirement_evidence(status, &value, &retirement.key)?;
+        if evidence == RetirementEvidence::Revoked {
+            return Ok(());
+        }
+        // Recheck local ownership before deleting only the recorded issuer id.
+        runtime.record(RetirementState::Pending).await?;
+        match runtime.delete(&retirement.key.record_id).await? {
+            200 => (),
+            404 if evidence == RetirementEvidence::Absent => (),
+            404 => {
+                // A route/proxy 404 can leave a listed key live. Confirm this id
+                // with another account read; the DELETE body establishes nothing.
+                let (status, value) = runtime.list().await?;
+                if retirement_evidence(status, &value, &retirement.key)?
+                    == RetirementEvidence::Unconfirmed
+                {
+                    return Err(RETIRE_FAILED.into());
+                }
+            }
+            _ => return Err(RETIRE_FAILED.into()),
+        }
+        Ok(())
+    }
+    .await;
+    let state = if result.is_ok() {
+        RetirementState::Revoked
+    } else {
+        RetirementState::Failed
+    };
+    runtime.record(state).await.map_err(|_| RETIRE_FAILED)?;
+    result.map_err(|_| RETIRE_FAILED.into())
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+#[derive(PartialEq)]
+enum RetirementEvidence {
+    Revoked,
+    Absent,
+    Unconfirmed,
+}
+
+/// Only a complete absence or this key's revocation metadata confirms a 404.
+#[cfg(any(target_arch = "wasm32", test))]
+fn retirement_evidence(
+    status: u16,
+    value: &serde_json::Value,
+    key: &crate::store::ai_keys::MachineKey,
+) -> Result<RetirementEvidence, String> {
+    if status != 200 || value["status"] != "success" {
+        return Err(RETIRE_FAILED.into());
+    }
+    let keys = value["data"].as_array().ok_or(RETIRE_FAILED)?;
+    let incomplete = keys.len() > 128
+        || value
+            .get("has_more")
+            .is_some_and(|v| !v.is_null() && v != false)
+        || value.get("next_cursor").is_some_and(|v| !v.is_null());
+    if !incomplete
+        && keys.iter().any(|entry| {
+            entry["_id"]
+                .as_str()
+                .is_none_or(|id| !super::credit::identifier(id))
+        })
+    {
+        return Err(RETIRE_FAILED.into());
+    }
+    let mut matches = keys.iter().filter(|entry| entry["_id"] == key.record_id);
+    let found = matches.next();
+    if matches.next().is_some() {
+        return Err(RETIRE_FAILED.into());
+    }
+    if let Some(found) = found {
+        if found["name"] != key.name {
+            return Err(RETIRE_FAILED.into());
+        }
+        return match found.get("deleted_at") {
+            Some(serde_json::Value::String(_)) => Ok(RetirementEvidence::Revoked),
+            Some(serde_json::Value::Null) | None => Ok(RetirementEvidence::Unconfirmed),
+            _ => Err(RETIRE_FAILED.into()),
+        };
+    }
+    Ok(if incomplete {
+        RetirementEvidence::Unconfirmed
+    } else {
+        RetirementEvidence::Absent
+    })
 }

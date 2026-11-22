@@ -1744,6 +1744,7 @@ const renderTasks = (store) => {
       else if (task.pause_reason) paragraph(card, task.pause_reason);
       else if (task.pending) paragraph(card, 'Waiting for the recorded renewal step. Resume collects its result without running it twice.');
       else if (task.status !== 'abandoned') paragraph(card, 'Continuing the AI key renewal.');
+      if (task.ai_key_retirement_message && task.ai_key_retirement_message !== task.pause_reason) paragraph(card, task.ai_key_retirement_message);
       if (!['complete', 'abandoned'].includes(task.status) && !awaitingAiKey(task)) {
         for (const [action, label] of [['resume', 'Resume'], ['abandon', 'Stop task']]) {
           const button = document.createElement('button');

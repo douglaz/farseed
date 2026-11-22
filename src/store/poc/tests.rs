@@ -3302,6 +3302,7 @@ fn poc_ai_key_resumed_approval_mints_its_cap_including_class_answer_and_renewal(
             for renewal in [false, true] {
                 if renewal {
                     let record = Record::RenewAiKey {
+                        replacement: None,
                         id: "a".repeat(48),
                         session: task.start_session.clone(),
                         limits: Limits::default(),

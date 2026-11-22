@@ -219,6 +219,11 @@ impl Exchange {
                 .map_err(|_| REFUSED)?
                 .dyn_into()
                 .map_err(|_| REFUSED)?;
+            if request.method() == "DELETE"
+                && crate::poc::key_renewal::delete_status_without_body(response.status())
+            {
+                return Ok((response.status(), ClearedValue(Value::Null)));
+            }
             let stream = js_sys::Reflect::get(&response, &"body".into()).map_err(|_| REFUSED)?;
             let reader = function(&stream, "getReader")?
                 .call0(&stream)
@@ -1108,4 +1113,112 @@ pub(crate) async fn prepare_ai_key(
         return Ok(false);
     }
     Ok(true)
+}
+
+/// Account-scoped, fenced retirement, serialized with minting and session cleanup.
+pub(crate) async fn retire_ai_key(
+    task: &crate::store::poc::Task,
+    continuation: &crate::lifecycle::Continuation,
+) -> Result<(), String> {
+    let (guard, _active) =
+        OperationFence::after_wait(continuation, Active::wait(), || REVISION.get())
+            .await
+            .map_err(|_| crate::poc::key_renewal::RETIRE_FAILED)?;
+    let fence = Fence {
+        guard,
+        session: Some(task.start_session.clone()),
+    };
+    crate::poc::key_renewal::retire(&mut KeyRetirement { task, fence }).await
+}
+
+struct KeyRetirement<'a> {
+    task: &'a crate::store::poc::Task,
+    fence: Fence,
+}
+impl crate::poc::key_renewal::RetirementRuntime for KeyRetirement<'_> {
+    async fn retirement(&mut self) -> Result<crate::store::ai_keys::Retirement, String> {
+        let local = crate::worker::local();
+        let mut local = local.lock().await;
+        let store = self.fence.store(&mut local)?;
+        store.poc_authority(&self.task.id, &self.task.start_session)?;
+        store.check_key_retirement(self.task)?;
+        store
+            .ai_key_retirements_for(self.task)
+            .cloned()
+            .ok_or("key retirement missing".into())
+    }
+    async fn record(
+        &mut self,
+        state: crate::store::ai_keys::RetirementState,
+    ) -> Result<(), String> {
+        let local = crate::worker::local();
+        let mut local = local.lock().await;
+        let store = self.fence.store(&mut local)?;
+        let issuer_id = store
+            .ai_key_retirements_for(self.task)
+            .ok_or("key retirement missing")?
+            .key
+            .record_id
+            .clone();
+        store
+            .ai_key_commit(crate::store::ai_keys::Record::Retirement {
+                task: self.task.id.clone(),
+                issuer_id,
+                state,
+            })
+            .await
+    }
+    async fn list(&mut self) -> Result<(u16, Value), String> {
+        let (status, value) = exchange(
+            &self.fence,
+            "GET",
+            "/keys?include_disabled=true",
+            Auth::Account,
+            None,
+        )
+        .await?;
+        // Only public key metadata enters the shared decision logic; key bytes stay zeroizing.
+        let keys = value.0["data"].as_array().map(|keys| {
+            keys.iter()
+                .map(|key| {
+                    let mut public = serde_json::json!({"_id":key["_id"],"name":key["name"]});
+                    if let Some(deleted_at) = key.get("deleted_at") {
+                        public["deleted_at"] = deleted_at.clone();
+                    }
+                    public
+                })
+                .collect::<Vec<_>>()
+        });
+        let public = serde_json::json!({"status":value.0["status"],"has_more":value.0.get("has_more"),"next_cursor":value.0.get("next_cursor"),"data":keys});
+        Ok((status, public))
+    }
+    async fn delete(&mut self, id: &str) -> Result<u16, String> {
+        let exchange = Exchange::new()?;
+        let request = {
+            let local = crate::worker::local();
+            let mut local = local.lock().await;
+            let store = self.fence.store(&mut local)?;
+            store.poc_authority(&self.task.id, &self.task.start_session)?;
+            store.check_key_retirement(self.task)?;
+            let retirement = store
+                .ai_key_retirements_for(self.task)
+                .ok_or("key retirement missing")?;
+            if retirement.key.record_id != id
+                || retirement.state != crate::store::ai_keys::RetirementState::Pending
+            {
+                return Err("key retirement identity changed".into());
+            }
+            prepare(
+                store,
+                &exchange,
+                "DELETE",
+                &format!("/keys/{id}"),
+                Auth::Account,
+                None,
+            )?
+        };
+        // No writer wait between the last task check and dispatch.
+        self.fence.check()?;
+        exchange.finish(&request).await.map(|(status, _)| status)
+    }
 }

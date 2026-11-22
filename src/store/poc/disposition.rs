@@ -413,6 +413,20 @@ impl<S: Storage> Store<S> {
     pub(crate) fn poc_task_view(&self, task: &Task) -> Value {
         let mut value = task.view();
         if crate::poc::key_renewal::is_renewal(task) {
+            if crate::poc::key_renewal::checked(task)
+                && !task.ended()
+                && let Some(retirement) = self.ai_key_retirements_for(task)
+            {
+                use crate::store::ai_keys::RetirementState;
+                value["ai_key_retirement"] = json!(retirement.state);
+                value["ai_key_retirement_message"] = json!(match retirement.state {
+                    RetirementState::Needed | RetirementState::Pending =>
+                        crate::poc::key_renewal::RETIRE_PENDING,
+                    RetirementState::Failed => crate::poc::key_renewal::RETIRE_FAILED,
+                    RetirementState::Revoked =>
+                        "The old key was revoked. Its file still needs removal. Resume collects any recorded removal job before continuing.",
+                });
+            }
             return value;
         }
         #[cfg(target_arch = "wasm32")]
