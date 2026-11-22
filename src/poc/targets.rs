@@ -191,6 +191,10 @@ pub fn resolve<S: crate::store::Storage>(
     let record = store
         .poc_target(machine)
         .ok_or("machine has no stored target or pin")?;
+    // An unsupported profile keeps its own reason (without echoing the stored value) ahead of the custody check.
+    if record.profile != "v1" {
+        return Err("unsupported relay profile".into());
+    }
     let unavailable = "The machine connection is unavailable. Try again.";
     let value = serde_json::to_value(record).map_err(|_| unavailable)?;
     if !crate::poc::inference::safe(store, &value, &[]) {
