@@ -171,10 +171,114 @@ function checkCard(expectedWidth) {
   check(rows().some(s=>s==='Step 1: look at the machine, failed with code 7. '), 'failed Step 1 Do is not done');
   return {nodes:base.nodes, created_per_update:counts[0], commands:entries.filter(([,tool])=>tool.name==='exec').length, status_height:base.status};
 }
+function checkDemoPage() {
+  const check = (ok, label) => { if (!ok) throw Error(label); };
+  const sent = [];
+  const originalPost = worker.postMessage;
+  const originalGeneration = worker.generation;
+  worker.postMessage = request => sent.push(request);
+  const declaration = {version:1, listeners:{inbound:[],outbound:[]}, services:[],
+    key_material:{spendable:false,permitted:[]}, drift_checks:[], required:[], default_credentials:'none'};
+  const session = {identity:'requirements-session',session_state:'active',bound_set:['demo-machine'],
+    goal:{text:'Install a small service',source:'operator'},standing_modes:[],
+    pending_requirements:{candidate:'candidate-a',proposal:{kind:'declaration',machine:'demo-machine',declaration}}};
+  const store = {state:'unlocked',seed_backup_stage:'inactive',lifecycle_state:'running',lifecycle_generation:1,
+    provider_configuration:{key_set:true},procurement:{phase:'email_verification'},
+    setup:[{entry:{machine:'demo-machine',vendor:'provider',product:'small',region:'test',cost:{amount:'100',unit:'sat',period:'month'}},
+      class:'single-purpose',answer:'no',access:{},declaration:null}],sessions:[session],tasks:[]};
+  const report = () => render(structuredClone(store), true);
+  const approval = () => document.querySelector('[data-requirements-decision="approve"]');
+  const rejection = () => document.querySelector('[data-requirements-decision="reject"]');
+  const decisions = () => sent.filter(request => request.requirements_answer);
+  try {
+    report();
+    const fetchButton = $('provider-catalogue');
+    check(!$('step-machine-fold').open && !fetchButton.closest('details') && fetchButton.checkVisibility(),
+      'fetch is visible with no offers and Machine options closed, even when another machine action is offered');
+    const first = approval(), firstReject = rejection();
+    report();
+    check(approval() === first && rejection() === firstReject, 'identical reports keep both requirements button nodes');
+    first.click();
+    check(first.disabled && firstReject.disabled, 'a press disables both decision controls on the same card');
+    first.click(); firstReject.click();
+    check(decisions().length === 1, 'repeat presses on the same card before the next report send exactly one decision');
+    report();
+    check(approval() !== first && rejection() !== firstReject && !approval().disabled && !rejection().disabled,
+      'the next identical report rebuilds a pressed card with enabled buttons');
+    check(JSON.stringify(decisions()[0]) === JSON.stringify({requirements_answer:{session:session.identity,machine:'demo-machine',candidate:'candidate-a',decision:'approve'}}),
+      'the decision names the displayed session, machine and candidate');
+    const beforeCandidate = approval();
+    session.pending_requirements.candidate = 'candidate-b'; report();
+    check(approval() !== beforeCandidate && !approval().disabled, 'a new candidate updates immediately');
+    const second = approval();
+    session.pending_requirements.proposal.declaration.services = [{name:'demo-service',scope:{kind:'system'},lifecycle:'running-at-delivery'}];
+    report();
+    check(approval() !== second && approval().closest('[data-requirements-card]').textContent.includes('demo-service must be running'),
+      'changed requirements update their text even when the candidate is unchanged');
+    second.click();
+    check(decisions().length === 1, 'a replaced card cannot send a stale decision');
+    rejection().click(); rejection().click(); approval().click();
+    check(decisions().length === 2 && decisions()[1].requirements_answer.decision === 'reject', 'Reject also sends once before the next report');
+    const pressedReject = rejection(); report();
+    check(rejection() !== pressedReject && !approval().disabled && !rejection().disabled,
+      'the next identical report also rebuilds a rejected card with enabled buttons');
+    session.pending_requirements = null; report();
+    check(!approval() && !rejection(), 'a recorded decision removes the requirements controls immediately');
+    session.pending_requirements = {candidate:'candidate-c',proposal:{kind:'tighten_class',machine:'demo-machine'}}; report();
+    const beforeGeneration = approval();
+    worker.generation = 'replacement-generation'; report();
+    check(approval() !== beforeGeneration, 'a worker authority change replaces the controls');
+    beforeGeneration.click();
+    const beforeLifecycle = approval(); store.lifecycle_generation++; report();
+    check(approval() !== beforeLifecycle, 'a lifecycle authority change replaces the controls');
+    beforeLifecycle.click();
+    check(decisions().length === 2, 'retired controls cannot answer in a new authority context');
+    // Refusals leave the pending proposal intact; even repeated refusal text must permit another decision.
+    store.store_error = 'journal refused'; store.page_error_step = 'task'; report();
+    for (const refusals of [1, 2]) {
+      const beforeRefusals = decisions().length;
+      for (let attempt = 1; attempt <= refusals; attempt++) {
+        const refusedApprove = approval(), refusedReject = rejection();
+        refusedApprove.click(); refusedApprove.click(); refusedReject.click();
+        check(decisions().length === beforeRefusals + attempt
+          && decisions().at(-1).requirements_answer.decision === 'approve',
+          `refused Approve ${attempt} of ${refusals} sends exactly one decision on its card`);
+        report();
+        check(approval() !== refusedApprove && rejection() !== refusedReject && !approval().disabled && !rejection().disabled,
+          `identical report after refusal ${attempt} of ${refusals} gives enabled replacement buttons`);
+      }
+      rejection().click(); rejection().click(); approval().click();
+      check(decisions().length === beforeRefusals + refusals + 1
+        && JSON.stringify(decisions().at(-1)) === JSON.stringify({requirements_answer:{session:session.identity,machine:'demo-machine',candidate:'candidate-c',decision:'reject'}}),
+        `Reject after ${refusals} refused Approves sends exactly one decision for the pending proposal`);
+      report();
+    }
+    delete store.store_error; delete store.page_error_step;
+    session.session_state = 'ended'; report();
+    check(!approval(), 'ending the session removes the requirements controls');
+    session.session_state = 'active'; session.pending_requirements = null;
+    const task = {id:'t3-delivery',machine:'demo-machine',start_session:session.identity,status:'complete',goal:session.goal.text,
+      requests:1,steps:1,limits:{requests:100,steps:200},verification:[],verdict:'Delivered',
+      completed:[['done',{name:'done',arguments:{urls:[{url:'https://app.t3.codes',label:'T3 Code'}]}},{content:{verification_required:true}}]]};
+    store.tasks = [task]; report();
+    const hint = "If the machine isn't listed in T3 Code yet, pull down to refresh the list.";
+    const taskCard = () => document.querySelector('[data-task="t3-delivery"]');
+    check(taskCard().textContent.includes(hint) && taskCard().querySelector('[data-delivered-url]').href === 'https://app.t3.codes/',
+      'the delivered T3 link includes the exact refresh hint');
+    task.completed[0][1].arguments.urls = [{url:'https://service.example',label:'Service'}]; report();
+    check(!taskCard().textContent.includes(hint), 'other delivered services keep their wording');
+    store.state = 'locked'; report();
+    check(!approval(), 'locking leaves no requirements controls');
+    return {requirements:'passed',fetch:'passed',t3_hint:'passed',decisions:decisions().length};
+  } finally {
+    worker.postMessage = originalPost;
+    worker.generation = originalGeneration;
+  }
+}
 const directory = await mkdtemp(resolve('.quietprog-card-'));
 try {
   // A file URL, stubbed fetch and Worker, and disabled browser networking keep this check offline.
-  const script = `globalThis.setInterval=()=>0; globalThis.Worker=class {postMessage(){}}; globalThis.fetch=async()=>({ok:false});\n${prefix}\nconst worker=firstWorker;\n${checkCard.toString()}\nglobalThis.runQuietCardCheck=checkCard;`;
+  const script = `globalThis.setInterval=()=>0; globalThis.Worker=class {postMessage(){}}; globalThis.fetch=async()=>({ok:false});\n${prefix}\nconst worker=firstWorker;\n${checkCard.toString()}\n${checkDemoPage.toString()}\nglobalThis.runQuietCardCheck=width=>({...checkCard(width),demo:checkDemoPage()});`;
   const file = join(directory,'card.html');
   await writeFile(file,html.replace('</body>',()=>`<script type="module">${script.replace(/<\/script/gi,'<\\/script')}</script></body>`));
   const failures=[];

@@ -161,6 +161,7 @@ section section { min-width: 0; }
 <div id="tau-provider-progress" aria-live="polite"></div>
 <div id="tau-purchase-review-slot"></div>
 <section id="tau-setup" hidden aria-label="Setup machines"></section>
+<div class="requires-store" hidden><button id="tau-provider-catalogue" type="button">Fetch offers and images</button></div>
 <details id="tau-step-machine-fold"><summary>Machine options</summary>
 <div class="requires-store" hidden><p>The published pin comes from the provider’s hypervisor scan, rather than attestation. It trusts the provider and whoever can answer the machine address inside its network at scan time.</p></div>
 <div class="requires-store" hidden>
@@ -184,7 +185,6 @@ section section { min-width: 0; }
 </details>
 <p id="tau-relay-deployment-status" role="status">No valid deployment relay key is loaded. The seed-derived relay key requires manual enrollment.</p>
 
-<button id="tau-provider-catalogue" type="button">Fetch offers and images</button>
 <div id="tau-provider-catalogue-view"></div>
 <form id="tau-provider-selection-form">
 <p><label>Fetched offer <select id="tau-provider-offer" required><option value="">Choose a fetched offer</option></select></label></p>

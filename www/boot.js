@@ -954,7 +954,39 @@ const renderEndedSessions = (section, machine, store) => {
   details.addEventListener('toggle', () => { if (details.open && details.isConnected) populate(); });
   section.append(details);
 };
+// Reuse unpressed decision controls until their proposal or session authority changes.
+const requirementsCardInputs = new WeakMap();
+const renderRequirementsCard = (session, store, previous) => {
+  const pending = session.pending_requirements;
+  const inputs = JSON.stringify([pending, session.bound_set, session.session_state,
+    store.lifecycle_generation, store.lifecycle_state]);
+  const cached = requirementsCardInputs.get(previous);
+  if (cached?.inputs === inputs && cached.worker === worker && cached.generation === worker?.generation
+      && !previous.querySelector('button:disabled')) return previous;
+  const sender = snapshotWorker();
+  const approval = document.createElement('section');
+  approval.dataset.requirementsCard = session.identity;
+  paragraph(approval, `Approve intended requirements for ${pending.proposal.machine}. These are proposed requirements, not measured results.`);
+  if (pending.proposal.kind === 'declaration') installationPreview(approval, pending.proposal.declaration);
+  else paragraph(approval, 'Tighten this machine from single-purpose to multi-tenant. It must remain bound alone and cannot hold spendable or private tenant material.');
+  for (const [decision, text] of [['approve', 'Approve these requirements'], ['reject', 'Reject these requirements']]) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.dataset.requirementsDecision = decision;
+    button.textContent = text;
+    button.addEventListener('click', () => {
+      if (button.disabled || !approval.isConnected) return;
+      for (const b of approval.querySelectorAll('button')) b.disabled = true;
+      sender.postMessage({ requirements_answer: { session: session.identity, machine: pending.proposal.machine, candidate: pending.candidate, decision } });
+    });
+    approval.append(button);
+  }
+  requirementsCardInputs.set(approval, {inputs, worker, generation: worker?.generation});
+  return approval;
+};
 const renderSetup = (store) => {
+  const previousRequirements = new Map([...document.querySelectorAll('[data-requirements-card]')]
+    .map(card => [card.dataset.requirementsCard, card]));
   const worker = snapshotWorker();
   const slot = $('setup');
   const facts = $('setup-facts');
@@ -1159,26 +1191,7 @@ const renderSetup = (store) => {
           card.append(choice);
         }
       }
-      const pending = session.pending_requirements;
-      if (pending) {
-        const approval = document.createElement('section');
-        approval.dataset.requirementsCard = session.identity;
-        paragraph(approval, `Approve intended requirements for ${pending.proposal.machine}. These are proposed requirements, not measured results.`);
-        if (pending.proposal.kind === 'declaration') installationPreview(approval, pending.proposal.declaration);
-        else paragraph(approval, 'Tighten this machine from single-purpose to multi-tenant. It must remain bound alone and cannot hold spendable or private tenant material.');
-        for (const [decision, text] of [['approve', 'Approve these requirements'], ['reject', 'Reject these requirements']]) {
-          const button = document.createElement('button');
-          button.type = 'button';
-          button.dataset.requirementsDecision = decision;
-          button.textContent = text;
-          button.addEventListener('click', () => {
-            for (const b of approval.querySelectorAll('button')) b.disabled = true;
-            worker.postMessage({ requirements_answer: { session: session.identity, machine: pending.proposal.machine, candidate: pending.candidate, decision } });
-          });
-          approval.append(button);
-        }
-        card.append(approval);
-      }
+      if (session.pending_requirements) card.append(renderRequirementsCard(session, store, previousRequirements.get(session.identity)));
       const outcome = goalOutcomes.get(session.identity);
       if (outcome) {
         const status = document.createElement('p');
@@ -1429,6 +1442,7 @@ const renderDeliveredUrls = (parent, entries) => {
     anchor.href = url.href; anchor.target = '_blank'; anchor.rel = 'noopener noreferrer';
     anchor.textContent = text;
     row.append(host, document.createElement('br'), anchor); section.append(row);
+    if (label === 'T3 Code') paragraph(section, "If the machine isn't listed in T3 Code yet, pull down to refresh the list.");
   }
   parent.append(section);
 };
