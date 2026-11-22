@@ -71,6 +71,7 @@ Propose exactly this declaration. It lists every listener and service the finish
       { "proto": "tcp", "port": 22, "from": "any" },
       { "proto": "udp", "port": 51820, "from": "any" },
       { "proto": "tcp", "port": 9119, "from": "peers" },
+      { "proto": "tcp", "port": 9121, "from": "peers" },
       { "proto": "tcp", "port": 9120, "from": "none" },
       { "proto": "tcp", "port": 3773, "from": "none" },
       { "proto": "tcp", "port": 20241, "from": "none" },
@@ -86,6 +87,7 @@ Propose exactly this declaration. It lists every listener and service the finish
     { "name": "systemd-networkd", "scope": { "kind": "system" }, "lifecycle": "enabled-survives-reboot" },
     { "name": "hermes-agent", "scope": { "kind": "system" }, "lifecycle": "enabled-survives-reboot" },
     { "name": "hermes-backend", "scope": { "kind": "system" }, "lifecycle": "enabled-survives-reboot" },
+    { "name": "nginx", "scope": { "kind": "system" }, "lifecycle": "enabled-survives-reboot" },
     { "name": "t3code", "scope": { "kind": "system" }, "lifecycle": "enabled-survives-reboot" },
     { "name": "tor", "scope": { "kind": "system" }, "lifecycle": "enabled-survives-reboot" }
   ],
@@ -109,6 +111,7 @@ What each entry is:
 - UDP 51820: WireGuard.
 - 9119: the Hermes dashboard. It listens on all addresses, but the firewall opens it on the WireGuard interface
   only.
+- 9121: the credit and rent status page (nginx), with basic auth using the dashboard password; wg0 only.
 - 9120: Hermes' internal listener.
 - 3773: T3 Code.
 - 20241: T3 Connect's tunnel client status port.
@@ -554,6 +557,236 @@ cat > /etc/nixos/cc-hermes.nix <<'FILE'
   };
 }
 FILE
+# Timer and page are base configuration, independent of Hermes's model and its credit.
+cat > /etc/nixos/extra/credit-status.nix <<'FILE'
+{ pkgs, ... }:
+{
+  systemd.tmpfiles.rules = [
+    "d /var/lib/hermes/workspace 0750 hermes hermes - -"
+    "d /var/lib/hermes/credit-monitor 0700 hermes hermes - -"
+    "d /var/lib/credit-status 0755 hermes hermes - -"
+  ];
+  # Hash at runtime, before nginx starts and whenever the dashboard password changes.
+  # Neither the password nor its hash enters the Nix store or a process argument.
+  systemd.services.credit-status-auth = {
+    description = "Credit status page credentials";
+    requiredBy = [ "nginx.service" ];
+    before = [ "nginx.service" ];
+    path = [ pkgs.coreutils ];
+    serviceConfig = { Type = "oneshot"; User = "root"; Group = "root"; UMask = "0077"; };
+    script = ''
+      set -eu
+      install -d -m 0750 -o root -g nginx /var/lib/credit-status-auth
+      auth=/var/lib/credit-status-auth
+      trap 'rm -f "$auth/htpasswd.new"' EXIT
+      { printf 'owner:'; ${pkgs.openssl}/bin/openssl passwd -6 -stdin < /var/lib/control-center/dashboard-password; } > "$auth/htpasswd.new"
+      chown root:nginx "$auth/htpasswd.new"
+      chmod 0440 "$auth/htpasswd.new"
+      mv "$auth/htpasswd.new" "$auth/htpasswd"
+    '';
+  };
+  systemd.paths.credit-status-auth = {
+    wantedBy = [ "multi-user.target" ];
+    pathConfig.PathChanged = "/var/lib/control-center/dashboard-password";
+  };
+  services.nginx = {
+    enable = true;
+    virtualHosts.credit-status = {
+      listen = [ { addr = "0.0.0.0"; port = 9121; } ];
+      root = "/var/lib/credit-status";
+      basicAuthFile = "/var/lib/credit-status-auth/htpasswd";
+      extraConfig = "add_header Cache-Control 'no-store' always;";
+    };
+  };
+  systemd.services.credit-status = {
+    description = "Credit and rent status (no model calls)";
+    wants = [ "network-online.target" ];
+    after = [ "network-online.target" "hermes-agent.service" ];
+    path = [ pkgs.curl pkgs.jq pkgs.coreutils pkgs.gnugrep pkgs.gawk pkgs.util-linux ];
+    # Only this small pre-start runs as root: hermes cannot traverse the secrets directory.
+    # Always remove the previous snapshot first, so a missing rent date cannot look current.
+    serviceConfig.ExecStartPre = "+${pkgs.writeShellScript "credit-rent-snapshot" ''
+      rm -f /var/lib/hermes/credit-monitor/paid-through
+      if [ -f /var/lib/control-center/paid-through ]; then
+        install -m 0440 -o hermes -g hermes /var/lib/control-center/paid-through /var/lib/hermes/credit-monitor/paid-through
+      fi
+    ''}";
+    serviceConfig = {
+      Type = "oneshot";
+      User = "hermes";
+      Group = "hermes";
+      UMask = "0027";
+      TimeoutStartSec = 240;
+      ExecStart = "/run/current-system/sw/bin/sh /etc/nixos/credit-status.sh";
+    };
+  };
+  systemd.timers.credit-status = {
+    wantedBy = [ "timers.target" ];
+    timerConfig = { OnBootSec = "1min"; OnUnitActiveSec = "5min"; AccuracySec = "1s"; };
+  };
+}
+FILE
+cat > /etc/nixos/credit-status.sh <<'FILE'
+#!/bin/sh
+# Account JSON: credit_id, default_key; optional key_id disambiguates the one monthly $5 Hermes key.
+# Rent is copied from /var/lib/control-center/paid-through by the root pre-start (its parent is 0700).
+set -eu
+umask 027
+A=/var/lib/hermes/credit-account
+D=/var/lib/hermes/credit-monitor
+W=/var/lib/hermes/workspace
+P=/var/lib/credit-status
+API=https://api.ppq.ai
+exec 9>"$D/lock"
+flock -n 9 || exit 0
+T=$(mktemp -d "$D/run.XXXXXX")
+S=$D/state.json
+now=$(date -u +%s); day=$(date -u +%F)
+balance=unknown; usage=unknown; rent='rent date unknown'; account='machine credit account: not set up yet'
+: > "$T/alerts"
+alert() { printf 'ALERT: %s\n' "$1" >> "$T/alerts"; }
+# Flush each journal replacement before a dispatch, and before publishing an invoice.
+save() { sync -f "$T/state"; mv "$T/state" "$S"; sync -f "$D"; }
+finish() {
+  rc=$?; trap - EXIT
+  [ "$rc" = 0 ] || alert 'Credit monitor failed; saved invoice remains authoritative. Check the timer.'
+  {
+    printf 'Updated: %s UTC\n%s\nBalance: %s USD\nThis period usage: %s USD (5 USD/month)\nRent paid through: %s\n' \
+      "$(date -u +%FT%TZ)" "$account" "$balance" "$usage" "$rent"
+    if [ -s "$S" ]; then
+      jq -r --argjson now "$now" 'select(.invoice != null) | .invoice |
+        "Invoice: \(.amount_sat // 2000) sat\nState: \(.state)\nMinutes left: \(if .expires_at then ([0, ((.expires_at-$now)/60|floor)]|max) else "unknown" end)\nBolt11: \(.bolt11 // "unavailable; creation outcome unknown")"' "$S" 2>/dev/null || true
+    fi
+    cat "$T/alerts"
+  } > "$W/credit-status.txt.new"
+  mv "$W/credit-status.txt.new" "$W/credit-status.txt"
+  {
+    printf '<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="60"><title>Machine credit and rent</title><h1>Machine credit and rent</h1><p>Checks every five minutes. Check the update time.</p><pre>'
+    jq -Rrs '@html' "$W/credit-status.txt"
+    printf '</pre>'
+    if [ -s "$S" ]; then
+      jq -r 'select(.invoice.state == "pending") | select(.invoice.bolt11? | strings | test("^lnbc[a-z0-9]+$")) |
+        "<p><a href=\"lightning:\(.invoice.bolt11)\">Pay invoice</a></p>"' "$S" 2>/dev/null || true
+    fi
+  } > "$P/index.html.new"
+  chmod 0644 "$P/index.html.new"; mv "$P/index.html.new" "$P/index.html"
+  rm -rf "$T"
+  exit "$rc"
+}
+trap finish EXIT
+# Missing or malformed rent never suppresses credit alerts.
+if [ -r "$D/paid-through" ]; then
+  rent=$(cat "$D/paid-through")
+  if printf '%s\n' "$rent" | grep -qxE '[0-9]{4}-[0-9]{2}-[0-9]{2}' && due=$(date -u -d "$rent" +%s 2>/dev/null); then
+    left=$((due-now))
+    if [ "$left" -le 259200 ]; then alert "Rent due within 3 days or overdue: $rent"
+    elif [ "$left" -le 1209600 ]; then alert "Rent due within 14 days: $rent"; fi
+  else rent='rent date unknown'; fi
+fi
+[ "$rent" != 'rent date unknown' ] || alert 'rent date unknown'
+[ -e "$A" ] || exit 0
+account='machine credit account: configured'
+if ! jq -e 'def token: type == "string" and length <= 8192 and test("^[!-~]+$");
+  (.credit_id|token) and (.default_key|token)' "$A" >/dev/null 2>&1; then
+  alert 'Machine credit account unreadable; no vendor request made'; exit 0
+fi
+if [ ! -e "$S" ]; then
+  jq '{credit_id, last_create:0, day:"", count:0, invoice:null}' "$A" > "$T/state"; save
+fi
+# Corrupt or replaced-account state is never treated as permission to create again.
+if ! jq -e --slurpfile a "$A" '
+  .credit_id == $a[0].credit_id and (.last_create|type == "number" and . >= 0) and
+  (.day|type == "string") and (.count|type == "number" and . >= 0 and floor == .) and
+  (.invoice == null or (.invoice | (.state|IN("unknown","pending","paid","expired_unpaid")) and
+    (.baseline|type == "number" and . >= 0) and
+    (.id == null or ((.id|type == "string" and test("^[A-Za-z0-9_-]{1,128}$")) and
+      (.bolt11|type == "string" and length <= 8192 and test("^lnbc[a-z0-9]+$")) and
+      .amount_sat == 2000 and (.expires_at|type == "number" and . > 0)))))' "$S" >/dev/null 2>&1; then
+  alert 'Credit journal invalid or account changed; reconcile it before any new invoice'; exit 0
+fi
+# Secrets go through stdin/config files, never curl arguments. No HTTP retries or redirects.
+request() {
+  method=$1; path=$2; auth=$3; body=$4
+  jq -r --arg auth "$auth" 'if $auth == "default" then
+    "header = " + ("Authorization: Bearer " + .default_key | tojson)
+    elif $auth == "account" then "header = " + ("x-credit-id: " + .credit_id | tojson)
+    else empty end' "$A" > "$T/curl"
+  if [ "$body" = none ]; then
+    HTTP=$(curl -q --config "$T/curl" -sf --connect-timeout 10 --max-time 30 -X "$method" \
+      -o "$T/reply" -w '%{http_code}' "$API$path")
+  else
+    HTTP=$(curl -q --config "$T/curl" -sf --connect-timeout 10 --max-time 30 -X "$method" \
+      -H 'Content-Type: application/json' --data-binary "@$body" -o "$T/reply" -w '%{http_code}' "$API$path")
+  fi
+}
+jq '{credit_id}' "$A" > "$T/balance"
+if request POST /credits/balance none "$T/balance" &&
+  jq -e '.balance|type == "number" and . >= 0 and . <= 1e12' "$T/reply" >/dev/null 2>&1; then
+  balance=$(jq -r .balance "$T/reply")
+else alert 'Credit balance unreadable; no new invoice'; fi
+if request GET '/keys?include_disabled=true' account none &&
+  jq -e --slurpfile a "$A" '[.data[] | select(.reset_period == "monthly" and .usage_limit_usd == 5 and
+    .expire_at == null and .disabled != true and .deleted != true and
+    ($a[0].key_id == null or ._id == $a[0].key_id))] |
+    length == 1 and (.[0].current_period_usage_usd|type == "number" and . >= 0 and . <= 1e12)' "$T/reply" >/dev/null 2>&1; then
+  usage=$(jq -r --slurpfile a "$A" '.data[] | select(.reset_period == "monthly" and .usage_limit_usd == 5 and
+    .expire_at == null and .disabled != true and .deleted != true and
+    ($a[0].key_id == null or ._id == $a[0].key_id)) | .current_period_usage_usd' "$T/reply")
+else alert 'Hermes monthly key usage unreadable or ambiguous'; fi
+[ "$usage" = unknown ] || { if awk "BEGIN {exit !($usage >= 5)}"; then alert 'Hermes monthly 5 USD limit reached'; fi; }
+state=$(jq -r '.invoice.state // "none"' "$S")
+case "$state" in
+  pending|unknown)
+    id=$(jq -r '.invoice.id // empty' "$S")
+    next=unknown
+    if [ -n "$id" ] && request GET "/topup/status/$id" default none &&
+      jq -e --arg id "$id" '.invoice_id == $id' "$T/reply" >/dev/null 2>&1; then
+      # The balance above was read before polling. Expiry needs a fresh read AFTER status.
+      cp "$T/reply" "$T/status"
+      if request POST /credits/balance none "$T/balance" &&
+        jq -e '.balance|type == "number" and . >= 0 and . <= 1e12' "$T/reply" >/dev/null 2>&1; then
+        balance=$(jq -r .balance "$T/reply")
+        next=$(jq -r --slurpfile s "$S" --argjson b "$balance" --argjson now "$now" '
+          if .status == "Settled" then "paid"
+          elif .status == "Expired" and $b > $s[0].invoice.baseline then "paid"
+          elif .status == "Expired" and .amount_paid == 0 and $b <= $s[0].invoice.baseline then "expired_unpaid"
+          elif .status == "New" and $now < $s[0].invoice.expires_at then "pending"
+          else "unknown" end' "$T/status")
+      else balance=unknown; alert 'Fresh balance unreadable; invoice outcome unknown'; fi
+    fi
+    jq --arg next "$next" '.invoice.state=$next' "$S" > "$T/state"; save
+    state=$next ;;
+esac
+[ "$state" != unknown ] || alert 'Invoice outcome unknown; no new invoice. Reconcile the saved request, never recreate it blindly'
+if [ "$balance" != unknown ] && awk "BEGIN {exit !($balance < 35)}"; then
+  now=$(date -u +%s); day=$(date -u +%F)
+  alert 'Credit below seven monthly periods (35 USD); see the saved 2000 sat invoice and its state'
+  case "$state" in
+    none|paid|expired_unpaid)
+      last=$(jq -r .last_create "$S")
+      count=$(jq -r --arg day "$day" 'if .day == $day then .count else 0 end' "$S")
+      if [ "$((now-last))" -lt 300 ] || [ "$count" -ge 100 ]; then
+        alert 'Invoice creation rate limit reached (one per 5 minutes, 100 per UTC day)'
+      else
+        # Persist unknown intent AND rate reservation before POST; a lost response cannot cause a second POST.
+        jq --arg day "$day" --argjson now "$now" --argjson b "$balance" --argjson count "$count" \
+          '.history=((.history // []) + (if .invoice then [.invoice] else [] end)) |
+          .last_create=$now | .day=$day | .count=($count+1) |
+          .invoice={state:"unknown",id:null,amount_sat:2000,baseline:$b}' "$S" > "$T/state"; save
+        printf '{"amount":2000,"currency":"SATS"}' > "$T/create"
+        if request POST /topup/create/btc-lightning default "$T/create" && [ "$HTTP" = 201 ] &&
+          now=$(date -u +%s) && jq -e --argjson now "$now" '(.invoice_id|type == "string" and test("^[A-Za-z0-9_-]{1,128}$")) and
+            .amount == 2000 and .currency == "SATS" and
+            (.lightning_invoice|type == "string" and length <= 8192 and test("^lnbc[a-z0-9]+$")) and
+            (.expires_at|type == "number" and floor == . and . > $now)' "$T/reply" >/dev/null 2>&1; then
+          jq --slurpfile r "$T/reply" '.invoice += {state:"pending",id:$r[0].invoice_id,
+            bolt11:$r[0].lightning_invoice,expires_at:$r[0].expires_at}' "$S" > "$T/state"; save
+        else alert 'Invoice creation outcome unknown; no retry until reconciled'; fi
+      fi ;;
+  esac
+fi
+FILE
+chmod 0644 /etc/nixos/credit-status.sh
 sed -i -e "s|@ai_base_url@|$URL|" -e "s|@ai_model@|$MODEL|" /etc/nixos/cc-hermes.nix
 grep -E 'base_url|default =' /etc/nixos/cc-hermes.nix
 sh /etc/nixos/cc-rebuild.sh
@@ -1138,6 +1371,8 @@ cat > /etc/nixos/cc-agent.nix <<'FILE'
     Put anything the user must copy (an address, an invoice, a file name, a link) alone in a code block.
     Before stopping or restarting a service, applying a rebuild, a large download, a new recurring automation or
     any spend, ask the user and wait, in every access mode.
+    If /var/lib/hermes/workspace/credit-status.txt has a line starting with `ALERT:`, tell the user at the start of your next reply, with the status page address <http://10.88.0.1:9121/>.
+    When the user asks for a credit invoice, read it from that file; never make one yourself.
     Recipes for common requests are in recipes/ next to this file: bitcoin-node.md (a pruned Bitcoin node and
     Tailscale), bitcoin-wallet.md (a watch-only wallet's balance), lightning-node.md (lnd, a read-only
     Zeus link, and payment access when the user wants the node to pay or be paid), and stronger-agent-model.md
@@ -1416,10 +1651,10 @@ cat > /etc/nixos/cc-wireguard.nix <<'FILE'
 { ... }:
 {
   # The second way in: a WireGuard VPN. UDP 51820 is its one public port; the dashboard port 9119 is open on the
-  # WireGuard interface only, never on the public one.
+  # WireGuard interface only, never on the public one. The status page on 9121 follows the same rule.
   networking.firewall.enable = true;
   networking.firewall.allowedUDPPorts = [ 51820 ];
-  networking.firewall.interfaces.wg0.allowedTCPPorts = [ 9119 ];
+  networking.firewall.interfaces.wg0.allowedTCPPorts = [ 9119 9121 ];
 
   networking.wireguard.interfaces.wg0 = {
     ips = [ "10.88.0.1/24" ];
@@ -1467,6 +1702,7 @@ cat > /etc/nixos/cc-tor.nix <<'FILE'
     client.enable = true;
     relay.onionServices.control-center.map = [
       { port = 80; target = { addr = "127.0.0.1"; port = 9119; }; }
+      { port = 9121; target = { addr = "127.0.0.1"; port = 9121; }; }
     ];
   };
 }
@@ -1527,9 +1763,10 @@ umask 077
   fi
   echo ""
   echo "Hermes dashboard over WireGuard: import wireguard.conf from this folder, then open http://10.88.0.1:9119/"
+  echo "Credit and rent status over WireGuard: http://10.88.0.1:9121/ (same user and password)"
   echo "user: owner"
   echo "password: $(cat $S/dashboard-password)"
-  [ -n "$ONION" ] && echo "Over Tor (Tor Browser): http://$ONION/ with the same user and password"
+  [ -n "$ONION" ] && echo "Over Tor (Tor Browser): http://$ONION/ and credit status http://$ONION:9121/ with the same user and password"
 } > "$H/control-center-login.txt"
 { echo "http://10.88.0.1:9119/"; [ -n "$ONION" ] && echo "http://$ONION/"; } > "$H/app-url.txt"
 chmod 600 "$H/wireguard.conf" "$H/control-center-login.txt"; chmod 644 "$H/app-url.txt"
