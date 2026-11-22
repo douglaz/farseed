@@ -411,10 +411,12 @@ mod tests {
             "node's fee estimate, never above 10 sat/vB or 2,000 sat total fee",
             "Anything outside these defaults needs the user to state the number",
             "One yes is for one command",
-            "journalctl -u lnd-backup-copy -n 5 --no-pager",
-            "`copied: <path>`",
-            "`ls -t /var/lib/farseed-files`; never compose a name",
-            "without waiting to be asked",
+            "cat /var/lib/farseed-files-receipt/latest",
+            "stat -c %y /var/lib/farseed-files-receipt/latest",
+            "record `date -Ins`, then copy",
+            "If the receipt is missing\n   or older than the copy you just started, say so and stop",
+            "Never compose a name",
+            "without waiting\n   to be asked",
             "Get a file from this machine",
         ] {
             assert!(
@@ -442,6 +444,57 @@ mod tests {
         }
         assert!(recipes.contains("contain the full link alone in a code block"));
         assert!(recipes.contains("restart lnd, ask the user and wait first"));
+    }
+
+    #[test]
+    fn template_backup_receipt_keeps_files_private_and_copy_successful() {
+        let step = &CONTROL_CENTER.steps[5];
+        let source = step.blocks.get("Do").unwrap();
+        let copy = source
+            .split("systemd.services.lnd-backup-copy = {")
+            .nth(1)
+            .unwrap()
+            .split("\n  };\n")
+            .next()
+            .unwrap();
+        for required in [
+            "UMask = \"0077\"",
+            "install -d -m 0700 /var/lib/farseed-files",
+            "install -m 0600 /var/lib/lnd/data/chain/bitcoin/mainnet/channel.backup",
+            "echo \"copied: /var/lib/farseed-files/$name",
+            "receipt=/var/lib/farseed-files-receipt",
+            "install -d -o root -g hermes -m 0750 \"$receipt\" &&",
+            "size=$(stat -c %s \"/var/lib/farseed-files/$name\") &&",
+            "printf '%s\\n%s\\n' \"$name\" \"$size\" > \"$receipt/latest.tmp\" &&",
+            "chown root:hermes \"$receipt/latest.tmp\" &&",
+            "chmod 0440 \"$receipt/latest.tmp\" &&",
+            "mv -f \"$receipt/latest.tmp\" \"$receipt/latest\"",
+            ") || echo \"backup copied; receipt not updated\"",
+        ] {
+            assert!(copy.contains(required), "missing copy rule: {required}");
+        }
+        let recipes = step.blocks.get("Recipes").unwrap();
+        let payment = recipes.split("**Payment access**").nth(1).unwrap();
+        let payment = payment.split("\nRECIPE\n").next().unwrap();
+        assert!(!payment.contains("journalctl"));
+        assert!(!payment.contains("ls -t /var/lib/farseed-files"));
+    }
+
+    #[test]
+    fn template_peer_alias_uses_readonly_key_after_connect() {
+        let recipes = CONTROL_CENTER.steps[5].blocks.get("Recipes").unwrap();
+        let payment = recipes.split("**Payment access**").nth(1).unwrap();
+        let payment = payment.split("\nRECIPE\n").next().unwrap();
+        let connect = payment.find("connect <pubkey>@<host>:<port>").unwrap();
+        let lookup = payment.find("lncli --tlscertpath=/var/lib/lnd/tls.cert --macaroonpath=/var/lib/lnd-pub/readonly.macaroon getnodeinfo <pubkey>").unwrap();
+        let proposal = payment.find("Before proposing a channel").unwrap();
+        assert!(connect < lookup && lookup < proposal);
+        assert!(payment.contains("After connect, look up its alias with the read-only key"));
+        assert!(payment.contains("Use no other command except the read-only lookup below"));
+        assert!(payment.contains("If the lookup gives no alias, say so and ask the user"));
+        let source = CONTROL_CENTER.steps[5].blocks.get("Do").unwrap();
+        let calls = source.split("calls = [").nth(1).unwrap();
+        assert!(!calls.split("];").next().unwrap().contains("GetNodeInfo"));
     }
 
     #[test]

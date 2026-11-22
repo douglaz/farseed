@@ -673,12 +673,16 @@ Only after the seed file is deleted (the user said "saved"); the module refuses 
    `lncli --tlscertpath=/var/lib/lnd/tls.cert --macaroonpath=/var/lib/lnd-pub/pay.macaroon <command>`, with these
    commands: getinfo, newaddress, connect, listpeers, openchannel, closechannel, pendingchannels, listchannels,
    decodepayreq, payinvoice, trackpayment, addinvoice, lookupinvoice, listpayments, listinvoices, walletbalance,
-   listchaintxns, sendcoins and estimatefee. Use no other command. lnd checks calls, not commands: it refuses
-   calls outside that set, but another command made of the same calls still works. Never use closeallchannels,
+   listchaintxns, sendcoins and estimatefee. Use no other command except the read-only lookup below.
+   lnd checks calls, not commands: it refuses calls outside that set, but another command made of the same calls
+   still works. Never use closeallchannels,
    which closes every channel at once.
    To receive, always use `lncli ... addinvoice --private`, even for "give me an invoice": private channels need
    route hints. Put the invoice alone in a code block.
    To reach a peer: `lncli ... connect <pubkey>@<host>:<port>` (outbound only).
+   After connect, look up its alias with the read-only key:
+   `lncli --tlscertpath=/var/lib/lnd/tls.cert --macaroonpath=/var/lib/lnd-pub/readonly.macaroon getnodeinfo <pubkey>`.
+   A node with no peers has no network map yet. If the lookup gives no alias, say so and ask the user.
    Before proposing a channel, show the peer's alias and public key. It must be able to route to the user's phone
    wallet. Say why in one sentence, including what you checked and what you couldn't check. If you can't establish
    that it can route there, pause and ask the user. For a user-supplied peer, show its alias and ask for confirmation.
@@ -693,11 +697,12 @@ Only after the seed file is deleted (the user said "saved"); the module refuses 
    `lncli ... listpayments --include_incomplete` and tell the user. After an unclear sendcoins, openchannel or
    closechannel, first check `lncli ... listchaintxns` and `lncli ... pendingchannels`, and never send again until
    that result is known.
-5. After a channel opens or closes, copy the channel backup for the user: `systemctl start lnd-backup-copy`.
-   Read the actual name from `journalctl -u lnd-backup-copy -n 5 --no-pager` (the `copied: <path>` line), or
-   `ls -t /var/lib/farseed-files`; never compose a name. Tell the user, without waiting to be asked, that the
-   backup is ready under "Get a file from this machine". Give its real name alone in a code block and its size,
-   never its contents.
+5. After a channel opens or closes, record `date -Ins`, then copy the channel backup for the user:
+   `systemctl start lnd-backup-copy`. Check `stat -c %y /var/lib/farseed-files-receipt/latest`, then read
+   `cat /var/lib/farseed-files-receipt/latest`: the real name, then the size in bytes. If the receipt is missing
+   or older than the copy you just started, say so and stop. Never compose a name. Tell the user, without waiting
+   to be asked, that the backup is ready under "Get a file from this machine". Give its real name alone in a code
+   block and its size, never its contents.
 6. To end payment access: delete /etc/nixos/extra/lightning-pay.nix and apply. That removes the macaroon and, while
    lnd answers, revokes every copy of it. If lnd isn't answering at that moment, copies stay valid until they
    expire (at most 2 days), unless payment access is turned on again, which revokes them first.
@@ -1045,6 +1050,15 @@ in
       name="channel-backup-$(date -u +%Y%m%dT%H%M%SZ).backup"
       install -m 0600 /var/lib/lnd/data/chain/bitcoin/mainnet/channel.backup "/var/lib/farseed-files/$name"
       echo "copied: /var/lib/farseed-files/$name ($(stat -c %s "/var/lib/farseed-files/$name") bytes)"
+      (
+        receipt=/var/lib/farseed-files-receipt
+        install -d -o root -g hermes -m 0750 "$receipt" &&
+          size=$(stat -c %s "/var/lib/farseed-files/$name") &&
+          printf '%s\n%s\n' "$name" "$size" > "$receipt/latest.tmp" &&
+          chown root:hermes "$receipt/latest.tmp" &&
+          chmod 0440 "$receipt/latest.tmp" &&
+          mv -f "$receipt/latest.tmp" "$receipt/latest"
+      ) || echo "backup copied; receipt not updated"
     '';
   };
 
