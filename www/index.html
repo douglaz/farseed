@@ -36,6 +36,15 @@ a[data-operator-link], a[data-delivered-url] { display: block; width: 100%; min-
 button.main-action { background: #175b5b; border-color: #175b5b; color: white; font-weight: 700; }
 [data-missing-record] button { display: block; width: 100%; min-height: 48px; margin-right: 0; white-space: normal; }
 [data-task] button { min-height: 48px; }
+/* Polls change the message, never the space before the task controls. Scroll rather than clip at large text sizes. */
+[data-task-heading] { display: grid; }
+[data-task-heading] > span, [data-task-heading]::after { grid-area: 1 / 1; }
+[data-task-heading]::after { content: attr(data-task-heading); visibility: hidden; }
+[data-progress-sizing] { display: grid; }
+[data-progress-sizing] > span, [data-progress-sizing]::after { grid-area: 1 / 1; }
+[data-progress-sizing]::after { content: attr(data-progress-sizing); visibility: hidden; }
+[data-task-status] { block-size: 10.5em; overflow: auto; margin: 12px 0; }
+[data-task-status] p { margin: 0 0 6px; }
 /* No double-tap-zoom wait on controls, so a tap clicks at once; pinch zoom and panning stay. */
 button, a, summary, label, input, select, textarea { touch-action: manipulation; }
 button:disabled { opacity: .55; cursor: default; }
