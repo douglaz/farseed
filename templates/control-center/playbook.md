@@ -674,6 +674,32 @@ finish() {
   exit "$rc"
 }
 trap finish EXIT
+# Lightning is optional. A missing unit has no restart counter and needs no monitoring.
+if systemctl show lnd -p ActiveState,SubState,NRestarts > "$T/lnd" 2>/dev/null; then
+  active=; sub=; restarts=
+  while IFS='=' read -r key value; do
+    case "$key" in ActiveState) active=$value ;; SubState) sub=$value ;; NRestarts) restarts=$value ;; esac
+  done < "$T/lnd"
+  if printf '%s\n' "$active:$sub:$restarts" | grep -qxE '[a-z-]+:[a-z-]+:[0-9]+'; then
+    previous=$restarts; since=0
+    if [ -r "$D/lnd-state" ]; then
+      read -r previous since < "$D/lnd-state" || true
+      if ! printf '%s\n' "$previous $since" | grep -qxE '[0-9]+ [0-9]+'; then previous=$restarts; since=0; fi
+    fi
+    if [ "$restarts" -gt "$previous" ]; then
+      alert "lnd restarted on its own $((restarts-previous)) time(s) since the last check"
+    fi
+    if [ "$active" = active ]; then since=0
+    else
+      [ "$since" -ne 0 ] || since=$now
+      if [ $((now-since)) -gt 900 ]; then
+        alert "lnd is not running (state $active/$sub) since $(date -u -d "@$since" +%FT%TZ)"
+      fi
+    fi
+    printf '%s %s\n' "$restarts" "$since" > "$T/lnd-state"
+    mv "$T/lnd-state" "$D/lnd-state"
+  fi
+fi
 # Missing or malformed rent never suppresses credit alerts.
 if [ -r "$D/paid-through" ]; then
   rent=$(cat "$D/paid-through")
@@ -1159,6 +1185,7 @@ in
   # can read.
   systemd.tmpfiles.rules = [ "d /var/lib/lnd-pub 0750 lnd hermes - -" ];
 
+  # Restart after any exit except an explicit stop, so a clean exit cannot leave the node off.
   systemd.services.lnd = {
     description = "Lightning Network Daemon";
     wantedBy = [ "multi-user.target" ];
@@ -1167,6 +1194,7 @@ in
     # lnd stops and restarts with Core.
     partOf = [ "bitcoind-main.service" ];
     restartTriggers = [ config.environment.etc."lnd/lnd.conf".source ];
+    unitConfig.StartLimitIntervalSec = 0;
     serviceConfig = {
       User = "lnd";
       Group = "lnd";
@@ -1189,7 +1217,7 @@ in
       ];
       ExecStart = "${lnd}/bin/lnd --lnddir=/var/lib/lnd --configfile=/etc/lnd/lnd.conf";
       TimeoutStartSec = "infinity";
-      Restart = "on-failure";
+      Restart = "always";
       RestartSec = 30;
     };
   };

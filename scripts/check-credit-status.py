@@ -4,8 +4,10 @@ import datetime
 import fcntl
 import http.server
 import json
+import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -110,9 +112,33 @@ class CreditStatus(unittest.TestCase):
         self.assertNotIn('https://', script)
         self.script = self.root / 'monitor.sh'
         self.script.write_text(script)
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        self.lnd_show = self.root / 'lnd-show'
+        self.lnd_exit = self.root / 'lnd-exit'
+        self.lnd_show.write_text('ActiveState=inactive\nSubState=dead\n')
+        self.lnd_exit.write_text('1\n')
+        systemctl = self.bin / 'systemctl'
+        systemctl.write_text(f'''#!/bin/sh
+[ "$*" = 'show lnd -p ActiveState,SubState,NRestarts' ] || exit 2
+cat '{self.lnd_show}'
+exit "$(cat '{self.lnd_exit}')"
+''')
+        systemctl.chmod(0o755)
+        self.now = int(time.time())
+        self.clock = self.root / 'clock'
+        self.clock.write_text(str(self.now))
+        date = self.bin / 'date'
+        date.write_text(f'''#!/bin/sh
+if [ "$*" = '-u +%s' ]; then cat '{self.clock}'
+else exec '{shutil.which('date')}' "$@"; fi
+''')
+        date.chmod(0o755)
+        self.env = dict(os.environ, PATH=str(self.bin) + os.pathsep + os.environ['PATH'])
 
     def run_monitor(self):
-        result = subprocess.run(['sh', str(self.script)], capture_output=True, text=True, timeout=15)
+        result = subprocess.run(['sh', str(self.script)], capture_output=True, text=True, timeout=15,
+                                env=self.env)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, '')
         self.assertEqual(self.errors, [])
@@ -137,6 +163,69 @@ class CreditStatus(unittest.TestCase):
         self.run_monitor()
         self.assertEqual(self.creates(), 1)
         self.assertEqual(self.state()['invoice']['state'], 'pending')
+
+    def lnd(self, active='active', sub='running', restarts=0):
+        self.lnd_exit.write_text('0\n')
+        self.lnd_show.write_text(f'ActiveState={active}\nSubState={sub}\nNRestarts={restarts}\n')
+
+    def test_no_lnd_unit_has_no_alert_or_state(self):
+        for code in (1, 0):
+            with self.subTest(exit=code):
+                self.lnd_exit.write_text(str(code))
+                self.assertNotIn('ALERT: lnd', self.run_monitor())
+                self.assertFalse((self.monitor / 'lnd-state').exists())
+
+    def test_lnd_active_unchanged_counter_has_no_alert(self):
+        self.lnd(restarts=3)
+        self.assertNotIn('ALERT: lnd', self.run_monitor())
+        self.assertNotIn('ALERT: lnd', self.run_monitor())
+        self.assertEqual((self.monitor / 'lnd-state').read_text(), '3 0\n')
+
+    def test_lnd_restart_alert_is_only_for_new_restarts(self):
+        self.lnd(restarts=3)
+        self.run_monitor()
+        self.lnd(restarts=5)
+        self.assertIn('ALERT: lnd restarted on its own 2 time(s) since the last check', self.run_monitor())
+        self.assertNotIn('ALERT: lnd', self.run_monitor())
+        self.lnd(restarts=0)
+        self.assertNotIn('ALERT: lnd', self.run_monitor())
+        self.lnd(restarts=1)
+        self.assertIn('lnd restarted on its own 1 time(s)', self.run_monitor())
+
+    def test_lnd_down_alert_waits_more_than_fifteen_minutes(self):
+        for active, sub in (('inactive', 'dead'), ('activating', 'start-pre')):
+            with self.subTest(state=active):
+                (self.monitor / 'lnd-state').unlink(missing_ok=True)
+                self.clock.write_text(str(self.now))
+                self.lnd(active, sub)
+                self.assertNotIn('ALERT: lnd', self.run_monitor())
+                for minutes in (14, 15):
+                    self.clock.write_text(str(self.now + minutes * 60))
+                    self.assertNotIn('ALERT: lnd', self.run_monitor())
+                self.clock.write_text(str(self.now + 16 * 60))
+                since = datetime.datetime.fromtimestamp(self.now, datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                self.assertIn(f'ALERT: lnd is not running (state {active}/{sub}) since {since}',
+                              self.run_monitor())
+
+    def test_lnd_recovery_clears_downtime(self):
+        self.lnd('inactive', 'dead')
+        self.run_monitor()
+        self.clock.write_text(str(self.now + 16 * 60))
+        self.assertIn('ALERT: lnd is not running', self.run_monitor())
+        self.lnd()
+        self.assertNotIn('ALERT: lnd', self.run_monitor())
+        self.assertEqual((self.monitor / 'lnd-state').read_text(), '0 0\n')
+        self.lnd('activating', 'start-pre')
+        self.assertNotIn('ALERT: lnd', self.run_monitor())
+        self.assertEqual((self.monitor / 'lnd-state').read_text(), f'0 {self.now + 16 * 60}\n')
+
+    def test_lnd_alert_without_credit_account(self):
+        self.account.unlink()
+        self.lnd('inactive', 'dead')
+        self.run_monitor()
+        self.clock.write_text(str(self.now + 16 * 60))
+        self.assertIn('ALERT: lnd is not running', self.run_monitor())
+        self.assertEqual(self.calls, [])
 
     def test_missing_account_never_calls_vendor_and_renders(self):
         self.account.unlink()
