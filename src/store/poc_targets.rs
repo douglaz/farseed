@@ -897,7 +897,7 @@ pub(crate) async fn test_poc_job_evidence(
     let settled = store.storage.files();
     let duplicate_refused =
         store.job_evidence(&evidence).await.is_err() && store.storage.files() == settled;
-    let mut recovered = unlock(
+    let recovered = unlock(
         MemoryStorage::with_files(store.storage.files()),
         &Fixed,
         pass(),

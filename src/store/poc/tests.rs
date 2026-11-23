@@ -478,11 +478,9 @@ impl Runtime for Fixture {
         let (exit, output) = if proposal.check_batch() {
             let mut output = Vec::new();
             let start = proposal.check.unwrap();
-            for index in start..proposal.check_batch_end(pending.checks.len()) {
-                assert!(matches!(
-                    pending.read_plan[index],
-                    crate::poc::completion::Read::Listeners
-                ));
+            let end = proposal.check_batch_end(pending.checks.len());
+            for (index, read) in (start..end).zip(&pending.read_plan[start..end]) {
+                assert!(matches!(read, crate::poc::completion::Read::Listeners));
                 crate::poc::check_batch::frame(&mut output, index, self.exit, b"");
             }
             (0, String::from_utf8(output).unwrap())

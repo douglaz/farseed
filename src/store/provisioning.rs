@@ -7,7 +7,7 @@ use crate::poc::provisioning::{
     self as protocol, Api, BillingTerms, REFUSED, Selection, Vendor, VendorRequest, array, id,
     unique_ids,
 };
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 use crate::poc::provisioning::{text, timestamp};
 use crate::poc::targets::TargetRecord;
 

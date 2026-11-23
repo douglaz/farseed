@@ -734,10 +734,7 @@ fn cpu_matches(offer: &Value, image: &Value, vm: &Value) -> Result<bool, String>
     {
         return Ok(false);
     }
-    if template_arch.is_some() && host_arch.is_some() && template_arch != host_arch {
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(template_arch.is_none() || host_arch.is_none() || template_arch == host_arch)
 }
 
 /// Image statistics do not identify the installed image. Missing optional fields and null

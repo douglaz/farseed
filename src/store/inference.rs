@@ -985,18 +985,14 @@ impl<S: Storage> InferenceJournal for Store<S> {
         first
     }
     async fn actionable(&mut self, request: &Request, now: u64) -> bool {
-        if !request.unchanged()
-            || request
+        request.unchanged()
+            && request
                 .continuation
                 .as_ref()
-                .is_none_or(|c| c.check().is_err())
-            || self
+                .is_some_and(|c| c.check().is_ok())
+            && self
                 .check_session_authority(&request.session, super::authority::current_pair(now))
-                .is_err()
-        {
-            return false;
-        }
-        true
+                .is_ok()
     }
 
     async fn session(&mut self, machine: &str) -> Result<String, String> {

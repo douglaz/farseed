@@ -1791,13 +1791,10 @@ fn late_identified_mint_reloads_protected_cleanup_and_replay_never_retries_lost_
         let mut f = Fake::default();
         let mut response = block_on(f.exchange(&sent)).unwrap();
         assert!(s.end_inference_sessions().is_empty());
-        match condition {
-            "unsafe" => {
-                let mut body: Value = serde_json::from_slice(&response.body).unwrap();
-                body["key_id"] = std::str::from_utf8(secret).unwrap().into();
-                response.body = Zeroizing::new(serde_json::to_vec(&body).unwrap());
-            }
-            _ => {}
+        if condition == "unsafe" {
+            let mut body: Value = serde_json::from_slice(&response.body).unwrap();
+            body["key_id"] = std::str::from_utf8(secret).unwrap().into();
+            response.body = Zeroizing::new(serde_json::to_vec(&body).unwrap());
         }
         let finished = block_on(s.inference_finish(call, &response, &sent)).unwrap();
         assert_eq!(finished.report["finished"], true);
