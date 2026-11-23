@@ -116,11 +116,11 @@ class CreditStatus(unittest.TestCase):
         self.bin.mkdir()
         self.lnd_show = self.root / 'lnd-show'
         self.lnd_exit = self.root / 'lnd-exit'
-        self.lnd_show.write_text('ActiveState=inactive\nSubState=dead\n')
-        self.lnd_exit.write_text('1\n')
+        self.lnd_show.write_text('LoadState=not-found\nActiveState=inactive\nSubState=dead\nNRestarts=0\n')
+        self.lnd_exit.write_text('0\n')
         systemctl = self.bin / 'systemctl'
         systemctl.write_text(f'''#!/bin/sh
-[ "$*" = 'show lnd -p ActiveState,SubState,NRestarts' ] || exit 2
+[ "$*" = 'show lnd -p LoadState,ActiveState,SubState,NRestarts' ] || exit 2
 cat '{self.lnd_show}'
 exit "$(cat '{self.lnd_exit}')"
 ''')
@@ -166,14 +166,20 @@ else exec '{shutil.which('date')}' "$@"; fi
 
     def lnd(self, active='active', sub='running', restarts=0):
         self.lnd_exit.write_text('0\n')
-        self.lnd_show.write_text(f'ActiveState={active}\nSubState={sub}\nNRestarts={restarts}\n')
+        self.lnd_show.write_text(f'LoadState=loaded\nActiveState={active}\nSubState={sub}\nNRestarts={restarts}\n')
 
     def test_no_lnd_unit_has_no_alert_or_state(self):
-        for code in (1, 0):
-            with self.subTest(exit=code):
-                self.lnd_exit.write_text(str(code))
-                self.assertNotIn('ALERT: lnd', self.run_monitor())
-                self.assertFalse((self.monitor / 'lnd-state').exists())
+        state = self.monitor / 'lnd-state'
+        for load, code in (('not-found', 0), ('masked', 0), ('', 0), ('not-found', 1)):
+            for stale in (False, True):
+                with self.subTest(load=load, exit=code, stale=stale):
+                    state.unlink(missing_ok=True)
+                    if stale:
+                        state.write_text(f'0 {self.now - 16 * 60}\n')
+                    self.lnd_exit.write_text(str(code))
+                    self.lnd_show.write_text(f'LoadState={load}\nActiveState=inactive\nSubState=dead\nNRestarts=0\n')
+                    self.assertNotIn('ALERT: lnd', self.run_monitor())
+                    self.assertFalse(state.exists())
 
     def test_lnd_active_unchanged_counter_has_no_alert(self):
         self.lnd(restarts=3)

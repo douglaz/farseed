@@ -674,13 +674,14 @@ finish() {
   exit "$rc"
 }
 trap finish EXIT
-# Lightning is optional. A missing unit has no restart counter and needs no monitoring.
-if systemctl show lnd -p ActiveState,SubState,NRestarts > "$T/lnd" 2>/dev/null; then
+# Lightning is optional. Missing units can have counters; monitor only loaded units.
+load=
+if systemctl show lnd -p LoadState,ActiveState,SubState,NRestarts > "$T/lnd" 2>/dev/null; then
   active=; sub=; restarts=
   while IFS='=' read -r key value; do
-    case "$key" in ActiveState) active=$value ;; SubState) sub=$value ;; NRestarts) restarts=$value ;; esac
+    case "$key" in LoadState) load=$value ;; ActiveState) active=$value ;; SubState) sub=$value ;; NRestarts) restarts=$value ;; esac
   done < "$T/lnd"
-  if printf '%s\n' "$active:$sub:$restarts" | grep -qxE '[a-z-]+:[a-z-]+:[0-9]+'; then
+  if [ "$load" = loaded ] && printf '%s\n' "$active:$sub:$restarts" | grep -qxE '[a-z-]+:[a-z-]+:[0-9]+'; then
     previous=$restarts; since=0
     if [ -r "$D/lnd-state" ]; then
       read -r previous since < "$D/lnd-state" || true
@@ -700,6 +701,7 @@ if systemctl show lnd -p ActiveState,SubState,NRestarts > "$T/lnd" 2>/dev/null; 
     mv "$T/lnd-state" "$D/lnd-state"
   fi
 fi
+[ "$load" = loaded ] || rm -f "$D/lnd-state"
 # Missing or malformed rent never suppresses credit alerts.
 if [ -r "$D/paid-through" ]; then
   rent=$(cat "$D/paid-through")
