@@ -48,13 +48,17 @@ class PinWatch(unittest.TestCase):
                         'edition="2024"\n[build-dependencies]\ntoml="1"\n')
                     (repository / 'src').mkdir()
                     (repository / 'src/lib.rs').write_text('')
-                    for name in ('build.rs', 'session_gate.rs', 'Cargo.lock'):
+                    for name in ('src/poc', 'templates/control-center'):
+                        (repository / name).mkdir(parents=True)
+                    for name in ('build.rs', 'session_gate.rs', 'Cargo.lock',
+                                 'src/poc/template_blocks.rs',
+                                 'templates/control-center/playbook.md'):
                         shutil.copyfile(ROOT / name, repository / name)
                     clone_spec(repository)
                     different_pin = git(repository / 'spec', 'commit-tree', 'HEAD^{tree}',
                                         '-p', pin, '-m', 'Different specification pin')
                     git(repository, 'add', 'Cargo.toml', 'Cargo.lock', 'src',
-                        'build.rs', 'session_gate.rs', 'spec')
+                        'build.rs', 'session_gate.rs', 'templates', 'spec')
                     git(repository, 'commit', '-m', 'Pin watch fixture')
                     original = git(repository, 'rev-parse', 'HEAD')
                     git(repository, 'update-index', '--cacheinfo', f'160000,{different_pin},spec')
@@ -82,7 +86,8 @@ class PinWatch(unittest.TestCase):
                     self.assertIn('spec/ is checked out at', build(101))
                     git(root, 'reset', '--soft', original)
                     build(0)
-                    generated = list((scratch / 'target').glob('debug/build/pin-watch-*/out/pinned.rs'))
+                    # Cargo supports both package-hash/out and package/hash/out layouts.
+                    generated = list((scratch / 'target').glob('debug/build/pin-watch*/**/out/pinned.rs'))
                     self.assertTrue(generated)
                     timestamps = {path: path.stat().st_mtime_ns for path in generated}
                     build(0)
@@ -125,6 +130,12 @@ if os.environ.get('PAUSE'):
     while not marker.with_suffix('.release').exists(): time.sleep(.01)
 if os.environ.get('FAIL_BINDGEN'): raise SystemExit(29)
 (out/'tau_web.js').write_text(variant)
+''')
+        self.program('wasm-opt', '''
+import os, pathlib, shutil, sys
+if os.environ.get('FAIL_OPT'): raise SystemExit(31)
+output = sys.argv.index('-o')
+shutil.copyfile(sys.argv[output-1], sys.argv[output+1])
 ''')
         self.env = dict(os.environ, PATH=str(self.root / 'bin') + os.pathsep + os.environ['PATH'])
         self.env.pop('CARGO_TARGET_DIR', None)
@@ -187,6 +198,7 @@ if os.environ.get('FAIL_BINDGEN'): raise SystemExit(29)
     def test_failure_status_and_previous_complete_output(self):
         self.finish(self.start())
         for settings, code in (({'FAIL_CARGO': '1'}, 23), ({'FAIL_BINDGEN': '1'}, 29),
+                               ({'FAIL_OPT': '1'}, 31),
                                ({'CLI_VERSION': '0.0.0'}, 1)):
             self.finish(self.start(**settings), code)
             self.bundle('served')

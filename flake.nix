@@ -65,6 +65,8 @@
             webRust
             wasmBindgen
             wasmLlvm
+            pkgs.binaryen
+            pkgs.brotli
           ];
           CC_wasm32_unknown_unknown = "${wasmClang}/bin/clang";
           AR_wasm32_unknown_unknown = "${wasmLlvm}/bin/llvm-ar";
