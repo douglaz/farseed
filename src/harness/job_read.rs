@@ -19,6 +19,7 @@ impl Read {
         self.sent.get()
     }
 
+    #[cfg(target_arch = "wasm32")]
     pub fn mark_interrupted(&self) {
         self.interrupted.set(true);
     }

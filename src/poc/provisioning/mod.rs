@@ -776,10 +776,9 @@ pub fn payment_id(payment: &Value) -> Result<&str, String> {
 }
 
 #[cfg(test)]
-pub(crate) use lnvps::{
-    catalogue_public, decoded_email_required, decoded_missing, request_method_allowed,
-    same_readiness,
-};
+pub(crate) use lnvps::{catalogue_public, decoded_missing, same_readiness};
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) use lnvps::{decoded_email_required, request_method_allowed};
 
 pub fn suitable_payment(payment: &Value, vm: u64, expected: &BillingTerms, created: u64) -> bool {
     Vendor::Lnvps.suitable_payment(payment, vm, expected, created)

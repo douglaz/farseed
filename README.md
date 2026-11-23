@@ -2673,6 +2673,17 @@ export CC_wasm32_unknown_unknown=$(nix build --no-link --print-out-paths nixpkgs
 export AR_wasm32_unknown_unknown=$(nix build --no-link --print-out-paths nixpkgs#llvmPackages.llvm)/bin/llvm-ar
 ```
 
+`flake.nix` carries both jobs' toolchains. `nix develop` is the `build` job's: the runner's stable
+Rust (1.100.0), with clippy and rustfmt. `nix develop .#web` is the `web` job's: Rust 1.97.1 with
+the wasm32 target, the pinned wasm-bindgen CLI, and the unwrapped clang and llvm-ar above, already
+exported. Both need the `spec` submodule checked out at its pin (`git submodule update --init`),
+because `build.rs` refuses any other revision:
+
+```sh
+nix develop -c cargo clippy --locked --all-targets -- -D warnings
+nix develop .#web -c cargo clippy --locked -p tau-web --target wasm32-unknown-unknown --all-targets -- -D warnings
+```
+
 ## The gates
 
 `build.rs` refuses to build unless `spec/` is the pinned tree — the commit HEAD records for the

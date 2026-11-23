@@ -9,17 +9,17 @@ pub(crate) const UNLOCKED_SEED: &str = "response requires an unlocked seed";
 pub(crate) const CREDENTIAL_SCAN: &str = "session credential has no response scan representation";
 pub(crate) const DERIVATION: &str = "held credential derivation refused";
 pub(crate) const REDACTION_MARKER: &str = "redaction marker cannot exclude held credentials";
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) const LOCKED: &str = "locked";
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) const MISSING_PENDING_JOB: &str = "missing pending job";
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) const MISSING_PENDING_IDENTITY: &str = "missing pending identity";
 pub(crate) const TARGET_DIFFERS: &str = "resolved target differs from task machine";
 pub(crate) const TARGET_REQUIRED: &str = "resolved relay, host and user are required before Resume";
 pub(crate) const PIN_REQUIRED: &str = "trusted host pin missing; configure it before Resume";
 pub(crate) const RESULT_ENCODING: &str = "task result encoding";
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) const RESULT_PUBLICATION: &str = "task result publication";
 #[cfg(any(target_arch = "wasm32", test))]
 pub(crate) const COMMITTED_MISMATCH: &str = "committed job record differs from its intent and cannot checkpoint; pending identity retained for inspection; to configure, Stop task; remote effects and command holds remain";
@@ -64,7 +64,7 @@ pub(crate) const EXCERPT_PROTECTION: &str =
 pub(crate) const REVISION_EXHAUSTED: &str = "task revision exhausted";
 pub(crate) const JOURNAL_REFUSED: &str = "journal refused";
 pub(crate) const ENCRYPTION_REFUSED: &str = "AES-GCM refused the record";
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) const MOVE_UNAVAILABLE: &str = "move: FileSystemHandle.move() is not available";
 pub(crate) const CHECKPOINT: &str = "recorded result could not be checkpointed: ";
 #[derive(Clone, Copy)]
@@ -83,7 +83,7 @@ pub(crate) const IDENTITY_MISMATCH: Shape = Shape(
 pub(crate) const COLLECTION_PROTECTION: Shape = Shape(
     "collection failed for pending call {number} job {job}: diagnostic protection failed; pending identity retained",
 );
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) const COLLECTION_FAILED: Shape =
     Shape("collection failed for pending call {number}: {payload}; pending identity retained");
 pub(crate) const EARLIER_APPEND: Shape =
@@ -124,19 +124,19 @@ pub(crate) fn with_detail(category: &str, detail: &str) -> String {
     format!("{category}: {detail}")
 }
 
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) const OPFS_CONTEXT: &str = "OPFS";
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) const MOVE_CONTEXT: &str = "move";
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn storage_error(context: &str, detail: &str) -> String {
     format!("{context}: {detail}")
 }
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn move_context(from: &str, to: &str) -> String {
     format!("move {from} to {to}")
 }
-#[cfg(any(target_arch = "wasm32", test))]
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn directory_missing() -> String {
     storage_error(crate::store::DIRECTORY, "not found")
 }
