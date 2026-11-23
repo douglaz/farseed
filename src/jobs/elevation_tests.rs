@@ -17,7 +17,7 @@ fn poc_none_preserves_recorded_wire_bytes() {
     );
     assert_eq!(
         hex::encode(Sha256::digest(launch.as_bytes())),
-        "969d57b69b9bc137a190c17585611005bf25a6cd8b86455d98304eba37aa2fad"
+        "88ab89b9a4083d6a39c935d70ffb33d16518eac965d3f239ece666475b1963fd"
     );
     assert_eq!(
         hex::encode(Sha256::digest(

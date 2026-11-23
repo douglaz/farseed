@@ -88,7 +88,7 @@ pub fn reader_event(event: &Value) -> Value {
             "operation_observation" => "operation_observation",
             "job_terminal" => "job_terminal",
             "job_observation" => "job_observation",
-            "disposition" => "disposition",
+            "disposition" | "poc_command_disposition" => "disposition",
             "setup" => "setup",
             "delivery" => "delivery",
             "allocation" => "allocation",

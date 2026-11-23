@@ -3,16 +3,13 @@ d=$1
 IFS= read -r process < "/proc/$$/stat" || exit 1
 process=${process##*) }
 set -- $process
-session=$4
 shift 19
 printf '%s %s\n' "$$" "$1" > "$d/group.pending" || exit 1
 mv "$d/group.pending" "$d/group" || exit 1
-# Monitor mode puts the command in its own process group in this same session.
-# The child verifies both properties before publishing its identity or running.
-set -m || exit 1
-sh -c '
+# A new session gives the command its own group without tty-dependent job control.
+# The child verifies both identities before publishing itself or running.
+setsid sh -c '
     d=$1
-    session=$2
     identity() {
         IFS= read -r process < "/proc/$1/stat" || return 1
         process=${process##*) }
@@ -24,7 +21,7 @@ sh -c '
     IFS= read -r process < "/proc/$$/stat" || exit 1
     process=${process##*) }
     set -- $process
-    [ "$3" = "$$" ] && [ "$4" = "$session" ] || exit 1
+    [ "$3" = "$$" ] && [ "$4" = "$$" ] || exit 1
     shift 19
     printf "%s %s\n" "$$" "$1" > "$d/pid.pending" || exit 1
     mv "$d/pid.pending" "$d/pid" || exit 1
@@ -43,9 +40,8 @@ sh -c '
     [ -f "$d/ready" ] || exit 1
     : > "$d/started" || exit 1
     exec sh "$d/command"
-' sh "$d" "$session" > "$d/stdout" 2> "$d/stderr" &
+' sh "$d" > "$d/stdout" 2> "$d/stderr" &
 command_pid=$!
-set +m
 wait "$command_pid"
 status=$?
 # A child that never received permission to start has no command outcome.

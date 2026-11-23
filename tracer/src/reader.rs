@@ -741,7 +741,17 @@ fn check_event(number: u64, event: &Value) -> Result<(), String> {
             }
             semantic::entered("reader.semantic.g041");
         }
-        "disposition" => {
+        "disposition" | "poc_command_disposition" => {
+            if kind == "poc_command_disposition"
+                && body.as_object().is_none_or(|fields| {
+                    fields.len() != 4
+                        || !["machine", "calls", "continuation", "uncertainty"]
+                            .iter()
+                            .all(|name| fields.contains_key(*name))
+                })
+            {
+                return Err("unknown or missing command disposition member".into());
+            }
             text("machine")?;
             text("uncertainty")?;
             if semantic::rejects(
@@ -2854,7 +2864,7 @@ mod tests {
             json!({"terminal":{"call":calls[0],"exit_status":7}})
         );
         assert_eq!(
-            crate::journal::event(&opened.records[16].1).unwrap()["disposition"]["continuation"],
+            crate::journal::event(&opened.records[16].1).unwrap()["poc_command_disposition"]["continuation"],
             "as_if_not_done"
         );
         let mnemonic = opened.mnemonic().unwrap();
@@ -2887,6 +2897,32 @@ mod tests {
                     "record {number}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn poc_reader_command_disposition_preserves_legacy_validation_and_closes_current_shape() {
+        let body = json!({"machine":"fixture","calls":[7],"continuation":"as_if_not_done","uncertainty":"outcome unknown"});
+        for kind in ["disposition", "poc_command_disposition"] {
+            assert!(check_event(8, &json!({kind:body})).is_ok());
+            for (field, value) in [
+                ("machine", json!(null)),
+                ("calls", json!(["7"])),
+                ("continuation", json!("unknown")),
+                ("uncertainty", json!(false)),
+            ] {
+                let mut invalid = body.clone();
+                invalid[field] = value;
+                assert!(check_event(8, &json!({kind:invalid})).is_err());
+            }
+        }
+        let mut extra = body.clone();
+        extra["extra"] = json!(true);
+        assert!(check_event(8, &json!({"poc_command_disposition":extra})).is_err());
+        for field in ["machine", "calls", "continuation", "uncertainty"] {
+            let mut missing = body.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(check_event(8, &json!({"poc_command_disposition":missing})).is_err());
         }
     }
 

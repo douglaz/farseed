@@ -2486,7 +2486,7 @@
     "delivery.amendment.wait_card": "observer"
   },
   "file_installation_rules": [
-    ["main.run",1,"inside","main.c002.p001",[4],["capture","file.main.dump.001","browser.store",[1]]],
+    ["main.run",1,"inside","main.c002.p001",[3],["capture","file.main.dump.001","browser.store",[1]]],
     ["main.run",1,"inside","main.c004.p001",[3],["capture","file.main.dump.004","browser.store",[1]]],
     ["main.run",1,"inside","main.c005.p001",[0],["capture","file.main.dump.005","browser.store",[1]]],
     ["main.run",1,"inside","main.c010.p001",[6],["capture","file.main.dump.008","browser.store",[1]]],

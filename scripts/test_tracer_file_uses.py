@@ -3,9 +3,26 @@ import json
 from pathlib import Path
 import unittest
 import tracer_file_uses
+import tracer_requirements
 
 
 class ConstructorInstallation(unittest.TestCase):
+    def test_saved_browser_restore_points_to_its_second_reload(self):
+        root=Path(__file__).resolve().parents[1]
+        key=tracer_requirements.read(root/'tracer/inventory.json')
+        plan=tracer_requirements.execution_plan({'TAU_TRACER_HOLD_CASE':'drop'},key)
+        row=next(r for r in plan['invocation_root_sequences']
+                 if r['scenario']=='main.run' and r['owner']=='inside' and r['case']=='main.c002.p001')
+        rules=[r for r in key['file_installation_rules']
+               if r[:4]==['main.run',1,'inside','main.c002.p001']]
+        self.assertEqual(len(rules),1)
+        rule=rules[0]
+        self.assertEqual(rule[5],['capture','file.main.dump.001','browser.store',[1]])
+        self.assertEqual(len(rule[4]),1)
+        position=rule[4][0]
+        self.assertEqual(row['tokens'][position],'call:runtime.worker')
+        self.assertEqual(row['reload_sources'][position],'main.rs::reload#2')
+
     def test_original_reset_window(self):
         fixture=json.loads((Path(__file__).resolve().parents[1]/'tracer/testdata/file-uses.json').read_text())
         base,key=fixture['report'],fixture['inventory']
