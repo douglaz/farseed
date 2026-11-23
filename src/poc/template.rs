@@ -403,8 +403,9 @@ mod tests {
 
     #[test]
     fn template_stronger_agent_model_is_opt_in_and_changes_only_the_model() {
-        let source = CONTROL_CENTER.steps[5].blocks.get("Do").unwrap();
-        let recipe = source
+        let step = &CONTROL_CENTER.steps[5];
+        let source = step.blocks.get("Do").unwrap();
+        let recipe = step.blocks["Recipes"]
             .split("cat > /etc/nixos/recipes/stronger-agent-model.md <<'RECIPE'\n")
             .nth(1)
             .unwrap()

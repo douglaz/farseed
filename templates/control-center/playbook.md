@@ -1061,6 +1061,41 @@ cat > /etc/nixos/recipes/tailscale.nix <<'RECIPE'
   };
 }
 RECIPE
+cat > /etc/nixos/recipes/stronger-agent-model.md <<'RECIPE'
+# Recipe: a stronger model for this agent
+
+To use a stronger model for this agent, follow these steps only when the user asks.
+
+1. Before applying, tell the user plainly:
+   - The agent's AI key has a 5 USD cap, roughly a dozen turns of the stronger model. When it runs out, the
+     agent stops answering until the key is renewed from the page.
+   - The credit service lists this model on its weaker 'anon' tier. This agent still asks for zero retention on
+     every request, and the service accepted that for this model in a test on 2026-11-22. Whether the upstream
+     provider keeps nothing is the service's promise; Farseed can't check it.
+   Ask the user whether to apply this change, including undo if the read-back fails, and wait for their approval.
+2. Write /etc/nixos/extra/agent-model.nix with the shell (`cat >`), using this module. The model id is on its
+   own line so it is easy to change:
+
+       { lib, ... }:
+       {
+         services.hermes-agent.settings = lib.mkAfter { model.default =
+           "anthropic/claude-sonnet-5.5";
+         };
+       }
+
+   Change only the model default. Leave the connection settings and AI key alone; keep zero retention on every
+   request.
+3. Run `systemctl start control-center-apply`. Read `tail -n 5 /var/log/cc-rebuild.log` about once a minute until
+   it ends with RESULT. Continue only on `RESULT 0`. If it fails or the result is unclear, stop and tell the user.
+4. Run the read-only command `HERMES_HOME=/var/lib/hermes/.hermes hermes config get model.default`. It
+   reads `model.default` from /var/lib/hermes/.hermes/config.yaml. Confirm the printed value equals the model id in step 2.
+   If the command fails or the value differs, tell the user and undo the change they approved:
+   delete /etc/nixos/extra/agent-model.nix, then apply again and wait for `RESULT 0` as in step 3. Do not report success.
+5. The new model applies to conversations started after the change: start a new T3 thread.
+
+To undo: ask the user and wait before applying, delete /etc/nixos/extra/agent-model.nix, then apply and wait for
+`RESULT 0` as in step 3. In a new T3 thread, the agent returns to the set-up model.
+RECIPE
 STEP
 ```
 **Do**
@@ -1312,41 +1347,6 @@ in
     });
   '';
 }
-RECIPE
-cat > /etc/nixos/recipes/stronger-agent-model.md <<'RECIPE'
-# Recipe: a stronger model for this agent
-
-To use a stronger model for this agent, follow these steps only when the user asks.
-
-1. Before applying, tell the user plainly:
-   - The agent's AI key has a 5 USD cap, roughly a dozen turns of the stronger model. When it runs out, the
-     agent stops answering until the key is renewed from the page.
-   - The credit service lists this model on its weaker 'anon' tier. This agent still asks for zero retention on
-     every request, and the service accepted that for this model in a test on 2026-11-22. Whether the upstream
-     provider keeps nothing is the service's promise; Farseed can't check it.
-   Ask the user whether to apply this change, including undo if the read-back fails, and wait for their approval.
-2. Write /etc/nixos/extra/agent-model.nix with the shell (`cat >`), using this module. The model id is on its
-   own line so it is easy to change:
-
-       { lib, ... }:
-       {
-         services.hermes-agent.settings = lib.mkAfter { model.default =
-           "anthropic/claude-sonnet-5.5";
-         };
-       }
-
-   Change only the model default. Leave the connection settings and AI key alone; keep zero retention on every
-   request.
-3. Run `systemctl start control-center-apply`. Read `tail -n 5 /var/log/cc-rebuild.log` about once a minute until
-   it ends with RESULT. Continue only on `RESULT 0`. If it fails or the result is unclear, stop and tell the user.
-4. Run the read-only command `HERMES_HOME=/var/lib/hermes/.hermes hermes config get model.default`. It
-   reads `model.default` from /var/lib/hermes/.hermes/config.yaml. Confirm the printed value equals the model id in step 2.
-   If the command fails or the value differs, tell the user and undo the change they approved:
-   delete /etc/nixos/extra/agent-model.nix, then apply again and wait for `RESULT 0` as in step 3. Do not report success.
-5. The new model applies to conversations started after the change: start a new T3 thread.
-
-To undo: ask the user and wait before applying, delete /etc/nixos/extra/agent-model.nix, then apply and wait for
-`RESULT 0` as in step 3. In a new T3 thread, the agent returns to the set-up model.
 RECIPE
 chmod 0644 /etc/nixos/recipes/bitcoin-node.md /etc/nixos/recipes/bitcoin-wallet.md /etc/nixos/recipes/lightning-node.md /etc/nixos/recipes/bitcoin-node.nix /etc/nixos/recipes/tailscale.nix /etc/nixos/recipes/lightning-node.nix /etc/nixos/recipes/lightning-pay.nix
 chmod 0644 /etc/nixos/recipes/stronger-agent-model.md
