@@ -1,4 +1,4 @@
-//! Independent closed format-2 plaintext decoding, including duplicate object members.
+//! Independent closed format-2 and format-4 decoding, including duplicate object members.
 use serde::de::{Error, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Number, Value};
@@ -65,10 +65,13 @@ pub fn event(bytes: &[u8]) -> Result<Value, String> {
         .as_object()
         .ok_or("journal wrapper is not an object")?;
     if object.len() != 2
-        || object.get("journal_version") != Some(&Value::from(2))
+        || !matches!(
+            object.get("journal_version").and_then(Value::as_u64),
+            Some(2 | 4)
+        )
         || !object.contains_key("event")
     {
-        return Err("journal requires the closed version-2 wrapper".into());
+        return Err("journal requires the closed version-2 or version-4 wrapper".into());
     }
     Ok(wrapper["event"].clone())
 }
@@ -82,21 +85,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn poc_reader_v2_wrapper_is_closed_and_rejects_nested_duplicate_members() {
+    fn poc_reader_supported_wrappers_are_closed_and_reject_nested_duplicate_members() {
         let inner = serde_json::json!({"command":{"machine":"fixture","command":"74727565"}});
-        assert_eq!(
-            event(&wrap(&inner).to_string().into_bytes()).unwrap(),
-            inner
-        );
+        for version in [2, 4] {
+            let wrapper = serde_json::json!({"journal_version":version,"event":inner});
+            assert_eq!(
+                event(&serde_json::to_vec(&wrapper).unwrap()).unwrap(),
+                inner
+            );
+        }
         for bytes in [
             br#"{"command":{"machine":"fixture","command":"74727565"}}"#.as_slice(),
             br#"{"journal_version":1,"event":{}}"#,
+            br#"{"journal_version":3,"event":{}}"#,
             br#"{"journal_version":73,"event":{}}"#,
             br#"{"journal_version":2}"#,
             br#"{"journal_version":2,"event":{},"extra":true}"#,
             br#"{"journal_version":2,"journal_version":2,"event":{}}"#,
             br#"{"journal_version":2,"event":{},"event":{}}"#,
             br#"{"journal_version":2,"event":{"end":{"session":"a","session":"b","reason":"explicit"}}}"#,
+            br#"{"journal_version":4,"event":{},"extra":true}"#,
+            br#"{"journal_version":4,"journal_version":4,"event":{}}"#,
+            br#"{"journal_version":4,"event":{},"event":{}}"#,
+            br#"{"journal_version":4,"event":{"end":{"session":"a","session":"b","reason":"explicit"}}}"#,
+            br#"{"journal_version":4.0,"event":{}}"#,
         ] {
             assert!(event(bytes).is_err());
         }
