@@ -151,7 +151,7 @@ async function resumeProof(c) {
   await wait(`fixtureReports.at(-1)?.lifecycle_state==='running' && (fixtureEvents.filter(e=>e.fixture_action==='resume').length>${resumes} || fixtureReports.at(-1)?.tasks?.[0]?.requests>${paused.requests})`);
   await point('poc_inference_writer');
   const afterQueued=await journal();
-  const activated={...paused,proposal:null,completed:[...paused.completed,[paused.proposal.call_id,paused.proposal.tool,{content:{approved:true},source:'tool_output',type:'untrusted'}]],status:'running',pause_reason:null,revision:beforeQueued.records};
+  const activated={...paused,proposal:null,completed:[...paused.completed,[paused.proposal.call_id,paused.proposal.tool,{content:{approved:true},source:'tool_output',type:'untrusted'}]],status:'running',pause_reason:null,requests:paused.requests+1,requesting:true,revision:beforeQueued.records+1};
   check(await evaluate(`JSON.stringify(fixtureReports.at(-1).tasks[0])===${JSON.stringify(JSON.stringify(activated))}`),'committed approval activates its task; retired queued Resume leaves its budget and work unchanged');
   check(afterQueued.records===beforeQueued.records+2 && afterQueued.poc_requests===beforeQueued.poc_requests+1 && afterQueued.poc_pauses===beforeQueued.poc_pauses,'approval and its one fresh Request append; retired Resume appends no extra Request, proposal or Pause');
   const queuedEffects=await control({inspect:true});
