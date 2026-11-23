@@ -450,6 +450,45 @@ fn saved_goal_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+    #[test]
+    fn poc_saved_browser_restore_points_to_its_second_reload() {
+        let key = crate::completion::inventory();
+        let selection = BTreeMap::from([("TAU_TRACER_HOLD_CASE".into(), "drop".into())]);
+        let plan = crate::selection::plan(&selection).unwrap();
+        let row = plan["invocation_root_sequences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                row["scenario"] == "main.run"
+                    && row["owner"] == "inside"
+                    && row["case"] == "main.c002.p001"
+            })
+            .unwrap();
+        let rules: Vec<_> = key["file_installation_rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|rule| {
+                rule[0] == "main.run"
+                    && rule[1] == 1
+                    && rule[2] == "inside"
+                    && rule[3] == "main.c002.p001"
+            })
+            .collect();
+        assert_eq!(rules.len(), 1);
+        let rule = rules[0];
+        assert_eq!(
+            rule[5],
+            json!(["capture", "file.main.dump.001", "browser.store", [1]])
+        );
+        assert_eq!(rule[4].as_array().unwrap().len(), 1);
+        let position = rule[4][0].as_u64().unwrap() as usize;
+        assert_eq!(row["tokens"][position], "call:runtime.worker");
+        assert_eq!(row["reload_sources"][position], "main.rs::reload#2");
+    }
+
     #[test]
     fn operation_inputs_and_before_after_observations() {
         for (text, controls) in [
