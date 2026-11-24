@@ -7,7 +7,6 @@ pub const CAP: f64 = 1.0;
 pub const AI_KEY_CAP: f64 = 5.0;
 // Records minted before the raise keep their recorded cap and still replay.
 pub const LEGACY_AI_KEY_CAPS: &[f64] = &[0.25, 1.0];
-pub const AI_KEY_LIFETIME: u64 = 30 * 86_400;
 pub const LIFETIME: u64 = 86_400;
 pub const POLL_SECONDS: u64 = 5;
 pub const ACCOUNT_FAILED: &str = "Couldn't create the credit account. Try again.";
@@ -15,6 +14,7 @@ pub const INVOICE_FAILED: &str = "No invoice was received. Try again.";
 pub const INVOICE_INVALID: &str = "The credit service sent an invoice this page can't use.";
 pub const UNKNOWN: &str = "Payment status unknown.";
 pub const MINT_FAILED: &str = "Couldn't create this session's inference key.";
+pub(crate) const AI_KEY_APPROVAL_REQUIRED: &str = "This saved AI key approval does not approve the 5 USD calendar-month limit with no expiry. Stop task and approve a new key request with those terms.";
 #[cfg(target_arch = "wasm32")]
 pub(crate) const RECOVERY_KEY_PRESS: &str = "This session needs a new AI key before the interrupted request can continue. Press Resume to create it; the task then carries on by itself.";
 pub const REFUSED: &str = "The credit service refused this request.";
@@ -346,10 +346,17 @@ pub struct Mint {
     pub session: String,
     pub name: String,
     pub requested_cap: f64,
-    pub requested_expiry: u64,
+    pub requested_expiry: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_reset_period: Option<ResetPeriod>,
     pub issuer_id: Option<String>,
     pub returned_cap: Option<f64>,
     pub returned_expiry: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetPeriod {
+    Monthly,
 }
 /// A 96-bit random name occupies exactly 25 characters, independently of session length.
 pub fn mint_name() -> Result<String, String> {
@@ -378,34 +385,51 @@ fn expiry_nanos(text: &str) -> Option<u128> {
 }
 impl Mint {
     #[cfg(any(target_arch = "wasm32", test))]
-    pub(crate) fn ai_key(task: &crate::store::poc::Task, name: String, expiry: u64) -> Self {
-        Self {
+    pub(crate) fn ai_key(task: &crate::store::poc::Task, name: String) -> Result<Self, String> {
+        if !task.ai_key_monthly_approved() {
+            return Err(AI_KEY_APPROVAL_REQUIRED.into());
+        }
+        Ok(Self {
             session: task.start_session.clone(),
             name,
             requested_cap: task.ai_key_cap(),
-            requested_expiry: expiry,
+            requested_expiry: None,
+            requested_reset_period: Some(ResetPeriod::Monthly),
             issuer_id: None,
             returned_cap: None,
             returned_expiry: None,
+        })
+    }
+    pub(crate) fn expiry_matches(&self, expiry: Option<&str>) -> bool {
+        match (self.requested_reset_period, self.requested_expiry, expiry) {
+            (Some(ResetPeriod::Monthly), None, None) => true,
+            (None, Some(requested), Some(actual)) => expiry_matches(requested, actual),
+            _ => false,
         }
     }
     #[cfg(any(target_arch = "wasm32", test))]
     pub(crate) fn retry_eligible(&self, now_nanos: u128) -> bool {
         let cutoff = match &self.returned_expiry {
             Some(expiry) => expiry_nanos(expiry),
-            None => Some((u128::from(self.requested_expiry) + 60) * 1_000_000_000),
+            None => self
+                .requested_expiry
+                .map(|expiry| (u128::from(expiry) + 60) * 1_000_000_000),
         };
         cutoff.is_some_and(|cutoff| now_nanos < cutoff)
     }
 }
 #[cfg(any(target_arch = "wasm32", test))]
-pub(crate) fn ai_key_request(mint: &Mint, expiry: &str) -> Value {
-    serde_json::json!({"name":mint.name,"usage_limit_usd":mint.requested_cap,"expire_at":expiry})
+pub(crate) fn ai_key_request(mint: &Mint) -> Value {
+    serde_json::json!({"name":mint.name,"usage_limit_usd":mint.requested_cap,"reset_period":mint.requested_reset_period,"expire_at":null})
 }
 
-pub fn returned_mint(value: &Value, mint: &Mint) -> Result<(String, String), String> {
+pub fn returned_mint(value: &Value, mint: &Mint) -> Result<(String, Option<String>), String> {
     let data = &value["data"];
-    let expiry = data["expire_at"].as_str().ok_or(MINT_FAILED)?;
+    let expiry = match data.get("expire_at") {
+        Some(Value::Null) => None,
+        Some(Value::String(expiry)) => Some(expiry.as_str()),
+        _ => return Err(MINT_FAILED.into()),
+    };
     let id = data["_id"]
         .as_str()
         .filter(|s| identifier(s))
@@ -413,12 +437,13 @@ pub fn returned_mint(value: &Value, mint: &Mint) -> Result<(String, String), Str
     if value["status"] != "success"
         || data["name"] != mint.name
         || data["usage_limit_usd"].as_f64() != Some(mint.requested_cap)
-        || data.get("reset_period") != Some(&Value::Null)
-        || !expiry_matches(mint.requested_expiry, expiry)
+        || data.get("reset_period") != Some(&serde_json::json!(mint.requested_reset_period))
+        || mint.issuer_id.as_ref().is_some_and(|expected| expected != id)
+        || !mint.expiry_matches(expiry)
     {
         return Err(MINT_FAILED.into());
     }
-    Ok((id.into(), expiry.into()))
+    Ok((id.into(), expiry.map(str::to_owned)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

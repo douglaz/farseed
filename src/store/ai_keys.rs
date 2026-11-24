@@ -1,6 +1,6 @@
 //! Application inference key custody is encrypted; the machine owns its revocation metadata.
 use super::*;
-use crate::poc::credit::{AI_KEY_CAP, LEGACY_AI_KEY_CAPS, Mint, SecretText};
+use crate::poc::credit::{AI_KEY_CAP, LEGACY_AI_KEY_CAPS, Mint, ResetPeriod, SecretText};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -9,7 +9,7 @@ pub(crate) struct MachineKey {
     pub record_id: String,
     pub application: String,
     pub path: String,
-    pub expires: String,
+    pub expires: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,7 +69,7 @@ pub(crate) enum Record {
         machine: String,
         name: String,
         issuer_id: String,
-        expires: String,
+        expires: Option<String>,
         key: SecretText,
     },
 }
@@ -162,6 +162,9 @@ impl<S: Storage> Store<S> {
         Ok(match self.ai_key(&task.id, &proposal.call_id) {
             Some(entry) if entry.key.is_some() => Preparation::Held,
             Some(_) => Preparation::Unknown,
+            None if !task.ai_key_monthly_approved() => {
+                return Err(crate::poc::credit::AI_KEY_APPROVAL_REQUIRED.into());
+            }
             None if self.credit_account().is_none() => Preparation::AccountRequired,
             None => Preparation::Mint,
         })
@@ -199,9 +202,11 @@ impl<S: Storage> Store<S> {
                 .endpoint
                 .strip_suffix("/chat/completions")
                 .unwrap_or(&configuration.endpoint);
-            Ok(
-                json!({"status":"created","path":entry.path,"limit_usd":entry.mint.requested_cap,"expires":machine_key.map(|key| &key.expires),"base_url":base_url,"api":"chat-completions","model":configuration.model}),
-            )
+            let mut outcome = json!({"status":"created","path":entry.path,"limit_usd":entry.mint.requested_cap,"expires":machine_key.and_then(|key| key.expires.as_ref()),"base_url":base_url,"api":"chat-completions","model":configuration.model});
+            if let Some(period) = entry.mint.requested_reset_period {
+                outcome["reset_period"] = json!(period);
+            }
+            Ok(outcome)
         } else {
             Ok(
                 json!({"status":"failed","reason":"the machine could not save the AI key","path":entry.path,"limit_usd":entry.mint.requested_cap}),
@@ -263,6 +268,18 @@ impl<S: Storage> Store<S> {
                 }
                 let task = self.poc_task(task)?;
                 let proposal = task.proposal.as_ref().ok_or("AI key request missing")?;
+                let policy_valid = match mint.requested_reset_period {
+                    None => {
+                        (mint.requested_cap == AI_KEY_CAP
+                            || LEGACY_AI_KEY_CAPS.contains(&mint.requested_cap))
+                            && mint.requested_expiry.is_some_and(|expiry| expiry > 0)
+                    }
+                    Some(ResetPeriod::Monthly) => {
+                        mint.requested_cap == AI_KEY_CAP
+                            && task.ai_key_monthly_approved()
+                            && mint.requested_expiry.is_none()
+                    }
+                };
                 if !matches!(proposal.tool, crate::goals::Tool::RequestAiKey { .. })
                     || !task.ai_key_approved
                     || !self.poc_targets.contains_key(&task.machine)
@@ -271,9 +288,7 @@ impl<S: Storage> Store<S> {
                     || self.ai_key(&task.id, call).is_some()
                     || *saved_path != path(&task)
                     || mint.session != task.start_session
-                    || (mint.requested_cap != AI_KEY_CAP
-                        && !LEGACY_AI_KEY_CAPS.contains(&mint.requested_cap))
-                    || mint.requested_expiry == 0
+                    || !policy_valid
                     || mint.name.len() != 25
                     || !crate::poc::credit::identifier(&mint.name)
                     || self.ai_keys.iter().any(|e| e.mint.name == mint.name)
@@ -307,7 +322,7 @@ impl<S: Storage> Store<S> {
                             .any(|key| key.record_id == *issuer_id)
                     })
                     || !crate::poc::credit::identifier(issuer_id)
-                    || !crate::poc::credit::expiry_matches(entry.mint.requested_expiry, expires)
+                    || !entry.mint.expiry_matches(expires.as_deref())
                 {
                     return Err("AI key custody refused".into());
                 }

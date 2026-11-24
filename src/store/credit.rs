@@ -229,7 +229,8 @@ impl<S: Storage> Store<S> {
                     || !identifier(&mint.name)
                     || self.credit.mints.iter().any(|m| m.name == mint.name)
                     || mint.requested_cap != CAP
-                    || mint.requested_expiry == 0
+                    || !mint.requested_expiry.is_some_and(|expiry| expiry > 0)
+                    || mint.requested_reset_period.is_some()
                     || mint.issuer_id.is_some()
                     || mint.returned_cap.is_some()
                     || mint.returned_expiry.is_some()
@@ -252,7 +253,7 @@ impl<S: Storage> Store<S> {
                 if mint.issuer_id.is_some()
                     || !identifier(issuer_id)
                     || *returned_cap != CAP
-                    || !crate::poc::credit::expiry_matches(mint.requested_expiry, returned_expiry)
+                    || !mint.expiry_matches(Some(returned_expiry))
                 {
                     return Err(crate::poc::credit::MINT_FAILED.into());
                 }

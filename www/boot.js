@@ -1571,11 +1571,14 @@ const playbookCommand = origin => {
   if (name && suffix !== undefined) return `step ${origin.step}, ${suffix || name}`;
 };
 const renewalDrafts = new Map();
+const aiKeyTerms = (cap, resetPeriod, expires) => resetPeriod === 'monthly'
+  ? `limit ${cap} USD per calendar month, resets monthly at UTC month boundaries, no expiry`
+  : `limit ${cap} USD, ${typeof expires === 'string' ? `expires ${expires}` : 'expires in 30 days'}`;
 const renderAiKeyApproval = (card, task, session, store, worker, draftDecision) => {
   const requestCard = document.createElement('section');
   requestCard.dataset.aiKeyRequest = '';
-  paragraph(requestCard, `Create an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} on this machine (limit ${task.ai_key_limit_usd} USD, expires in 30 days)?`);
-  paragraph(requestCard, "Paid from your inference balance. It can read the account's usage history. It ends when the machine is destroyed, it expires, or it is revoked.");
+  paragraph(requestCard, `Create an AI key for ${shortLine(task.proposal.tool.arguments.application, 64)} on this machine (${aiKeyTerms(task.ai_key_limit_usd, task.ai_key_reset_period, null)})?`);
+  paragraph(requestCard, "Usage is paid from your inference balance. Resetting the limit adds no credit, pays no rent and charges no wallet. The key can read the account's usage history. It has no expiry and ends when the machine is destroyed or it is revoked.");
   paragraph(requestCard, "This key is for the operator's application and outlives this session. Lock, Stop task and End session do not revoke it.");
   const needsClass = (store.poc_targets ?? []).find(target => target.machine === task.machine)?.ai_key_needs_class_answer !== false;
   const unavailable = !session || ['suspended', 'reconciling', 'ended'].includes(store.lifecycle_state);
@@ -1657,7 +1660,7 @@ const taskKeyNote = (parent, tool, outcome) => {
   const declined = outcome?.content?.status === 'declined';
   const application = shortLine(tool.arguments.application, 64);
   const note = document.createElement('span');
-  note.textContent = created ? `Created an AI key for ${application} on this machine (limit ${outcome.content.limit_usd} USD, expires in 30 days)` : declined ? `Didn't create an AI key for ${application}.` : `Couldn't create an AI key: ${shortLine(outcome?.content?.reason ?? 'the outcome is unavailable', 160)}.`;
+  note.textContent = created ? `Created an AI key for ${application} on this machine (${aiKeyTerms(outcome.content.limit_usd, outcome.content.reset_period, outcome.content.expires)})` : declined ? `Didn't create an AI key for ${application}.` : `Couldn't create an AI key: ${shortLine(outcome?.content?.reason ?? 'the outcome is unavailable', 160)}.`;
   parent.append(note);
 };
 const taskCardButton = (card, task, choices, field, label, store) => {
@@ -1686,7 +1689,7 @@ const renderTaskCommands = (card, task, store) => {
       const created = outcome?.content?.status === 'created';
       const declined = outcome?.content?.status === 'declined';
       const application = shortLine(tool.arguments.application, 64);
-      paragraph(card, created ? `Created an AI key for ${application} on this machine (limit ${outcome.content.limit_usd} USD, expires in 30 days)` : declined ? `Didn't create an AI key for ${application}.` : `Couldn't create an AI key: ${shortLine(outcome?.content?.reason ?? 'the outcome is unavailable', 160)}.`);
+      paragraph(card, created ? `Created an AI key for ${application} on this machine (${aiKeyTerms(outcome.content.limit_usd, outcome.content.reset_period, outcome.content.expires)})` : declined ? `Didn't create an AI key for ${application}.` : `Couldn't create an AI key: ${shortLine(outcome?.content?.reason ?? 'the outcome is unavailable', 160)}.`);
     } else paragraph(card, id.startsWith('$before:') ? 'Read the listening ports before setup.' : tool.name === 'exec' ? `Ran: ${(!id.startsWith('$rerun:') && playbookCommand(controlCenterOrigin(task, id))) || commandSummary(tool.arguments.command)} (${commandResultWord(outcome)})` : tool.name === 'propose_declaration' ? 'The AI proposed requirements.' : tool.name === 'done' ? 'The AI handed the work over for checks.' : 'Completed a step.');
     const machineKey = tool.name === 'request_ai_key' ? (store.poc_targets ?? []).find(target => target.machine === task.machine)?.application_inference_keys?.find(key => key.path === outcome?.content?.path) : undefined;
     rawDetails(card, {tool: tool.name === 'done' ? {name: tool.name, arguments: {machine: tool.arguments.machine}} : tool, outcome, ...(machineKey ? {application_inference_key: machineKey} : {})}, ['task', task.id, 'completed', id]);
@@ -1732,7 +1735,8 @@ const renderTasks = (store) => {
     if (!session || existing) { renewalDrafts.delete(machine); continue; }
     const card = document.createElement('section');
     paragraph(card, `Renewing Hermes's AI key on ${machine}: waiting for you.`);
-    const draft = {machine, ai_key_limit_usd: (store.poc_targets ?? []).find(target => target.machine === machine)?.ai_key_limit_usd, proposal: {tool: {arguments: {application: 'Hermes Agent'}}}};
+    const target = (store.poc_targets ?? []).find(target => target.machine === machine);
+    const draft = {machine, ai_key_limit_usd: target?.ai_key_limit_usd, ai_key_reset_period: target?.ai_key_reset_period, proposal: {tool: {arguments: {application: 'Hermes Agent'}}}};
     renderAiKeyApproval(card, draft, session, store, worker, (decision, answer) => {
       renewalDrafts.delete(machine);
       if (decision === 'create') worker.postMessage({task: {action: 'renew-ai-key', id, machine, session: identity, ...(answer ? {machine_class_answer: answer} : {})}});
@@ -1983,7 +1987,7 @@ const renderTasks = (store) => {
       paragraph(card, "Finished? End session stops Farseed's AI and cancels its session key. Your machine keeps running, and billing, until you delete it.");
       for (const {index} of progress.keys) {
         const [, tool, outcome] = task.completed[index];
-        if (tool.name === 'request_ai_key' && outcome?.content?.status === 'created') paragraph(card, `The AI key made for ${shortLine(tool.arguments.application, 64)} keeps working, up to its limit, until it expires or is revoked.`);
+        if (tool.name === 'request_ai_key' && outcome?.content?.status === 'created') paragraph(card, `The AI key made for ${shortLine(tool.arguments.application, 64)} keeps working with available credit, up to its limit, ${outcome.content.reset_period === 'monthly' ? 'with no expiry, until it is revoked' : 'until it expires or is revoked'}.`);
       }
       const identity = session.identity;
       const end = document.createElement('button');
@@ -2922,7 +2926,7 @@ const renderPoc = (store) => {
     else if (target.file_access_unavailable_message) paragraph(row, target.file_access_unavailable_message);
     const liveSession = (store.sessions ?? []).find(session => session.session_state !== 'ended' && (session.bound_set ?? []).includes(target.machine));
     if (liveSession) creditTemplateDrafts.delete(target.machine);
-    if (target.hermes_ai_key) paragraph(row, `Hermes's AI key: cap ${target.hermes_ai_key.cap} USD, expires ${target.hermes_ai_key.expires}. When Hermes answers 'HTTP 402 … usage limit exceeded', the key is used up: press Renew AI key.`);
+    if (target.hermes_ai_key) paragraph(row, `Hermes's AI key: ${aiKeyTerms(target.hermes_ai_key.cap, target.hermes_ai_key.reset_period, target.hermes_ai_key.expires)}. ${target.hermes_ai_key.reset_period === 'monthly' ? 'At the limit, wait for the next calendar month or explicitly press Renew AI key. A reset adds no credit, pays no rent and charges no wallet.' : "When Hermes answers 'HTTP 402 … usage limit exceeded', the key is used up: press Renew AI key."}`);
     if (target.hermes_ai_key_not_installed) paragraph(row, 'A newer key was created but not installed; press Renew AI key to try again.');
     if (target.ai_key_renewal_available) {
       const button = document.createElement('button');

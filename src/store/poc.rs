@@ -117,6 +117,15 @@ pub struct UnmetCommand {
     /// Exact UTF-8 command bytes, without normalization.
     pub command: String,
 }
+/// Absent policy means legacy consent, never approval of monthly/no-expiry terms.
+/// Fresh AiKeyDecision and OnlyMe AiKeyClassDecision records write approved_policy
+/// on Create key (initial or renewal). That approval append precedes Request and
+/// is incompatible with older closed-schema approval readers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiKeyPolicy {
+    MonthlyNoExpiry,
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Task {
@@ -136,6 +145,8 @@ pub struct Task {
     pub ai_key_approved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_key_approved_cap: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_key_approved_policy: Option<AiKeyPolicy>,
     pub pending: Option<Pending>,
     pub status: Status,
     pub pause_reason: Option<String>,
@@ -170,6 +181,12 @@ pub struct Task {
     pub commands_recorded_as_run: Vec<UnmetCommand>,
 }
 impl Task {
+    pub(crate) fn ai_key_monthly_approved(&self) -> bool {
+        !self.ended()
+            && self.ai_key_approved
+            && self.ai_key_approved_cap == Some(crate::poc::credit::AI_KEY_CAP)
+            && self.ai_key_approved_policy == Some(AiKeyPolicy::MonthlyNoExpiry)
+    }
     pub(crate) fn ai_key_cap(&self) -> f64 {
         self.ai_key_approved_cap.unwrap_or(if self.ai_key_approved {
             // Approvals recorded before the cap was persisted authorized 1 USD.
@@ -221,6 +238,7 @@ impl Task {
         }
         if self.awaiting_ai_key() {
             value["ai_key_limit_usd"] = json!(self.ai_key_cap());
+            value["ai_key_reset_period"] = json!(crate::poc::credit::ResetPeriod::Monthly);
         }
         value
     }
@@ -416,6 +434,8 @@ pub enum Change {
         create: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         approved_cap: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approved_policy: Option<AiKeyPolicy>,
     },
     OperatorAnswer {
         call_id: String,
@@ -426,6 +446,8 @@ pub enum Change {
         at: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         approved_cap: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        approved_policy: Option<AiKeyPolicy>,
     },
     Settle,
     Inspect,
@@ -1272,19 +1294,23 @@ impl<S: Storage> Store<S> {
             Change::AiKeyDecision {
                 create: true,
                 approved_cap,
+                approved_policy,
             } => {
                 // New approvals require the class answer; recorded approvals retain their meaning.
                 if self.ai_key_needs_class_answer(&self.poc_task(id)?.machine) {
                     return Err("answer the machine question on the key card first".into());
                 }
                 *approved_cap = Some(crate::poc::credit::AI_KEY_CAP);
+                *approved_policy = Some(AiKeyPolicy::MonthlyNoExpiry);
             }
             Change::AiKeyClassDecision {
                 answer: super::poc_targets::KeyCardAnswer::OnlyMe,
                 approved_cap,
+                approved_policy,
                 ..
             } => {
                 *approved_cap = Some(crate::poc::credit::AI_KEY_CAP);
+                *approved_policy = Some(AiKeyPolicy::MonthlyNoExpiry);
             }
             Change::Pause(why) | Change::Wait { why, .. } | Change::SkipRead(why) => {
                 *why = self
@@ -1834,6 +1860,7 @@ impl<S: Storage> Store<S> {
                 }),
                 ai_key_approved: false,
                 ai_key_approved_cap: None,
+                ai_key_approved_policy: None,
                 pending: None,
                 status: if renewal {
                     Status::Waiting
@@ -2054,6 +2081,7 @@ impl<S: Storage> Store<S> {
                     }
                     Change::Abandon => {
                         task.status = Status::Abandoned;
+                        task.ai_key_approved_policy = None;
                         task.pause_reason = Some(
                         "local orchestration abandoned; remote effects and command holds remain"
                             .into(),
@@ -2232,6 +2260,7 @@ impl<S: Storage> Store<S> {
                         task.completion_tokens = initial_completion_tokens();
                         task.ai_key_approved = false;
                         task.ai_key_approved_cap = None;
+                        task.ai_key_approved_policy = None;
                         let wire = serde_json::to_value(tool).map_err(|_| "tool encoding")?;
                         Tool::parse(&wire)?;
                         if call_id.is_empty()
@@ -2450,8 +2479,12 @@ impl<S: Storage> Store<S> {
                     Change::AiKeyDecision {
                         create,
                         approved_cap,
+                        approved_policy,
                     } => {
                         if !task.awaiting_ai_key()
+                            || (approved_policy.is_some()
+                                && (!*create
+                                    || *approved_cap != Some(crate::poc::credit::AI_KEY_CAP)))
                             || self
                                 .ai_key(&task.id, &task.proposal.as_ref().expect("request").call_id)
                                 .is_some()
@@ -2461,7 +2494,9 @@ impl<S: Storage> Store<S> {
                         if *create {
                             task.ai_key_approved = true;
                             task.ai_key_approved_cap = *approved_cap;
+                            task.ai_key_approved_policy = *approved_policy;
                         } else {
+                            task.ai_key_approved_policy = None;
                             let proposal = task.proposal.take().expect("request");
                             task.completed.push((
                                 proposal.call_id,
@@ -2481,8 +2516,12 @@ impl<S: Storage> Store<S> {
                         answer,
                         at,
                         approved_cap,
+                        approved_policy,
                     } => {
                         if !task.awaiting_ai_key()
+                            || (approved_policy.is_some()
+                                && (*answer != super::poc_targets::KeyCardAnswer::OnlyMe
+                                    || *approved_cap != Some(crate::poc::credit::AI_KEY_CAP)))
                             || !self.ai_key_needs_class_answer(&task.machine)
                             || !self.poc_targets.contains_key(&task.machine)
                             || !self.dispatch.approved_entries.contains_key(&task.machine)
@@ -2496,7 +2535,9 @@ impl<S: Storage> Store<S> {
                         if *answer == super::poc_targets::KeyCardAnswer::OnlyMe {
                             task.ai_key_approved = true;
                             task.ai_key_approved_cap = *approved_cap;
+                            task.ai_key_approved_policy = *approved_policy;
                         } else {
+                            task.ai_key_approved_policy = None;
                             let proposal = task.proposal.take().expect("request");
                             let reason = if *answer == super::poc_targets::KeyCardAnswer::OthersToo
                             {

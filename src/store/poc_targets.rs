@@ -183,16 +183,18 @@ impl<S: Storage> Store<S> {
                 value["hermes_ai_key_not_installed"] =
                     json!(!hermes_keys.is_empty() && installed != Some(hermes_keys.len() - 1));
                 value["ai_key_limit_usd"] = json!(crate::poc::credit::AI_KEY_CAP);
+                value["ai_key_reset_period"] = json!(crate::poc::credit::ResetPeriod::Monthly);
                 value["ai_key_renewal_available"] = json!(!hermes_keys.is_empty() && live_session);
                 value["ai_key_renewal_unavailable_message"] = json!(
                     (!hermes_keys.is_empty() && !live_session)
                         .then_some(crate::poc::key_renewal::LIVE_REQUIRED)
                 );
                 if let Some(key) = hermes_key {
-                    let cap = keys_by_name
-                        .get(key.name.as_str())
-                        .map(|entry| entry.mint.requested_cap);
-                    value["hermes_ai_key"] = json!({"cap":cap,"expires":key.expires});
+                    let mint = keys_by_name.get(key.name.as_str()).map(|entry| &entry.mint);
+                    value["hermes_ai_key"] = json!({"cap":mint.map(|mint| mint.requested_cap),"expires":key.expires});
+                    if let Some(period) = mint.and_then(|mint| mint.requested_reset_period) {
+                        value["hermes_ai_key"]["reset_period"] = json!(period);
+                    }
                 }
                 value["application_inference_keys"] = json!(record.application_inference_keys);
                 value["ai_key_needs_class_answer"] =

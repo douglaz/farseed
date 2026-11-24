@@ -1095,8 +1095,9 @@ cat > /etc/nixos/recipes/stronger-agent-model.md <<'RECIPE'
 To use a stronger model for this agent, follow these steps only when the user asks.
 
 1. Before applying, tell the user plainly:
-   - The agent's AI key has a 5 USD cap, roughly a dozen turns of the stronger model. When it runs out, the
-     agent stops answering until the key is renewed from the page.
+   - New application AI keys have a 5 USD calendar-month limit and no expiry. At the limit, the agent stops
+     answering until the next UTC month boundary or an explicit renewal from the page. A reset adds no credit,
+     pays no rent and charges no wallet; inference still needs available credit. Older keys keep their recorded limits.
    - The credit service lists this model on its weaker 'anon' tier. This agent still asks for zero retention on
      every request, and the service accepted that for this model in a test on 2026-11-22. Whether the upstream
      provider keeps nothing is the service's promise; Farseed can't check it.

@@ -94,6 +94,8 @@ pub(crate) fn local_change(task: &Task, change: Change, unknown_key: bool) -> Ch
                 APPROVAL.into()
             } else if cause == CREDIT || cause == "no inference credit account is available" {
                 CREDIT.into()
+            } else if cause == super::credit::AI_KEY_APPROVAL_REQUIRED {
+                cause.into()
             } else if cause == "Credit store write hold; unlock again before continuing."
                 || cause == "Unlock before using inference credit."
                 || cause == "locked"

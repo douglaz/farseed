@@ -866,16 +866,19 @@ async fn mint_inner(session: &str, replace: bool, parent: &Fence) -> Result<(), 
         session: session.into(),
         name: mint_name()?,
         requested_cap: CAP,
-        requested_expiry: now().checked_add(LIFETIME).ok_or(MINT_FAILED)?,
+        requested_expiry: Some(now().checked_add(LIFETIME).ok_or(MINT_FAILED)?),
+        requested_reset_period: None,
         issuer_id: None,
         returned_cap: None,
         returned_expiry: None,
     };
     append(&fence, Record::MintName(mint.clone())).await?;
-    let expiry = js_sys::Date::new(&JsValue::from_f64(mint.requested_expiry as f64 * 1000.0))
-        .to_iso_string()
-        .as_string()
-        .ok_or(MINT_FAILED)?;
+    let expiry = js_sys::Date::new(&JsValue::from_f64(
+        mint.requested_expiry.ok_or(MINT_FAILED)? as f64 * 1000.0,
+    ))
+    .to_iso_string()
+    .as_string()
+    .ok_or(MINT_FAILED)?;
     let cleanup = {
         let local = crate::worker::local();
         let mut local = local.lock().await;
@@ -925,7 +928,7 @@ async fn mint_inner(session: &str, replace: bool, parent: &Fence) -> Result<(), 
                 name: mint.name.clone(),
                 issuer_id: id,
                 returned_cap: CAP,
-                returned_expiry: expiry,
+                returned_expiry: expiry.ok_or(MINT_FAILED)?,
             })
             .await?;
         fence.check()?;
@@ -994,6 +997,12 @@ pub(crate) async fn prepare_ai_key(
             if crate::poc::key_renewal::is_renewal(task) {
                 return Err(crate::poc::key_renewal::UNKNOWN_KEY.into());
             }
+            if store
+                .ai_key(&task.id, &proposal.call_id)
+                .is_some_and(|entry| entry.mint.requested_reset_period.is_some())
+            {
+                return Err(UNKNOWN.into());
+            }
             store
                 .poc_change(
                     &task.id,
@@ -1020,11 +1029,7 @@ pub(crate) async fn prepare_ai_key(
                 .await?;
             return Ok(false);
         }
-        let mint = Mint::ai_key(
-            task,
-            mint_name()?,
-            now().checked_add(AI_KEY_LIFETIME).ok_or(MINT_FAILED)?,
-        );
+        let mint = Mint::ai_key(task, mint_name()?)?;
         store
             .ai_key_commit(KeyRecord::Request {
                 task: task.id.clone(),
@@ -1038,16 +1043,12 @@ pub(crate) async fn prepare_ai_key(
             .await?;
         mint
     };
-    let expiry = js_sys::Date::new(&JsValue::from_f64(mint.requested_expiry as f64 * 1000.0))
-        .to_iso_string()
-        .as_string()
-        .ok_or(MINT_FAILED)?;
     let (status, mut value) = exchange(
         &fence,
         "POST",
         "/keys",
         Auth::Account,
-        Some(ai_key_request(&mint, &expiry)),
+        Some(ai_key_request(&mint)),
     )
     .await
     .map_err(|_| UNKNOWN)?;
@@ -1098,19 +1099,8 @@ pub(crate) async fn prepare_ai_key(
     drop(raw_key);
     drop(value);
     if let Err(reason) = accepted {
-        let mut local = local.lock().await;
-        // A lock can discard a validated response before custody was committed. Leave
-        // the request unresolved now; the next continuation records its failure once.
-        let store = fence.store(&mut local).map_err(|_| UNKNOWN)?;
-        store.check_task_session(task, &task.start_session)?;
-        store
-            .poc_change(
-                &task.id,
-                task.revision,
-                crate::store::poc::Change::AiKeyFailed(reason),
-            )
-            .await?;
-        return Ok(false);
+        // Keep the durable request open: an unusable answer cannot authorize another mint.
+        return Err(format!("{reason}. The recorded key request will not be sent again; check the credit account and Stop task before starting another request."));
     }
     Ok(true)
 }
