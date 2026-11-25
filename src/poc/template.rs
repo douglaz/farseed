@@ -448,11 +448,24 @@ mod tests {
         ] {
             assert!(!recipe.contains(forbidden), "recipe contains {forbidden}");
         }
+        let key_warning = recipe
+            .split_once("1. Before applying, tell the user plainly:\n")
+            .unwrap()
+            .1
+            .split_once("\n   - The credit service")
+            .unwrap()
+            .0;
+        assert_eq!(
+            key_warning,
+            concat!(
+                "   - New application AI keys have a 5 USD calendar-month limit and no expiry. At the limit, the agent stops\n",
+                "     answering until the next UTC month boundary or an explicit renewal from the page. A reset adds no credit,\n",
+                "     pays no rent and charges no wallet; inference still needs available credit. Older keys keep their recorded limits.",
+            )
+        );
         for required in [
             "only when the user asks",
             "Before applying, tell the user plainly",
-            "5 USD cap, roughly a dozen turns",
-            "agent stops answering until the key is renewed from the page",
             "weaker 'anon' tier",
             "still asks for zero retention on\n     every request",
             "accepted that for this model in a test on 2026-11-22",
