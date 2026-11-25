@@ -2681,7 +2681,13 @@ const renderProvider = (store, enabled) => {
   if (purchase.stop) paragraph(stopNotice, purchase.stop.message);
   $('provider-stop').onclick = () => providerRequest({action: 'stop', stage: purchase.stop.stage});
   if (purchase.phase) {
-    if (purchase.duplicate_orders?.length) paragraph(progress, `The provider received this order twice. The extra machine (${purchase.duplicate_orders.join(', ')}) is unpaid; the provider deletes it within about an hour. Nothing is charged for it.`);
+    if (purchase.duplicate_orders?.length) {
+      const ids = purchase.duplicate_orders.join(', ');
+      const single = purchase.duplicate_orders.length === 1;
+      const extra = single ? 'an extra machine' : 'extra machines';
+      const used = purchase.vm_id ? ` This page will only use machine ${purchase.vm_id}.` : '';
+      paragraph(progress, `The provider created ${extra} (${ids}) for this order.${used} This page leaves the ${single ? 'spare' : 'spares'} unpaid. The provider normally removes unpaid orders after about an hour.`);
+    }
     if (purchase.payment_notice) paragraph(progress, purchase.payment_notice);
     if (purchase.stop_after && !purchase.stop) paragraph(progress, `If no machine appears by ${new Date(purchase.stop_after * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}, you can stop this purchase.`);
     if (purchase.candidates?.length) {

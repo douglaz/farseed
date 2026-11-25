@@ -10,6 +10,9 @@ use crate::poc::provisioning::{
 #[cfg(test)]
 use crate::poc::provisioning::{text, timestamp};
 use crate::poc::targets::TargetRecord;
+use std::collections::BTreeSet;
+
+const MAX_RECOVERY_MACHINES: usize = 7;
 
 fn close_eligible(p: &Purchase, now: u64) -> bool {
     p.vm.is_some()
@@ -129,6 +132,8 @@ pub struct Purchase {
     pub target: Option<TargetRecord>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub duplicate_orders: Vec<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unverified_machines: Vec<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped: Option<Stopped>,
 }
@@ -239,8 +244,18 @@ pub enum Record {
     },
     EmailVerified,
     CreateEmailRefused,
+    MachineEvidenceObserved {
+        vm_ids: Vec<u64>,
+    },
     Associated(Value),
+    AssociatedWithSpares {
+        vm: Value,
+        spare_ids: Vec<u64>,
+    },
     DuplicateOrders {
+        vm_ids: Vec<u64>,
+    },
+    SpareOrdersObserved {
         vm_ids: Vec<u64>,
     },
     PurchaseStopped(Stopped),
@@ -495,15 +510,22 @@ impl<S: Storage> Store<S> {
             .as_ref()
             .filter(|p| close_eligible(p, api.now()))
             .ok_or(self.procurement_vendor().close_refused())?;
+        let before_invoice = p.invoice.is_none() && p.payment.is_none();
         let vm_id = id(p
             .vm
             .as_ref()
             .ok_or(self.procurement_vendor().close_refused())?)?;
-        let (inventory_status, inventory) = self
-            .provider_response(api, self.procurement_vendor().list())
-            .await
-            .map_err(protocol::ReadError::message)?;
-        if !(200..300).contains(&inventory_status) || unique_ids(&inventory)?.contains(&vm_id) {
+        let (inventory_status, inventory) = self.recovery_inventory(api).await?;
+        if before_invoice {
+            let (_, known) = self.observe_recovery_inventory(api, &inventory).await?;
+            if known.len() > MAX_RECOVERY_MACHINES {
+                return Err(
+                    "More machines were observed for this order than the page can verify. The purchase remains paused."
+                        .into(),
+                );
+            }
+        }
+        if unique_ids(&inventory)?.contains(&vm_id) {
             return Err(REFUSED.into());
         }
         for vm in array(&inventory)? {
@@ -821,6 +843,7 @@ impl<S: Storage> Store<S> {
             publication: None,
             target: None,
             duplicate_orders: Vec::new(),
+            unverified_machines: Vec::new(),
             stopped: None,
         };
         self.procurement_commit(Record::Approved(Box::new(record)))
@@ -888,6 +911,7 @@ impl<S: Storage> Store<S> {
                 || p.target.is_some()
                 || p.publication.is_some()
                 || !p.duplicate_orders.is_empty()
+                || !p.unverified_machines.is_empty()
                 || p.stopped.is_some()
             {
                 return Err(REFUSED.into());
@@ -918,30 +942,30 @@ impl<S: Storage> Store<S> {
             return Err(REFUSED.into());
         }
         // Archived VM and payment identities remain consumed.
-        for closed in self
+        let mut archived = self
             .closed_purchases
             .iter()
             .chain(&self.completed_purchases)
-        {
-            let reused = match record {
-                Record::Associated(vm) => {
-                    closed
-                        .vm
-                        .as_ref()
-                        .is_some_and(|old| p.vendor.same_vm_id(old, vm))
+            .filter(|closed| closed.origin == p.origin);
+        let reused = match record {
+            Record::Associated(vm) | Record::AssociatedWithSpares { vm, .. } => {
+                archived.any(|closed| {
+                    closed.vm.as_ref().is_some_and(|old| p.vendor.same_vm_id(old, vm))
                         || id(vm).is_ok_and(|id| closed.duplicate_orders.contains(&id))
-                }
-                Record::Payment { payment, .. } => closed
+                })
+            }
+            Record::Payment { payment, .. } => archived.any(|closed| {
+                closed
                     .payment
                     .as_ref()
                     .and_then(|old| self.procurement_vendor().payment_id(old).ok())
                     .zip(self.procurement_vendor().payment_id(payment).ok())
-                    .is_some_and(|(old, new)| old.eq_ignore_ascii_case(new)),
-                _ => false,
-            };
-            if closed.origin == p.origin && reused {
-                return Err(REFUSED.into());
-            }
+                    .is_some_and(|(old, new)| old.eq_ignore_ascii_case(new))
+            }),
+            _ => false,
+        };
+        if reused {
+            return Err(REFUSED.into());
         }
         match record {
             Record::Approved(_) => unreachable!(),
@@ -960,7 +984,11 @@ impl<S: Storage> Store<S> {
                 }
             }
             Record::CreateEmailRefused => {
-                if p.create.is_none() || p.vm.is_some() || p.target.is_some() {
+                if p.create.is_none()
+                    || p.vm.is_some()
+                    || p.target.is_some()
+                    || !p.unverified_machines.is_empty()
+                {
                     return Err(REFUSED.into());
                 }
                 // Only the exact decoded order-time refusal establishes no creation.
@@ -974,6 +1002,9 @@ impl<S: Storage> Store<S> {
                 checked_at,
             } => {
                 if !close_eligible(&p, *checked_at)
+                    || !p.unverified_machines.is_empty()
+                        && p.unverified_machines.len() + p.duplicate_orders.len()
+                            > MAX_RECOVERY_MACHINES
                     || p.vm.as_ref().and_then(|vm| id(vm).ok()) != Some(*vm_id)
                     || !(200..300).contains(inventory_status)
                     || *detail_status != 404
@@ -1088,12 +1119,41 @@ impl<S: Storage> Store<S> {
                 }
                 p.create = Some(intent.clone());
             }
-            Record::Associated(vm) => {
+            Record::MachineEvidenceObserved { vm_ids } => {
                 let intent = p.create.as_ref().ok_or(REFUSED)?;
+                let chosen = p.vm.as_ref().map(id).transpose()?;
+                if p.invoice.is_some()
+                    || p.payment.is_some()
+                    || p.target.is_some()
+                    || vm_ids.is_empty()
+                    || vm_ids.windows(2).any(|ids| ids[0] >= ids[1])
+                    || p.unverified_machines.len() + p.duplicate_orders.len() + vm_ids.len()
+                        > MAX_RECOVERY_MACHINES + 1
+                    || vm_ids.iter().any(|vm| {
+                        id(&json!({"id": vm})).is_err()
+                            || chosen == Some(*vm)
+                            || p.unverified_machines.contains(vm)
+                            || p.duplicate_orders.contains(vm)
+                            || intent.before.iter().any(|old| id(old).ok() == Some(*vm))
+                    })
+                {
+                    return Err(REFUSED.into());
+                }
+                p.unverified_machines.extend(vm_ids);
+            }
+            Record::Associated(vm) | Record::AssociatedWithSpares { vm, .. } => {
+                let intent = p.create.as_ref().ok_or(REFUSED)?;
+                let vm_id = id(vm)?;
+                let spare_ids = if let Record::AssociatedWithSpares { spare_ids, .. } = record {
+                    spare_ids.as_slice()
+                } else {
+                    &[]
+                };
                 if p.vm.is_some()
-                    || p.duplicate_orders
+                    || p.unverified_machines
                         .iter()
-                        .any(|duplicate| id(vm).is_ok_and(|associated| associated >= *duplicate))
+                        .any(|vm| *vm != vm_id && !spare_ids.contains(vm))
+                    || p.duplicate_orders.first().is_some_and(|spare| vm_id >= *spare)
                     || intent.before.iter().any(|old| p.vendor.same_vm_id(old, vm))
                     || !p.vendor.matches(
                         &p.selected,
@@ -1104,23 +1164,44 @@ impl<S: Storage> Store<S> {
                 {
                     return Err(REFUSED.into());
                 }
+                if matches!(record, Record::AssociatedWithSpares { .. }) {
+                    if !unpaid_machine(vm)
+                        || spare_ids.is_empty()
+                        || p.duplicate_orders.len() + spare_ids.len() > MAX_RECOVERY_MACHINES
+                        || spare_ids.windows(2).any(|ids| ids[0] >= ids[1])
+                        || spare_ids.iter().any(|spare| {
+                            *spare <= vm_id
+                                || p.duplicate_orders.contains(spare)
+                                || intent.before.iter().any(|old| id(old).ok() == Some(*spare))
+                        })
+                    {
+                        return Err(REFUSED.into());
+                    }
+                    p.duplicate_orders.extend(spare_ids);
+                    p.duplicate_orders.sort_unstable();
+                    p.duplicate_orders.dedup();
+                }
+                p.unverified_machines.clear();
                 p.vm = Some(vm.clone());
             }
-            Record::DuplicateOrders { vm_ids } => {
+            Record::DuplicateOrders { vm_ids } | Record::SpareOrdersObserved { vm_ids } => {
                 let intent = p.create.as_ref().ok_or(REFUSED)?;
-                if self.provider_account_entered()
+                let legacy = matches!(record, Record::DuplicateOrders { .. });
+                if legacy && self.provider_account_entered()
                     || vm_ids.is_empty()
-                    || vm_ids.len() > 7
+                    || vm_ids.len() > MAX_RECOVERY_MACHINES
+                    || !legacy && p.duplicate_orders.len() + vm_ids.len() > MAX_RECOVERY_MACHINES
                     || p.invoice.is_some()
                     || p.payment.is_some()
                     || p.target.is_some()
                     || vm_ids.windows(2).any(|ids| ids[0] >= ids[1])
                     || vm_ids.iter().any(|vm| {
                         *vm == 0
+                            || !legacy && p.duplicate_orders.contains(vm)
                             || intent.before.iter().any(|old| id(old).ok() == Some(*vm))
-                            || p.vm
-                                .as_ref()
-                                .is_some_and(|own| id(own).is_ok_and(|own| *vm <= own))
+                            || p.vm.as_ref().is_some_and(|own| {
+                                id(own).is_ok_and(|own| *vm == own || legacy && *vm < own)
+                            })
                     })
                 {
                     return Err(REFUSED.into());
@@ -1128,6 +1209,7 @@ impl<S: Storage> Store<S> {
                 p.duplicate_orders.extend(vm_ids);
                 p.duplicate_orders.sort_unstable();
                 p.duplicate_orders.dedup();
+                p.unverified_machines.retain(|vm| !vm_ids.contains(vm));
             }
             Record::BillingQuoted(billing) => {
                 let vm = p.vm.as_ref().ok_or(REFUSED)?;
@@ -1144,6 +1226,7 @@ impl<S: Storage> Store<S> {
                     || p.vm.is_none()
                     || p.invoice.is_some()
                     || p.payment.is_some()
+                    || !p.unverified_machines.is_empty()
                     || !intent.before.is_empty()
                 {
                     return Err(REFUSED.into());
@@ -1362,36 +1445,83 @@ impl<S: Storage> Store<S> {
         let number = self.commit(&Event::Procurement(record.clone())).await?;
         self.apply_procurement(number, &record, next)
     }
-    async fn history(&mut self, api: &mut impl Api, vm: u64) -> Result<Vec<Value>, String> {
-        let result = self
-            .provider_read(api, self.procurement_vendor().invoice_history(vm))
-            .await?;
-        self.procurement_vendor().parse_history(&result, vm)
+    async fn empty_spare_history(&mut self, api: &mut impl Api, vm: u64) -> bool {
+        let vendor = self.procurement_vendor();
+        self.provider_response(api, vendor.invoice_history(vm))
+            .await
+            .is_ok_and(|(status, result)| {
+                (200..300).contains(&status)
+                    && vendor.parse_history(&result, vm).is_ok_and(|history| history.is_empty())
+            })
     }
-    async fn reconcile_create(&mut self, api: &mut impl Api) -> Result<Reconciliation, String> {
-        self.procurement_recovery = Default::default();
-        let p = self.procurement.clone().ok_or(REFUSED)?;
-        let intent = p.create.as_ref().ok_or(REFUSED)?;
-        let key = id(p.ssh_key.as_ref().ok_or(REFUSED)?)?;
-        let checked_at = api.now();
+    async fn recovery_inventory(&mut self, api: &mut impl Api) -> Result<(u16, Value), String> {
         let (status, inventory) = self
-            .provider_response(api, p.vendor.list())
+            .provider_response(api, self.procurement_vendor().list())
             .await
             .map_err(protocol::ReadError::message)?;
         if !(200..300).contains(&status) {
             return Err(REFUSED.into());
         }
+        Ok((status, inventory))
+    }
+    async fn observe_recovery_inventory<'a>(
+        &mut self,
+        api: &impl Api,
+        inventory: &'a Value,
+    ) -> Result<(Vec<&'a Value>, BTreeSet<u64>), String> {
+        self.check_api(api)?;
+        let p = self.procurement.as_ref().ok_or(REFUSED)?;
+        let intent = p.create.as_ref().ok_or(REFUSED)?;
+        let key = id(p.ssh_key.as_ref().ok_or(REFUSED)?)?;
+        let chosen = p.vm.as_ref().map(id).transpose()?;
+        let mut known: BTreeSet<_> = p
+            .duplicate_orders
+            .iter()
+            .chain(&p.unverified_machines)
+            .copied()
+            .collect();
         // Other keys and the before-list never consume the detail/history budget.
         let rows: Vec<_> = inventory
             .as_array()
             .ok_or(REFUSED)?
             .iter()
             .filter(|vm| {
-                vm["ssh_key"]["id"].as_u64() == Some(key)
+                let vm_id = id(vm).ok();
+                !(chosen.is_some() && chosen == vm_id)
+                    && (vm["ssh_key"]["id"].as_u64() == Some(key)
+                        || vm_id.is_some_and(|id| known.contains(&id)))
                     && !intent.before.iter().any(|old| p.vendor.same_vm_id(old, vm))
             })
             .collect();
-        let ids = unique_ids(&json!(rows))?;
+        // Save evidence before validating the whole list. The eighth distinct ID keeps a
+        // purchase over the verification bound paused even if the oversized list shrinks.
+        let mut vm_ids = Vec::new();
+        for vm in &rows {
+            if known.len() > MAX_RECOVERY_MACHINES {
+                break;
+            }
+            if let Ok(vm_id) = id(vm)
+                && known.insert(vm_id)
+            {
+                vm_ids.push(vm_id);
+            }
+        }
+        if !vm_ids.is_empty() {
+            vm_ids.sort_unstable();
+            self.procurement_commit(Record::MachineEvidenceObserved { vm_ids })
+                .await?;
+        }
+        Ok((rows, known))
+    }
+    async fn reconcile_create(&mut self, api: &mut impl Api) -> Result<Reconciliation, String> {
+        self.procurement_recovery = Default::default();
+        let p = self.procurement.clone().ok_or(REFUSED)?;
+        let intent = p.create.as_ref().ok_or(REFUSED)?;
+        let key = id(p.ssh_key.as_ref().ok_or(REFUSED)?)?;
+        let chosen = p.vm.as_ref().map(id).transpose()?;
+        let checked_at = api.now();
+        let (status, inventory) = self.recovery_inventory(api).await?;
+        let (rows, known) = self.observe_recovery_inventory(api, &inventory).await?;
         let mut result = Reconciliation {
             candidates: Vec::new(),
             failing: Vec::new(),
@@ -1399,48 +1529,99 @@ impl<S: Storage> Store<S> {
             status,
             checked_at,
         };
-        if rows.len() > 8 {
-            result.failing = ids;
+        // Seven machines can use two reads each between the two inventory reads.
+        if known.len() > MAX_RECOVERY_MACHINES {
+            result.failing.extend(known);
             return Ok(result);
         }
-        for vm in rows {
+        let ids = unique_ids(&json!(rows))?;
+        result.failing.extend(known.iter().copied().filter(|id| !ids.contains(id)));
+        if !result.failing.is_empty() {
+            // A missing VM may have lost its billing evidence in a purge.
+            return Ok(result);
+        }
+        for &vm in &rows {
             let vm_id = id(vm)?;
-            if p.duplicate_orders.contains(&vm_id) {
-                result.ignored.push(vm_id);
-                continue;
-            }
             if !p.vendor.matches(&p.selected, vm, key, intent.started) || !unpaid_machine(vm) {
                 result.failing.push(vm_id);
                 continue;
             }
-            let detail = self.provider_read(api, p.vendor.get(vm_id)).await;
-            let usable = if let Ok(detail) = detail {
-                if p.vendor.matches(&p.selected, &detail, key, intent.started)
-                    && p.vendor.same_vm_identity(vm, &detail)
-                    && unpaid_machine(&detail)
-                    && self
-                        .history(api, vm_id)
-                        .await
-                        .is_ok_and(|history| history.is_empty())
-                {
-                    result.candidates.push(detail);
-                    true
-                } else {
-                    false
-                }
+            let recorded_spare = p.duplicate_orders.contains(&vm_id);
+            let evidence = if chosen.is_some() && recorded_spare {
+                // Inventory carries the same status as detail for a spare checked earlier.
+                vm.clone()
             } else {
-                false
+                let Ok(detail) = self.provider_read(api, p.vendor.get(vm_id)).await else {
+                    result.failing.push(vm_id);
+                    continue;
+                };
+                if !p.vendor.matches(&p.selected, &detail, key, intent.started)
+                    || !p.vendor.same_vm_identity(vm, &detail)
+                    || !unpaid_machine(&detail)
+                {
+                    result.failing.push(vm_id);
+                    continue;
+                }
+                detail
             };
-            if !usable {
+            if !self.empty_spare_history(api, vm_id).await {
                 result.failing.push(vm_id);
+            } else if recorded_spare {
+                result.ignored.push(vm_id);
+            } else {
+                result.candidates.push(evidence);
             }
+        }
+        if result.failing.is_empty() && !rows.is_empty() {
+            // A purge between the provider's ownership and history queries can return an empty
+            // history. Require the checked machines to still be visible and unpaid afterwards.
+            let (_, inventory) = self.recovery_inventory(api).await?;
+            let (current, known) = self.observe_recovery_inventory(api, &inventory).await?;
+            if known.len() > MAX_RECOVERY_MACHINES {
+                result.failing.extend(known);
+                return Ok(result);
+            }
+            let current_ids = unique_ids(&json!(current))?;
+            for (vm, vm_id) in rows.into_iter().zip(&ids) {
+                if current_ids.iter().position(|id| id == vm_id).is_none_or(|index| {
+                    let latest = current[index];
+                    !p.vendor.same_vm_identity(vm, latest)
+                        || !p.vendor.matches(&p.selected, latest, key, intent.started)
+                        || !unpaid_machine(latest)
+                }) {
+                    result.failing.push(*vm_id);
+                }
+            }
+            result.failing.extend(current_ids.into_iter().filter(|id| !ids.contains(id)));
         }
         self.check_api(api)?;
         result
             .candidates
             .sort_by_key(|vm| id(vm).expect("validated candidate"));
+        if chosen.is_none()
+            && let (Some(vm), Some(spare)) = (result.candidates.first(), p.duplicate_orders.first())
+            && id(vm)? >= *spare
+        {
+            // A legacy spare record without its association cannot promote a later VM.
+            for vm in &result.candidates {
+                result.failing.push(id(vm)?);
+            }
+        }
         result.failing.sort_unstable();
         Ok(result)
+    }
+    async fn check_attached_spares(&mut self, api: &mut impl Api) -> Result<bool, String> {
+        let result = self.reconcile_create(api).await?;
+        if !result.failing.is_empty() {
+            return Err("The page could not verify the other machines for this order are unpaid. Invoice issuance is paused.".into());
+        }
+        let vm_ids = result.candidates.iter().map(id).collect::<Result<Vec<_>, _>>()?;
+        if vm_ids.is_empty() {
+            return Ok(false);
+        }
+        self.procurement_commit(Record::SpareOrdersObserved { vm_ids })
+            .await?;
+        Ok(true)
     }
     fn offer_create_stop(&mut self, result: &Reconciliation) {
         let Some(p) = &self.procurement else {
@@ -1473,41 +1654,37 @@ impl<S: Storage> Store<S> {
         api: &mut impl Api,
         choice: Option<u64>,
     ) -> Result<(), String> {
-        let mut result = self.reconcile_create(api).await?;
+        let result = self.reconcile_create(api).await?;
         self.offer_create_stop(&result);
         if !result.failing.is_empty() {
             return Err("Create evidence incomplete or conflicting; no order is retried.".into());
         }
-        if result.candidates.is_empty() {
+        let mut candidates = result.candidates.into_iter();
+        let Some(vm) = candidates.next() else {
             return Err(
                 "Create outcome unknown: no evidenced machine. Refresh later; no order is retried."
                     .into(),
             );
-        }
-        let vm = if self.provider_account_entered() {
-            let Some(choice) = choice else {
-                self.procurement_recovery.candidates = result.candidates;
-                return Err("The provider holds machines that match this order. Confirm the one this purchase uses; the others are left as they are and never invoiced here.".into());
-            };
-            let index = result
-                .candidates
-                .iter()
-                .position(|vm| id(vm).ok() == Some(choice))
-                .ok_or(REFUSED)?;
-            result.candidates.remove(index)
-        } else {
-            if choice.is_some() {
-                return Err(REFUSED.into());
-            }
-            let vm = result.candidates.remove(0);
-            let vm_ids: Vec<_> = result.candidates.iter().map(id).collect::<Result<_, _>>()?;
-            if !vm_ids.is_empty() {
-                self.procurement_commit(Record::DuplicateOrders { vm_ids })
+        };
+        let spare_ids = candidates.map(|vm| id(&vm)).collect::<Result<Vec<_>, _>>()?;
+        if self.provider_account_entered() && choice.is_none() {
+            if !spare_ids.is_empty() {
+                self.procurement_commit(Record::SpareOrdersObserved { vm_ids: spare_ids })
                     .await?;
             }
-            vm
+            self.procurement_recovery.candidates.push(vm);
+            return Err("Confirm the machine this purchase uses.".into());
+        }
+        if choice.is_some_and(|choice| id(&vm).ok() != Some(choice)) {
+            return Err("The matching machine changed. Check the order again.".into());
+        }
+        let record = if spare_ids.is_empty() {
+            Record::Associated(vm)
+        } else {
+            // Save the choice and every spare together before billing can use the VM.
+            Record::AssociatedWithSpares { vm, spare_ids }
         };
-        self.procurement_commit(Record::Associated(vm)).await?;
+        self.procurement_commit(record).await?;
         self.procurement_recovery = Default::default();
         Ok(())
     }
@@ -1806,6 +1983,11 @@ impl<S: Storage> Store<S> {
             #[cfg(all(feature = "tracer", target_arch = "wasm32"))]
             crate::testonly::session_point("procurement_associated").await;
             p = self.procurement.clone().ok_or(REFUSED)?;
+        } else if p.payment.is_none()
+            && p.invoice.is_none()
+            && self.check_attached_spares(api).await?
+        {
+            return Err("The provider created additional unpaid machines. Review the notice before continuing with the chosen machine.".into());
         }
         if p.payment.is_none() {
             self.associate_payment(api, issue_invoice).await?;
