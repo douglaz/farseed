@@ -50,7 +50,8 @@ fn poc_credit_cleanup_cutoffs_use_returned_precision_or_requested_tolerance() {
         session: "session-1".into(),
         name: "k0123456789abcdef012345678".into(),
         requested_cap: CAP,
-        requested_expiry: requested,
+        requested_expiry: Some(requested),
+        requested_reset_period: None,
         issuer_id: None,
         returned_cap: None,
         returned_expiry: None,
@@ -78,7 +79,7 @@ fn poc_credit_cleanup_cutoffs_use_returned_precision_or_requested_tolerance() {
         assert!(!mint.retry_eligible(0));
     }
     mint.returned_expiry = None;
-    mint.requested_expiry = u64::MAX;
+    mint.requested_expiry = Some(u64::MAX);
     assert!(mint.retry_eligible(u128::from(u64::MAX) * 1_000_000_000));
 }
 
@@ -241,15 +242,19 @@ fn poc_credit_returned_limits_are_exact_and_closed() {
         session: "session-1".into(),
         name: mint_name().unwrap(),
         requested_cap: CAP,
-        requested_expiry: expiry,
+        requested_expiry: Some(expiry),
+        requested_reset_period: None,
         issuer_id: None,
         returned_cap: None,
         returned_expiry: None,
     };
+    let recorded = serde_json::to_value(&mint).unwrap();
+    assert_eq!(recorded["requested_expiry"], expiry);
+    assert!(recorded.get("requested_reset_period").is_none());
     let good = json!({"status":"success","data":{"_id":"key-1","name":mint.name,"api_key":"session-synthetic-value","usage_limit_usd":1.0,"expire_at":"2026-11-11T00:00:00Z","reset_period":null}});
     assert_eq!(
         returned_mint(&good, &mint).unwrap(),
-        ("key-1".into(), "2026-11-11T00:00:00Z".into())
+        ("key-1".to_owned(), Some("2026-11-11T00:00:00Z".to_owned()))
     );
     for (field, bad) in [
         ("usage_limit_usd", json!(0.26)),
@@ -355,26 +360,42 @@ fn poc_credit_account_response_is_validated_as_one_pair() {
 #[test]
 fn poc_credit_ai_key_request_and_returned_cap_are_exactly_five_dollars() {
     let name = "k0123456789abcdef01234567";
-    let expiry = "2026-11-11T00:00:00Z";
     let mint = Mint {
         session: "session-1".into(),
         name: name.into(),
         requested_cap: AI_KEY_CAP,
-        requested_expiry: super::super::provisioning::timestamp(expiry).unwrap(),
+        requested_expiry: None,
+        requested_reset_period: Some(ResetPeriod::Monthly),
         issuer_id: None,
         returned_cap: None,
         returned_expiry: None,
     };
-    let request = ai_key_request(&mint, expiry);
+    let request = ai_key_request(&mint);
     assert_eq!(
         request,
-        json!({"name":name,"usage_limit_usd":5.0,"expire_at":expiry})
+        json!({"name":name,"usage_limit_usd":5.0,"reset_period":"monthly","expire_at":null})
     );
     assert_eq!(mint.requested_cap, 5.0);
     let mut response = json!({"status":"success","data":request});
     response["data"]["_id"] = json!("key-1");
-    response["data"]["reset_period"] = Value::Null;
-    assert!(returned_mint(&response, &mint).is_ok());
+    assert_eq!(
+        returned_mint(&response, &mint).unwrap(),
+        ("key-1".to_owned(), None)
+    );
+    for (field, bad) in [
+        ("reset_period", Value::Null),
+        ("reset_period", json!("daily")),
+        ("expire_at", json!("2026-11-11T00:00:00Z")),
+    ] {
+        let mut value = response.clone();
+        value["data"][field] = bad;
+        assert!(returned_mint(&value, &mint).is_err());
+    }
+    for field in ["reset_period", "expire_at"] {
+        let mut value = response.clone();
+        value["data"].as_object_mut().unwrap().remove(field);
+        assert!(returned_mint(&value, &mint).is_err());
+    }
     for cap in [
         json!(0.25),
         json!(0.5),

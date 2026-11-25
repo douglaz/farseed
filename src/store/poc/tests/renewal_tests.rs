@@ -14,19 +14,22 @@ fn renewal_session_mode(approve: bool, legacy: bool) -> (Store<MemoryStorage>, T
         201, &json!({"success":true,"credit_id":"synthetic-credit-account","api_key":"synthetic-default-key"}),
     ).unwrap())).unwrap();
     let setup = ai_key_proposal(&mut store);
-    let setup = change(
+    // The replacement starts with a previously installed finite key.
+    let setup = apply_recorded_ai_key_decision(
         &mut store,
         &setup,
         Change::AiKeyDecision {
             create: true,
-            approved_cap: None,
+            approved_cap: Some(5.0),
+            approved_policy: None,
         },
     );
+    let expiry = "2026-11-11T00:00:00Z";
     block_on(store.ai_key_commit(KeyRecord::Request {
         task: setup.id.clone(),
         call: setup.proposal.as_ref().unwrap().call_id.clone(),
         path: crate::store::ai_keys::path(&setup),
-        mint: Mint::ai_key(&setup, "k0123456789abcdef01234567".into(), 1_794_355_200),
+        mint: finite_ai_key_mint(&setup, "k0123456789abcdef01234567", 5.0, expiry),
         configuration: None,
     }))
     .unwrap();
@@ -34,7 +37,7 @@ fn renewal_session_mode(approve: bool, legacy: bool) -> (Store<MemoryStorage>, T
         machine: setup.machine.clone(),
         name: "k0123456789abcdef01234567".into(),
         issuer_id: "setup-key".into(),
-        expires: "2026-11-11T00:00:00Z".into(),
+        expires: Some(expiry.into()),
         key: SecretText(Zeroizing::new("synthetic-setup-application-key".into())),
     }))
     .unwrap();
@@ -69,6 +72,7 @@ fn renewal_session_mode(approve: bool, legacy: bool) -> (Store<MemoryStorage>, T
             Change::AiKeyDecision {
                 create: true,
                 approved_cap: None,
+                approved_policy: None,
             },
         )
     } else {
@@ -151,6 +155,7 @@ fn poc_ai_key_renewal_starting_goal_requirements_approval_then_resume_creates() 
         Change::AiKeyDecision {
             create: true,
             approved_cap: None,
+            approved_policy: None,
         },
     );
     assert!(
@@ -305,7 +310,7 @@ impl CreditService {
             201,
             json!({"status":"success","data":{
                 "_id":format!("key-{}", self.requests), "api_key":format!("synthetic-application-key-{}", self.requests),
-                "name":name,"usage_limit_usd":body["usage_limit_usd"],"reset_period":null,"expire_at":body["expire_at"]
+                "name":name,"usage_limit_usd":body["usage_limit_usd"],"reset_period":body["reset_period"],"expire_at":body["expire_at"]
             }}),
         )
     }
@@ -366,6 +371,88 @@ impl MintRuntime {
         }
     }
 }
+
+const LEGACY_REPLACEMENT_NAME: &str = "historical-renewal-key-v1";
+const LEGACY_REPLACEMENT_EXPIRY: &str = "2026-11-11T00:00:00Z";
+
+fn legacy_renewal() -> (MintRuntime, Task) {
+    use crate::poc::credit::{AI_KEY_APPROVAL_REQUIRED, returned_mint};
+
+    let (mut store, _, task) = renewal_session_mode(false, true);
+    let task = apply_recorded_ai_key_decision(
+        &mut store,
+        &task,
+        Change::AiKeyDecision {
+            create: true,
+            approved_cap: Some(5.0),
+            approved_policy: None,
+        },
+    );
+    assert_eq!(
+        store.ai_key_preparation(&task).unwrap_err(),
+        AI_KEY_APPROVAL_REQUIRED
+    );
+
+    // Recreate the historical request and custody before the current runtime resumes.
+    let mut runtime = MintRuntime::new(store);
+    let mint = finite_ai_key_mint(
+        &task,
+        LEGACY_REPLACEMENT_NAME,
+        5.0,
+        LEGACY_REPLACEMENT_EXPIRY,
+    );
+    block_on(runtime.store.ai_key_commit(KeyRecord::Request {
+        task: task.id.clone(),
+        call: task.proposal.as_ref().unwrap().call_id.clone(),
+        path: crate::store::ai_keys::path(&task),
+        mint: mint.clone(),
+        configuration: None,
+    }))
+    .unwrap();
+    let (status, value) = runtime.service.create(
+        "operator",
+        &json!({
+            "name": mint.name,
+            "usage_limit_usd": mint.requested_cap,
+            "expire_at": LEGACY_REPLACEMENT_EXPIRY,
+        }),
+    );
+    assert_eq!(status, 201);
+    let (issuer_id, expires) = returned_mint(&value, &mint).unwrap();
+    block_on(runtime.store.ai_key_commit(KeyRecord::Held {
+        machine: task.machine.clone(),
+        name: mint.name,
+        issuer_id,
+        expires,
+        key: SecretText(Zeroizing::new(
+            value["data"]["api_key"].as_str().unwrap().into(),
+        )),
+    }))
+    .unwrap();
+    (runtime, task)
+}
+
+fn assert_legacy_replacement(store: &Store<MemoryStorage>, task: &Task) {
+    let entry = store
+        .ai_key(&task.id, crate::poc::key_renewal::KEY)
+        .unwrap();
+    assert_eq!(entry.mint.name, LEGACY_REPLACEMENT_NAME);
+    assert_eq!(entry.mint.requested_cap, 5.0);
+    assert_eq!(
+        entry.mint.requested_expiry,
+        Some(crate::poc::provisioning::timestamp(LEGACY_REPLACEMENT_EXPIRY).unwrap())
+    );
+    assert_eq!(entry.mint.requested_reset_period, None);
+    assert!(entry.key.is_some());
+    let held = store.poc_targets[&task.machine]
+        .application_inference_keys
+        .iter()
+        .find(|key| key.name == entry.mint.name && key.path == entry.path)
+        .unwrap();
+    assert_eq!(held.record_id, "key-1");
+    assert_eq!(held.expires.as_deref(), Some(LEGACY_REPLACEMENT_EXPIRY));
+}
+
 impl Runtime for MintRuntime {
     async fn load(&mut self, id: &str) -> Result<Task, String> {
         self.store.poc_task(id)
@@ -418,12 +505,7 @@ impl Runtime for MintRuntime {
             Preparation::AccountRequired => return Err(crate::poc::key_renewal::CREDIT.into()),
             Preparation::Held => {}
             Preparation::Mint => {
-                let expiry = "2026-11-11T00:00:00Z";
-                let mint = Mint::ai_key(
-                    task,
-                    crate::poc::credit::mint_name()?,
-                    crate::poc::provisioning::timestamp(expiry)?,
-                );
+                let mint = Mint::ai_key(task, crate::poc::credit::mint_name()?)?;
                 self.store
                     .ai_key_commit(KeyRecord::Request {
                         task: task.id.clone(),
@@ -436,9 +518,7 @@ impl Runtime for MintRuntime {
                 self.checkpoint("mint request");
                 self.interrupt(Interruption::AfterRecord);
                 fence.check(self.revision.get())?;
-                let (status, value) = self
-                    .service
-                    .create("operator", &ai_key_request(&mint, expiry));
+                let (status, value) = self.service.create("operator", &ai_key_request(&mint));
                 self.interrupt(Interruption::AfterResponse);
                 fence.check(self.revision.get())?;
                 assert_eq!(status, 201);
@@ -583,8 +663,11 @@ fn poc_ai_key_renewal_credit_queue_waits_for_start_and_uses_real_api_shape() {
         &task.start_session,
     ))
     .unwrap();
-    assert_eq!(completed.completed[0].2["content"]["status"], "created");
-    assert_eq!(completed.completed[0].2["content"]["limit_usd"], 5.0);
+    let outcome = &completed.completed[0].2["content"];
+    assert_eq!(outcome["status"], "created");
+    assert_eq!(outcome["limit_usd"], 5.0);
+    assert_eq!(outcome["reset_period"], "monthly");
+    assert_eq!(outcome.get("expires"), Some(&Value::Null));
     assert_eq!(runtime.service.names["operator"].len(), 2);
     assert_eq!(runtime.writes, 1);
     run::reserve_execution_response(&goal, &mut response);
@@ -596,9 +679,7 @@ fn poc_ai_key_renewal_credit_queue_waits_for_start_and_uses_real_api_shape() {
     crate::poc::credit::session_mint_ready().unwrap();
 }
 
-/// This uses unlock/replay, not a second compiled historical reader. The replay path
-/// (including apply_requirements_task, apply_poc, project_poc, project_poc_task,
-/// apply_poc_key_class, validate_ai_key and replay_ai_key) is unchanged from b3f6e11.
+/// This compares the live projection against unlock/replay in the current reader.
 /// Comparing every Task compares status, revision, proposal and completed outcomes too.
 /// The fake service/transport does not establish browser scheduling or remote effects.
 #[test]
@@ -622,6 +703,7 @@ fn poc_ai_key_renewal_whole_journal_replays_with_unchanged_projection() {
             Change::AiKeyDecision {
                 create: true,
                 approved_cap: None,
+                approved_policy: None,
             },
         );
         let mut runtime = MintRuntime::new(store);
@@ -858,11 +940,14 @@ impl crate::poc::key_renewal::RetirementRuntime for RetireRuntime<'_> {
 
 /// Drive all real proposals/settlements through CHECK, with fake machine output only.
 fn checked_renewal(pass: bool) -> (MintRuntime, Task) {
-    checked_renewal_mode(pass, false)
+    let (store, _, task) = starting_session();
+    complete_renewal_check(MintRuntime::new(store), &task, pass)
 }
-fn checked_renewal_mode(pass: bool, legacy: bool) -> (MintRuntime, Task) {
-    let (store, _, task) = renewal_session_mode(true, legacy);
-    let mut runtime = MintRuntime::new(store);
+fn complete_renewal_check(
+    mut runtime: MintRuntime,
+    task: &Task,
+    pass: bool,
+) -> (MintRuntime, Task) {
     let mut task = block_on(run::resume(
         &mut runtime,
         &mut run::Unconfigured,
@@ -946,6 +1031,10 @@ fn poc_ai_key_renewal_retirement_only_after_check_and_never_new_key() {
     assert!(!task.ended());
     let retirement = runtime.store.ai_key_retirements_for(&task).unwrap().clone();
     assert_eq!(retirement.key.record_id, "setup-key");
+    assert_eq!(
+        retirement.key.expires.as_deref(),
+        Some("2026-11-11T00:00:00Z")
+    );
     let new = runtime.store.poc_targets[&task.machine]
         .application_inference_keys
         .last()
@@ -1407,7 +1496,8 @@ fn poc_ai_key_renewal_r2_ended_session_recovers_same_task_and_retirement() {
                 recovered.clone(),
                 Change::AiKeyDecision {
                     create: true,
-                    approved_cap: None
+                    approved_cap: None,
+                    approved_policy: None,
                 }
             ))
             .unwrap(),
@@ -1532,7 +1622,8 @@ fn poc_ai_key_renewal_fixed_command_removes_only_old_file() {
 
 #[test]
 fn poc_ai_key_renewal_legacy_journal_keeps_check_completion_unchanged() {
-    let (runtime, task) = checked_renewal_mode(true, true);
+    let (runtime, task) = legacy_renewal();
+    let (runtime, task) = complete_renewal_check(runtime, &task, true);
     assert_eq!(
         task.template.as_deref(),
         Some(crate::poc::key_renewal::LEGACY_ID)
@@ -1544,12 +1635,14 @@ fn poc_ai_key_renewal_legacy_journal_keeps_check_completion_unchanged() {
     );
     assert_eq!(task.completed.len(), 6);
     let replayed = reopen(&runtime.store);
+    assert_legacy_replacement(&replayed, &task);
     assert_eq!(replayed.poc, runtime.store.poc);
     assert!(replayed.ai_key_retirements.is_empty());
     assert_eq!(
         replayed.poc_targets_view(),
         runtime.store.poc_targets_view()
     );
+    assert_eq!(runtime.service.requests, 1);
 }
 
 #[test]
@@ -1800,8 +1893,7 @@ fn poc_ai_key_renewal_card_shows_failure_retry_progress_and_success_offline() {
 
 #[test]
 fn poc_ai_key_renewal_legacy_resume_records_upgrade_without_losing_pending_job() {
-    let (store, _, task) = renewal_session_mode(true, true);
-    let mut runtime = MintRuntime::new(store);
+    let (mut runtime, task) = legacy_renewal();
     let created = block_on(run::resume(
         &mut runtime,
         &mut run::Unconfigured,
@@ -1816,6 +1908,7 @@ fn poc_ai_key_renewal_legacy_resume_records_upgrade_without_losing_pending_job()
     append(&mut runtime.store, &proposed, &task.start_session);
     let before = runtime.store.poc_task(&task.id).unwrap();
     runtime.store = reopen(&runtime.store);
+    assert_legacy_replacement(&runtime.store, &task);
     assert_eq!(
         runtime.store.poc_task(&task.id).unwrap(),
         before,
@@ -1841,6 +1934,7 @@ fn poc_ai_key_renewal_legacy_resume_records_upgrade_without_losing_pending_job()
         "setup-key"
     );
     let replayed = reopen(&runtime.store);
+    assert_legacy_replacement(&replayed, &task);
     assert_eq!(replayed.poc_task(&task.id).unwrap(), upgraded);
     assert_eq!(
         replayed.ai_key_retirements,
@@ -1860,6 +1954,14 @@ fn poc_ai_key_renewal_legacy_resume_records_upgrade_without_losing_pending_job()
     .unwrap();
     assert!(collected.pending.is_none());
     assert_eq!(collected.completed.len(), 2);
+    assert_eq!(
+        &collected.completed[..before.completed.len()],
+        before.completed.as_slice()
+    );
+    assert_eq!(
+        collected.completed[1].0,
+        before.proposal.as_ref().unwrap().call_id
+    );
     assert!(
         runtime.service.deletes.is_empty(),
         "upgrading does not revoke before CHECK"
