@@ -203,7 +203,8 @@ const renderSteps = store => {
       statusLine.dataset.taskHeading = store.tasks.map(task => `${task.machine}: ${routineTask(task) ? 'waiting for the machine' : taskStatus(task.status, task)}${task.inference_retry ? ' — waiting to retry the AI connection' : ''}${task.pause_reason && !routineTask(task) ? ' — ' + plainPause(task.pause_reason) : ''}`).join(' ');
       const text = document.createElement('span'); text.textContent = messages[name]; statusLine.replaceChildren(text);
     } else delete statusLine.dataset.taskHeading;
-    const errors = [name === (store.page_error_step ?? 'store') ? store.error : '', name === 'task' ? pocKeyRefusal : ''];
+    const actionError = name === 'machine' && messages.machine === store.error ? '' : store.error;
+    const errors = [name === (store.page_error_step ?? 'store') ? actionError : '', name === 'task' ? pocKeyRefusal : ''];
     $(`step-${name}-error`).textContent = [...new Set(errors.filter(Boolean))].join(' ');
     $(`step-${name}-fold`).open = foldChoices.get(name) ?? false;
     step.querySelectorAll('.main-action').forEach(button => { button.classList.remove('main-action'); if (!button.className) button.removeAttribute('class'); });
@@ -499,7 +500,7 @@ const renderProgress = (store) => {
     } else if (current === 3) {
       line = purchase.stop ? 'Waiting for you: decide below whether to stop this purchase.'
         : purchase.candidates?.length ? 'Waiting for you: choose below which machine this purchase uses.'
-        : purchase.payment?.is_paid === false && Date.parse(purchase.payment.expires) <= Date.now()
+        : purchase.payment?.is_paid === false && invoiceDeadline(purchase) <= Date.now()
           ? "The machine's invoice has expired. See the machine step below."
         : ({
           approved: 'Waiting for you: order the machine below.',
@@ -721,15 +722,19 @@ const operatorLink = link => {
 };
 const taskStatus = (status, task) => awaitingAiKey(task) || awaitingOperator(task) ? 'waiting for you' : ({running:'working', waiting:'waiting for the machine', verifying:'checking the result', paused:'paused', complete:'done', abandoned:'stopped'})[status] ?? status;
 const routineTask = task => ['running', 'waiting', 'verifying'].includes(task.status) && !awaitingAiKey(task) && !awaitingOperator(task);
+const invoiceDeadline = purchase => purchase.recovered_invoice_deadline_ms ?? Date.parse(purchase.payment?.expires);
+const recoveredInvoiceExpired = purchase => purchase.recovered_invoice_deadline_ms !== undefined && invoiceDeadline(purchase) <= Date.now();
 const purchaseStatus = purchase => ({
   approved: "Purchase approved; the machine hasn't been ordered yet. Press Create the server to order it.",
   registration_uncertain: 'Waiting to confirm that the provider saved the access key. The page will check before continuing.',
   registered: 'Access key saved; preparing the machine order.',
-  create_uncertain: 'Waiting to confirm the machine order. The page will check before continuing.',
+  create_uncertain: purchase.confirmation_message,
   email_verification: 'Waiting for your email to be verified by the machine provider.',
-  initial_invoice: 'Machine ordered; review the invoice before paying.',
-  invoice_uncertain: 'Waiting to confirm the invoice. The page will check before continuing.',
-  payment_readiness: purchase.payment?.is_paid ? 'Payment received; the provider is starting the machine.' : 'Waiting for payment of the machine invoice.',
+  initial_invoice: 'Machine ordered. Review the price for the first period.',
+  invoice_uncertain: purchase.confirmation_message,
+  payment_readiness: purchase.payment?.is_paid ? 'Payment received; the provider is starting the machine.'
+    : recoveredInvoiceExpired(purchase) ? 'This invoice has expired. Press “Check now” if you already paid.'
+    : 'Waiting for payment of the machine invoice.',
   handed_off: 'Machine ready.',
   terms_changed: 'The price or setup changed. Review the updated plan before approving it.'
 })[purchase.phase] ?? 'Purchase status is unavailable. Open Details for the saved information.';
@@ -2391,8 +2396,15 @@ const lightningMillisats = invoice => {
   if (invoice.currency !== 'BTC' || ![invoice.amount, invoice.tax].every(part => Number.isSafeInteger(part) && part >= 0)) return null;
   return {millisats: BigInt(invoice.amount) + BigInt(invoice.tax), currency: invoice.currency};
 };
-const invoiceControls = (parent, savedInvoice, expires, total) => {
+const invoiceControls = (parent, savedInvoice, expires, total, recoveredDeadline) => {
   const wallet = document.createElement('a'); wallet.textContent = 'Open in wallet'; wallet.href = `lightning:${savedInvoice}`;
+  if (recoveredDeadline !== undefined) {
+    wallet.dataset.recoveredInvoiceDeadline = String(recoveredDeadline);
+    const guardExpired = event => {
+      if (Date.now() >= recoveredDeadline) event.preventDefault();
+    };
+    for (const event of ['click', 'auxclick', 'contextmenu', 'dragstart']) wallet.addEventListener(event, guardExpired);
+  }
   const bound = total?.currency === 'BTC' && typeof total.millisats === 'bigint' && total.millisats >= 0n ? total.millisats : null;
   const requested = bolt11AmountTenths(savedInvoice);
   let guidance = null;
@@ -2416,6 +2428,7 @@ const invoiceControls = (parent, savedInvoice, expires, total) => {
   }
   const copy = document.createElement('button'); copy.type = 'button'; copy.textContent = 'Copy';
   copy.addEventListener('click', async () => {
+    if (Date.now() >= recoveredDeadline) return;
     try { await navigator.clipboard.writeText(savedInvoice); copy.textContent = 'Copied'; }
     catch { copy.textContent = 'Copy unavailable'; }
   });
@@ -2427,13 +2440,18 @@ const invoiceControls = (parent, savedInvoice, expires, total) => {
 let providerCloseState = {purchase: {}, enabled: false};
 const updateProviderClose = () => {
   const {purchase, enabled} = providerCloseState;
-  const closeEligible = Boolean(purchase.vm_id) && !purchase.target && (!purchase.payment || (purchase.payment.is_paid === false && Math.floor(Date.parse(purchase.payment.expires) / 1000) <= Math.floor(Date.now() / 1000)));
+  const closeEligible = Boolean(purchase.vm_id) && !purchase.target && !purchase.invoice_recovery_blocked && (!purchase.payment || (purchase.payment.is_paid === false && Math.floor(Date.parse(purchase.payment.expires) / 1000) <= Math.floor(Date.now() / 1000)));
   $('provider-close').hidden = !closeEligible;
   $('provider-close').disabled = !enabled || !closeEligible;
   $('provider-stop').hidden = !purchase.stop;
   $('provider-stop').disabled = !enabled || !purchase.stop;
 };
 setInterval(() => {
+  const recoveredWallet = document.querySelector('[data-recovered-invoice-deadline]');
+  if (recoveredWallet && Date.now() >= Number(recoveredWallet.dataset.recoveredInvoiceDeadline)) {
+    render(renderedReport, true);
+    return;
+  }
   for (const node of document.querySelectorAll('[data-invoice-expires]')) node.textContent = `${Math.max(0, Math.ceil((Number(node.dataset.invoiceExpires) - Date.now() / 1000) / 60))} minutes left`;
   updateProviderClose();
   // Unchanged payment-timer reports skip render, so time-based progress lines (an invoice expiring) refresh here.
@@ -2711,11 +2729,19 @@ const renderProvider = (store, enabled) => {
     }
     if (purchase.payment) {
       const pay = purchase.payment;
+      const recovered = purchase.recovered_invoice_deadline_ms !== undefined;
+      const expired = recoveredInvoiceExpired(purchase);
+      const deadline = invoiceDeadline(purchase);
       paragraph(progress, `Price, before any account credit: ${readableMoney(boundInvoiceTotal(pay), pay.currency)} (amount ${readableMoney(pay.amount, pay.currency)}, tax ${readableMoney(pay.tax, pay.currency)}).`);
       if (pay.processing_fee !== 0) paragraph(progress, `Its processing fee of ${readableMoney(pay.processing_fee, pay.currency)} is not part of the Lightning invoice.`);
-      paragraph(progress, `Invoice ${pay.is_paid ? 'paid' : 'awaiting payment'}; expires ${pay.expires}. Amount ${pay.amount}, tax ${pay.tax}, processing fee ${pay.processing_fee} (${pay.currency === 'BTC' ? 'millisats' : pay.currency + ' cents'}).`);
+      const invoiceStatus = pay.is_paid ? 'paid' : expired ? 'expired' : 'awaiting payment';
+      const expiry = recovered ? (deadline > 0 ? `; expires ${new Date(deadline).toISOString()}` : '') : `; expires ${pay.expires}`;
+      paragraph(progress, `Invoice ${invoiceStatus}${expiry}. Amount ${pay.amount}, tax ${pay.tax}, processing fee ${pay.processing_fee} (${pay.currency === 'BTC' ? 'millisats' : pay.currency + ' cents'}).`);
       if (!pay.is_paid) {
-        invoiceControls(progress, pay.data.lightning, Math.floor(Date.parse(pay.expires) / 1000), lightningMillisats(pay));
+        if (!expired) {
+          const expires = recovered ? deadline / 1000 : Math.floor(deadline / 1000);
+          invoiceControls(progress, pay.data.lightning, expires, lightningMillisats(pay), purchase.recovered_invoice_deadline_ms);
+        }
         const check = document.createElement('button'); check.type = 'button'; check.textContent = 'Check now'; check.disabled = !enabled;
         check.addEventListener('click', () => providerRequest({action:'payment_check'})); progress.append(check);
       }

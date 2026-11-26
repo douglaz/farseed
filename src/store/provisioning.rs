@@ -10,22 +10,30 @@ use crate::poc::provisioning::{
 #[cfg(test)]
 use crate::poc::provisioning::{text, timestamp};
 use crate::poc::targets::TargetRecord;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_RECOVERY_MACHINES: usize = 7;
+const PAYMENT_HISTORY_LIMIT: usize = 100;
 
 fn close_eligible(p: &Purchase, now: u64) -> bool {
     p.vm.is_some()
         && p.target.is_none()
+        && p.invoice_recovery_block.is_none()
         && p.payment
             .as_ref()
             .is_none_or(|pay| p.vendor.close_payment_eligible(pay, now))
 }
 const ENTERED_REFUSED: &str = "This page no longer starts purchases on a provider account you entered yourself. Your existing machines keep working here.";
 const ENTERED_ISSUANCE_REFUSED: &str = "This page can't pay for this purchase, because it no longer issues invoices on a provider account you entered yourself. Leave it with Stop this purchase or Close purchase below. Your existing machines keep working here.";
-const SECOND_INVOICE: &str = "The provider made a second invoice for this machine by mistake. It is not shown here; don't pay any invoice except the one on this page. It expires unpaid.";
-const PAID_TWICE: &str =
-    "The provider shows this machine paid twice. Contact the provider about the second payment.";
+const ORDER_CONFIRMATION_MISSING: &str = "The provider hasn’t confirmed your machine order. The page hasn’t sent another order. Press “Check the order again” to see if your order went through.";
+const INVOICE_CONFIRMATION_MISSING: &str = "The provider hasn’t confirmed your invoice request. The page hasn’t requested another invoice. Press “Check the order again” to see if your invoice is ready.";
+const INVOICE_TERMS_UNVERIFIED: &str = "The page couldn’t match the provider’s invoices to the price and terms you approved. This purchase is paused.";
+const INVOICE_HISTORY_INCOMPLETE: &str = "The page couldn’t check all of the provider’s invoices. This purchase is paused.";
+const INVOICE_DETAIL_UNVERIFIED: &str = "The page couldn’t verify the invoice with the provider. This purchase is paused.";
+const INVOICE_ALREADY_PAID: &str = "The provider shows an invoice already paid for this machine. This purchase is paused.";
+const INVOICES_EXPIRED: &str = "The provider’s invoices for this machine have expired. This purchase is paused.";
+const INVOICE_EXPIRED_BEFORE_DISPLAY: &str = "An invoice expired before the page could show it. Press “Check the order again” to see if another invoice is ready.";
+const INVOICE_REOPEN_TO_CHECK: &str = "The page couldn’t finish saving the invoice status. Reopen and unlock the page before checking the order again.";
 
 fn stopped_message(p: &Purchase, stage: StopStage, entered: bool) -> String {
     match stage {
@@ -127,6 +135,14 @@ pub struct Purchase {
     #[serde(default)]
     pub billing: Option<Billing>,
     pub payment: Option<Value>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    invoice_history_ids: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invoice_history_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invoice_recovery: Option<InvoiceRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    invoice_recovery_block: Option<InvoiceRecoveryBlock>,
     pub paid_at: Option<u64>,
     pub publication: Option<Value>,
     pub target: Option<TargetRecord>,
@@ -136,6 +152,27 @@ pub struct Purchase {
     pub unverified_machines: Vec<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped: Option<Stopped>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvoiceRecovery {
+    observed_ids: BTreeSet<String>,
+    expired_unshown_ids: BTreeSet<String>,
+    wallet_amount_millisats: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvoiceRecoveryBlock {
+    HistoryLimit,
+    AlreadyPaid,
+}
+impl InvoiceRecoveryBlock {
+    fn message(self) -> &'static str {
+        match self {
+            Self::HistoryLimit => INVOICE_HISTORY_INCOMPLETE,
+            Self::AlreadyPaid => INVOICE_ALREADY_PAID,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -156,7 +193,6 @@ pub struct Stopped {
 pub(super) struct Recovery {
     candidates: Vec<Value>,
     stop: Option<Stopped>,
-    payment_notice: Option<&'static str>,
 }
 struct Reconciliation {
     candidates: Vec<Value>,
@@ -188,7 +224,7 @@ fn failing_payments(p: &Purchase, history: &[Value]) -> Result<Vec<Value>, Strin
 }
 fn initial_history(p: &Purchase, value: &Value) -> Result<Vec<Value>, String> {
     let rows = array(value)?;
-    if rows.len() >= 100 {
+    if rows.len() >= PAYMENT_HISTORY_LIMIT {
         return Err("Payment history incomplete; Refresh without issuing another invoice.".into());
     }
     let mut ids = std::collections::BTreeSet::new();
@@ -199,6 +235,118 @@ fn initial_history(p: &Purchase, value: &Value) -> Result<Vec<Value>, String> {
     }
     // Keep conflicting machine ids as evidence; suitability decides whether a row is usable.
     Ok(rows.clone())
+}
+
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+const NANOS_PER_MILLI: u64 = 1_000_000;
+
+fn payment_timestamp(payment: &Value, field: &str) -> Result<u64, String> {
+    let timestamp = protocol::text(payment, field, 40)?;
+    let seconds = protocol::timestamp(timestamp)?;
+    let fraction = timestamp
+        .split_once('.')
+        .map_or("", |(_, fraction)| fraction.trim_end_matches('Z'));
+    let nanos = format!("{fraction:0<9}")
+        .parse::<u64>()
+        .map_err(|_| REFUSED)?;
+    Ok(seconds * NANOS_PER_SECOND + nanos)
+}
+
+fn recovered_payment_deadline(payment: &Value, bolt11_expires: u64) -> Result<u64, String> {
+    Ok(payment_timestamp(payment, "expires")?.min(bolt11_expires.saturating_mul(NANOS_PER_SECOND)))
+}
+
+fn approved_wallet_max(terms: &BillingTerms) -> u64 {
+    (terms.amount + terms.tax).div_ceil(1_000) * 1_000
+}
+
+fn invoice_history_pending(p: &Purchase) -> bool {
+    (p.invoice.is_some() || p.payment.is_some()) && p.paid_at.is_none() && p.target.is_none()
+}
+
+fn known_invoice_ids(p: &Purchase) -> Result<BTreeSet<String>, String> {
+    let mut known = p.invoice_history_ids.clone();
+    if let Some(recovery) = &p.invoice_recovery {
+        known.extend(recovery.observed_ids.iter().cloned());
+    }
+    if let Some(payment) = &p.payment {
+        known.insert(p.vendor.payment_id(payment)?.to_ascii_lowercase());
+    }
+    Ok(known)
+}
+
+fn invoice_recovery_evidence(
+    p: &Purchase,
+    observed_ids: &BTreeSet<String>,
+    expired_ids: &BTreeSet<String>,
+    wallet_amount_millisats: u64,
+) -> Result<InvoiceRecovery, String> {
+    let terms = &p.billing.as_ref().ok_or(REFUSED)?.terms;
+    let previous = p.invoice_recovery.as_ref();
+    if p.invoice.is_none()
+        || p.payment.is_some()
+        || p.invoice_recovery_block.is_some()
+        || !(2..PAYMENT_HISTORY_LIMIT).contains(&observed_ids.len())
+        || observed_ids.iter().any(|id| {
+            id.len() != 64 || !id.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        })
+        || !expired_ids.is_subset(observed_ids)
+        || wallet_amount_millisats == 0
+        || wallet_amount_millisats > approved_wallet_max(terms)
+        || previous.is_some_and(|recovery| {
+            recovery.wallet_amount_millisats != wallet_amount_millisats
+                || !recovery.observed_ids.is_subset(observed_ids)
+        })
+    {
+        return Err(REFUSED.into());
+    }
+    let mut expired_unshown_ids = previous
+        .map(|r| r.expired_unshown_ids.clone())
+        .unwrap_or_default();
+    expired_unshown_ids.extend(expired_ids.iter().cloned());
+    Ok(InvoiceRecovery {
+        observed_ids: observed_ids.clone(),
+        expired_unshown_ids,
+        wallet_amount_millisats,
+    })
+}
+
+fn recovered_payment_expired(api: &impl Api, deadline: u64) -> bool {
+    api.now_millis() >= deadline.div_ceil(NANOS_PER_MILLI)
+}
+
+fn expire_unshown_recovered_payment(
+    p: &mut Purchase,
+    checked_at_ms: u64,
+    expired_ids: &BTreeSet<String>,
+) -> Result<(), String> {
+    let payment = p.payment.as_ref().ok_or(REFUSED)?;
+    let recovery = p.invoice_recovery.as_mut().ok_or(REFUSED)?;
+    let invoice = p.vendor.lightning_invoice_terms(payment).ok_or(REFUSED)?;
+    let deadline = recovered_payment_deadline(payment, invoice.expires)?;
+    if p.paid_at.is_some()
+        || p.vendor.paid(payment)
+        || p.target.is_some()
+        || checked_at_ms < deadline.div_ceil(NANOS_PER_MILLI)
+    {
+        return Err(REFUSED.into());
+    }
+    let id = p.vendor.payment_id(payment)?.to_ascii_lowercase();
+    if !expired_ids.contains(&id)
+        || !expired_ids.is_subset(&recovery.observed_ids)
+        || recovery.expired_unshown_ids.contains(&id)
+    {
+        return Err(REFUSED.into());
+    }
+    recovery.expired_unshown_ids.extend(expired_ids.iter().cloned());
+    p.payment = None;
+    Ok(())
+}
+
+fn recovered_payment_changed(vendor: Vendor, history: &Value, detail: &Value) -> Result<bool, String> {
+    Ok(vendor.payment_changed(history, detail)
+        || payment_timestamp(history, "created")? != payment_timestamp(detail, "created")?
+        || payment_timestamp(history, "expires")? != payment_timestamp(detail, "expires")?)
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -264,6 +412,25 @@ pub enum Record {
     Payment {
         payment: Value,
         paid_at: Option<u64>,
+    },
+    RecoveredPayment {
+        payment: Value,
+        observed_ids: BTreeSet<String>,
+        expired_ids: BTreeSet<String>,
+    },
+    InvoiceRecoveryObserved {
+        observed_ids: BTreeSet<String>,
+        expired_ids: BTreeSet<String>,
+        wallet_amount_millisats: u64,
+    },
+    InvoiceHistoryObserved {
+        ids: BTreeSet<String>,
+        received_at_ms: u64,
+    },
+    InvoiceRecoveryBlocked(InvoiceRecoveryBlock),
+    RecoveredPaymentExpiredBeforeDisplay {
+        checked_at_ms: u64,
+        expired_ids: BTreeSet<String>,
     },
     Observation(Value),
     Handoff {
@@ -507,7 +674,7 @@ impl<S: Storage> Store<S> {
         self.check_api(api)?;
         let p = self
             .procurement
-            .as_ref()
+            .clone()
             .filter(|p| close_eligible(p, api.now()))
             .ok_or(self.procurement_vendor().close_refused())?;
         let before_invoice = p.invoice.is_none() && p.payment.is_none();
@@ -531,14 +698,16 @@ impl<S: Storage> Store<S> {
         for vm in array(&inventory)? {
             self.procurement_vendor().validate_vm(vm)?;
         }
-        for request in [
-            self.procurement_vendor().get(vm_id),
-            self.procurement_vendor().invoice_history(vm_id),
-        ] {
-            match self.provider_response(api, request).await {
-                Err(protocol::ReadError::NotFound) => (),
-                _ => return Err(REFUSED.into()),
+        if !matches!(self.provider_response(api, p.vendor.get(vm_id)).await, Err(protocol::ReadError::NotFound)) {
+            return Err(REFUSED.into());
+        }
+        match self.provider_response(api, p.vendor.invoice_history(vm_id)).await {
+            Err(protocol::ReadError::NotFound) => (),
+            Ok((status, value)) if (200..300).contains(&status) => {
+                self.check_invoice_recovery_history(vm_id, &value, api.now_millis()).await?;
+                return Err(REFUSED.into());
             }
+            _ => return Err(REFUSED.into()),
         }
         self.check_api(api)?;
         let checked_at = api.now();
@@ -604,13 +773,14 @@ impl<S: Storage> Store<S> {
         let Some(p) = &self.procurement else {
             return json!({"origin":self.procurement_origin(),"selection":self.procurement_selection,"closed":self.closed_purchases.last().map(|p| closed_message(p, self.provider_account_entered()))});
         };
+        let payment = p.payment.as_ref().filter(|_| p.invoice_recovery_block.is_none());
         let phase = if p.pending_selection.is_some() {
             "terms_changed"
         } else if p.target.is_some() {
             "handed_off"
-        } else if p.payment.is_some() {
+        } else if payment.is_some() {
             "payment_readiness"
-        } else if p.invoice.is_some() {
+        } else if p.invoice.is_some() || p.invoice_recovery_block.is_some() {
             "invoice_uncertain"
         } else if p.vm.is_some() {
             "initial_invoice"
@@ -630,14 +800,43 @@ impl<S: Storage> Store<S> {
         } else {
             Some(p.pending_selection.as_ref().unwrap_or(&p.selected))
         };
-        let mut view = json!({"origin":p.origin,"phase":phase,"machine":p.machine,"account":p.account,"selection":selection,"approved_selection":p.selected,"relay":p.relay,"class_answer":p.class_answer,"identity":p.identity,"ssh_key_id":p.ssh_key.as_ref().map(|k|p.vendor.raw_id(k)),"vm_id":p.vm.as_ref().map(|vm|p.vendor.raw_id(vm)),"billing":p.billing,"payment":p.payment,"paid_at":p.paid_at,"readiness_poll_seconds":protocol::readiness_poll_seconds(),"readiness_wait_seconds":protocol::readiness_wait_seconds(),"readiness_state":p.vm.as_ref().map(|vm|p.vendor.readiness_state(vm)),"auto_renewal_enabled":p.vm.as_ref().and_then(|vm|p.vendor.auto_renewal_enabled(vm)),"target":p.target,"publication":p.publication,"public_keys":self.poc_identity_public_keys(&p.machine,&p.identity).ok()});
+        let mut view = json!({"origin":p.origin,"phase":phase,"machine":p.machine,"account":p.account,"selection":selection,"approved_selection":p.selected,"relay":p.relay,"class_answer":p.class_answer,"identity":p.identity,"ssh_key_id":p.ssh_key.as_ref().map(|k|p.vendor.raw_id(k)),"vm_id":p.vm.as_ref().map(|vm|p.vendor.raw_id(vm)),"billing":p.billing,"payment":payment,"paid_at":p.paid_at,"readiness_poll_seconds":protocol::readiness_poll_seconds(),"readiness_wait_seconds":protocol::readiness_wait_seconds(),"readiness_state":p.vm.as_ref().map(|vm|p.vendor.readiness_state(vm)),"auto_renewal_enabled":p.vm.as_ref().and_then(|vm|p.vendor.auto_renewal_enabled(vm)),"target":p.target,"publication":p.publication,"public_keys":self.poc_identity_public_keys(&p.machine,&p.identity).ok()});
         if phase == "email_verification" {
             view["email_entered"] = json!(self.procurement_email.expected.is_some());
         }
+        match phase {
+            "create_uncertain" => view["confirmation_message"] = json!(ORDER_CONFIRMATION_MISSING),
+            "invoice_uncertain" => {
+                view["confirmation_message"] = json!(if let Some(block) = p.invoice_recovery_block {
+                    block.message()
+                } else {
+                    match &p.invoice_recovery {
+                        Some(recovery) if recovery.observed_ids == recovery.expired_unshown_ids => INVOICES_EXPIRED,
+                        Some(recovery) if !recovery.expired_unshown_ids.is_empty() => INVOICE_EXPIRED_BEFORE_DISPLAY,
+                        _ => INVOICE_CONFIRMATION_MISSING,
+                    }
+                });
+            }
+            _ => (),
+        }
         view["duplicate_orders"] = json!(p.duplicate_orders);
+        if p.invoice_recovery_block.is_some() {
+            view["invoice_recovery_blocked"] = json!(true);
+        }
         view["candidates"] = json!(self.procurement_recovery.candidates.iter().map(|vm| json!({"id":vm["id"],"created":vm["created"],"addresses":vm["ip_assignments"]})).collect::<Vec<_>>());
         view["stop"] = json!(self.procurement_recovery.stop.as_ref().map(|stop| json!({"stage":stop.stage,"checked_at":stop.checked_at,"read_status":stop.read_status,"failing_ids":stop.failing_ids,"message":stop_prompt(p, stop, self.provider_account_entered())})));
-        view["payment_notice"] = json!(self.procurement_recovery.payment_notice);
+        if let (Some(payment), Some(recovery)) = (payment, &p.invoice_recovery) {
+            view["payment_notice"] = json!(if recovery.observed_ids.len() == 2 {
+                "The provider issued a second unpaid invoice for the same price and period. This page uses only the invoice shown here and leaves the other unpaid."
+            } else {
+                "The provider issued other unpaid invoices for the same price and period. This page uses only the invoice shown here and leaves the others unpaid."
+            });
+            let deadline = p.vendor.lightning_invoice_terms(payment).and_then(|invoice| {
+                recovered_payment_deadline(payment, invoice.expires).ok()
+            });
+            view["recovered_invoice_deadline_ms"] =
+                json!(deadline.map_or(0, |nanos| nanos.div_ceil(NANOS_PER_MILLI)));
+        }
         view["stop_after"] = json!(
             p.create
                 .as_ref()
@@ -839,6 +1038,10 @@ impl<S: Storage> Store<S> {
             invoice: None,
             billing: None,
             payment: None,
+            invoice_history_ids: BTreeSet::new(),
+            invoice_history_at_ms: None,
+            invoice_recovery: None,
+            invoice_recovery_block: None,
             paid_at: None,
             publication: None,
             target: None,
@@ -908,6 +1111,10 @@ impl<S: Storage> Store<S> {
                 || p.invoice.is_some()
                 || p.paid_at.is_some()
                 || p.payment.is_some()
+                || !p.invoice_history_ids.is_empty()
+                || p.invoice_history_at_ms.is_some()
+                || p.invoice_recovery.is_some()
+                || p.invoice_recovery_block.is_some()
                 || p.target.is_some()
                 || p.publication.is_some()
                 || !p.duplicate_orders.is_empty()
@@ -954,7 +1161,7 @@ impl<S: Storage> Store<S> {
                         || id(vm).is_ok_and(|id| closed.duplicate_orders.contains(&id))
                 })
             }
-            Record::Payment { payment, .. } => archived.any(|closed| {
+            Record::Payment { payment, .. } | Record::RecoveredPayment { payment, .. } => archived.any(|closed| {
                 closed
                     .payment
                     .as_ref()
@@ -1014,7 +1221,10 @@ impl<S: Storage> Store<S> {
                 }
             }
             Record::PurchaseStopped(stop) => {
-                if p.target.is_some() || !(200..300).contains(&stop.read_status) {
+                if p.target.is_some()
+                    || p.invoice_recovery_block.is_some()
+                    || !(200..300).contains(&stop.read_status)
+                {
                     return Err(REFUSED.into());
                 }
                 match stop.stage {
@@ -1233,31 +1443,100 @@ impl<S: Storage> Store<S> {
                 }
                 p.invoice = Some(intent.clone());
             }
-            Record::Payment { payment, paid_at } => {
-                let vm = p.vm.as_ref().ok_or(REFUSED)?;
-                if !p.vendor.suitable_payment(
-                    payment,
-                    id(vm)?,
-                    &p.billing
-                        .as_ref()
-                        .filter(|b| id(vm).ok() == Some(b.vm_id))
-                        .ok_or(REFUSED)?
-                        .terms,
-                    p.vendor.created(vm)?,
-                ) || p
-                    .payment
-                    .as_ref()
-                    .is_some_and(|old| p.vendor.payment_changed(old, payment))
-                {
+            Record::Payment { payment, .. } | Record::RecoveredPayment { payment, .. } => {
+                if p.invoice_recovery_block.is_some() {
                     return Err(REFUSED.into());
+                }
+                let vm = p.vm.as_ref().ok_or(REFUSED)?;
+                let terms = &p
+                    .billing
+                    .as_ref()
+                    .filter(|b| id(vm).ok() == Some(b.vm_id))
+                    .ok_or(REFUSED)?
+                    .terms;
+                let paid_at = match record {
+                    Record::Payment { paid_at, .. } => {
+                        if p.invoice_recovery.is_some() && p.payment.is_none() {
+                            return Err(REFUSED.into());
+                        }
+                        *paid_at
+                    }
+                    Record::RecoveredPayment {
+                        observed_ids,
+                        expired_ids,
+                        ..
+                    } => {
+                        let invoice = p.vendor.lightning_invoice_terms(payment).ok_or(REFUSED)?;
+                        let payment_id = p.vendor.payment_id(payment)?.to_ascii_lowercase();
+                        let recovery = invoice_recovery_evidence(
+                            &p, observed_ids, expired_ids, invoice.amount_millisats,
+                        )?;
+                        if !recovery.observed_ids.contains(&payment_id)
+                            || recovery.expired_unshown_ids.contains(&payment_id)
+                        {
+                            return Err(REFUSED.into());
+                        }
+                        p.invoice_recovery = Some(recovery);
+                        None
+                    }
+                    _ => unreachable!(),
+                };
+                if !p.vendor.suitable_payment(payment, id(vm)?, terms, p.vendor.created(vm)?) {
+                    return Err(REFUSED.into());
+                }
+                if let Some(old) = &p.payment {
+                    let changed = if p.invoice_recovery.is_some() {
+                        recovered_payment_changed(p.vendor, old, payment)?
+                    } else {
+                        p.vendor.payment_changed(old, payment)
+                    };
+                    if changed {
+                        return Err(REFUSED.into());
+                    }
                 }
                 if p.vendor.paid(payment) != paid_at.is_some()
-                    || p.paid_at.is_some_and(|saved| Some(saved) != *paid_at)
+                    || p.paid_at.is_some_and(|saved| Some(saved) != paid_at)
                 {
                     return Err(REFUSED.into());
                 }
-                p.paid_at = *paid_at;
+                p.paid_at = paid_at;
                 p.payment = Some(payment.clone());
+            }
+            Record::InvoiceRecoveryObserved {
+                observed_ids,
+                expired_ids,
+                wallet_amount_millisats,
+            } => {
+                p.invoice_recovery = Some(invoice_recovery_evidence(
+                    &p, observed_ids, expired_ids, *wallet_amount_millisats,
+                )?);
+            }
+            Record::InvoiceHistoryObserved { ids, received_at_ms } => {
+                let known = known_invoice_ids(&p)?;
+                if !invoice_history_pending(&p)
+                    || p.invoice_recovery_block.is_some()
+                    || (ids.is_empty()
+                        && p.invoice_history_at_ms.is_some_and(|saved| *received_at_ms <= saved))
+                    || !known.is_disjoint(ids)
+                    || known.len() + ids.len() >= PAYMENT_HISTORY_LIMIT
+                    || ids.iter().any(|id| {
+                        id.bytes().any(|byte| byte.is_ascii_uppercase())
+                            || p.vendor.payment_id(&json!({"id": id})).is_err()
+                    })
+                {
+                    return Err(REFUSED.into());
+                }
+                p.invoice_history_ids.extend(ids.iter().cloned());
+                p.invoice_history_at_ms = Some(p.invoice_history_at_ms.unwrap_or_default().max(*received_at_ms));
+            }
+            Record::InvoiceRecoveryBlocked(block) => {
+                if !invoice_history_pending(&p) || p.invoice_recovery_block.is_some() {
+                    return Err(REFUSED.into());
+                }
+                p.invoice_recovery_block = Some(*block);
+            }
+            Record::RecoveredPaymentExpiredBeforeDisplay { checked_at_ms, expired_ids } => {
+                expire_unshown_recovered_payment(&mut p, *checked_at_ms, expired_ids)?;
             }
             Record::Observation(vm) => {
                 let old = p.vm.as_ref().ok_or(REFUSED)?;
@@ -1351,6 +1630,7 @@ impl<S: Storage> Store<S> {
                 }
             }
             Record::EmailVerified => self.procurement_email.required = false,
+            Record::InvoiceRecoveryBlocked(_) => self.procurement_recovery.stop = None,
             _ => (),
         }
         if matches!(record, Record::Approved(_) | Record::Reapproved { .. }) {
@@ -1661,10 +1941,7 @@ impl<S: Storage> Store<S> {
         }
         let mut candidates = result.candidates.into_iter();
         let Some(vm) = candidates.next() else {
-            return Err(
-                "Create outcome unknown: no evidenced machine. Refresh later; no order is retried."
-                    .into(),
-            );
+            return Err(ORDER_CONFIRMATION_MISSING.into());
         };
         let spare_ids = candidates.map(|vm| id(&vm)).collect::<Result<Vec<_>, _>>()?;
         if self.provider_account_entered() && choice.is_none() {
@@ -1724,9 +2001,12 @@ impl<S: Storage> Store<S> {
                 self.offer_create_stop(&result);
             }
             StopStage::PaymentConflict => {
-                let p = self.procurement.as_ref().ok_or(REFUSED)?;
+                let p = self.procurement.clone().ok_or(REFUSED)?;
                 if p.invoice.is_none() || p.payment.is_some() || p.target.is_some() {
                     return Err(REFUSED.into());
+                }
+                if let Some(block) = p.invoice_recovery_block {
+                    return Err(block.message().into());
                 }
                 let vm = id(p.vm.as_ref().ok_or(REFUSED)?)?;
                 let checked_at = api.now();
@@ -1734,7 +2014,11 @@ impl<S: Storage> Store<S> {
                     .provider_response(api, self.procurement_vendor().invoice_history(vm))
                     .await
                     .map_err(protocol::ReadError::message)?;
-                let history = initial_history(self.procurement.as_ref().ok_or(REFUSED)?, &value)?;
+                if !(200..300).contains(&status) {
+                    return Err(REFUSED.into());
+                }
+                self.check_invoice_recovery_history(vm, &value, api.now_millis()).await?;
+                let history = initial_history(&p, &value)?;
                 self.offer_payment_stop(history, status, checked_at)?;
             }
         }
@@ -1781,8 +2065,12 @@ impl<S: Storage> Store<S> {
             terms: p.vendor.parse_billing(&value)?,
         })
     }
-    async fn associate_payment(&mut self, api: &mut impl Api, issue: bool) -> Result<(), String> {
+    /// Returns true when recovery already checked the selected unpaid invoice by ID.
+    async fn associate_payment(&mut self, api: &mut impl Api, issue: bool) -> Result<bool, String> {
         let p = self.procurement.clone().ok_or(REFUSED)?;
+        if let Some(block) = p.invoice_recovery_block {
+            return Err(block.message().into());
+        }
         let vm = p.vm.as_ref().ok_or(REFUSED)?;
         let vm_id = id(vm)?;
         self.procurement_recovery.stop = None;
@@ -1790,16 +2078,16 @@ impl<S: Storage> Store<S> {
         let value = self
             .provider_read(api, p.vendor.invoice_history(vm_id))
             .await?;
-        let history = initial_history(&p, &value)?;
+        let history_received_at_ms = api.now_millis();
         let history_status = api.response_status();
         if !(200..300).contains(&history_status) {
             return Err(REFUSED.into());
         }
+        self.check_invoice_recovery_history(vm_id, &value, history_received_at_ms).await?;
+        let history = initial_history(&p, &value).map_err(|_| INVOICE_HISTORY_INCOMPLETE)?;
         if !history.is_empty() {
             if p.invoice.is_none() && history.len() != 1 {
-                return Err(
-                    "Initial payment evidence conflicts or is ambiguous; no invoice issued.".into(),
-                );
+                return Err("The provider shows more than one invoice for this machine. This purchase is paused.".into());
             }
             if p.billing.is_none() {
                 let billing = self.initial_billing_quote(api).await?;
@@ -1807,43 +2095,182 @@ impl<S: Storage> Store<S> {
                     .await?;
             }
             let saved = self.procurement.as_ref().ok_or(REFUSED)?;
-            if !failing_payments(saved, &history)?.is_empty() {
-                self.offer_payment_stop(history, history_status, checked_at)?;
-                return Err("Initial payment evidence conflicts or cannot be established from the saved one-period quote; no invoice issued.".into());
-            }
-            let paid = history.iter().filter(|row| p.vendor.paid(row)).count();
-            let mut ranked = Vec::new();
-            for row in &history {
-                if paid == 0 || p.vendor.paid(row) {
-                    let made = protocol::text(row, "created", 40)?;
-                    let fraction = made
-                        .split_once('.')
-                        .map_or("", |(_, fraction)| fraction.trim_end_matches('Z'));
-                    ranked.push((
-                        (
-                            p.vendor.created(row)?,
-                            format!("{fraction:0<9}"),
-                            p.vendor.payment_id(row)?.to_ascii_lowercase(),
-                        ),
-                        row,
-                    ));
+            if p.invoice.is_some() {
+                let present = history.iter().map(|row| Ok(p.vendor.payment_id(row)?.to_ascii_lowercase()))
+                    .collect::<Result<BTreeSet<_>, String>>()?;
+                if saved.invoice_history_ids.iter().any(|id| {
+                    !present.contains(id) && !saved.invoice_recovery.as_ref()
+                        .is_some_and(|recovery| recovery.observed_ids.contains(id))
+                }) {
+                    return Err(INVOICE_TERMS_UNVERIFIED.into());
                 }
             }
+            if !failing_payments(saved, &history)?.is_empty() {
+                self.offer_payment_stop(history, history_status, checked_at)?;
+                return Err(INVOICE_TERMS_UNVERIFIED.into());
+            }
+            let observed_at_ms = history_received_at_ms.max(saved.invoice_history_at_ms.unwrap_or_default());
+            let now = api.now().max(observed_at_ms / 1_000);
+            if let [payment] = history.as_slice()
+                && p.invoice_recovery.is_none()
+            {
+                if p.invoice.is_some() && p.vendor.payment_expires(payment)? <= now {
+                    return Err(INVOICES_EXPIRED.into());
+                }
+                self.procurement_commit(self.payment_record(payment.clone(), now))
+                    .await?;
+                return Ok(false);
+            }
+            let terms = &p.billing.as_ref().ok_or(REFUSED)?.terms;
+            let approved_max = approved_wallet_max(terms);
+            let previous = p.invoice_recovery.as_ref();
+            let mut observed_ids = previous.map(|r| r.observed_ids.clone()).unwrap_or_default();
+            let mut expired_ids = BTreeSet::new();
+            let mut wallet_amount = previous.map(|r| r.wallet_amount_millisats);
+            let mut ranked = Vec::new();
+            let now_millis = api.now_millis().max(observed_at_ms);
+            for row in &history {
+                let lightning = p.vendor.lightning_invoice_terms(row).ok_or(INVOICE_TERMS_UNVERIFIED)?;
+                if lightning.amount_millisats > approved_max
+                    || wallet_amount.is_some_and(|amount| amount != lightning.amount_millisats)
+                {
+                    return Err(INVOICE_TERMS_UNVERIFIED.into());
+                }
+                wallet_amount = Some(lightning.amount_millisats);
+                let expires = recovered_payment_deadline(row, lightning.expires)?;
+                let payment_id = p.vendor.payment_id(row)?.to_ascii_lowercase();
+                observed_ids.insert(payment_id.clone());
+                if now_millis >= expires.div_ceil(NANOS_PER_MILLI) {
+                    expired_ids.insert(payment_id);
+                    continue;
+                }
+                if previous.is_some_and(|r| r.expired_unshown_ids.contains(&payment_id)) {
+                    continue;
+                }
+                ranked.push((
+                    (payment_timestamp(row, "created")?, payment_id),
+                    row,
+                    expires,
+                ));
+            }
+            if observed_ids.len() >= PAYMENT_HISTORY_LIMIT {
+                return self.block_invoice_recovery(InvoiceRecoveryBlock::HistoryLimit).await;
+            }
+            let wallet_amount_millisats = wallet_amount.ok_or(REFUSED)?;
             ranked.sort_by(|left, right| left.0.cmp(&right.0));
-            let payment = ranked.first().ok_or(REFUSED)?.1.clone();
-            self.procurement_commit(self.payment_record(payment, api.now()))
-                .await?;
-            self.procurement_recovery.payment_notice = if paid >= 2 {
-                Some(PAID_TWICE)
-            } else if history.len() >= 2 {
-                Some(SECOND_INVOICE)
-            } else {
-                None
+            let remember_expired = |expired_ids: &mut BTreeSet<String>, checked_at_ms: u64| {
+                expired_ids.extend(ranked.iter().filter_map(|((_, id), _, deadline)| {
+                    (checked_at_ms >= deadline.div_ceil(NANOS_PER_MILLI)).then(|| id.clone())
+                }));
             };
-            return Ok(());
+            self.remember_invoice_recovery(
+                api, &observed_ids, &mut expired_ids, wallet_amount_millisats, &remember_expired,
+            ).await?;
+            let Some(((_, selected_id), payment, expires)) = ranked.iter()
+                .find(|((_, id), _, _)| !expired_ids.contains(id)) else {
+                return Err(INVOICES_EXPIRED.into());
+            };
+            let created = p.vendor.created(vm)?;
+            let request = p.vendor.payment(p.vendor.payment_id(payment)?);
+            let detail = self.provider_read(api, request).await;
+            let detail_checked_at_ms = api.now_millis();
+            let detail_ok = (200..300).contains(&api.response_status());
+            if detail_ok && detail.as_ref().is_ok_and(|value| {
+                p.vendor.paid(value)
+                    && protocol::number(value, "vm_id") == Ok(vm_id)
+                    && p.vendor.payment_id(value).is_ok_and(|id| id.eq_ignore_ascii_case(selected_id))
+            }) {
+                return self.block_invoice_recovery(InvoiceRecoveryBlock::AlreadyPaid).await;
+            }
+            remember_expired(&mut expired_ids, detail_checked_at_ms);
+            self.remember_invoice_recovery(
+                api, &observed_ids, &mut expired_ids, wallet_amount_millisats, &remember_expired,
+            ).await?;
+            let detail = detail.map_err(|_| INVOICE_DETAIL_UNVERIFIED)?;
+            if !detail_ok
+                || !p.vendor.suitable_payment(&detail, vm_id, terms, created)
+                || recovered_payment_changed(p.vendor, payment, &detail)?
+            {
+                return Err(INVOICE_DETAIL_UNVERIFIED.into());
+            }
+            // A sibling can settle while the selected invoice is being checked.
+            let latest = self
+                .provider_read(api, p.vendor.invoice_history(vm_id))
+                .await;
+            let latest_received_at_ms = api.now_millis();
+            let history_ok = (200..300).contains(&api.response_status());
+            if history_ok && let Ok(value) = &latest {
+                self.check_invoice_recovery_history(vm_id, value, latest_received_at_ms).await?;
+            }
+            remember_expired(&mut expired_ids, latest_received_at_ms.max(detail_checked_at_ms));
+            self.remember_invoice_recovery(
+                api, &observed_ids, &mut expired_ids, wallet_amount_millisats, &remember_expired,
+            ).await?;
+            let latest = latest.map_err(|_| INVOICE_TERMS_UNVERIFIED)?;
+            let latest = initial_history(&p, &latest).map_err(|_| INVOICE_TERMS_UNVERIFIED)?;
+            if !history_ok || latest.len() != history.len() {
+                return Err(INVOICE_TERMS_UNVERIFIED.into());
+            }
+            let earlier = history
+                .iter()
+                .map(|row| Ok((p.vendor.payment_id(row)?.to_ascii_lowercase(), row)))
+                .collect::<Result<BTreeMap<_, _>, String>>()?;
+            for row in &latest {
+                let id = p.vendor.payment_id(row)?.to_ascii_lowercase();
+                let previous = earlier.get(&id).ok_or(INVOICE_TERMS_UNVERIFIED)?;
+                if !p.vendor.suitable_payment(row, vm_id, terms, created)
+                    || recovered_payment_changed(p.vendor, previous, row)?
+                {
+                    return Err(INVOICE_TERMS_UNVERIFIED.into());
+                }
+            }
+            remember_expired(&mut expired_ids, api.now_millis().max(detail_checked_at_ms));
+            if expired_ids.contains(selected_id) {
+                self.remember_invoice_recovery(
+                    api, &observed_ids, &mut expired_ids, wallet_amount_millisats, &remember_expired,
+                ).await?;
+                return Err(INVOICE_EXPIRED_BEFORE_DISPLAY.into());
+            }
+            let record = Record::RecoveredPayment {
+                payment: detail,
+                observed_ids: observed_ids.clone(),
+                expired_ids: expired_ids.clone(),
+            };
+            self.procurement_ready()?;
+            let mut next = self.procurement_projection(&record)?;
+            let number = self.commit(&Event::Procurement(record.clone())).await?;
+            // This action still owns the store lock. No report has carried the selected
+            // invoice. Keep it out of the view even if the second append fails.
+            let checked_at_ms = api.now_millis();
+            if checked_at_ms >= expires.div_ceil(NANOS_PER_MILLI) {
+                remember_expired(&mut expired_ids, checked_at_ms);
+                let result = async {
+                    expire_unshown_recovered_payment(&mut next, checked_at_ms, &expired_ids)?;
+                    let expired = Record::RecoveredPaymentExpiredBeforeDisplay {
+                        checked_at_ms,
+                        expired_ids: expired_ids.clone(),
+                    };
+                    let number = self.commit(&Event::Procurement(expired.clone())).await?;
+                    self.apply_procurement(number, &expired, next)
+                }
+                .await;
+                if let Err(why) = result {
+                    self.failed = Some(why);
+                    return Err(INVOICE_REOPEN_TO_CHECK.into());
+                }
+                self.remember_invoice_recovery(
+                    api, &observed_ids, &mut expired_ids, wallet_amount_millisats, &remember_expired,
+                ).await?;
+                return Err(INVOICE_EXPIRED_BEFORE_DISPLAY.into());
+            }
+            self.apply_procurement(number, &record, next)?;
+            return Ok(true);
+        }
+        if p.invoice_recovery.is_some() {
+            return Err(INVOICE_TERMS_UNVERIFIED.into());
         }
         if p.invoice.is_some() {
-            return Err("Initial invoice outcome unknown; Refresh payment history later. It will never be reissued.".into());
+            return Err(INVOICE_CONFIRMATION_MISSING.into());
         }
         if p.vendor.is_lnvps() && self.provider_account_entered() {
             return Err(ENTERED_ISSUANCE_REFUSED.into());
@@ -1870,9 +2297,87 @@ impl<S: Storage> Store<S> {
             started: api.now(),
         }))
         .await?;
-        let payment = self.provider_read(api, p.vendor.invoice(vm_id)).await?;
-        self.procurement_commit(self.payment_record(payment, api.now()))
+        let payment = self
+            .provider_read(api, p.vendor.invoice(vm_id))
             .await
+            .map_err(|_| INVOICE_CONFIRMATION_MISSING)?;
+        self.procurement_commit(self.payment_record(payment, api.now()))
+            .await?;
+        Ok(false)
+    }
+
+    async fn check_invoice_recovery_history(
+        &mut self,
+        vm_id: u64,
+        value: &Value,
+        received_at_ms: u64,
+    ) -> Result<(), String> {
+        let p = self.procurement.as_ref().ok_or(REFUSED)?;
+        if !invoice_history_pending(p) {
+            return Ok(());
+        }
+        if let Some(block) = p.invoice_recovery_block {
+            return Err(block.message().into());
+        }
+        let Some(rows) = value.as_array() else {
+            return Ok(());
+        };
+        if rows.iter().any(|row| p.vendor.paid(row) && protocol::number(row, "vm_id") == Ok(vm_id)) {
+            return self.block_invoice_recovery(InvoiceRecoveryBlock::AlreadyPaid).await;
+        }
+        if rows.len() >= PAYMENT_HISTORY_LIMIT {
+            return self.block_invoice_recovery(InvoiceRecoveryBlock::HistoryLimit).await;
+        }
+        let current = rows.iter().filter_map(|row| p.vendor.payment_id(row).ok())
+            .map(str::to_ascii_lowercase).collect::<BTreeSet<_>>();
+        let known = known_invoice_ids(p)?;
+        let new_ids = current.difference(&known).cloned().collect::<BTreeSet<_>>();
+        if known.len() + new_ids.len() >= PAYMENT_HISTORY_LIMIT {
+            return self.block_invoice_recovery(InvoiceRecoveryBlock::HistoryLimit).await;
+        }
+        if !new_ids.is_empty() || p.invoice_history_at_ms.is_none_or(|saved| received_at_ms > saved) {
+            self.record_invoice_recovery(Record::InvoiceHistoryObserved { ids: new_ids, received_at_ms }).await?;
+        }
+        Ok(())
+    }
+
+    async fn remember_invoice_recovery(
+        &mut self,
+        api: &impl Api,
+        observed_ids: &BTreeSet<String>,
+        expired_ids: &mut BTreeSet<String>,
+        wallet_amount_millisats: u64,
+        remember_expired: impl Fn(&mut BTreeSet<String>, u64),
+    ) -> Result<(), String> {
+        loop {
+            remember_expired(expired_ids, api.now_millis());
+            if self.procurement.as_ref().and_then(|p| p.invoice_recovery.as_ref())
+                .is_some_and(|saved| saved.observed_ids == *observed_ids
+                    && expired_ids.is_subset(&saved.expired_unshown_ids))
+            {
+                return Ok(());
+            }
+            // After the first record, each iteration must add a newly expired ID
+            // from the bounded, verified history. No provider read happens here.
+            self.record_invoice_recovery(Record::InvoiceRecoveryObserved {
+                observed_ids: observed_ids.clone(),
+                expired_ids: expired_ids.clone(),
+                wallet_amount_millisats,
+            }).await?;
+        }
+    }
+
+    async fn block_invoice_recovery<T>(&mut self, block: InvoiceRecoveryBlock) -> Result<T, String> {
+        self.record_invoice_recovery(Record::InvoiceRecoveryBlocked(block)).await?;
+        Err(block.message().into())
+    }
+
+    async fn record_invoice_recovery(&mut self, record: Record) -> Result<(), String> {
+        if let Err(why) = self.procurement_commit(record).await {
+            self.failed = Some(why);
+            return Err(INVOICE_REOPEN_TO_CHECK.into());
+        }
+        Ok(())
     }
     /// Explicit bounded progress. Refresh never sends a create or invoice whose intent exists.
     /// Automatic observation can only read the saved payment, never issue an invoice.
@@ -1884,6 +2389,9 @@ impl<S: Storage> Store<S> {
         let purchase = self.procurement.as_ref().ok_or(REFUSED)?;
         if purchase.target.is_some() {
             return Ok(());
+        }
+        if let Some(block) = purchase.invoice_recovery_block {
+            return Err(block.message().into());
         }
         let payment = purchase
             .payment
@@ -1912,6 +2420,9 @@ impl<S: Storage> Store<S> {
             .ok_or("Approve a fetched selection first.")?;
         if p.target.is_some() {
             return Ok(());
+        }
+        if let Some(block) = p.invoice_recovery_block {
+            return Err(block.message().into());
         }
         if p.pending_selection.is_some() {
             return Err(
@@ -1974,9 +2485,8 @@ impl<S: Storage> Store<S> {
                         self.procurement_commit(Record::CreateEmailRefused).await?;
                         return Ok(());
                     }
-                    result => {
-                        result?;
-                    }
+                    Err(_) => return Err(ORDER_CONFIRMATION_MISSING.into()),
+                    Ok(_) => (),
                 }
             }
             self.associate_create(api, None).await?;
@@ -1990,7 +2500,9 @@ impl<S: Storage> Store<S> {
             return Err("The provider created additional unpaid machines. Review the notice before continuing with the chosen machine.".into());
         }
         if p.payment.is_none() {
-            self.associate_payment(api, issue_invoice).await?;
+            if self.associate_payment(api, issue_invoice).await? {
+                return Ok(());
+            }
             p = self.procurement.clone().ok_or(REFUSED)?;
         }
         let payment = p.payment.as_ref().ok_or(REFUSED)?;
@@ -2000,7 +2512,12 @@ impl<S: Storage> Store<S> {
         self.procurement_commit(self.payment_record(updated.clone(), api.now()))
             .await?;
         if !p.vendor.paid(&updated) {
-            if p.vendor.payment_expires(&updated)? <= api.now() {
+            if p.invoice_recovery.is_some() {
+                let lightning = p.vendor.lightning_invoice_terms(&updated).ok_or(REFUSED)?;
+                if recovered_payment_expired(api, recovered_payment_deadline(&updated, lightning.expires)?) {
+                    return Err("This invoice has expired. Press “Check now” if you already paid.".into());
+                }
+            } else if p.vendor.payment_expires(&updated)? <= api.now() {
                 return Err("Initial invoice expired; this purchase remains paused with the same VM/payment. Reissue is unsupported.".into());
             }
             return Err(

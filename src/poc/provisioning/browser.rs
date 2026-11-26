@@ -368,6 +368,9 @@ impl Api for Browser {
     fn now(&self) -> u64 {
         (js_sys::Date::now() / 1000.0) as u64
     }
+    fn now_millis(&self) -> u64 {
+        js_sys::Date::now() as u64
+    }
     fn current(&self) -> Result<(), String> {
         self.continuation.check()?;
         if self

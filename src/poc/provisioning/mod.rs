@@ -272,6 +272,11 @@ impl Vendor {
             Self::Lnvps => lnvps::suitable_payment(payment, vm, expected, created),
         }
     }
+    pub(crate) fn lightning_invoice_terms(self, payment: &Value) -> Option<LightningInvoiceTerms> {
+        match self {
+            Self::Lnvps => lnvps::lightning_invoice_terms(payment),
+        }
+    }
     pub(crate) fn published_pin(self, vm: &Value) -> Result<(Value, String), String> {
         match self {
             Self::Lnvps => lnvps::published_pin(vm),
@@ -565,6 +570,9 @@ pub(crate) trait Api {
     }
     fn account(&self) -> String;
     fn now(&self) -> u64;
+    fn now_millis(&self) -> u64 {
+        self.now().saturating_mul(1_000)
+    }
     fn current(&self) -> Result<(), String>;
 }
 
@@ -690,6 +698,11 @@ pub struct BillingTerms {
     pub processing_fee: u64,
     pub currency: String,
     pub time: u64,
+}
+
+pub(crate) struct LightningInvoiceTerms {
+    pub amount_millisats: u64,
+    pub expires: u64,
 }
 
 #[cfg(target_arch = "wasm32")]

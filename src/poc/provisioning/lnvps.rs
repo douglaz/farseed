@@ -1015,6 +1015,96 @@ pub fn suitable_payment(payment: &Value, vm: u64, expected: &BillingTerms, creat
     check().unwrap_or(false)
 }
 
+pub(super) fn lightning_invoice_terms(payment: &Value) -> Option<LightningInvoiceTerms> {
+    let invoice = text(&payment["data"], "lightning", 8192).ok()?;
+    let (prefix, data) = invoice.rsplit_once('1')?;
+    let amount = prefix.strip_prefix("lnbc")?;
+    let (digits, multiplier) = match amount.as_bytes().last()? {
+        b'm' => (&amount[..amount.len() - 1], 1_000_000_000),
+        b'u' => (&amount[..amount.len() - 1], 1_000_000),
+        b'n' => (&amount[..amount.len() - 1], 1000),
+        b'p' => (&amount[..amount.len() - 1], 1),
+        _ => (amount, 1_000_000_000_000),
+    };
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let tenths = digits.parse::<u64>().ok()?.checked_mul(multiplier)?;
+    // The data contains seven timestamp words, a signature and six checksum words.
+    if tenths == 0 || !tenths.is_multiple_of(10) || data.len() < 117 {
+        return None;
+    }
+    const ALPHABET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    const GENERATORS: [u32; 5] = [
+        0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3,
+    ];
+    let prefix_words = prefix
+        .bytes()
+        .map(|byte| Some(u32::from(byte >> 5)))
+        .chain(std::iter::once(Some(0)))
+        .chain(prefix.bytes().map(|byte| Some(u32::from(byte & 31))));
+    let data_words = data
+        .bytes()
+        .map(|byte| ALPHABET.iter().position(|&symbol| symbol == byte).map(|word| word as u8))
+        .collect::<Option<Vec<_>>>()?;
+    // BOLT11 uses the Bech32 checksum. The wallet still validates the invoice signature.
+    let mut checksum = 1_u32;
+    for word in prefix_words.chain(data_words.iter().map(|&word| Some(u32::from(word)))) {
+        let top = checksum >> 25;
+        checksum = ((checksum & 0x01ff_ffff) << 5) ^ word?;
+        for (bit, generator) in GENERATORS.into_iter().enumerate() {
+            if (top >> bit) & 1 != 0 {
+                checksum ^= generator;
+            }
+        }
+    }
+    if checksum != 1 {
+        return None;
+    }
+
+    let created = base32_number(&data_words[..7])?;
+    let mut fields = &data_words[7..data_words.len() - 110];
+    let mut hash = None;
+    let mut expiry = None;
+    while let [tag, high, low, rest @ ..] = fields {
+        let size = (usize::from(*high) << 5) | usize::from(*low);
+        let (field, next) = rest.split_at_checked(size)?;
+        fields = next;
+        match ALPHABET[usize::from(*tag)] {
+            b'p' if hash.is_none() && field.len() == 52 && field[51] & 15 == 0 => {
+                let mut bytes = [0_u8; 32];
+                for (index, byte) in bytes.iter_mut().enumerate() {
+                    let bit = index * 8;
+                    let offset = bit / 5;
+                    let word = (u16::from(field[offset]) << 10)
+                        | (u16::from(field[offset + 1]) << 5)
+                        | u16::from(field[offset + 2]);
+                    *byte = (word >> (7 - bit % 5)) as u8;
+                }
+                hash = Some(bytes);
+            }
+            b'x' if expiry.is_none() && !field.is_empty() => expiry = Some(base32_number(field)?),
+            b'p' | b'x' => return None,
+            _ => (),
+        }
+    }
+    let mut id = [0_u8; 32];
+    hex::decode_to_slice(payment_id(payment).ok()?, &mut id).ok()?;
+    if !fields.is_empty() || hash? != id {
+        return None;
+    }
+    Some(LightningInvoiceTerms {
+        amount_millisats: tenths / 10,
+        expires: created.checked_add(expiry.unwrap_or(3600))?,
+    })
+}
+
+fn base32_number(words: &[u8]) -> Option<u64> {
+    words.iter().try_fold(0_u64, |number, &word| {
+        number.checked_mul(32)?.checked_add(u64::from(word))
+    })
+}
+
 /// Support Ed25519 first, which the existing SSH client also negotiates first.
 pub fn published_pin(vm: &Value) -> Result<(Value, String), String> {
     let mut supported = Vec::new();
