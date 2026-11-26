@@ -130,6 +130,8 @@ pub struct Purchase {
     pub registration_sent: bool,
     pub ssh_key: Option<Value>,
     pub create: Option<Create>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    order_id: Option<String>,
     pub vm: Option<Value>,
     pub invoice: Option<Invoice>,
     #[serde(default)]
@@ -354,6 +356,33 @@ pub struct Create {
     pub before: Vec<Value>,
     pub started: u64,
 }
+
+fn new_order_id() -> Result<String, String> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes).map_err(|_| REFUSED)?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex = hex::encode(bytes);
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &hex[..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..]
+    ))
+}
+
+fn valid_order_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            14 => byte == b'4',
+            19 => matches!(byte, b'8' | b'9' | b'a' | b'b'),
+            _ => matches!(byte, b'0'..=b'9' | b'a'..=b'f'),
+        })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Billing {
@@ -386,6 +415,10 @@ pub enum Record {
     RegistrationSent,
     Registered(Value),
     CreateSent(Create),
+    CreateSentWithOrderId {
+        intent: Create,
+        order_id: String,
+    },
     EmailRequired,
     EmailEntered {
         email: String,
@@ -1034,6 +1067,7 @@ impl<S: Storage> Store<S> {
             registration_sent: false,
             ssh_key: None,
             create: None,
+            order_id: None,
             vm: None,
             invoice: None,
             billing: None,
@@ -1106,6 +1140,7 @@ impl<S: Storage> Store<S> {
                 || p.registration_sent
                 || p.ssh_key.is_some()
                 || p.create.is_some()
+                || p.order_id.is_some()
                 || p.vm.is_some()
                 || p.billing.is_some()
                 || p.invoice.is_some()
@@ -1298,6 +1333,7 @@ impl<S: Storage> Store<S> {
                 p.selected = selected.clone();
                 p.approved_at = *approved_at;
                 p.pending_selection = None;
+                p.order_id = None;
             }
             Record::RegistrationSent => {
                 if p.registration_sent {
@@ -1312,7 +1348,7 @@ impl<S: Storage> Store<S> {
                 p.vendor.validate_registered(key)?;
                 p.ssh_key = Some(key.clone());
             }
-            Record::CreateSent(intent) => {
+            Record::CreateSent(intent) | Record::CreateSentWithOrderId { intent, .. } => {
                 if p.pending_selection.is_some()
                     || self.procurement_email.required
                     || p.ssh_key.is_none()
@@ -1326,6 +1362,16 @@ impl<S: Storage> Store<S> {
                 }
                 for vm in &intent.before {
                     self.procurement_vendor().validate_vm(vm)?;
+                }
+                if let Record::CreateSentWithOrderId { order_id, .. } = record {
+                    if !valid_order_id(order_id)
+                        || p.order_id.as_ref().is_some_and(|saved| saved != order_id)
+                    {
+                        return Err(REFUSED.into());
+                    }
+                    p.order_id = Some(order_id.clone());
+                } else if p.order_id.is_some() {
+                    return Err(REFUSED.into());
                 }
                 p.create = Some(intent.clone());
             }
@@ -2472,14 +2518,28 @@ impl<S: Storage> Store<S> {
                 }
                 let before = array(&before)?.clone();
                 let started = api.now();
-                self.procurement_commit(Record::CreateSent(Create { before, started }))
-                    .await?;
+                let order_id = match p.order_id.take() {
+                    Some(saved) => saved,
+                    None => new_order_id()?,
+                };
+                self.procurement_commit(Record::CreateSentWithOrderId {
+                    intent: Create { before, started },
+                    order_id,
+                })
+                .await?;
                 #[cfg(all(feature = "tracer", target_arch = "wasm32"))]
                 crate::testonly::session_point("procurement_create_intent").await;
                 self.check_api(api)?;
-                let request = p
-                    .vendor
-                    .create(&p.selected, id(p.ssh_key.as_ref().ok_or(REFUSED)?)?);
+                let order_id = self
+                    .procurement
+                    .as_ref()
+                    .and_then(|purchase| purchase.order_id.as_deref())
+                    .ok_or(REFUSED)?;
+                let request = p.vendor.create(
+                    &p.selected,
+                    id(p.ssh_key.as_ref().ok_or(REFUSED)?)?,
+                    order_id,
+                );
                 match self.provider_read(api, request).await {
                     Err(why) if why == protocol::EMAIL_REQUIRED => {
                         self.procurement_commit(Record::CreateEmailRefused).await?;

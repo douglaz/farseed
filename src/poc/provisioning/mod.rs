@@ -194,10 +194,11 @@ impl Vendor {
             Self::Lnvps => lnvps::payment(payment_id),
         }
     }
-    pub(crate) fn create(self, selected: &Selection, key: u64) -> VendorRequest {
+    pub(crate) fn create(self, selected: &Selection, key: u64, order_id: &str) -> VendorRequest {
         match self {
             Self::Lnvps => {
-                let (path, body) = selected.lnvps_create(key);
+                let (path, mut body) = selected.lnvps_create(key);
+                body["order_id"] = order_id.into();
                 VendorRequest {
                     method: "POST",
                     path: path.into(),
