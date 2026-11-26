@@ -233,13 +233,14 @@ const renderSteps = store => {
   emphasize('store', [$('create'), $('unlock'), $('seed-backup-answer'), $('seed-backup-check'), $('redisplay')]);
   emphasize('credit', [$('credit-invoice'), $('credit-check'), $('credit-configure'), $('poc-inference-form').querySelector('button')]);
   const purchase = store.procurement;
+  const catalogue = $('provider-catalogue');
   const machineAction = purchase?.stop ? $('provider-stop')
-    : !store.provider_configuration?.key_set ? $('provider-catalogue')
+    : !store.provider_configuration?.key_set ? catalogue
     : purchase?.phase === 'email_verification' ? (purchase.email_entered ? $('provider-email-check') : $('provider-email-form').querySelector('button'))
     : purchase?.phase === 'initial_invoice' ? $('provider-invoice')
     : purchase?.phase && !['terms_changed', 'handed_off'].includes(purchase.phase) ? $('provider-resume')
     : purchase?.selection ? $('provider-approval-form').querySelector('button')
-    : providerCatalogue ? $('provider-selection-form').querySelector('button') : $('provider-catalogue');
+    : providerCatalogue ? $('provider-selection-form').querySelector('button') : catalogue;
   emphasize('machine', [machineAction, $('setup-approve')]);
   const taskControls = selector => [...document.querySelector('[data-step="task"]').querySelectorAll(selector)];
   const needsDeclaration = (store.setup ?? []).some(machine => !machine.declaration);
@@ -260,6 +261,14 @@ const renderSteps = store => {
     ...(!workingTasks.size ? taskControls('[data-poc-propose], [data-end-session], [data-delivery-check], [data-task] button, #tau-poc-targets button') : []),
   ]);
   restoreMainActions(retained);
+  const catalogueGroup = catalogue.parentElement;
+  const machineSlot = $('step-machine-action');
+  const earlierPurchase = purchase?.phase === 'handed_off'
+    || (!purchase?.phase && purchase?.completed?.length && !purchase.closed?.startsWith('Stopped:'));
+  const promoteCatalogue = earlierPurchase && !purchase.selection
+    && !providerCatalogue && !catalogue.disabled && catalogue.classList.contains('main-action');
+  if (promoteCatalogue && catalogueGroup.parentElement !== machineSlot) machineSlot.append(catalogueGroup);
+  if (!promoteCatalogue && catalogueGroup.parentElement === machineSlot) $('step-machine-fold').before(catalogueGroup);
 };
 let renderedReport;
 let renderedReportJson;
