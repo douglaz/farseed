@@ -39,6 +39,8 @@ struct Fixture {
     urls: Vec<String>,
     signed_requests: Vec<Value>,
     record_signatures: bool,
+    create_journal: Option<MemoryStorage>,
+    create_bodies: Vec<Value>,
     machines: Vec<Value>,
     payments: Vec<Value>,
     history_response: Option<Value>,
@@ -78,6 +80,8 @@ impl Fixture {
             urls: Vec::new(),
             signed_requests: Vec::new(),
             record_signatures: false,
+            create_journal: None,
+            create_bodies: Vec::new(),
             machines: Vec::new(),
             payments: Vec::new(),
             history_response: None,
@@ -100,6 +104,10 @@ impl Fixture {
     }
     fn count(&self, request: &str) -> usize {
         self.calls.iter().filter(|c| c.as_str() == request).count()
+    }
+    fn refuse_create_for_email(&mut self) {
+        let body = serde_json::to_vec(&json!({"error":protocol::EMAIL_REQUIRED})).unwrap();
+        self.order_response = Some((403, body));
     }
     fn finish_read(&mut self, method: &str, path: &str) {
         if self
@@ -225,6 +233,27 @@ impl Api for Fixture {
                 }
                 ("GET", "/api/v1/vm") => Ok(json!(self.machines)),
                 ("POST", "/api/v1/vm" | "/api/v1/vm/custom-template") => {
+                    if let Some(storage) = &self.create_journal {
+                        let store = unlock(
+                            MemoryStorage::with_files(storage.files()),
+                            &Fixed,
+                            pass(),
+                        )
+                        .await
+                        .unwrap();
+                        let events = purchase_events(&store);
+                        let Some(Event::Procurement(
+                            record @ Record::CreateSentWithOrderId { order_id, .. },
+                        )) = events.last()
+                        else {
+                            panic!("the create intent must be durable before the request");
+                        };
+                        let encoded = serde_json::to_value(record).unwrap();
+                        assert_eq!(encoded["create_sent_with_order_id"]["order_id"], *order_id);
+                        let body = body.unwrap();
+                        assert_eq!(body["order_id"], *order_id);
+                        self.create_bodies.push(body);
+                    }
                     if let Some((status, body)) = self.order_response.take() {
                         self.status = status;
                         return Err(
@@ -791,6 +820,7 @@ fn provisioning_fixed_and_custom_encrypted_same_identity_handoff_and_replay() {
     for custom in [false, true] {
         let mut s = ready();
         let mut api = Fixture::new(custom);
+        api.create_journal = Some(s.storage.clone());
         approve(&mut s, &mut api);
         let identity = s.procurement.as_ref().unwrap().identity.clone();
         let before = s.poc_identity_public_keys("machine-a", &identity).unwrap();
@@ -800,6 +830,20 @@ fn provisioning_fixed_and_custom_encrypted_same_identity_handoff_and_replay() {
                 .unwrap_err()
                 .contains("initial Lightning")
         );
+        let order_id = api.create_bodies[0]["order_id"].as_str().unwrap().to_owned();
+        let groups: Vec<_> = order_id.split('-').collect();
+        assert_eq!(
+            groups.iter().map(|group| group.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
+        assert!(
+            groups
+                .iter()
+                .flat_map(|group| group.bytes())
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        );
+        assert!(groups[2].starts_with('4'));
+        assert!(matches!(groups[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'));
         assert!(
             issue_invoice(&mut s, &mut api)
                 .unwrap_err()
@@ -808,6 +852,11 @@ fn provisioning_fixed_and_custom_encrypted_same_identity_handoff_and_replay() {
         api.payments[0]["is_paid"] = true.into();
         block_on(s.procurement_resume(&mut api, false)).unwrap();
         let mut loaded = reopen(&s);
+        assert_eq!(loaded.procurement, s.procurement);
+        assert_eq!(
+            loaded.procurement.as_ref().unwrap().order_id.as_deref(),
+            Some(order_id.as_str())
+        );
         block_on(loaded.procurement_resume(&mut api, false)).unwrap();
         assert_eq!(loaded.poc_target("machine-a"), s.poc_target("machine-a"));
         assert_eq!(loaded.poc_target("machine-a").unwrap().host, "192.0.2.10");
@@ -897,6 +946,7 @@ fn provisioning_unknown_create_stays_read_only_across_reload_and_empty_conflicti
         api.lose_create = true;
         approve(&mut s, &mut api);
         assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+        let order_id = s.procurement.as_ref().unwrap().order_id.clone().unwrap();
         match mode {
             "empty" => api.machines.clear(),
             "incomplete" => {
@@ -910,10 +960,31 @@ fn provisioning_unknown_create_stays_read_only_across_reload_and_empty_conflicti
             }
         }
         let mut s = reopen(&s);
+        let before = api.calls.len();
+        // Resume and checking the order again use the same read-only path here.
         for _ in 0..2 {
             assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
         }
+        assert_eq!(
+            api.calls[before..]
+                .iter()
+                .filter(|call| *call == "GET /api/v1/vm")
+                .count(),
+            2
+        );
+        assert!(api.calls[before..].iter().all(|call| matches!(
+            call.as_str(),
+            "GET /api/v1/vm"
+                | "GET /api/v1/vm/11"
+                | "GET /api/v1/vm/12"
+                | "GET /api/v1/vm/11/payments?limit=100&offset=0"
+                | "GET /api/v1/vm/12/payments?limit=100&offset=0"
+        )));
         assert_eq!(api.count("POST /api/v1/vm"), 1);
+        assert_eq!(
+            s.procurement.as_ref().unwrap().order_id.as_deref(),
+            Some(order_id.as_str())
+        );
         assert!(s.procurement.as_ref().unwrap().vm.is_none());
         assert_eq!(
             s.procurement.as_ref().unwrap().unverified_machines,
@@ -987,13 +1058,34 @@ fn provisioning_pre_send_gap_and_uncertain_identity_appends_never_create_twice()
         json!({"id":7,"name":"tau-0","created":"2026-11-06T14:00:00Z"}),
     )))
     .unwrap();
-    block_on(s.procurement_commit(Record::CreateSent(Create {
-        before: Vec::new(),
-        started: api.now(),
-    })))
+    let legacy: Record = serde_json::from_value(json!({
+        "create_sent": {"before": [], "started": api.now()}
+    }))
     .unwrap();
+    block_on(s.procurement_commit(legacy)).unwrap();
     let mut loaded = reopen(&s);
-    assert!(block_on(loaded.procurement_resume(&mut api, false)).is_err());
+    let purchase = loaded.procurement.as_ref().unwrap();
+    assert!(purchase.create.is_some());
+    assert!(purchase.order_id.is_none());
+    assert_eq!(loaded.procurement_view()["phase"], "create_uncertain");
+    assert_eq!(loaded.procurement, s.procurement);
+    let before = api.calls.len();
+    for _ in 0..2 {
+        assert_eq!(
+            block_on(loaded.procurement_resume(&mut api, false)).unwrap_err(),
+            ORDER_CONFIRMATION_MISSING
+        );
+    }
+    assert_eq!(&api.calls[before..], ["GET /api/v1/vm", "GET /api/v1/vm"]);
+    api.machines.push(fixtures::vm(&api.current_selection, 11));
+    assert!(
+        block_on(loaded.procurement_resume(&mut api, false))
+            .unwrap_err()
+            .contains("initial Lightning")
+    );
+    let reconciled = reopen(&loaded);
+    assert_eq!(reconciled.procurement_view()["vm_id"], 11);
+    assert!(reconciled.procurement.as_ref().unwrap().order_id.is_none());
     assert_eq!(api.count("POST /api/v1/vm"), 0);
     for fault in [Fault::Fail(1), Fault::LandThenFail(3)] {
         let mut s = ready();
@@ -3055,6 +3147,104 @@ fn provisioning_i49_order_403_exact_refusal_clears_intent_other_text_stays_uncer
         assert!(!protocol::decoded_email_required(
             method, path, status, body
         ));
+    }
+}
+
+#[test]
+fn provisioning_order_id_survives_email_refusal_and_changes_with_new_approval() {
+    for custom in [false, true] {
+        let mut s = ready();
+        let mut api = Fixture::new(custom);
+        api.create_journal = Some(s.storage.clone());
+        api.refuse_create_for_email();
+        approve(&mut s, &mut api);
+        block_on(s.procurement_resume(&mut api, false)).unwrap();
+        assert_eq!(api.create_bodies.len(), 1);
+        let order_id = api.create_bodies[0]["order_id"].as_str().unwrap().to_owned();
+        assert!(s.procurement.as_ref().unwrap().create.is_none());
+        assert_eq!(i49_email_records(&s), [json!("create_email_refused")]);
+
+        let mut s = i49_assert_replay(&s);
+        assert_eq!(
+            s.procurement.as_ref().unwrap().order_id.as_deref(),
+            Some(order_id.as_str())
+        );
+        api.create_journal = Some(s.storage.clone());
+        api.status = 200;
+        api.email_account = Some(i49_account(true, I49_EMAIL));
+        assert!(
+            block_on(s.procurement_resume(&mut api, false))
+                .unwrap_err()
+                .contains("initial Lightning")
+        );
+        assert_eq!(api.create_bodies.len(), 2);
+        assert_eq!(api.create_bodies[0], api.create_bodies[1]);
+        assert_eq!(s.procurement_view()["vm_id"], 11);
+
+        disappear(&mut api);
+        block_on(s.procurement_close(&mut api)).unwrap();
+        let mut s = i49_assert_replay(&s);
+        assert_eq!(
+            s.closed_purchases.last().unwrap().order_id.as_deref(),
+            Some(order_id.as_str())
+        );
+        api.create_journal = Some(s.storage.clone());
+        approve(&mut s, &mut api);
+        // Refuse the new order before creating a machine so the fixture can keep using VM 11.
+        api.refuse_create_for_email();
+        block_on(s.procurement_resume(&mut api, false)).unwrap();
+        assert_eq!(api.create_bodies.len(), 3);
+        assert_ne!(api.create_bodies[2]["order_id"], order_id);
+        i49_assert_replay(&s);
+    }
+}
+
+#[test]
+fn provisioning_order_id_changes_when_terms_are_reapproved_after_email_refusal() {
+    for custom in [false, true] {
+        let mut s = ready();
+        let mut api = Fixture::new(custom);
+        api.create_journal = Some(s.storage.clone());
+        api.refuse_create_for_email();
+        approve(&mut s, &mut api);
+        block_on(s.procurement_resume(&mut api, false)).unwrap();
+        assert_eq!(api.create_bodies.len(), 1);
+        let refused_id = api.create_bodies[0]["order_id"].clone();
+        let identity = s.procurement.as_ref().unwrap().identity.clone();
+        assert_eq!(i49_email_records(&s), [json!("create_email_refused")]);
+
+        let mut s = i49_assert_replay(&s);
+        api.status = 200;
+        api.email_account = Some(i49_account(true, I49_EMAIL));
+        api.current_selection.charge.amount *= 2;
+        if !custom {
+            api.current_selection.offer["cost_plan"]["amount"] =
+                api.current_selection.charge.amount.into();
+        }
+        assert!(
+            block_on(s.procurement_resume(&mut api, false))
+                .unwrap_err()
+                .contains("review and approve")
+        );
+        assert_eq!(s.procurement_view()["phase"], "terms_changed");
+        assert_eq!(api.create_bodies.len(), 1);
+        assert_eq!(
+            s.procurement.as_ref().unwrap().order_id.as_deref(),
+            refused_id.as_str()
+        );
+
+        block_on(s.procurement_approve(&mut api, approval())).unwrap();
+        let mut s = i49_assert_replay(&s);
+        api.create_journal = Some(s.storage.clone());
+        assert!(
+            block_on(s.procurement_resume(&mut api, false))
+                .unwrap_err()
+                .contains("initial Lightning")
+        );
+        assert_eq!(api.create_bodies.len(), 2);
+        assert_ne!(api.create_bodies[1]["order_id"], refused_id);
+        assert_eq!(s.procurement.as_ref().unwrap().identity, identity);
+        assert_eq!(s.procurement_view()["vm_id"], 11);
     }
 }
 
