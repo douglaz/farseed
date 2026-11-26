@@ -71,6 +71,92 @@ pub(crate) fn billing_terms() -> BillingTerms {
     BillingTerms::parse(&payment(11)).unwrap()
 }
 
+// A synthetic wire invoice for the amount, payment hash, checksum and expiry checks.
+// The page leaves signature verification to the wallet, so this fixture uses zero signature words.
+pub(crate) fn recovered_invoice(hash_byte: u8, hrp_amount: &str, expiry: Option<u64>) -> Value {
+    const ALPHABET: &[u8] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+    let prefix = format!("lnbc{hrp_amount}");
+    let created = timestamp("2026-11-06T14:00:00Z").unwrap();
+    let mut words: Vec<u8> = (0..7)
+        .rev()
+        .map(|i| ((created >> (5 * i)) & 31) as u8)
+        .collect();
+    words.extend([1, 1, 20]); // p, 52 words
+    let mut hash_bits = (0..256)
+        .map(|bit| (hash_byte >> (7 - bit % 8)) & 1)
+        .chain([0; 4]);
+    words.extend((0..52).map(|_| {
+        hash_bits.by_ref().take(5).fold(0, |word, bit| (word << 1) | bit)
+    }));
+    if let Some(expiry) = expiry {
+        let fields: Vec<u8> = (0..13)
+            .rev()
+            .map(|i| ((expiry >> (5 * i)) & 31) as u8)
+            .skip_while(|&word| word == 0)
+            .collect();
+        words.extend([6, 0, fields.len() as u8]); // x, tagged expiry
+        words.extend(fields);
+    }
+    words.extend([0; 104]);
+    let expanded = prefix
+        .bytes()
+        .map(|byte| byte >> 5)
+        .chain([0])
+        .chain(prefix.bytes().map(|byte| byte & 31))
+        .chain(words.iter().copied())
+        .chain([0; 6]);
+    let generators = [0x3b6a_57b2, 0x2650_8e6d, 0x1ea1_19fa, 0x3d42_33dd, 0x2a14_62b3];
+    let checksum = expanded.fold(1_u32, |sum, word| {
+        let mut next = ((sum & 0x01ff_ffff) << 5) ^ u32::from(word);
+        for (bit, generator) in generators.into_iter().enumerate() {
+            if sum & (1 << (25 + bit)) != 0 {
+                next ^= generator;
+            }
+        }
+        next
+    }) ^ 1;
+    words.extend((0..6).rev().map(|i| ((checksum >> (5 * i)) & 31) as u8));
+    let data: String = words
+        .into_iter()
+        .map(|word| char::from(ALPHABET[usize::from(word)]))
+        .collect();
+    let mut row = payment(11);
+    row["id"] = json!(hex::encode([hash_byte; 32]));
+    row["data"]["lightning"] = json!(format!("{prefix}1{data}"));
+    row
+}
+
+#[test]
+fn provisioning_recovered_invoice_verifies_amount_hash_checksum_and_expiry() {
+    let created = timestamp("2026-11-06T14:00:00Z").unwrap();
+    for (amount, expiry, expected_amount, expected_expiry) in [
+        ("12300n", Some(197), 1_230_000, 197),
+        ("8u", None, 800_000, 3600),
+        ("8000001p", Some(60), 0, 0),
+        ("", Some(60), 0, 0),
+        ("0n", Some(60), 0, 0),
+    ] {
+        let mut row = recovered_invoice(0xa7, amount, expiry);
+        let read = Vendor::Lnvps.lightning_invoice_terms(&row);
+        if expected_amount == 0 {
+            assert!(read.is_none(), "{amount}");
+            continue;
+        }
+        let read = read.unwrap();
+        assert_eq!(read.amount_millisats, expected_amount);
+        assert_eq!(read.expires, created + expected_expiry);
+        row["id"] = json!(hex::encode([0xa8; 32]));
+        assert!(Vendor::Lnvps.lightning_invoice_terms(&row).is_none());
+        row["id"] = json!(hex::encode([0xa7; 32]).to_ascii_uppercase());
+        assert!(Vendor::Lnvps.lightning_invoice_terms(&row).is_some());
+        let mut invoice = row["data"]["lightning"].as_str().unwrap().to_owned();
+        let last = invoice.pop().unwrap();
+        invoice.push(if last == 'q' { 'p' } else { 'q' });
+        row["data"]["lightning"] = json!(invoice);
+        assert!(Vendor::Lnvps.lightning_invoice_terms(&row).is_none());
+    }
+}
+
 #[test]
 fn provisioning_signs_exact_request_and_unique_read_identity() {
     let input = hex::encode([7; 32]);

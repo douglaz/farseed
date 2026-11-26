@@ -1,10 +1,25 @@
 use super::*;
+use std::collections::VecDeque;
+
+const INVENTORY: &str = "/api/v1/vm";
+const HISTORY: &str = "/api/v1/vm/11/payments?limit=100&offset=0";
+const ISSUE: &str = "GET /api/v1/vm/11/renew?method=lightning&intervals=1";
+
+struct ReadStep {
+    path: &'static str,
+    response: Value,
+    millis: Option<u64>,
+    fault: Option<(MemoryStorage, Fault)>,
+}
 
 struct B947Api {
     inner: Fixture,
     duplicate_create: bool,
     list_status: u16,
     history_status: u16,
+    scripted_reads: VecDeque<ReadStep>,
+    subsecond_millis: u64,
+    clock_after_append: Vec<(MemoryStorage, u64, u64)>,
 }
 impl B947Api {
     fn new() -> Self {
@@ -13,7 +28,23 @@ impl B947Api {
             duplicate_create: false,
             list_status: 200,
             history_status: 200,
+            scripted_reads: VecDeque::new(),
+            subsecond_millis: 0,
+            clock_after_append: Vec::new(),
         }
+    }
+    fn queue_read(&mut self, path: &'static str, response: Value) -> &mut ReadStep {
+        self.scripted_reads.push_back(ReadStep {
+            path,
+            response,
+            millis: None,
+            fault: None,
+        });
+        self.scripted_reads.back_mut().unwrap()
+    }
+    fn set_millis(&mut self, millis: u64) {
+        self.inner.clock = millis / 1_000;
+        self.subsecond_millis = millis % 1_000;
     }
 }
 impl Api for B947Api {
@@ -21,7 +52,20 @@ impl Api for B947Api {
         self.inner.account()
     }
     fn now(&self) -> u64 {
-        self.inner.now()
+        self.now_millis() / 1_000
+    }
+    fn now_millis(&self) -> u64 {
+        self.clock_after_append
+            .iter()
+            .rev()
+            .find_map(|(storage, number, millis)| {
+                storage
+                    .memory()
+                    .files
+                    .contains_key(&number.to_string())
+                    .then_some(*millis)
+            })
+            .unwrap_or(self.inner.now_millis() + self.subsecond_millis)
     }
     fn current(&self) -> Result<(), String> {
         self.inner.current()
@@ -83,6 +127,17 @@ impl Api for B947Api {
         if let Some(read) = read {
             self.inner.calls.push(format!("{method} {path}"));
             self.inner.urls.push(url.into());
+            self.inner.finish_read(method, &path);
+            if self.scripted_reads.front().is_some_and(|step| step.path == path) {
+                let step = self.scripted_reads.pop_front().unwrap();
+                if let Some(millis) = step.millis {
+                    self.set_millis(millis);
+                }
+                if let Some((storage, fault)) = step.fault {
+                    storage.fault(fault);
+                }
+                return Ok(step.response);
+            }
             if let Some(error) = self.inner.read_errors.remove(&path) {
                 return Err(error);
             }
@@ -255,7 +310,7 @@ fn b947_candidate_key_filter_window_checks_and_cap() {
             .unwrap()
             .failing
             .len(),
-        9
+        8
     );
     assert!(s.procurement.as_ref().unwrap().vm.is_none());
 }
@@ -282,7 +337,7 @@ fn b947_lowest_id_duplicates_replay_and_immutable_association() {
     assert_eq!(
         api.inner
             .count("GET /api/v1/vm/12/payments?limit=100&offset=0"),
-        0
+        1
     );
     assert_eq!(
         api.inner
@@ -299,17 +354,37 @@ fn b947_lowest_id_duplicates_replay_and_immutable_association() {
 
 #[test]
 fn b947_successful_create_reconciles_before_adoption() {
-    let mut s = ready();
-    let mut api = B947Api::new();
-    approve(&mut s, &mut api.inner);
-    api.duplicate_create = true;
-    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
-    let p = s.procurement.as_ref().unwrap();
-    assert_eq!(p.vm.as_ref().unwrap()["id"], 10);
-    assert_eq!(p.duplicate_orders, vec![11]);
-    assert_eq!(api.inner.count("POST /api/v1/vm"), 1);
-    assert_eq!(api.inner.count("GET /api/v1/vm"), 2);
-    assert_eq!(reopen(&s).procurement, s.procurement);
+    for (lost, skew) in [(false, 0), (true, -60), (true, 60)] {
+        let mut s = ready();
+        let mut api = B947Api::new();
+        api.inner.clock = api.inner.clock.checked_add_signed(skew).unwrap();
+        approve(&mut s, &mut api.inner);
+        api.inner.lose_create = lost;
+        api.duplicate_create = true;
+        api.inner.read_values.insert(
+            "/api/v1/vm/10/renew/quote?method=lightning&intervals=1".into(),
+            json!(api.inner.billing_terms),
+        );
+        let result = block_on(s.procurement_resume(&mut api, false));
+        if lost {
+            assert_eq!(result.unwrap_err(), ORDER_CONFIRMATION_MISSING);
+            assert!(s.procurement_view()["vm_id"].is_null());
+            s = reopen(&s);
+            assert!(
+                block_on(s.procurement_resume(&mut api, false))
+                    .unwrap_err()
+                    .contains("initial Lightning")
+            );
+        } else {
+            assert!(result.unwrap_err().contains("initial Lightning"));
+        }
+        let p = s.procurement.as_ref().unwrap();
+        assert_eq!(p.vm.as_ref().unwrap()["id"], 10, "{skew}");
+        assert_eq!(p.duplicate_orders, vec![11], "{skew}");
+        assert_eq!(api.inner.count("POST /api/v1/vm"), 1);
+        assert_eq!(api.inner.count("GET /api/v1/vm"), 3);
+        assert_eq!(reopen(&s).procurement, s.procurement);
+    }
 }
 
 #[test]
@@ -321,15 +396,19 @@ fn b947_entered_single_and_multiple_require_one_choice() {
             .collect();
         assert!(block_on(s.associate_create(&mut api, None)).is_err());
         assert!(s.procurement.as_ref().unwrap().vm.is_none());
-        assert_eq!(
-            s.procurement_view()["candidates"].as_array().unwrap().len(),
-            count as usize
-        );
-        let chosen = 10 + count;
-        block_on(s.procurement_choose(&mut api, chosen)).unwrap();
-        assert_eq!(s.procurement_view()["vm_id"], chosen);
-        assert!(s.procurement.as_ref().unwrap().duplicate_orders.is_empty());
-        assert!(block_on(s.procurement_choose(&mut api, chosen)).is_err());
+        assert_eq!(s.procurement_view()["candidates"][0]["id"], 11);
+        assert_eq!(s.procurement_view()["candidates"].as_array().unwrap().len(), 1);
+        let spares: Vec<_> = (12..11 + count).collect();
+        assert_eq!(s.procurement.as_ref().unwrap().duplicate_orders, spares);
+        let mut s = reopen(&s);
+        if count == 2 {
+            assert!(block_on(s.procurement_choose(&mut api, 12)).is_err());
+            assert!(s.procurement.as_ref().unwrap().vm.is_none());
+        }
+        block_on(s.procurement_choose(&mut api, 11)).unwrap();
+        assert_eq!(s.procurement_view()["vm_id"], 11);
+        assert_eq!(s.procurement.as_ref().unwrap().duplicate_orders, spares);
+        assert!(block_on(s.procurement_choose(&mut api, 11)).is_err());
         assert_eq!(reopen(&s).procurement, s.procurement);
     }
 }
@@ -540,54 +619,95 @@ fn b947_payment_conflict_stop_refuses_saved_payment_or_resolved_history() {
 
 #[test]
 fn b947_lost_invoice_reply_selects_once_before_display() {
-    for (rows, chosen, notice) in [
-        (
-            vec![("ccdd", false, "00"), ("aabb", true, "01")],
-            "aabb",
-            Some(SECOND_INVOICE),
-        ),
-        (vec![("ccdd", false, "00")], "ccdd", None),
-        (vec![("ccdd", true, "00")], "ccdd", None),
-        (
-            vec![("CCDD", false, "00"), ("aabb", false, "00")],
-            "aabb",
-            Some(SECOND_INVOICE),
-        ),
-        (
-            vec![("ccdd", true, "01"), ("aabb", true, "00")],
-            "aabb",
-            Some(PAID_TWICE),
-        ),
-        (
-            vec![("aabb", false, "00.900"), ("ccdd", false, "00.100")],
-            "ccdd",
-            Some(SECOND_INVOICE),
-        ),
+    let notice = "The provider issued a second unpaid invoice for the same price and period. This page uses only the invoice shown here and leaves the other unpaid.";
+    for (first, second, winner) in [
+        ("00", "00", 0xab),
+        ("00.900", "00.100", 0xcd),
     ] {
-        let (mut s, mut api) = b947_invoice_intent(false);
-        for (id, paid, seconds) in rows {
-            let mut payment = fixtures::payment(11);
-            payment["id"] = json!(id);
-            payment["is_paid"] = json!(paid);
-            payment["created"] = json!(format!("2026-11-06T14:00:{seconds}Z"));
-            api.inner.payments.push(payment);
+        for reverse in [false, true] {
+            let (mut s, mut api) = b947_invoice_intent(false);
+            for (hash, seconds) in [(0xab, first), (0xcd, second)] {
+                let mut row = fixtures::recovered_invoice(hash, "8000n", None);
+                row["created"] = json!(format!("2026-11-06T14:00:{seconds}Z"));
+                if hash == 0xcd {
+                    row["id"] = json!(row["id"].as_str().unwrap().to_ascii_uppercase());
+                }
+                api.inner.payments.push(row);
+            }
+            if reverse {
+                api.inner.payments.reverse();
+            }
+            assert!(block_on(s.associate_payment(&mut api, true)).unwrap());
+            let payment = s.procurement_view()["payment"].clone();
+            assert_eq!(
+                payment["id"].as_str().unwrap().to_ascii_lowercase(),
+                hex::encode([winner; 32])
+            );
+            assert_eq!(s.procurement_view()["payment_notice"], notice);
+            let mut loaded = reopen(&s);
+            assert_eq!(loaded.procurement, s.procurement);
+            assert_eq!(loaded.procurement_view(), s.procurement_view());
+            api.inner.calls.clear();
+            block_on(loaded.procurement_payment_check(&mut api)).unwrap();
+            assert_eq!(
+                api.inner.calls,
+                [format!("GET /api/v1/payment/{}", payment["id"].as_str().unwrap())]
+            );
+            assert_eq!(loaded.procurement_view()["payment"], payment);
+            let replacement = fixtures::recovered_invoice(0xef, "8000n", None);
+            assert!(
+                loaded
+                    .procurement_projection(&loaded.payment_record(replacement, api.now()))
+                    .is_err()
+            );
         }
-        block_on(s.associate_payment(&mut api, true)).unwrap();
-        assert_eq!(s.procurement_view()["payment"]["id"], chosen);
-        assert_eq!(s.procurement_view()["payment_notice"], json!(notice));
-        assert_eq!(reopen(&s).procurement, s.procurement);
-        let mut replacement = fixtures::payment(11);
-        replacement["id"] = json!("eeff");
-        assert!(
-            s.procurement_projection(&s.payment_record(replacement, api.now()))
-                .is_err()
-        );
-        assert_eq!(
-            api.inner
-                .count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
-            0
-        );
     }
+    // These three valid histories formerly selected a paid invoice after a lost
+    // reply. A paid observation now pauses before either singleton or duplicate adoption.
+    for statuses in [vec![true], vec![false, true], vec![true, true]] {
+        let (mut s, mut api) = b947_approved(false);
+        assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+        api.inner.lose_invoice = true;
+        assert_eq!(
+            block_on(s.procurement_resume(&mut api, true)).unwrap_err(),
+            INVOICE_CONFIRMATION_MISSING
+        );
+        api.inner.payments = statuses
+            .into_iter()
+            .enumerate()
+            .map(|(index, paid)| {
+                let mut row = fixtures::recovered_invoice(0xab + index as u8, "8000n", None);
+                row["is_paid"] = json!(paid);
+                row
+            })
+            .collect();
+        assert_eq!(
+            block_on(s.procurement_resume(&mut api, true)).unwrap_err(),
+            INVOICE_ALREADY_PAID
+        );
+        let mut loaded = reopen(&s);
+        api.inner.payments.clear();
+        let calls = api.inner.calls.len();
+        assert_eq!(
+            block_on(loaded.procurement_resume(&mut api, true)).unwrap_err(),
+            INVOICE_ALREADY_PAID
+        );
+        assert_eq!(api.inner.calls.len(), calls);
+        assert_eq!(loaded.procurement_view()["phase"], "invoice_uncertain");
+        assert!(loaded.procurement_view()["payment"].is_null());
+        assert!(loaded.procurement_view()["payment_notice"].is_null());
+        assert_eq!(api.inner.count(ISSUE), 1);
+    }
+    let (mut s, mut api) = b947_invoice_intent(false);
+    api.inner.payments.push(fixtures::payment(11));
+    assert!(!block_on(s.associate_payment(&mut api, true)).unwrap());
+    assert_eq!(s.procurement_view()["payment"]["id"], "aabb");
+    assert!(s.procurement_view()["payment_notice"].is_null());
+    assert_eq!(reopen(&s).procurement, s.procurement);
+    assert_eq!(
+        api.inner.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
+        0
+    );
     let (mut s, mut api) = b947_invoice_intent(false);
     api.inner.payments = vec![fixtures::payment(11), fixtures::payment(11)];
     api.inner.payments[1]["id"] = json!("ccdd");
@@ -805,3 +925,232 @@ fn b947_entered_account_reapproves_changed_terms_on_existing_purchase() {
     assert_eq!(api.inner.count("POST /api/v1/vm"), 0);
     assert_eq!(reopen(&s).procurement, s.procurement);
 }
+
+#[test]
+fn b947_machine_observation_lands_before_any_detail_or_history_read() {
+    let (mut s, mut api) = b947_intent(false);
+    api.inner.machines = [12, 11]
+        .map(|id| b947_vm(&api.inner.current_selection, id))
+        .to_vec();
+    api.inner.fault_after = Some((
+        "GET /api/v1/vm".into(),
+        s.storage.clone(),
+        Fault::LandThenFail(3),
+    ));
+    assert!(block_on(s.associate_create(&mut api, None)).is_err());
+    assert_eq!(api.inner.calls, ["GET /api/v1/vm"]);
+    let mut s = reopen(&s);
+    assert_eq!(s.procurement.as_ref().unwrap().unverified_machines, [11, 12]);
+    assert!(matches!(
+        purchase_events(&s).last().unwrap(),
+        Event::Procurement(Record::MachineEvidenceObserved { vm_ids }) if vm_ids == &[11, 12]
+    ));
+
+    api.inner.machines.remove(0);
+    api.inner.calls.clear();
+    assert!(block_on(s.procurement_resume(&mut api, true)).is_err());
+    assert_eq!(api.inner.calls, ["GET /api/v1/vm"]);
+    assert!(s.procurement_view()["vm_id"].is_null());
+    assert_eq!(reopen(&s).procurement, s.procurement);
+}
+
+#[test]
+fn b947_machine_disappearing_or_first_seen_on_closing_inventory_stays_pending() {
+    for (opening, closing, observed) in [
+        (vec![11], vec![], vec![11]),
+        (vec![11, 12], vec![11], vec![11, 12]),
+        (vec![11], vec![11, 12], vec![11, 12]),
+    ] {
+        let (mut s, mut api) = b947_intent(false);
+        api.inner.machines = opening
+            .iter()
+            .map(|id| b947_vm(&api.inner.current_selection, *id))
+            .collect();
+        let after: Vec<_> = closing
+            .iter()
+            .map(|id| b947_vm(&api.inner.current_selection, *id))
+            .collect();
+        api.queue_read(INVENTORY, json!(api.inner.machines));
+        // Detail and history use the original list. The next inventory sees the
+        // purge (including a history read that returned 200 []) or the new spare.
+        api.queue_read(INVENTORY, json!(after));
+        assert!(block_on(s.associate_create(&mut api, None)).is_err());
+        assert!(api.scripted_reads.is_empty());
+        assert_eq!(api.inner.count("GET /api/v1/vm"), 2);
+        assert_eq!(api.inner.count(&format!("GET {HISTORY}")), 1);
+        assert_eq!(s.procurement.as_ref().unwrap().unverified_machines, observed);
+        assert!(s.procurement_view()["vm_id"].is_null());
+
+        let mut s = reopen(&s);
+        api.inner.machines = after.into_iter().filter(|row| row["id"] != 12).collect();
+        api.inner.calls.clear();
+        assert!(block_on(s.procurement_resume(&mut api, true)).is_err());
+        assert_eq!(api.inner.calls, ["GET /api/v1/vm"]);
+        assert_eq!(s.procurement.as_ref().unwrap().unverified_machines, observed);
+        assert!(s.procurement_view()["vm_id"].is_null());
+    }
+}
+
+#[test]
+fn b947_machine_inventory_bound_survives_opening_and_closing_reads_and_reload() {
+    for bound_on_closing in [false, true] {
+        let (mut s, mut api) = b947_intent(false);
+        api.inner.machines = vec![b947_vm(&api.inner.current_selection, 11)];
+        let oversized: Vec<_> = (11..=139)
+            .map(|id| b947_vm(&api.inner.current_selection, id))
+            .collect();
+        if bound_on_closing {
+            api.queue_read(INVENTORY, json!(api.inner.machines));
+        }
+        api.queue_read(INVENTORY, json!(oversized));
+        assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+        assert!(api.scripted_reads.is_empty());
+        assert_eq!(api.inner.calls.len(), if bound_on_closing { 4 } else { 1 });
+        assert_eq!(
+            s.procurement.as_ref().unwrap().unverified_machines,
+            (11..=18).collect::<Vec<_>>()
+        );
+        let mut loaded = reopen(&s);
+        api.inner.calls.clear();
+        assert!(block_on(loaded.procurement_resume(&mut api, true)).is_err());
+        assert_eq!(api.inner.calls, ["GET /api/v1/vm"]);
+        assert!(loaded.procurement_view()["vm_id"].is_null());
+        assert_eq!(loaded.procurement, s.procurement);
+    }
+}
+
+#[test]
+fn b947_six_verified_spares_fit_the_read_budget_and_only_the_lowest_is_invoiced() {
+    let (mut s, mut api) = b947_intent(false);
+    api.inner.machines = (11..=17)
+        .rev()
+        .map(|id| b947_vm(&api.inner.current_selection, id))
+        .collect();
+    block_on(s.associate_create(&mut api, None)).unwrap();
+    assert_eq!(api.inner.calls.len(), 16);
+    let events = purchase_events(&s);
+    assert!(matches!(
+        &events[events.len() - 2..],
+        [
+            Event::Procurement(Record::MachineEvidenceObserved { vm_ids }),
+            Event::Procurement(Record::AssociatedWithSpares { vm, spare_ids }),
+        ] if vm_ids == &[11, 12, 13, 14, 15, 16, 17] && vm["id"] == 11
+            && spare_ids == &[12, 13, 14, 15, 16, 17]
+    ));
+    let mut loaded = reopen(&s);
+    assert_eq!(
+        loaded.procurement_view()["duplicate_orders"],
+        json!([12, 13, 14, 15, 16, 17])
+    );
+    for approve_invoice in [false, true] {
+        api.inner.calls.clear();
+        assert!(block_on(loaded.procurement_resume(&mut api, approve_invoice)).is_err());
+        assert!(api.inner.calls.len() <= 16);
+        assert_eq!(api.inner.count(ISSUE), usize::from(approve_invoice));
+        assert_eq!(
+            api.inner.calls.iter().filter(|call| call.contains("/renew?")).count(),
+            usize::from(approve_invoice)
+        );
+        for spare in 12..=17 {
+            assert_eq!(api.inner.count(&format!("GET /api/v1/vm/{spare}")), 0);
+            assert_eq!(
+                api.inner.count(&format!("GET /api/v1/vm/{spare}/payments?limit=100&offset=0")),
+                1
+            );
+        }
+    }
+    assert_eq!(loaded.procurement_view()["payment"]["vm_id"], 11);
+}
+
+#[test]
+fn b947_late_spare_is_saved_before_billing_and_billed_or_missing_spares_pause() {
+    for mode in ["billed", "expired", "purged", "retained_history", "purged_during_history"] {
+        let (mut s, mut api) = b947_intent(false);
+        api.inner.machines = vec![b947_vm(&api.inner.current_selection, 11)];
+        block_on(s.associate_create(&mut api, None)).unwrap();
+        assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+        api.inner.machines.push(b947_vm(&api.inner.current_selection, 12));
+        assert!(
+            block_on(s.procurement_resume(&mut api, true))
+                .unwrap_err()
+                .contains("Review the notice")
+        );
+        assert_eq!(
+            api.inner.calls.iter().filter(|call| call.contains("/renew?")).count(),
+            0
+        );
+        assert_eq!(s.procurement_view()["duplicate_orders"], json!([12]));
+        assert!(matches!(
+            purchase_events(&s).last().unwrap(),
+            Event::Procurement(Record::SpareOrdersObserved { vm_ids }) if vm_ids == &[12]
+        ));
+        match mode {
+            "billed" => api.inner.payments.push(fixtures::payment(12)),
+            "expired" => api.inner.machines[1]["expires"] = json!("2026-12-06T14:00:00Z"),
+            "purged" => {
+                api.inner.machines.pop();
+            }
+            _ => {
+                api.queue_read(INVENTORY, json!(api.inner.machines));
+                api.inner.machines.pop();
+                if mode == "retained_history" {
+                    api.inner.payments.push(fixtures::payment(12));
+                }
+            }
+        }
+        let mut loaded = reopen(&s);
+        api.inner.calls.clear();
+        assert!(
+            block_on(loaded.procurement_resume(&mut api, true))
+                .unwrap_err()
+                .contains("Invoice issuance is paused"),
+            "{mode}"
+        );
+        assert!(api.scripted_reads.is_empty(), "{mode}");
+        assert_eq!(
+            api.inner.count("GET /api/v1/vm/12/payments?limit=100&offset=0"),
+            usize::from(matches!(mode, "billed" | "retained_history" | "purged_during_history")),
+            "{mode}"
+        );
+        assert_eq!(
+            api.inner.count("GET /api/v1/vm"),
+            if mode == "purged_during_history" { 2 } else { 1 },
+            "{mode}"
+        );
+        assert!(loaded.procurement_view()["payment"].is_null());
+        assert_eq!(loaded.procurement_view()["duplicate_orders"], json!([12]));
+        assert_eq!(
+            api.inner.calls.iter().filter(|call| call.contains("/renew?")).count(),
+            0
+        );
+    }
+}
+
+#[test]
+fn b947_close_keeps_late_machine_evidence_through_a_smaller_inventory() {
+    for (chosen_present, count, reads) in [(true, 1, 1), (false, 1, 3), (false, 8, 1)] {
+        let (mut s, mut api) = b947_intent(false);
+        api.inner.machines = vec![b947_vm(&api.inner.current_selection, 11)];
+        block_on(s.associate_create(&mut api, None)).unwrap();
+        let first_id = if chosen_present { 11 } else { 12 };
+        api.inner.machines = (first_id..12 + count)
+            .map(|id| b947_vm(&api.inner.current_selection, id))
+            .collect();
+        api.inner.calls.clear();
+        assert!(block_on(s.procurement_close(&mut api)).is_err());
+        assert_eq!(
+            s.procurement.as_ref().unwrap().unverified_machines,
+            (12..12 + count).collect::<Vec<_>>()
+        );
+        assert_eq!(api.inner.calls.len(), reads);
+        let mut loaded = reopen(&s);
+        api.inner.machines.retain(|row| row["id"] == 11);
+        api.inner.calls.clear();
+        assert!(block_on(loaded.procurement_resume(&mut api, true)).is_err());
+        assert_eq!(api.inner.calls, ["GET /api/v1/vm"]);
+        assert_eq!(loaded.procurement, s.procurement);
+        assert!(loaded.closed_purchases.is_empty());
+    }
+}
+
+mod invoice_recovery;

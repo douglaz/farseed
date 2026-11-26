@@ -101,6 +101,23 @@ impl Fixture {
     fn count(&self, request: &str) -> usize {
         self.calls.iter().filter(|c| c.as_str() == request).count()
     }
+    fn finish_read(&mut self, method: &str, path: &str) {
+        if self
+            .fault_after
+            .as_ref()
+            .is_some_and(|(route, _, _)| route == &format!("{method} {path}"))
+        {
+            let (_, storage, fault) = self.fault_after.take().unwrap();
+            storage.fault(fault);
+        }
+        if self
+            .after_read_clock
+            .as_ref()
+            .is_some_and(|(route, _)| route == path)
+        {
+            self.clock = self.after_read_clock.take().unwrap().1;
+        }
+    }
 }
 impl Api for Fixture {
     fn response_status(&self) -> u16 {
@@ -281,21 +298,7 @@ impl Api for Fixture {
             };
             result.map_err(Into::into)
         };
-        if self
-            .fault_after
-            .as_ref()
-            .is_some_and(|(route, _, _)| route == &format!("{method} {path}"))
-        {
-            let (_, storage, fault) = self.fault_after.take().unwrap();
-            storage.fault(fault);
-        }
-        if self
-            .after_read_clock
-            .as_ref()
-            .is_some_and(|(route, _)| route == &path)
-        {
-            self.clock = self.after_read_clock.take().unwrap().1;
-        }
+        self.finish_read(method, &path);
         result
     }
 }
@@ -662,7 +665,7 @@ fn provisioning_history_exactly_100_rows_is_incomplete() {
     api.payments = history_rows(100);
     assert_history_refused(
         &mut api,
-        "Payment history incomplete; Refresh without issuing another invoice.",
+        INVOICE_HISTORY_INCOMPLETE,
     );
 }
 
@@ -673,7 +676,7 @@ fn provisioning_history_101_through_128_rows_is_incomplete() {
         api.payments = history_rows(count);
         assert_history_refused(
             &mut api,
-            "Payment history incomplete; Refresh without issuing another invoice.",
+            INVOICE_HISTORY_INCOMPLETE,
         );
     }
 }
@@ -682,14 +685,14 @@ fn provisioning_history_101_through_128_rows_is_incomplete() {
 fn provisioning_history_129_rows_exceeds_array_bound() {
     let mut api = Fixture::new(false);
     api.payments = history_rows(129);
-    assert_history_refused(&mut api, REFUSED);
+    assert_history_refused(&mut api, INVOICE_HISTORY_INCOMPLETE);
 }
 
 #[test]
 fn provisioning_history_nested_pagination_is_refused() {
     let mut api = Fixture::new(false);
     api.history_response = Some(json!({"data":[],"total":0,"limit":100,"offset":0}));
-    assert_history_refused(&mut api, REFUSED);
+    assert_history_refused(&mut api, INVOICE_HISTORY_INCOMPLETE);
 }
 
 #[test]
@@ -697,7 +700,7 @@ fn provisioning_history_other_nonarrays_are_refused() {
     for value in [Value::Null, json!(true), json!(0), json!(""), json!({})] {
         let mut api = Fixture::new(false);
         api.history_response = Some(value);
-        assert_history_refused(&mut api, REFUSED);
+        assert_history_refused(&mut api, INVOICE_HISTORY_INCOMPLETE);
     }
 }
 
@@ -708,7 +711,7 @@ fn provisioning_history_complete_multiple_rows_remain_ambiguous() {
         api.payments = history_rows(count);
         assert_history_refused(
             &mut api,
-            "Initial payment evidence conflicts or is ambiguous; no invoice issued.",
+            "The provider shows more than one invoice for this machine. This purchase is paused.",
         );
     }
 }
@@ -733,7 +736,7 @@ fn provisioning_history_duplicate_wrong_vm_and_missing_identity_are_refused() {
             // accepted, the row is unusable, and no payment or invoice results.
             assert_history_conflict(&mut api);
         } else {
-            assert_history_refused(&mut api, REFUSED);
+            assert_history_refused(&mut api, INVOICE_HISTORY_INCOMPLETE);
         }
     }
 }
@@ -744,7 +747,7 @@ fn assert_history_conflict(api: &mut Fixture) {
     api.empty_history_reads = 1;
     assert_eq!(
         block_on(s.procurement_resume(api, true)).unwrap_err(),
-        "Initial payment evidence conflicts or cannot be established from the saved one-period quote; no invoice issued."
+        INVOICE_TERMS_UNVERIFIED
     );
     assert_eq!(api.empty_history_reads, 0, "the adoption read happened");
     let p = s.procurement.as_ref().unwrap();
@@ -769,7 +772,7 @@ fn provisioning_history_missing_payment_terms_cannot_issue_invoice() {
     api.empty_history_reads = 1;
     assert_eq!(
         block_on(s.procurement_resume(&mut api, true)).unwrap_err(),
-        "Initial payment evidence conflicts or cannot be established from the saved one-period quote; no invoice issued."
+        INVOICE_TERMS_UNVERIFIED
     );
     assert_eq!(api.empty_history_reads, 0, "the adoption read happened");
     let p = s.procurement.as_ref().unwrap();
@@ -852,16 +855,26 @@ fn provisioning_lost_create_and_invoice_reconcile_without_resend() {
     let mut api = Fixture::new(false);
     api.lose_create = true;
     approve(&mut s, &mut api);
-    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+    let order_message = "The provider hasn’t confirmed your machine order. The page hasn’t sent another order. Press “Check the order again” to see if your order went through.";
+    let invoice_message = "The provider hasn’t confirmed your invoice request. The page hasn’t requested another invoice. Press “Check the order again” to see if your invoice is ready.";
+    assert_eq!(
+        block_on(s.procurement_resume(&mut api, false)).unwrap_err(),
+        order_message
+    );
     let mut s = reopen(&s);
+    assert_eq!(s.procurement_view()["confirmation_message"], order_message);
     assert!(
         block_on(s.procurement_resume(&mut api, false))
             .unwrap_err()
             .contains("initial Lightning")
     );
+    assert_eq!(s.procurement_view()["phase"], "initial_invoice");
+    assert!(s.procurement_view()["payment"].is_null());
+    assert!(s.procurement_view()["confirmation_message"].is_null());
     api.lose_invoice = true;
-    assert!(issue_invoice(&mut s, &mut api).is_err());
+    assert_eq!(issue_invoice(&mut s, &mut api).unwrap_err(), invoice_message);
     let mut s = reopen(&s);
+    assert_eq!(s.procurement_view()["confirmation_message"], invoice_message);
     assert!(
         issue_invoice(&mut s, &mut api)
             .unwrap_err()
@@ -890,9 +903,11 @@ fn provisioning_unknown_create_stays_read_only_across_reload_and_empty_conflicti
                 api.machines[0].as_object_mut().unwrap().remove("ssh_key");
             }
             "conflicting" => api.machines[0]["image"]["id"] = 999.into(),
-            _ => api
-                .machines
-                .push(fixtures::vm(&fixtures::selection(false), 12)),
+            _ => {
+                let mut spare = fixtures::vm(&fixtures::selection(false), 12);
+                spare["expires"] = json!("2026-12-06T14:00:00Z");
+                api.machines.push(spare);
+            }
         }
         let mut s = reopen(&s);
         for _ in 0..2 {
@@ -900,6 +915,14 @@ fn provisioning_unknown_create_stays_read_only_across_reload_and_empty_conflicti
         }
         assert_eq!(api.count("POST /api/v1/vm"), 1);
         assert!(s.procurement.as_ref().unwrap().vm.is_none());
+        assert_eq!(
+            s.procurement.as_ref().unwrap().unverified_machines,
+            match mode {
+                "empty" | "incomplete" => vec![],
+                "multiple" => vec![11, 12],
+                _ => vec![11],
+            }
+        );
         assert!(
             block_on(s.procurement_select(
                 &mut api,
@@ -1295,39 +1318,40 @@ fn provisioning_multiple_incomplete_and_conflicting_invoice_evidence_never_reiss
         api.lose_invoice = true;
         assert!(issue_invoice(&mut s, &mut api).is_err());
         let original = s.procurement.clone().unwrap();
-        match mode {
+        let reason = match mode {
             "multiple" => {
                 let mut second = api.payments[0].clone();
                 second["id"] = json!("aabc");
                 api.payments.push(second);
+                // Matching row fields alone cannot use two opaque wallet strings safely.
+                INVOICE_TERMS_UNVERIFIED
             }
             "incomplete" => {
                 api.payments[0].as_object_mut().unwrap().remove("time");
+                INVOICE_TERMS_UNVERIFIED
             }
             "conflicting" => {
                 api.payments[0]["amount"] = json!(2);
+                INVOICE_TERMS_UNVERIFIED
             }
-            _ => api.payments.clear(),
-        }
-        if mode == "multiple" {
-            // B947: a lost invoice reply is recovered from the provider's history by choosing one payment (the
-            // earliest by creation time, then id), so two unpaid invoices adopt "aabb" once and never reissue.
-            for _ in 0..2 {
-                let mut loaded = reopen(&s);
-                let _ = issue_invoice(&mut loaded, &mut api);
-                let p = loaded.procurement.as_ref().unwrap();
-                assert_eq!(p.payment.as_ref().unwrap()["id"], json!("aabb"));
-                assert_eq!(p.invoice, original.invoice);
-                assert_eq!(p.vm, original.vm);
-                s = loaded;
+            _ => {
+                api.payments.clear();
+                INVOICE_CONFIRMATION_MISSING
             }
-        } else {
-            for _ in 0..2 {
-                let mut loaded = reopen(&s);
-                assert!(issue_invoice(&mut loaded, &mut api).is_err());
-                assert_eq!(loaded.procurement, Some(original.clone()));
-                s = loaded;
-            }
+        };
+        for _ in 0..2 {
+            let mut loaded = reopen(&s);
+            assert_eq!(issue_invoice(&mut loaded, &mut api).unwrap_err(), reason);
+            let p = loaded.procurement.as_ref().unwrap();
+            assert_eq!(p.invoice, original.invoice);
+            assert_eq!(p.vm, original.vm);
+            assert_eq!(p.billing, original.billing);
+            assert!(p.payment.is_none());
+            assert_eq!(
+                p.invoice_history_ids,
+                api.payments.iter().map(|row| row["id"].as_str().unwrap().to_owned()).collect()
+            );
+            s = loaded;
         }
         assert_eq!(
             api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
@@ -1423,16 +1447,17 @@ fn provisioning_invoice_pre_send_gap_replays_without_issuance() {
         started: api.clock,
     })))
     .unwrap();
-    let original = s.procurement.clone();
+    let mut expected = s.procurement.clone().unwrap();
+    expected.invoice_history_at_ms = Some(api.now_millis());
     let mut loaded = reopen(&s);
     for _ in 0..2 {
-        assert!(
-            issue_invoice(&mut loaded, &mut api)
-                .unwrap_err()
-                .contains("never be reissued")
+        assert_eq!(
+            issue_invoice(&mut loaded, &mut api).unwrap_err(),
+            INVOICE_CONFIRMATION_MISSING
         );
     }
-    assert_eq!(loaded.procurement, original);
+    assert_eq!(loaded.procurement.as_ref(), Some(&expected));
+    assert_eq!(reopen(&loaded).procurement.as_ref(), Some(&expected));
     assert_eq!(
         api.count("GET /api/v1/vm/11/renew?method=lightning&intervals=1"),
         0
@@ -1707,12 +1732,14 @@ fn provisioning_outside_clock_evidence_preserves_uncertain_intent_without_resend
             approve(&mut s, &mut api);
             api.lose_create = lost;
             assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
-            let original = s.procurement.clone();
+            let mut expected = s.procurement.clone().unwrap();
             let mut loaded = reopen(&s);
             for _ in 0..2 {
                 assert!(block_on(loaded.procurement_resume(&mut api, false)).is_err());
             }
-            assert_eq!(loaded.procurement, original);
+            expected.unverified_machines = vec![11];
+            assert_eq!(loaded.procurement.as_ref(), Some(&expected));
+            assert_eq!(reopen(&loaded).procurement.as_ref(), Some(&expected));
             assert!(loaded.procurement.as_ref().unwrap().vm.is_none());
             assert_eq!(api.count("POST /api/v1/vm"), 1);
         }
@@ -1849,12 +1876,14 @@ fn provisioning_existing_paid_or_unpaid_initial_history_reuses_authoritative_quo
         let mut api = Fixture::new(false);
         approve(&mut s, &mut api);
         api.fault_after = Some((
-            "POST /api/v1/vm".into(),
+            "GET /api/v1/vm/11/payments?limit=100&offset=0".into(),
             s.storage.clone(),
             Fault::LandThenFail(3),
         ));
         assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
         let mut loaded = reopen(&s);
+        assert_eq!(loaded.procurement_view()["vm_id"], 11);
+        assert!(loaded.procurement_view()["billing"].is_null());
         let mut payment = fixtures::payment(11);
         payment["is_paid"] = json!(paid);
         api.payments.push(payment);
@@ -1883,7 +1912,7 @@ fn provisioning_billing_intent_requires_saved_terms_and_failed_quote_append_send
     let mut api = Fixture::new(false);
     approve(&mut s, &mut api);
     api.fault_after = Some((
-        "POST /api/v1/vm".into(),
+        "GET /api/v1/vm/11/payments?limit=100&offset=0".into(),
         s.storage.clone(),
         Fault::LandThenFail(3),
     ));
@@ -2977,11 +3006,7 @@ fn provisioning_i49_order_403_exact_refusal_clears_intent_other_text_stays_uncer
                 assert_eq!(s.procurement_view()["phase"], "email_verification");
                 assert_eq!(i49_email_records(&s), vec![json!("create_email_refused")]);
             } else {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .contains("Provider mutation outcome unknown")
-                );
+                assert_eq!(result.unwrap_err(), ORDER_CONFIRMATION_MISSING);
                 assert!(s.procurement.as_ref().unwrap().create.is_some());
                 assert!(!s.procurement_email_eligible());
                 assert_eq!(s.procurement_view()["phase"], "create_uncertain");
@@ -2998,7 +3023,7 @@ fn provisioning_i49_order_403_exact_refusal_clears_intent_other_text_stays_uncer
                 result.unwrap();
                 assert!(loaded.procurement_email_eligible());
             } else {
-                assert!(result.unwrap_err().contains("Create outcome unknown"));
+                assert_eq!(result.unwrap_err(), ORDER_CONFIRMATION_MISSING);
                 assert_eq!(loaded.procurement, s.procurement);
             }
             assert_eq!(
@@ -3348,11 +3373,22 @@ fn provisioning_close_provider_refusals_keep_only_dispatched_protections() {
         let before = s.next;
         assert!(block_on(s.procurement_close(&mut api)).is_err(), "{case}");
         assert_eq!(api.calls.len(), expected, "{case}");
-        assert_eq!(s.next, before);
-        assert_eq!(s.procurement, p);
+        let mut p = p.unwrap();
+        if case == "inventory-over-bound" {
+            assert_eq!(s.next, before + 1);
+            p.unverified_machines = (101..=108).collect();
+            assert!(matches!(
+                purchase_events(&s).last().unwrap(),
+                Event::Procurement(Record::MachineEvidenceObserved { vm_ids })
+                    if *vm_ids == p.unverified_machines
+            ));
+        } else {
+            assert_eq!(s.next, before);
+        }
+        assert_eq!(s.procurement.as_ref(), Some(&p));
         assert_eq!(s.dispatch.setup_view(), setup);
         assert_eq!(s.allocation(), &allocation);
-        assert_eq!(reopen(&s).procurement, p);
+        assert_eq!(reopen(&s).procurement, Some(p));
     }
 }
 
