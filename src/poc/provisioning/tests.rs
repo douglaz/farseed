@@ -777,3 +777,54 @@ fn provisioning_readiness_comparison_uses_state_key_set_and_ipv4_only() {
     fresh["host_ssh_keys"] = json!([]);
     assert!(!same_readiness(&old, &fresh).unwrap());
 }
+
+#[test]
+fn provisioning_only_an_explicit_true_catalogue_flag_names_a_honouring_provider() {
+    let catalogue = |flag: Option<Value>| {
+        let mut reply = json!({"templates":[offer()],"custom_template":[custom()]});
+        if let Some(flag) = flag {
+            reply["honours_order_id"] = flag;
+        }
+        reply
+    };
+    assert!(Vendor::Lnvps.honours_order_id(&catalogue(Some(json!(true)))));
+    for flag in [
+        None,
+        Some(json!(false)),
+        Some(json!(null)),
+        Some(json!("true")),
+        Some(json!(1)),
+        Some(json!([true])),
+        Some(json!({"value":true})),
+    ] {
+        assert!(!Vendor::Lnvps.honours_order_id(&catalogue(flag)));
+    }
+    // The flag belongs to the catalogue reply itself, not to an offer inside it.
+    let mut nested = catalogue(None);
+    nested["templates"][0]["honours_order_id"] = json!(true);
+    assert!(!Vendor::Lnvps.honours_order_id(&nested));
+}
+
+#[test]
+fn provisioning_match_window_reaches_the_latest_send_of_the_same_order_id() {
+    let started = timestamp("2026-11-06T14:00:00Z").unwrap();
+    let selected = selection(false);
+    let at = |time: &str| {
+        let mut machine = vm(&selected, 11);
+        machine["created"] = json!(time);
+        machine
+    };
+    let late = at("2026-11-06T14:10:00Z");
+    // Without a re-send the window is the first send's, as before.
+    assert!(selected.matches(&at("2026-11-06T14:02:00Z"), 7, started));
+    assert!(!selected.matches(&late, 7, started));
+    assert!(!Vendor::Lnvps.matches(&selected, &late, 7, started, started));
+    // A re-send at 14:10 admits the machine it created and still the original Order's.
+    let resent = started + 600;
+    assert!(Vendor::Lnvps.matches(&selected, &late, 7, started, resent));
+    assert!(Vendor::Lnvps.matches(&selected, &at("2026-11-06T14:00:00Z"), 7, started, resent));
+    assert!(!Vendor::Lnvps.matches(&selected, &at("2026-11-06T14:12:01Z"), 7, started, resent));
+    assert!(!Vendor::Lnvps.matches(&selected, &at("2026-11-06T13:58:59Z"), 7, started, resent));
+    // A latest send earlier than the first never narrows the window.
+    assert!(Vendor::Lnvps.matches(&selected, &at("2026-11-06T14:02:00Z"), 7, started, started - 300));
+}

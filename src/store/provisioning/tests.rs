@@ -61,6 +61,12 @@ struct Fixture {
     account: String,
     clock: u64,
     fault_after: Option<(String, MemoryStorage, Fault)>,
+    // The catalogue's `honours_order_id` member on every templates reply, when set.
+    catalogue_claim: Option<Value>,
+    // A Honouring provider: a create repeating a seen Order ID returns the original machine.
+    honours: bool,
+    create_order_ids: Vec<Value>,
+    create_bytes: Vec<String>,
 }
 impl Fixture {
     fn new(custom: bool) -> Self {
@@ -100,6 +106,10 @@ impl Fixture {
             account: "a".repeat(64),
             clock: timestamp("2026-11-06T14:00:00Z").unwrap(),
             fault_after: None,
+            catalogue_claim: None,
+            honours: false,
+            create_order_ids: Vec::new(),
+            create_bytes: Vec::new(),
         }
     }
     fn count(&self, request: &str) -> usize {
@@ -213,9 +223,11 @@ impl Api for Fixture {
                     if let Some(echo) = &self.response_echo {
                         fixed["name"] = echo.clone().into();
                     }
-                    Ok(
-                        json!({"templates":[fixed],"custom_template":[if self.custom { self.current_selection.offer.clone() } else { fixtures::custom() }]}),
-                    )
+                    let mut reply = json!({"templates":[fixed],"custom_template":[if self.custom { self.current_selection.offer.clone() } else { fixtures::custom() }]});
+                    if let Some(claim) = &self.catalogue_claim {
+                        reply["honours_order_id"] = claim.clone();
+                    }
+                    Ok(reply)
                 }
                 ("GET", "/api/v1/image") => Ok(json!([self.current_selection.image])),
                 ("POST", "/api/v1/vm/custom-template/price") => {
@@ -233,6 +245,11 @@ impl Api for Fixture {
                 }
                 ("GET", "/api/v1/vm") => Ok(json!(self.machines)),
                 ("POST", "/api/v1/vm" | "/api/v1/vm/custom-template") => {
+                    let sent_id = body.as_ref().map_or(Value::Null, |b| b["order_id"].clone());
+                    let repeat = self.create_order_ids.contains(&sent_id);
+                    self.create_order_ids.push(sent_id.clone());
+                    let sends = self.create_order_ids.iter().filter(|id| **id == sent_id).count();
+                    self.create_bytes.push(body.as_ref().map(Value::to_string).unwrap_or_default());
                     if let Some(storage) = &self.create_journal {
                         let store = unlock(
                             MemoryStorage::with_files(storage.files()),
@@ -242,16 +259,29 @@ impl Api for Fixture {
                         .await
                         .unwrap();
                         let events = purchase_events(&store);
-                        let Some(Event::Procurement(
-                            record @ Record::CreateSentWithOrderId { order_id, .. },
-                        )) = events.last()
-                        else {
-                            panic!("the create intent must be durable before the request");
+                        // Each send has its own durable intent, except a re-send of the same Order ID.
+                        let intents = events
+                            .iter()
+                            .filter(|event| matches!(event, Event::Procurement(Record::CreateSentWithOrderId { order_id, .. }) if json!(order_id) == sent_id))
+                            .count();
+                        let order_id = match events.last() {
+                            Some(Event::Procurement(
+                                record @ Record::CreateSentWithOrderId { order_id, .. },
+                            )) if intents == sends => {
+                                let encoded = serde_json::to_value(record).unwrap();
+                                assert_eq!(encoded["create_sent_with_order_id"]["order_id"], *order_id);
+                                order_id.clone()
+                            }
+                            // A re-send of a seen Order ID follows its own durable record.
+                            Some(Event::Procurement(Record::CreateResent { .. })) if repeat && intents < sends => {
+                                let saved = store.procurement.as_ref().unwrap();
+                                assert!(saved.resent_at.is_some());
+                                saved.order_id.clone().unwrap()
+                            }
+                            _ => panic!("the create intent must be durable before the request"),
                         };
-                        let encoded = serde_json::to_value(record).unwrap();
-                        assert_eq!(encoded["create_sent_with_order_id"]["order_id"], *order_id);
                         let body = body.unwrap();
-                        assert_eq!(body["order_id"], *order_id);
+                        assert_eq!(body["order_id"], order_id);
                         self.create_bodies.push(body);
                     }
                     if let Some((status, body)) = self.order_response.take() {
@@ -263,6 +293,10 @@ impl Api for Fixture {
                                 protocol::ReadError::Refused("Provider mutation outcome unknown or browser access unavailable; the saved intent is retained. Use read-only Refresh/Resume to reconcile or remain paused; never retry the mutation.".into())
                             },
                         );
+                    }
+                    if self.honours && repeat && !self.machines.is_empty() {
+                        self.status = 200;
+                        return Ok(self.machines[0].clone());
                     }
                     self.clock += self.advance_before_create;
                     self.advance_before_create = 0;
@@ -4096,6 +4130,379 @@ fn provisioning_legacy_request_fingerprints_replay_without_changing_purchase() {
         serde_json::to_value(purchase_events(&restored).last().unwrap()).unwrap(),
         serde_json::to_value(&event).unwrap()
     );
+}
+
+fn honour_events(s: &Store<MemoryStorage>) -> Vec<Value> {
+    purchase_events(s)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Procurement(
+                ref record @ (Record::CreateSentWithOrderId { .. }
+                | Record::CreateResent { .. }
+                | Record::ResendRefused),
+            ) => Some(serde_json::to_value(record).unwrap()),
+            _ => None,
+        })
+        .collect()
+}
+fn has_event(events: &[Value], name: &str) -> bool {
+    events
+        .iter()
+        .any(|record| record == &json!(name) || record.get(name).is_some())
+}
+const MAIN_ORDER_ID: &str = "6f1c2a3b-4d5e-4f60-8a7b-9c0d1e2f3a4b";
+
+#[test]
+fn provisioning_honours_order_id_is_saved_only_from_an_explicit_true_before_the_first_send() {
+    for claim in [
+        None,
+        Some(json!(false)),
+        Some(json!(null)),
+        Some(json!("true")),
+        Some(json!(1)),
+        Some(json!(true)),
+    ] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        api.catalogue_claim = claim.clone();
+        api.create_journal = Some(s.storage.clone());
+        approve(&mut s, &mut api);
+        let reads = api.count("GET /api/v1/vm/templates");
+        assert!(
+            block_on(s.procurement_resume(&mut api, false))
+                .unwrap_err()
+                .contains("initial Lightning")
+        );
+        // The first send uses the catalogue read it always made: no extra request.
+        assert_eq!(api.count("GET /api/v1/vm/templates"), reads + 1);
+        assert_eq!(api.count("POST /api/v1/vm"), 1);
+        let honours = claim == Some(json!(true));
+        let saved = honour_events(&s);
+        assert_eq!(saved.len(), 1, "{claim:?}");
+        assert_eq!(
+            saved[0]["create_sent_with_order_id"].get("honours_order_id"),
+            honours.then_some(&json!(true)),
+            "{claim:?}"
+        );
+        assert_eq!(s.procurement.as_ref().unwrap().honours_order_id, honours);
+        assert_eq!(reopen(&s).procurement, s.procurement);
+    }
+    // Selection and approval see one claim, the first send's own read another: the latter is saved.
+    for (approval_claim, send_claim) in [(json!(true), json!(false)), (json!(false), json!(true))] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        api.catalogue_claim = Some(approval_claim);
+        approve(&mut s, &mut api);
+        api.catalogue_claim = Some(send_claim.clone());
+        assert!(
+            block_on(s.procurement_resume(&mut api, false))
+                .unwrap_err()
+                .contains("initial Lightning")
+        );
+        assert_eq!(
+            s.procurement.as_ref().unwrap().honours_order_id,
+            send_claim == json!(true)
+        );
+    }
+}
+
+#[test]
+fn provisioning_uncertain_purchase_saved_without_the_capability_recovers_read_only() {
+    for (mut shape, started) in [
+        (
+            json!({"create_sent_with_order_id": {"intent": {"before": [], "started": 0}, "order_id": MAIN_ORDER_ID}}),
+            "/create_sent_with_order_id/intent/started",
+        ),
+        (
+            json!({"create_sent": {"before": [], "started": 0}}),
+            "/create_sent/started",
+        ),
+    ] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        api.catalogue_claim = Some(json!(true));
+        api.honours = true;
+        approve(&mut s, &mut api);
+        block_on(s.procurement_commit(Record::RegistrationSent)).unwrap();
+        block_on(s.procurement_commit(Record::Registered(
+            json!({"id":7,"name":"tau-0","created":"2026-11-06T14:00:00Z"}),
+        )))
+        .unwrap();
+        // The shapes the build on main writes: no capability member.
+        *shape.pointer_mut(started).unwrap() = json!(api.now());
+        let record: Record = serde_json::from_value(shape).unwrap();
+        block_on(s.procurement_commit(record)).unwrap();
+        let mut loaded = reopen(&s);
+        assert!(!loaded.procurement.as_ref().unwrap().honours_order_id);
+        let before = api.calls.len();
+        for _ in 0..2 {
+            assert_eq!(
+                block_on(loaded.procurement_resume(&mut api, false)).unwrap_err(),
+                ORDER_CONFIRMATION_MISSING
+            );
+        }
+        assert_eq!(&api.calls[before..], ["GET /api/v1/vm", "GET /api/v1/vm"]);
+        assert_eq!(api.count("POST /api/v1/vm"), 0);
+        assert!(honour_events(&loaded).len() <= 1);
+    }
+}
+
+#[test]
+fn provisioning_honouring_provider_gets_one_resend_with_the_saved_order_id_and_bytes() {
+    for (custom, recorded) in [(false, true), (false, false), (true, true), (true, false)] {
+        let mut s = ready();
+        let mut api = Fixture::new(custom);
+        api.catalogue_claim = Some(json!(true));
+        api.honours = true;
+        if recorded {
+            api.lose_create = true;
+        } else {
+            api.order_response = Some((0, Vec::new()));
+        }
+        approve(&mut s, &mut api);
+        assert_eq!(
+            block_on(s.procurement_resume(&mut api, false)).unwrap_err(),
+            ORDER_CONFIRMATION_MISSING
+        );
+        api.lose_create = false;
+        api.status = 200;
+        assert_eq!(api.machines.len(), usize::from(recorded));
+        let route = if custom {
+            "POST /api/v1/vm/custom-template"
+        } else {
+            "POST /api/v1/vm"
+        };
+        let mut s = reopen(&s);
+        api.create_journal = Some(s.storage.clone());
+        let before = api.calls.len();
+        assert!(
+            block_on(s.procurement_resume(&mut api, false))
+                .unwrap_err()
+                .contains("initial Lightning")
+        );
+        // The fixture found `create_resent` durable when the re-send arrived.
+        assert_eq!(api.create_bodies.len(), 1);
+        let after: Vec<_> = api.calls[before..].iter().map(String::as_str).collect();
+        // The fresh catalogue read comes first; the one create follows the first send's reads.
+        assert_eq!(after[0], "GET /api/v1/vm/templates");
+        assert_eq!(after.iter().filter(|call| **call == route).count(), 1);
+        let create_at = after.iter().position(|call| *call == route).unwrap();
+        assert!(
+            after[..create_at]
+                .iter()
+                .all(|call| call.starts_with("GET ") || call.ends_with("/price"))
+        );
+        assert_eq!(api.count(route), 2);
+        assert_eq!(api.create_bytes[0], api.create_bytes[1]);
+        assert_eq!(api.create_order_ids[0], api.create_order_ids[1]);
+        assert_eq!(
+            api.create_order_ids[0],
+            json!(s.procurement.as_ref().unwrap().order_id.clone().unwrap())
+        );
+        assert_eq!(api.machines.len(), 1);
+        assert_eq!(s.procurement_view()["vm_id"], 11);
+        assert_eq!(s.procurement_view()["phase"], "initial_invoice");
+        assert!(s.procurement.as_ref().unwrap().resent_at.is_some());
+        assert!(has_event(&honour_events(&s), "create_resent"));
+        let mut s = reopen(&s);
+        assert_eq!(s.procurement_view()["vm_id"], 11);
+        let _ = block_on(s.procurement_resume(&mut api, false));
+        assert_eq!(api.count(route), 2, "a later check never sends again");
+    }
+}
+
+#[test]
+fn provisioning_resend_needs_a_fresh_explicit_true_on_the_approved_terms() {
+    for case in ["false", "null", "string", "absent", "failed", "price"] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        api.catalogue_claim = Some(json!(true));
+        api.honours = true;
+        api.lose_create = true;
+        approve(&mut s, &mut api);
+        assert_eq!(
+            block_on(s.procurement_resume(&mut api, false)).unwrap_err(),
+            ORDER_CONFIRMATION_MISSING
+        );
+        api.lose_create = false;
+        match case {
+            "false" => api.catalogue_claim = Some(json!(false)),
+            "null" => api.catalogue_claim = Some(json!(null)),
+            "string" => api.catalogue_claim = Some(json!("true")),
+            "absent" => api.catalogue_claim = None,
+            "failed" => api.fail_catalogue = true,
+            _ => api.current_selection.offer["cost_plan"]["amount"] = json!(2000000),
+        }
+        let mut s = reopen(&s);
+        let before = api.calls.len();
+        let result = block_on(s.procurement_resume(&mut api, false));
+        assert_eq!(api.count("POST /api/v1/vm"), 1, "{case}");
+        assert!(
+            api.calls[before..].iter().all(|call| call.starts_with("GET ")),
+            "{case}"
+        );
+        // Today's read-only check still attaches the recorded machine.
+        assert!(result.unwrap_err().contains("initial Lightning"), "{case}");
+        assert_eq!(s.procurement_view()["vm_id"], 11, "{case}");
+        // An answered read ends re-sending; a failed read only skips it this time.
+        assert_eq!(
+            s.procurement.as_ref().unwrap().honours_order_id,
+            case == "failed",
+            "{case}"
+        );
+        assert_eq!(
+            has_event(&honour_events(&s), "resend_refused"),
+            case != "failed",
+            "{case}"
+        );
+        assert!(!has_event(&honour_events(&s), "create_resent"), "{case}");
+    }
+}
+
+#[test]
+fn provisioning_refused_resend_pauses_with_the_same_order_id_and_never_creates_again() {
+    for status in [409u16, 404, 403] {
+        let mut s = ready();
+        let mut api = Fixture::new(false);
+        api.catalogue_claim = Some(json!(true));
+        api.honours = true;
+        api.order_response = Some((0, Vec::new()));
+        approve(&mut s, &mut api);
+        assert_eq!(
+            block_on(s.procurement_resume(&mut api, false)).unwrap_err(),
+            ORDER_CONFIRMATION_MISSING
+        );
+        api.status = 200;
+        let order_id = s.procurement.as_ref().unwrap().order_id.clone().unwrap();
+        let body = if status == 403 {
+            serde_json::to_vec(&json!({"error":protocol::EMAIL_REQUIRED})).unwrap()
+        } else {
+            serde_json::to_vec(&json!({"error":"order_id has already been used"})).unwrap()
+        };
+        api.order_response = Some((status, body));
+        let mut s = reopen(&s);
+        assert_eq!(
+            block_on(s.procurement_resume(&mut api, false)).unwrap_err(),
+            ORDER_CONFIRMATION_MISSING,
+            "{status}"
+        );
+        api.status = 200;
+        assert_eq!(api.count("POST /api/v1/vm"), 2);
+        let saved = s.procurement.as_ref().unwrap();
+        assert!(!saved.honours_order_id);
+        assert_eq!(saved.order_id.as_deref(), Some(order_id.as_str()));
+        assert!(has_event(&honour_events(&s), "resend_refused"));
+        assert_eq!(s.procurement_view()["phase"], "create_uncertain");
+        assert_eq!(
+            s.procurement_view()["confirmation_message"],
+            ORDER_CONFIRMATION_MISSING
+        );
+        let mut s = reopen(&s);
+        let before = api.calls.len();
+        for _ in 0..2 {
+            assert_eq!(
+                block_on(s.procurement_resume(&mut api, false)).unwrap_err(),
+                ORDER_CONFIRMATION_MISSING
+            );
+        }
+        // Later checks only read: no fresh catalogue read, no create.
+        assert_eq!(&api.calls[before..], ["GET /api/v1/vm", "GET /api/v1/vm"]);
+        assert!(block_on(s.procurement_approve(&mut api, approval())).is_err());
+        assert_eq!(api.count("POST /api/v1/vm"), 2);
+        assert_eq!(
+            s.procurement.as_ref().unwrap().order_id.as_deref(),
+            Some(order_id.as_str())
+        );
+    }
+}
+
+#[test]
+fn provisioning_machine_made_by_a_late_resend_attaches_and_replays() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    api.catalogue_claim = Some(json!(true));
+    api.honours = true;
+    api.order_response = Some((0, Vec::new()));
+    approve(&mut s, &mut api);
+    assert_eq!(
+        block_on(s.procurement_resume(&mut api, false)).unwrap_err(),
+        ORDER_CONFIRMATION_MISSING
+    );
+    api.status = 200;
+    // Ten minutes later the first Order never reached the provider; the re-send makes it.
+    api.clock += 600;
+    api.created = Some("2026-11-06T14:10:00Z".into());
+    let mut s = reopen(&s);
+    assert!(
+        block_on(s.procurement_resume(&mut api, false))
+            .unwrap_err()
+            .contains("initial Lightning")
+    );
+    assert_eq!(s.procurement.as_ref().unwrap().resent_at, Some(api.clock));
+    assert_eq!(s.procurement_view()["vm_id"], 11);
+    let loaded = reopen(&s);
+    assert_eq!(loaded.procurement, s.procurement);
+    assert_eq!(api.count("POST /api/v1/vm"), 2);
+}
+
+#[test]
+fn provisioning_new_capability_members_cannot_be_prefilled_and_a_new_first_send_resets_them() {
+    let mut s = ready();
+    let mut api = Fixture::new(false);
+    approve(&mut s, &mut api);
+    let last = s.records().last().unwrap();
+    let event = purchase_events(&s).pop();
+    let Some(Event::Procurement(Record::Approved(approved))) = &event else {
+        panic!("the approval is the last event");
+    };
+    let mut files = s.storage.files();
+    files.remove(&last.to_string());
+    let before = block_on(unlock(MemoryStorage::with_files(files), &Fixed, pass())).unwrap();
+    assert!(
+        before
+            .procurement_projection(&Record::Approved(approved.clone()))
+            .is_ok()
+    );
+    for (member, value) in [("honours_order_id", json!(true)), ("resent_at", json!(api.now()))] {
+        let mut prefilled = serde_json::to_value(&**approved).unwrap();
+        prefilled[member] = value;
+        let prefilled: Purchase = serde_json::from_value(prefilled).unwrap();
+        assert!(
+            before
+                .procurement_projection(&Record::Approved(Box::new(prefilled)))
+                .is_err(),
+            "{member}"
+        );
+    }
+    // A re-send record needs a saved true; after an email refusal the next first send starts afresh.
+    api.catalogue_claim = Some(json!(true));
+    api.order_response = Some((0, Vec::new()));
+    assert!(block_on(s.procurement_resume(&mut api, false)).is_err());
+    api.status = 200;
+    let order_id = s.procurement.as_ref().unwrap().order_id.clone().unwrap();
+    assert!(s.procurement.as_ref().unwrap().honours_order_id);
+    block_on(s.procurement_commit(Record::CreateResent { at: api.now() })).unwrap();
+    assert!(
+        block_on(s.procurement_commit(Record::CreateResent { at: api.now() - 1 })).is_err()
+    );
+    block_on(s.procurement_commit(Record::CreateEmailRefused)).unwrap();
+    assert!(block_on(s.procurement_commit(Record::ResendRefused)).is_err());
+    block_on(s.procurement_commit(Record::EmailVerified)).unwrap();
+    block_on(s.procurement_commit(Record::CreateSentWithOrderId {
+        intent: Create {
+            before: Vec::new(),
+            started: api.now(),
+        },
+        order_id: order_id.clone(),
+        honours_order_id: false,
+    }))
+    .unwrap();
+    let saved = s.procurement.as_ref().unwrap();
+    assert_eq!(saved.resent_at, None);
+    assert!(!saved.honours_order_id);
+    assert_eq!(saved.order_id.as_deref(), Some(order_id.as_str()));
+    assert!(block_on(s.procurement_commit(Record::CreateResent { at: api.now() })).is_err());
+    assert_eq!(reopen(&s).procurement, s.procurement);
 }
 
 mod b947;
