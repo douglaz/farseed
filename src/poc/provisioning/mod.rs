@@ -144,6 +144,11 @@ impl Vendor {
             Self::Lnvps => lnvps::catalogue(),
         }
     }
+    pub(crate) fn honours_order_id(self, catalogue: &Value) -> bool {
+        match self {
+            Self::Lnvps => lnvps::honours_order_id(catalogue),
+        }
+    }
     pub(crate) fn images(self) -> VendorRequest {
         match self {
             Self::Lnvps => lnvps::images(),
@@ -237,9 +242,10 @@ impl Vendor {
         vm: &Value,
         key: u64,
         not_before: u64,
+        latest: u64,
     ) -> bool {
         match self {
-            Self::Lnvps => selection.lnvps_matches(vm, key, not_before),
+            Self::Lnvps => selection.lnvps_matches(vm, key, not_before, latest),
         }
     }
     pub(crate) fn validate_vm(self, vm: &Value) -> Result<(), String> {
@@ -765,7 +771,7 @@ impl Selection {
         }
     }
     pub fn matches(&self, vm: &Value, key: u64, not_before: u64) -> bool {
-        Vendor::Lnvps.matches(self, vm, key, not_before)
+        Vendor::Lnvps.matches(self, vm, key, not_before, not_before)
     }
 }
 

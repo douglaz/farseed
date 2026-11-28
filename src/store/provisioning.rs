@@ -1,4 +1,5 @@
-//! Durable procurement. Possibly-sent intents are never retried.
+//! Durable procurement. Possibly-sent intents are never retried, except that an Uncertain
+//! purchase is sent once more under its saved Order ID to a Honouring provider.
 use super::*;
 use crate::dispatch::{
     Access, ApprovedEntry, BillingInterval, ClassAnswer, MachineEntry, Period, RecurringCost, Unit,
@@ -132,6 +133,12 @@ pub struct Purchase {
     pub create: Option<Create>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     order_id: Option<String>,
+    /// Saved with the Order ID from the catalogue read for this send: a Honouring provider.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    honours_order_id: bool,
+    /// When this Uncertain purchase was last sent again under the same Order ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resent_at: Option<u64>,
     pub vm: Option<Value>,
     pub invoice: Option<Invoice>,
     #[serde(default)]
@@ -208,6 +215,13 @@ struct Reconciliation {
 fn unpaid_machine(vm: &Value) -> bool {
     vm.get("expires").is_some_and(Value::is_null)
         && vm.get("deleting_on").is_none_or(Value::is_null)
+}
+/// A machine made for this Approval: created around its first send or its latest re-send.
+fn order_matches(p: &Purchase, vm: &Value, key: u64) -> bool {
+    p.create.as_ref().is_some_and(|intent| {
+        let latest = p.resent_at.unwrap_or(intent.started);
+        p.vendor.matches(&p.selected, vm, key, intent.started, latest)
+    })
 }
 fn failing_payments(p: &Purchase, history: &[Value]) -> Result<Vec<Value>, String> {
     let vm = p.vm.as_ref().ok_or(REFUSED)?;
@@ -418,7 +432,16 @@ pub enum Record {
     CreateSentWithOrderId {
         intent: Create,
         order_id: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        honours_order_id: bool,
     },
+    /// Saved before an Uncertain purchase is sent again to a Honouring provider.
+    CreateResent {
+        at: u64,
+    },
+    /// The provider refused the re-send of an Uncertain purchase, or a fresh catalogue read no
+    /// longer said it honours Order IDs on the approved terms; later checks only read.
+    ResendRefused,
     EmailRequired,
     EmailEntered {
         email: String,
@@ -882,18 +905,23 @@ impl<S: Storage> Store<S> {
         &mut self,
         api: &mut impl Api,
     ) -> Result<Value, String> {
+        Ok(self.procurement_offers(api).await?.0)
+    }
+    /// The offers and whether this same catalogue reply says it is a Honouring provider.
+    async fn procurement_offers(&mut self, api: &mut impl Api) -> Result<(Value, bool), String> {
         self.check_api(api)?;
         let catalogue = self
             .provider_read(api, self.procurement_vendor().catalogue())
             .await?;
         self.procurement_vendor().catalogue_shape(&catalogue)?;
+        let honours_order_id = self.procurement_vendor().honours_order_id(&catalogue);
         let images = self
             .provider_read(api, self.procurement_vendor().images())
             .await?;
         let (catalogue, images) = self
             .procurement_vendor()
             .catalogue_public(catalogue, images)?;
-        Ok(json!({"offers":catalogue,"images":images}))
+        Ok((json!({"offers":catalogue,"images":images}), honours_order_id))
     }
     pub(crate) async fn procurement_select(
         &mut self,
@@ -908,7 +936,7 @@ impl<S: Storage> Store<S> {
         {
             return Err("Complete the saved purchase before reviewing another machine.".into());
         }
-        let selected = self.procurement_fetch_selection(api, choice).await?;
+        let (selected, _) = self.procurement_fetch_selection(api, choice).await?;
         if self
             .procurement
             .as_ref()
@@ -925,8 +953,8 @@ impl<S: Storage> Store<S> {
         &mut self,
         api: &mut impl Api,
         choice: Choice,
-    ) -> Result<Selection, String> {
-        let catalogue = self.procurement_catalogue(api).await?;
+    ) -> Result<(Selection, bool), String> {
+        let (catalogue, honours_order_id) = self.procurement_offers(api).await?;
         let (offer, image) = self.procurement_vendor().selection_inputs(
             &catalogue,
             choice.resources.as_ref(),
@@ -950,7 +978,25 @@ impl<S: Storage> Store<S> {
             charge,
         };
         self.procurement_vendor().validate_selection(&selected)?;
-        Ok(selected)
+        Ok((selected, honours_order_id))
+    }
+    /// The fresh read before a re-send, the same one a first send makes: the catalogue must
+    /// say true explicitly and still offer exactly the approved terms. A failed read says no
+    /// this time; any other answer ends re-sending, so later checks keep today's read budget.
+    async fn honouring_now(&mut self, api: &mut impl Api, p: &Purchase) -> Result<bool, String> {
+        let choice = Choice {
+            offer_id: id(&p.selected.offer)?,
+            image_id: id(&p.selected.image)?,
+            resources: p.selected.resources.clone(),
+        };
+        let Ok((fresh, honours)) = self.procurement_fetch_selection(api, choice).await else {
+            return Ok(false);
+        };
+        if honours && p.vendor.same_terms(&fresh, &p.selected) {
+            return Ok(true);
+        }
+        self.procurement_commit(Record::ResendRefused).await?;
+        Ok(false)
     }
     pub(crate) async fn procurement_approve(
         &mut self,
@@ -1013,7 +1059,7 @@ impl<S: Storage> Store<S> {
             .or_else(|| self.procurement_selection.clone())
             .ok_or("Fetch and choose an offer before approval.")?;
         // Approval authorizes exactly the displayed terms, never a newly fetched change.
-        let fresh = self
+        let (fresh, _) = self
             .procurement_fetch_selection(
                 api,
                 Choice {
@@ -1068,6 +1114,8 @@ impl<S: Storage> Store<S> {
             ssh_key: None,
             create: None,
             order_id: None,
+            honours_order_id: false,
+            resent_at: None,
             vm: None,
             invoice: None,
             billing: None,
@@ -1141,6 +1189,8 @@ impl<S: Storage> Store<S> {
                 || p.ssh_key.is_some()
                 || p.create.is_some()
                 || p.order_id.is_some()
+                || p.honours_order_id
+                || p.resent_at.is_some()
                 || p.vm.is_some()
                 || p.billing.is_some()
                 || p.invoice.is_some()
@@ -1334,6 +1384,7 @@ impl<S: Storage> Store<S> {
                 p.approved_at = *approved_at;
                 p.pending_selection = None;
                 p.order_id = None;
+                p.honours_order_id = false;
             }
             Record::RegistrationSent => {
                 if p.registration_sent {
@@ -1363,17 +1414,49 @@ impl<S: Storage> Store<S> {
                 for vm in &intent.before {
                     self.procurement_vendor().validate_vm(vm)?;
                 }
-                if let Record::CreateSentWithOrderId { order_id, .. } = record {
+                if let Record::CreateSentWithOrderId {
+                    order_id,
+                    honours_order_id,
+                    ..
+                } = record
+                {
                     if !valid_order_id(order_id)
                         || p.order_id.as_ref().is_some_and(|saved| saved != order_id)
                     {
                         return Err(REFUSED.into());
                     }
                     p.order_id = Some(order_id.clone());
+                    p.honours_order_id = *honours_order_id;
                 } else if p.order_id.is_some() {
                     return Err(REFUSED.into());
+                } else {
+                    p.honours_order_id = false;
                 }
+                p.resent_at = None;
                 p.create = Some(intent.clone());
+            }
+            Record::CreateResent { at } => {
+                let intent = p.create.as_ref().ok_or(REFUSED)?;
+                if p.vm.is_some()
+                    || p.order_id.is_none()
+                    || !p.honours_order_id
+                    || *at < intent.started
+                    || p.resent_at.is_some_and(|saved| *at < saved)
+                {
+                    return Err(REFUSED.into());
+                }
+                p.resent_at = Some(*at);
+            }
+            Record::ResendRefused => {
+                if p.create.is_none()
+                    || p.vm.is_some()
+                    || p.order_id.is_none()
+                    || !p.honours_order_id
+                {
+                    return Err(REFUSED.into());
+                }
+                // The Order ID stays bound to this Approval; only the re-send stops.
+                p.honours_order_id = false;
             }
             Record::MachineEvidenceObserved { vm_ids } => {
                 let intent = p.create.as_ref().ok_or(REFUSED)?;
@@ -1411,12 +1494,7 @@ impl<S: Storage> Store<S> {
                         .any(|vm| *vm != vm_id && !spare_ids.contains(vm))
                     || p.duplicate_orders.first().is_some_and(|spare| vm_id >= *spare)
                     || intent.before.iter().any(|old| p.vendor.same_vm_id(old, vm))
-                    || !p.vendor.matches(
-                        &p.selected,
-                        vm,
-                        id(p.ssh_key.as_ref().ok_or(REFUSED)?)?,
-                        intent.started,
-                    )
+                    || !order_matches(&p, vm, id(p.ssh_key.as_ref().ok_or(REFUSED)?)?)
                 {
                     return Err(REFUSED.into());
                 }
@@ -1587,12 +1665,7 @@ impl<S: Storage> Store<S> {
             Record::Observation(vm) => {
                 let old = p.vm.as_ref().ok_or(REFUSED)?;
                 if !p.vendor.same_vm_identity(old, vm)
-                    || !p.vendor.matches(
-                        &p.selected,
-                        vm,
-                        id(p.ssh_key.as_ref().ok_or(REFUSED)?)?,
-                        p.create.as_ref().ok_or(REFUSED)?.started,
-                    )
+                    || !order_matches(&p, vm, id(p.ssh_key.as_ref().ok_or(REFUSED)?)?)
                 {
                     return Err(REFUSED.into());
                 }
@@ -1842,7 +1915,7 @@ impl<S: Storage> Store<S> {
     async fn reconcile_create(&mut self, api: &mut impl Api) -> Result<Reconciliation, String> {
         self.procurement_recovery = Default::default();
         let p = self.procurement.clone().ok_or(REFUSED)?;
-        let intent = p.create.as_ref().ok_or(REFUSED)?;
+        p.create.as_ref().ok_or(REFUSED)?;
         let key = id(p.ssh_key.as_ref().ok_or(REFUSED)?)?;
         let chosen = p.vm.as_ref().map(id).transpose()?;
         let checked_at = api.now();
@@ -1868,7 +1941,7 @@ impl<S: Storage> Store<S> {
         }
         for &vm in &rows {
             let vm_id = id(vm)?;
-            if !p.vendor.matches(&p.selected, vm, key, intent.started) || !unpaid_machine(vm) {
+            if !order_matches(&p, vm, key) || !unpaid_machine(vm) {
                 result.failing.push(vm_id);
                 continue;
             }
@@ -1881,7 +1954,7 @@ impl<S: Storage> Store<S> {
                     result.failing.push(vm_id);
                     continue;
                 };
-                if !p.vendor.matches(&p.selected, &detail, key, intent.started)
+                if !order_matches(&p, &detail, key)
                     || !p.vendor.same_vm_identity(vm, &detail)
                     || !unpaid_machine(&detail)
                 {
@@ -1912,7 +1985,7 @@ impl<S: Storage> Store<S> {
                 if current_ids.iter().position(|id| id == vm_id).is_none_or(|index| {
                     let latest = current[index];
                     !p.vendor.same_vm_identity(vm, latest)
-                        || !p.vendor.matches(&p.selected, latest, key, intent.started)
+                        || !order_matches(&p, latest, key)
                         || !unpaid_machine(latest)
                 }) {
                     result.failing.push(*vm_id);
@@ -2497,7 +2570,7 @@ impl<S: Storage> Store<S> {
         }
         if p.vm.is_none() {
             if p.create.is_none() {
-                let fresh = self
+                let (fresh, honours_order_id) = self
                     .procurement_fetch_selection(
                         api,
                         Choice {
@@ -2525,6 +2598,7 @@ impl<S: Storage> Store<S> {
                 self.procurement_commit(Record::CreateSentWithOrderId {
                     intent: Create { before, started },
                     order_id,
+                    honours_order_id,
                 })
                 .await?;
                 #[cfg(all(feature = "tracer", target_arch = "wasm32"))]
@@ -2547,6 +2621,24 @@ impl<S: Storage> Store<S> {
                     }
                     Err(_) => return Err(ORDER_CONFIRMATION_MISSING.into()),
                     Ok(_) => (),
+                }
+            } else if p.honours_order_id && self.honouring_now(api, &p).await? {
+                // A Honouring provider said so with the Order ID and again just now, on the
+                // approved terms: send the Uncertain purchase once more, byte for byte.
+                self.procurement_commit(Record::CreateResent { at: api.now() })
+                    .await?;
+                self.check_api(api)?;
+                let request = p.vendor.create(
+                    &p.selected,
+                    id(p.ssh_key.as_ref().ok_or(REFUSED)?)?,
+                    p.order_id.as_deref().ok_or(REFUSED)?,
+                );
+                if self.provider_read(api, request).await.is_err() {
+                    // A lost reply stays uncertain; a refusal stops every later re-send.
+                    if (400..500).contains(&api.response_status()) {
+                        self.procurement_commit(Record::ResendRefused).await?;
+                    }
+                    return Err(ORDER_CONFIRMATION_MISSING.into());
                 }
             }
             self.associate_create(api, None).await?;

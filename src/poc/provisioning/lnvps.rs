@@ -869,7 +869,8 @@ impl Selection {
         }
     }
     /// Sufficient association requires creation, key, image, region, price and every resource.
-    pub(super) fn lnvps_matches(&self, vm: &Value, key: u64, not_before: u64) -> bool {
+    /// `latest` is the last send of the same Order ID, the first send unless it was sent again.
+    pub(super) fn lnvps_matches(&self, vm: &Value, key: u64, not_before: u64, latest: u64) -> bool {
         let check = || -> Result<bool, String> {
             validate_vm(vm)?;
             if !self.offer["limits"].is_object() {
@@ -878,7 +879,7 @@ impl Selection {
             let created = timestamp(text(vm, "created", 40)?)?;
             // Authentication permits 60s clock skew; journal/dispatch work shares the 60s action bound.
             if created.saturating_add(60) < not_before
-                || created > not_before.saturating_add(120)
+                || created > latest.max(not_before).saturating_add(120)
                 || !cpu_matches(&self.offer, &self.image, vm)?
                 || id(&vm["ssh_key"])? != key
                 || !same_image(&vm["image"], &self.image)
@@ -1193,6 +1194,11 @@ pub(super) fn catalogue_shape(catalogue: &Value) -> Result<(), String> {
         array(custom)?;
     }
     Ok(())
+}
+
+/// Only an explicit JSON true makes a Honouring provider; any other value or its absence does not.
+pub(super) fn honours_order_id(catalogue: &Value) -> bool {
+    catalogue.get("honours_order_id") == Some(&Value::Bool(true))
 }
 
 pub(super) fn selection_inputs(
